@@ -3847,14 +3847,22 @@ void retire_slot_locked(int k) {
     g.gpu_us.fetch_add(fence_us);
     bump(g_stream_stats.fence_ns, static_cast<std::uint64_t>(fence_us) * 1000);
     if (r != VK_SUCCESS) {
-        host_log("gpu: waiting for submission %d failed (%d)%s", k, r,
-                 r == VK_ERROR_DEVICE_LOST ? "; device lost, GPU execution disabled" : "");
-        if (r == VK_ERROR_DEVICE_LOST) device_lost_locked("a wait for a submission");
+        if (!g.ok.load(std::memory_order_relaxed)) return;
+        host_log("gpu: waiting for submission %d failed (%d)s", k, r,
+            r == VK_ERROR_DEVICE_LOST ? ", device lost, GPU execution disabled" : "");
+        if (r == VK_ERROR_DEVICE_LOST) {
+            // Çift tetiklenmeyi önlemek için bayrağı güvenli şekilde kapat
+            bool expected = true;
+            if (g.ok.compare_exchange_strong(expected, false)) {
+                device_lost_locked("a wait for a submission");
+            }
+        }
     }
     vkResetFences(g.device, 1, &sl.fence);
     vkResetDescriptorPool(g.device, sl.pool, 0);
     sl.spare_sets.clear();
     for (DevBuffer& b : sl.garbage) {
+        if (b.buffer == VK_NULL_HANDLE) continue; // Geçersiz handle kontrolü
         vkDestroyBuffer(g.device, b.buffer, nullptr);
         vkFreeMemory(g.device, b.memory, nullptr);
     }
