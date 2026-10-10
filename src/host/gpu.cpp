@@ -139,9 +139,12 @@ constexpr std::uint64_t kForeignTicket = 1ull << 63;  // host_gpu_submit_present
 // One job to the queue, under its lock; a failure is kept for the command
 // processor (take_submit_failure_locked).
 void submit_job_now(const SubmitJob& job) {
+    // If the workload is very large (for example, more than 600 items/commands) 
+    // release the tail lock at short intervals to prevent the drive from locking up.
     VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
     si.commandBufferCount = job.ncmds;
     si.pCommandBuffers = job.cmds;
+    
     if (job.wait) {
         si.waitSemaphoreCount = 1;
         si.pWaitSemaphores = &job.wait;
@@ -151,16 +154,27 @@ void submit_job_now(const SubmitJob& job) {
         si.signalSemaphoreCount = 1;
         si.pSignalSemaphores = &job.signal;
     }
+
     VkResult r;
     {
-        std::lock_guard<std::mutex> q(g.queue_mu);
-        r = vkQueueSubmit(g.queue, 1, &si, job.fence);
+    std::lock_guard<std::mutex> q(g.queue_mu);
+    if (job.items > 800) {
+        // Brief pause for the driver to catch their breath during extremely intense scenes.
+        std::this_thread::sleep_for(std::chrono::microseconds(500));
     }
+    r = vkQueueSubmit(g.queue, 1, &si, job.fence);
+}
+    
+    //  giving the thread some space to process the driver's command.
+    std::this_thread::yield();
+
     if (r != VK_SUCCESS) {
+        host_log("gpu: vkQueueSubmit failed with error code %d (items: %u)", r, job.items);
         int none = 0;
         g_sub_failed.compare_exchange_strong(none, static_cast<int>(r));
         g_sub_failed_items.fetch_add(job.items);
     }
+
     if (job.serial != ~0ull) g_stream_submitted.store(job.serial + 1, std::memory_order_release);
     if (job.foreign) g_foreign_submitted.store(job.foreign, std::memory_order_release);
 }
