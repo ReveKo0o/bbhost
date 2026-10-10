@@ -443,7 +443,29 @@ void shadow_locate_locked(std::uint64_t va, std::uint64_t bytes, Located& loc) {
     std::uint32_t n_regions = 0;
     VkCommandBuffer cmd = VK_NULL_HANDLE;
     auto flush = [&] {
-        if (n_regions) vkCmdCopyBuffer(cmd, source->buffer, m->buffer, n_regions, regions);
+        if (n_regions) {
+            vkCmdCopyBuffer(cmd, source->buffer, m->buffer, n_regions, regions);
+            
+            // Post-copy memory barrier for the NVIDIA driver (Access Violation prevention)
+            VkBufferMemoryBarrier barrier{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
+            barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            barrier.dstAccessMask = VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_INDEX_READ_BIT | VK_ACCESS_SHADER_READ_BIT;
+            barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            barrier.buffer = m->buffer;
+            barrier.offset = 0;
+            barrier.size = VK_WHOLE_SIZE;
+
+            vkCmdPipelineBarrier(
+                cmd,
+                VK_PIPELINE_STAGE_TRANSFER_BIT,
+                VK_PIPELINE_STAGE_VERTEX_INPUT_BIT | VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                0,
+                0, nullptr,
+                1, &barrier,
+                0, nullptr
+            );
+        }
         n_regions = 0;
     };
     for (std::uint32_t p = p0; p <= p1; ++p) {
