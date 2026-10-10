@@ -44,6 +44,8 @@ bool host_gpu_dump_display(std::uint64_t, const char*, bool) { return false; }
 void host_gpu_request_dump() {}
 bool host_gpu_take_dump_request(std::string*) { return false; }
 std::string host_gpu_capture_dir() { return {}; }
+void host_gpu_capture_arm(int, const char*) {}
+const char* host_gpu_draw_fail_name(int) { return nullptr; }
 const char* host_gpu_capture_ext() { return ".ppm"; }
 void host_gpu_glitch_watch(std::uint64_t, std::uint64_t) {}
 std::uint64_t host_gpu_draw_mark() { return 0; }
@@ -62,4 +64,5 @@ std::string host_gpu_ps_wave_report() { return {}; }
 std::string host_gpu_memory_budget_report() { return {}; }
 void host_gpu_set_loading(bool) {}
 void host_gpu_world_reached() {}
+std::size_t host_gpu_shader_backlog() { return 0; }
 int host_gpu_stream_selftest(int) { return 2; }  // no Vulkan: nothing to test

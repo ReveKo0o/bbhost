@@ -149,15 +149,15 @@ target_link_libraries(bbhost PRIVATE ZLIB::ZLIB)
 
 # The git revision the binary logs on its first line (build/gen/bbhost_version.h,
 # rewritten by every build only when it changes): a crash report from a
-# machine names the build to symbolize it against. bbhost_build_id.h beside it:
-# the shader caches' stamp for "the same build".
+# machine names the build to symbolize it against.
 add_custom_target(bbhost_version
   COMMAND ${CMAKE_COMMAND} -DSRC=${CMAKE_SOURCE_DIR} -DOUT=${CMAKE_BINARY_DIR}/gen/bbhost_version.h
-          -DBUILD_ID_OUT=${CMAKE_BINARY_DIR}/gen/bbhost_build_id.h -P ${CMAKE_SOURCE_DIR}/cmake/version.cmake
-  BYPRODUCTS ${CMAKE_BINARY_DIR}/gen/bbhost_version.h ${CMAKE_BINARY_DIR}/gen/bbhost_build_id.h)
+          -P ${CMAKE_SOURCE_DIR}/cmake/version.cmake
+  BYPRODUCTS ${CMAKE_BINARY_DIR}/gen/bbhost_version.h)
 add_dependencies(bbhost bbhost_version)
 # The translator's fingerprint (build/gen/translator_fingerprint.h): the
-# translation cache's key for "the same translator".
+# translation cache's key for "the same translator" - its sources and the
+# cache's own key and entry code.
 add_custom_target(bbhost_translator_fingerprint
   COMMAND ${CMAKE_COMMAND} -DSRC=${CMAKE_SOURCE_DIR} -DOUT=${CMAKE_BINARY_DIR}/gen/translator_fingerprint.h
           -P ${CMAKE_SOURCE_DIR}/cmake/translator_fingerprint.cmake
@@ -349,11 +349,25 @@ if(UNIX)
   find_package(Python3 COMPONENTS Interpreter QUIET)
   if(Python3_Interpreter_FOUND)
     add_test(NAME world_baseline_test COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/world_baseline_test.py)
+    add_test(NAME area_check_test COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/area_check_test.py)
+    add_test(NAME lift_verify_test COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/lift_verify_test.py)
     # The Debug Menu plugin's English against the 1.09 eboot: skipped without
     # one (BBHOST_EBOOT, or eboot-109-decrypted.bin in the checkout).
     add_test(NAME debug_menu_strings_test COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/debug_menu_strings.py check)
     set_tests_properties(debug_menu_strings_test PROPERTIES SKIP_RETURN_CODE 77)
   endif()
+  # The map-validation probe's tour steps (tools/area_check.py's) on a pretend
+  # host. Built beside the tests, never into plugins/, where bbhost would load it.
+  add_library(mapval_probe MODULE tools/mapval_plugin.c)
+  target_include_directories(mapval_probe PRIVATE include)
+  target_link_libraries(mapval_probe PRIVATE m)
+  set_target_properties(mapval_probe PROPERTIES PREFIX "")
+  add_executable(mapval_probe_test tests/mapval_probe_test.cpp)
+  target_include_directories(mapval_probe_test PRIVATE include)
+  target_link_libraries(mapval_probe_test PRIVATE ${CMAKE_DL_LIBS})
+  add_dependencies(mapval_probe_test mapval_probe)
+  add_test(NAME mapval_probe_test COMMAND mapval_probe_test $<TARGET_FILE:mapval_probe>)
+  set_tests_properties(mapval_probe_test PROPERTIES SKIP_RETURN_CODE 77)
   add_executable(thunk_args tests/thunk_args.cpp src/core/thunk.cpp src/core/tls_rewrite.cpp src/core/portable.cpp src/hle/sysv_va.cpp src/host/main_wait.cpp)
   target_include_directories(thunk_args PRIVATE src)
   target_link_libraries(thunk_args PRIVATE pthread)

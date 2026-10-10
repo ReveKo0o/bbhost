@@ -203,6 +203,7 @@ struct ShaderStage {
     void take(const std::shared_ptr<const Cached>& hit) {  // the stage cache's entry, kept alive by the pointer
         shared = std::shared_ptr<const gcn::TranslateResult>(hit, &hit->meta);
         own = gcn::TranslateResult{};
+        lifted = hit->lifted;
     }
 };
 struct GfxPipeline {
@@ -1166,6 +1167,31 @@ bool plausible_extent(std::uint32_t v, std::uint32_t padded) {
 // extent learned. target_image() reuses its last answer until then.
 std::uint64_t g_rt_gen = 1;
 
+std::uint64_t steady_ms() {
+    return static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+// A draw, a fill or a copy wrote the target (the reuse retire's age and order).
+void rt_written(RtImage& r) {
+    r.written_flip = hle_video_flip_count();
+    r.written_ms = steady_ms();
+}
+// The reuse retire's bases and when it retired them, to count a target made
+// again at a base it had retired within the idle time - the sign of retiring
+// too early (each such remake costs an allocation and the old contents).
+std::unordered_map<std::uint64_t, std::uint64_t> g_reuse_retired_at;  // under g.mu
+std::uint64_t g_reuse_remade = 0;                                     // under g.mu
+// BBHOST_IMG_REUSE_IDLE=<s>: how long nothing may have written an image before
+// the reuse retire looks at it (10 s).
+std::uint64_t reuse_idle_ms() {
+    static const std::uint64_t ms = [] {
+        const char* e = std::getenv("BBHOST_IMG_REUSE_IDLE");
+        const std::uint64_t s = e && *e ? std::strtoull(e, nullptr, 10) : 10;
+        return (s ? s : 10) * 1000;
+    }();
+    return ms;
+}
+
 std::uint32_t unpadded(std::unordered_map<std::uint64_t, std::uint32_t>& seen, std::uint64_t base, std::uint32_t padded,
                        std::uint32_t scissor_edge) {
     if (auto it = seen.find(base); it != seen.end() && plausible_extent(it->second, padded)) {
@@ -1251,6 +1277,7 @@ RtImage* rt_image(std::uint64_t base, VkFormat format, std::uint32_t width, std:
             ++g_rt_gen;
             RtImage& kept = (g_rts[base] = std::move(promoted));
             g_max_rt_bytes = std::max<std::uint64_t>(g_max_rt_bytes, rt_size_bytes(kept));
+            rt_written(kept);
             return &kept;
         }
         g.rt_replacements.fetch_add(1);
@@ -1272,6 +1299,7 @@ RtImage* rt_image(std::uint64_t base, VkFormat format, std::uint32_t width, std:
         if (r.format == format && r.width == width && r.height == height && r.layers >= layers) {
             if (!r.slice_bytes) r.slice_bytes = slice_bytes;
             apply_pending_clear(r);
+            rt_written(r);
             return &r;
         }
         g.rt_replacements.fetch_add(1);
@@ -1401,6 +1429,18 @@ RtImage* rt_image(std::uint64_t base, VkFormat format, std::uint32_t width, std:
     ++g_rt_gen;
     RtImage& created = (g_rts[base] = r);
     g_max_rt_bytes = std::max<std::uint64_t>(g_max_rt_bytes, rt_size_bytes(created));
+    rt_written(created);
+    created.created_flip = created.written_flip;
+    if (auto ra = g_reuse_retired_at.find(base); ra != g_reuse_retired_at.end()) {
+        if (created.written_ms - ra->second < reuse_idle_ms()) {
+            if (++g_reuse_remade <= 8) {
+                host_log("render: %s target 0x%llx %ux%u format %d made again %llu ms after the reuse retire took its image (flip %llu)",
+                         depth ? "depth" : "colour", static_cast<unsigned long long>(base), width, height, static_cast<int>(format),
+                         static_cast<unsigned long long>(created.written_ms - ra->second), static_cast<unsigned long long>(created.written_flip));
+            }
+        }
+        g_reuse_retired_at.erase(ra);
+    }
     bump_view_epoch();
     if (grow) {
         created.htile = grown_from.htile;
@@ -1494,6 +1534,7 @@ RtImage* target_image(int slot, std::uint64_t base, VkFormat format, std::uint32
     if (m.rt && m.gen == g_rt_gen && m.base == base && m.format == format && m.padded_w == padded_w && m.padded_h == padded_h &&
         m.right == scissor_right && m.bottom == scissor_bottom && m.layers == layers && m.slice_bytes == slice_bytes && m.extent == extent) {
         apply_pending_clear(*m.rt);
+        rt_written(*m.rt);
         return m.rt;
     }
     std::uint32_t w = 0, h = 0;
@@ -1839,6 +1880,14 @@ bool decomp_selects(const std::string& ps_name) {
         return s;
     }();
     return selection.first || selection.second.count(ps_name) != 0;
+}
+
+// How a draw bound to `p` runs its pixel shader (GpuStats::draws_ps): only the
+// no-fallback variant ever carries a lift.
+int draw_ps_kind(const GfxPipeline& p) {
+    if (p.ps.lifted) return kDrawPsLifted;
+    if (!p.ps.module && p.ps.meta().spirv.empty()) return kDrawPsNone;
+    return p.lean ? kDrawPsTranslated : kDrawPsFallback;
 }
 
 struct DrawState {
@@ -2603,6 +2652,9 @@ std::uint64_t lift_key(std::uint64_t key, bool lifted) { return lifted ? key ^ k
 struct CachedStage {
     gcn::TranslateResult meta;
     VkShaderModule module = VK_NULL_HANDLE;
+    // The lift's module rather than the translation's. A lift key holds either:
+    // a rejected lift caches the translation under it.
+    bool lifted = false;
 };
 std::mutex g_stage_cache_mu;
 std::unordered_map<std::uint64_t, std::shared_ptr<const CachedStage>> g_stage_cache;
@@ -2613,10 +2665,11 @@ std::shared_ptr<const CachedStage> cached_stage(std::uint64_t key) {
     return it == g_stage_cache.end() ? nullptr : it->second;
 }
 
-void cache_stage(std::uint64_t key, const gcn::TranslateResult& meta, VkShaderModule module) {
+void cache_stage(std::uint64_t key, const gcn::TranslateResult& meta, VkShaderModule module, bool lifted) {
     auto entry = std::make_shared<CachedStage>();
     entry->meta = meta;
     entry->module = module;
+    entry->lifted = lifted;
     std::lock_guard<std::mutex> lk(g_stage_cache_mu);
     g_stage_cache.emplace(key, std::move(entry));
 }
@@ -3709,7 +3762,7 @@ GfxPipeline& build_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const std::
                                  pl.ps.meta().spirv.size());
                     }
                     pl.ps.fresh().spirv = std::move(lifted.spirv);
-                    pl.ps.fresh().wave64_needs = 0;  // no cross-lane operation left: any subgroup size (gcn/wave.h)
+                    pl.ps.fresh().wave64_needs = 0;  // quad operations at most, which no subgroup size changes (gcn/wave.h)
                     pl.ps.lifted = true;
                 } else if (first) {
                     host_log("render: PS %s not lifted, translated shader kept: %s", ps_name.c_str(), lifted.rejections[0].c_str());
@@ -3727,7 +3780,7 @@ GfxPipeline& build_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const std::
             t_stage = std::chrono::steady_clock::now();
             if (!make_module(pl.ps.meta().spirv, pl.ps.module)) return fail("PS module");
             if (!t_pipeline_worker) g_pl_module_us.fetch_add(pl_us_since(t_stage), std::memory_order_relaxed);
-            if (ps_cacheable) cache_stage(ps_key, pl.ps.meta(), pl.ps.module);
+            if (ps_cacheable) cache_stage(ps_key, pl.ps.meta(), pl.ps.module, pl.ps.lifted);
         }
     }
     // Vertex shader (+ fetch shader)
@@ -3829,7 +3882,7 @@ GfxPipeline& build_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const std::
         t_stage = std::chrono::steady_clock::now();
         if (!make_module(pl.vs.meta().spirv, pl.vs.module)) return fail("VS module");
         if (!t_pipeline_worker) g_pl_module_us.fetch_add(pl_us_since(t_stage), std::memory_order_relaxed);
-        if (vs_cacheable) cache_stage(vs_key, pl.vs.meta(), pl.vs.module);
+        if (vs_cacheable) cache_stage(vs_key, pl.vs.meta(), pl.vs.module, pl.vs.lifted);
     }
     // The LS as the pipeline's own vertex stage, so the control
     // point reaches the evaluation stage through the pipeline and no compute
@@ -3869,7 +3922,7 @@ GfxPipeline& build_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const std::
         if (!ls_hit) {
             dump_spirv(pl.name + "-tess-ls", pl.tess_ls.meta().spirv);
             if (!make_module(pl.tess_ls.meta().spirv, pl.tess_ls.module)) return fail("tessellation LS module");
-            if (g_stage_cache_on) cache_stage(ls_key, pl.tess_ls.meta(), pl.tess_ls.module);
+            if (g_stage_cache_on) cache_stage(ls_key, pl.tess_ls.meta(), pl.tess_ls.module, false);
             manifest_note_ls(ls_key, ls->name, ls->words, fetch ? &fetch->words : nullptr, s.ls_rsrc1, s.ls_rsrc2, s.tess_attr_vec4s);
         }
     }
@@ -4848,10 +4901,11 @@ void precompile_ps(Precompiler& w, const PrecompileJob& job) {
             if (lifted.ok()) {
                 stage.fresh().spirv = std::move(lifted.spirv);
                 stage.fresh().wave64_needs = 0;  // as build_gfx_pipeline's lift
+                stage.lifted = true;
             }
         }
         if (!make_module(stage.meta().spirv, stage.module)) return give_up("shader module");
-        if (cacheable) cache_stage(key, stage.meta(), stage.module);
+        if (cacheable) cache_stage(key, stage.meta(), stage.module, stage.lifted);
     }
     w.translate_us.fetch_add(pl_us_since(t0), std::memory_order_relaxed);
     const auto t1 = std::chrono::steady_clock::now();
@@ -4885,7 +4939,7 @@ void precompile_ps(Precompiler& w, const PrecompileJob& job) {
         if (!ok) {
             spirv_drop_early_fragment_tests(twin.spirv);
             ok = make_module(twin.spirv, twin_module);
-            if (ok && cacheable) cache_stage(twin_key, twin, twin_module);
+            if (ok && cacheable) cache_stage(twin_key, twin, twin_module, stage.lifted);
         }
         t_library_owner = job.name.c_str();
         ok = ok && fragment_library(twin, twin_module, set, layout) != VK_NULL_HANDLE;
@@ -4918,7 +4972,7 @@ void precompile_manifest(const ManifestStage& m) {
         if (ok && !(g_stage_cache_on && cached_stage(key))) {
             ls.fresh() = translate_cached(prog, tess_ls_options(m.rsrc1, m.rsrc2, m.tess_attr_vec4s, m.fetch_words.empty() ? nullptr : &fprog));
             ok = ls.meta().ok() && make_module(ls.meta().spirv, ls.module);
-            if (ok && g_stage_cache_on) cache_stage(key, ls.meta(), ls.module);
+            if (ok && g_stage_cache_on) cache_stage(key, ls.meta(), ls.module, false);
         }
         g_manifest.compile_us.fetch_add(pl_us_since(t0), std::memory_order_relaxed);
         std::lock_guard<std::mutex> lk(g_manifest.mu);
@@ -4969,6 +5023,7 @@ void precompile_manifest(const ManifestStage& m) {
                 if (lifted.ok()) {
                     stage.fresh().spirv = std::move(lifted.spirv);
                     stage.fresh().wave64_needs = 0;  // as build_gfx_pipeline's lift
+                    stage.lifted = true;
                 }
             }
         } else {
@@ -4976,11 +5031,14 @@ void precompile_manifest(const ManifestStage& m) {
             stage.fresh() = translate_cached(prog, options);
             if (stage.meta().ok() && m.lift) {
                 gcn::LiftResult lifted = lift_cached(true, prog, options, stage.meta());
-                if (lifted.ok()) stage.fresh().spirv = std::move(lifted.spirv);
+                if (lifted.ok()) {
+                    stage.fresh().spirv = std::move(lifted.spirv);
+                    stage.lifted = true;
+                }
             }
         }
         ok = stage.meta().ok() && make_module(stage.meta().spirv, stage.module);
-        if (ok && g_stage_cache_on) cache_stage(key, stage.meta(), stage.module);
+        if (ok && g_stage_cache_on) cache_stage(key, stage.meta(), stage.module, stage.lifted);
     }
     if (ok && !m.tess_hw && !m.domain_level) {
         const VkDescriptorSetLayout set = g.gfx_set_layout;  // both sets take the shared layout under libraries
@@ -5073,11 +5131,14 @@ void precompile_vs(Precompiler& w, const PrecompileJob& job) {
         // same stage the draw wants and is not thrown away for it.
         if (lift) {
             gcn::LiftResult lifted = lift_cached(true, prog, options, stage.meta());
-            if (lifted.ok()) stage.fresh().spirv = std::move(lifted.spirv);
+            if (lifted.ok()) {
+                stage.fresh().spirv = std::move(lifted.spirv);
+                stage.lifted = true;
+            }
         }
         dump_spirv("precompile-" + job.name + "-vs", stage.meta().spirv);
         if (!make_module(stage.meta().spirv, stage.module)) return give_up("shader module");
-        if (cacheable) cache_stage(key, stage.meta(), stage.module);
+        if (cacheable) cache_stage(key, stage.meta(), stage.module, stage.lifted);
     }
     w.vs_translate_us.fetch_add(pl_us_since(t0), std::memory_order_relaxed);
     const auto t1 = std::chrono::steady_clock::now();
@@ -6695,6 +6756,7 @@ bool clear_target_locked(std::uint64_t va, std::size_t bytes, const float rgba[4
     auto it = g_rts.find(va);
     if (it == g_rts.end()) return false;
     if (bytes < rt_size_bytes(it->second)) return false;
+    rt_written(it->second);
     clear_image_locked(it->second, rgba);
     note_fill_last(it->second, va, bytes, rgba);
     return true;
@@ -7304,6 +7366,8 @@ bool render_copy_target_locked(std::uint64_t src_base, std::uint64_t dst_base, s
         ++g_rt_gen;
         st = g_snapshots.emplace(dst_base, r).first;
         g_max_rt_bytes = std::max<std::uint64_t>(g_max_rt_bytes, rt_size_bytes(st->second));
+        rt_written(st->second);
+        st->second.created_flip = st->second.written_flip;
         bump_view_epoch();
     }
     if (!into) {
@@ -7319,6 +7383,7 @@ bool render_copy_target_locked(std::uint64_t src_base, std::uint64_t dst_base, s
         }
     }
     RtImage& dst = into ? *into : st->second;
+    rt_written(dst);
     begin_recording_locked();
     render_end_pass_locked();
     if (!dst.initialised) {
@@ -7732,6 +7797,118 @@ std::string render_barriers_report() {
                   static_cast<unsigned long long>(g_barriers_paid.load()), static_cast<unsigned long long>(g_barriers_skipped.load()),
                   static_cast<unsigned long long>(g_barriers_mid_pass.load()));
     return b;
+}
+
+bool render_target_newer_overlapping_locked(std::uint64_t va, std::size_t bytes, std::uint64_t after_flip, const RtImage* self) {
+    const auto scan = [&](const std::map<std::uint64_t, RtImage>& m) {
+        auto it = m.lower_bound(va + bytes);
+        while (it != m.begin()) {
+            --it;
+            const RtImage& r = it->second;
+            if (r.base + g_max_rt_bytes <= va) break;
+            if (&r != self && r.created_flip > after_flip && ranges_overlap(va, bytes, r.base, std::max<std::size_t>(rt_size_bytes(r), 1))) {
+                return true;
+            }
+        }
+        return false;
+    };
+    return scan(g_rts) || scan(g_snapshots);
+}
+
+ReuseRetired render_retire_reused_locked(std::uint64_t now_ms, std::uint64_t idle_ms, std::chrono::steady_clock::time_point deadline) {
+    ReuseRetired out;
+    static std::uint64_t cursor_rts = 0, cursor_snapshots = 0;  // the next base each scan looks at
+    bool stopped = false;
+    const auto sweep = [&](std::map<std::uint64_t, RtImage>& m, bool snapshots, std::uint64_t& cursor) {
+        if (stopped) return;
+        int k = 0;
+        for (auto it = m.lower_bound(cursor); it != m.end();) {
+            if ((++k & 15) == 0 && std::chrono::steady_clock::now() >= deadline) {
+                cursor = it->first;
+                stopped = true;
+                return;
+            }
+            RtImage& r = it->second;
+            const std::size_t span = std::max<std::size_t>(rt_size_bytes(r), 1);
+            if (r.written_ms + idle_ms > now_ms || gx_resource_at(r.base, span, nullptr) ||
+                (!gx_resource_newer_overlapping(r.base, span, r.written_flip) &&
+                 !render_target_newer_overlapping_locked(r.base, span, r.written_flip, &r))) {
+                ++it;
+                continue;
+            }
+            static std::atomic<int> logs{0};
+            if (logs.fetch_add(1) < 8) {
+                host_log("render: %s 0x%llx %ux%u format %d (%llu MiB) retired: a newer object holds its memory, last written %llu s ago",
+                         snapshots ? "snapshot" : r.depth ? "depth target" : "colour target", static_cast<unsigned long long>(r.base), r.width,
+                         r.height, static_cast<int>(r.format), static_cast<unsigned long long>(r.memory.size >> 20),
+                         static_cast<unsigned long long>((now_ms - r.written_ms) / 1000));
+            }
+            ++out.n;
+            out.bytes += r.memory.size;
+            if (g_reuse_retired_at.size() > 65536) g_reuse_retired_at.clear();
+            g_reuse_retired_at[it->first] = now_ms;
+            textures_drop_rt_regions_locked(it->first);
+            destroy_rt_image(r);
+            it = m.erase(it);
+        }
+        cursor = 0;  // the scan reached the end: the next one starts over
+    };
+    sweep(g_rts, false, cursor_rts);
+    sweep(g_snapshots, true, cursor_snapshots);
+    if (out.n) {
+        ++g_rt_gen;
+        bump_view_epoch();
+    }
+    return out;
+}
+
+namespace {
+ReuseRetired g_reuse_targets, g_reuse_textures;  // retired so far (under g.mu)
+std::uint64_t g_reuse_sweeps = 0, g_reuse_sweep_us = 0, g_reuse_sweep_max_us = 0;  // what the sweeps cost (under g.mu)
+}  // namespace
+
+void image_reuse_sweep_locked() {
+    static const bool on = [] {
+        const char* e = std::getenv("BBHOST_IMG_RETIRE_REUSED");
+        return !(e && e[0] == '0');
+    }();
+    if (!on) return;
+    static std::uint64_t last = 0;
+    const std::uint64_t now = steady_ms();
+    if (now - last < 1000) return;
+    last = now;
+    // At most 0.3 ms of g.mu a second: the scans go on where they stopped,
+    // and take turns going first so neither waits on the other.
+    const auto t0 = std::chrono::steady_clock::now();
+    const auto deadline = t0 + std::chrono::microseconds(300);
+    static bool textures_first = false;
+    textures_first = !textures_first;
+    ReuseRetired t, x;
+    if (textures_first) x = textures_retire_reused_locked(now, reuse_idle_ms(), deadline);
+    t = render_retire_reused_locked(now, reuse_idle_ms(), deadline);
+    if (!textures_first) x = textures_retire_reused_locked(now, reuse_idle_ms(), deadline);
+    const std::uint64_t us = static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count());
+    ++g_reuse_sweeps;
+    g_reuse_sweep_us += us;
+    g_reuse_sweep_max_us = std::max(g_reuse_sweep_max_us, us);
+    g_reuse_targets.n += t.n;
+    g_reuse_targets.bytes += t.bytes;
+    g_reuse_textures.n += x.n;
+    g_reuse_textures.bytes += x.bytes;
+}
+
+std::string image_reuse_report_locked() {
+    char buf[320];
+    std::snprintf(buf, sizeof(buf),
+                  "images retired as their memory went to newer objects: targets and snapshots %llu (%llu MiB), shader-written textures %llu "
+                  "(%llu MiB); targets made again within the idle time %llu; %llu sweeps, %llu us on average, the longest %llu us",
+                  static_cast<unsigned long long>(g_reuse_targets.n), static_cast<unsigned long long>(g_reuse_targets.bytes >> 20),
+                  static_cast<unsigned long long>(g_reuse_textures.n), static_cast<unsigned long long>(g_reuse_textures.bytes >> 20),
+                  static_cast<unsigned long long>(g_reuse_remade), static_cast<unsigned long long>(g_reuse_sweeps),
+                  static_cast<unsigned long long>(g_reuse_sweeps ? g_reuse_sweep_us / g_reuse_sweeps : 0),
+                  static_cast<unsigned long long>(g_reuse_sweep_max_us));
+    return buf;
 }
 
 }  // namespace gpu
@@ -13124,6 +13301,7 @@ static bool draw_impl(const GpuDraw& d) {
     if (!g.profile_passes) profile_end_locked();
     cmds.publish();  // the diagnostics below may record or flush: they come after this draw
     bump(g.draws);  // the one writer, under g.mu: no locked add
+    bump(g.draws_ps[draw_ps_kind(*bind_pl)]);
     draw_stamp.to(kRenderCostRecord);
     if (g_render_cost_enabled) report_render_split(false);
     if (capture_session) {
@@ -14606,6 +14784,15 @@ void precompile_set_loading(bool loading) {
 void precompile_set_world_reached() {
     g_world_seen.store(true);
     precompile_boost_update("the first in-game frame");
+}
+
+std::size_t precompile_backlog() {
+    Precompiler* w = g_precompiler.load();
+    if (!w) return 0;
+    std::lock_guard<std::mutex> lk(w->mu);
+    std::size_t n = w->jobs.size();
+    for (const auto& [name, k] : w->running) n += static_cast<std::size_t>(k);
+    return n;
 }
 
 // At the end of device init: the manifest's stages go to the precompile

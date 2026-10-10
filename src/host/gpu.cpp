@@ -5,7 +5,6 @@
 #include "host/gpu_internal.h"
 #include "host/shader_patch.h"
 #include "host/translation_cache.h"
-#include "bbhost_build_id.h"
 
 #include "gcn/container.h"
 #include "gcn/half.h"
@@ -990,21 +989,25 @@ std::string translation_cache_path() {
     return path.substr(0, path.rfind('/') + 1) + "translation-cache.bin";
 }
 
-// The shader caches belong to the build that made them. A translation is keyed
-// by the translator's sources and the options hash_options names, a pipeline
-// by the driver - neither by the rest of the host, so a change there (a lift,
-// an option missing from the key) would leave the next build running the last
-// one's shaders. A build other than the one named in
-// <data root>/bbhost/shader-cache-build.txt starts both empty. The stage
-// manifest stays: it holds the guest's inputs, which the running build
-// translates again on the precompile workers, filling the caches before the
-// title. BBHOST_KEEP_SHADER_CACHE=1 keeps them across builds.
+// The shader caches belong to the translator that made them. A translation is
+// keyed by the program, every option and switch it was translated with and the
+// translator's fingerprint - its sources and the cache's own key and entry
+// code - and a pipeline by the driver, by its shaders and state; so an update
+// that leaves the translator alone keeps both and starts with every shader
+// built. Another translator - <data root>/bbhost/shader-cache-build.txt names
+// the one that made them - starts both empty: its translations would not be
+// taken anyway, and the pipelines its shaders replace would stay in the
+// pipeline cache, which the driver keeps whole (one translator's are 25 MiB on
+// the Steam Deck to 100 MiB on NVIDIA; the file grew past 400 MiB over a few
+// weeks of builds). The stage manifest stays: it holds the guest's inputs,
+// which the running build translates again on the precompile workers.
+// BBHOST_KEEP_SHADER_CACHE=1 keeps them across translators.
 static void shader_caches_check_build() {
     const std::string pipelines = pipeline_cache_path();
     if (pipelines.empty()) return;
     const std::string dir = pipelines.substr(0, pipelines.rfind('/') + 1);
     const std::string stamp = dir + "shader-cache-build.txt";
-    const std::string ours = BBHOST_BUILD_ID;
+    const std::string ours = translator_fingerprint();
     std::string theirs;
     {
         std::ifstream in(stamp);
@@ -1013,8 +1016,8 @@ static void shader_caches_check_build() {
     if (theirs == ours) return;
     std::error_code ec;
     if (const char* e = std::getenv("BBHOST_KEEP_SHADER_CACHE"); e && e[0] == '1') {
-        host_log("gpu: shader caches made by %s kept for %s (BBHOST_KEEP_SHADER_CACHE=1)", theirs.empty() ? "an earlier build" : theirs.c_str(),
-                 ours.c_str());
+        host_log("gpu: shader caches made by translator %s kept for translator %s (BBHOST_KEEP_SHADER_CACHE=1)",
+                 theirs.empty() ? "of an earlier build" : theirs.c_str(), ours.c_str());
     } else {
         std::uintmax_t freed = 0;
         int removed = 0;
@@ -1024,8 +1027,8 @@ static void shader_caches_check_build() {
             if (std::filesystem::remove(path, ec)) freed += bytes, ++removed;
         }
         if (removed)
-            host_log("gpu: shader caches made by %s, this is %s: cleared (%.1f MiB); the precompile builds them again", theirs.empty() ? "an earlier build" : theirs.c_str(),
-                     ours.c_str(), freed / 1048576.0);
+            host_log("gpu: shader caches made by translator %s, this is translator %s: cleared (%.1f MiB); the precompile builds them again",
+                     theirs.empty() ? "of an earlier build" : theirs.c_str(), ours.c_str(), freed / 1048576.0);
     }
     std::filesystem::create_directories(dir, ec);
     std::ofstream(stamp, std::ios::trunc) << ours << '\n';
@@ -2256,7 +2259,7 @@ bool init_locked() {
     // The pipeline cache persists under the data root, so a later run creates
     // the pipelines this one compiled without the driver compiling them again.
     // The driver ignores data from another device or driver version; another
-    // build of bbhost throws it away itself (and its translations with it).
+    // translator throws it away itself (and its translations with it).
     shader_caches_check_build();
     std::vector<char> cache_data;
     if (const std::string path = pipeline_cache_path(); !path.empty()) {
@@ -4192,6 +4195,7 @@ std::string image_heap_report() {
                   static_cast<unsigned long long>(g_heap_cp_blocks), static_cast<unsigned long long>(g_heap_released),
                   static_cast<unsigned long long>(g.staging_free_bytes >> 20), static_cast<unsigned long long>(view_epoch()));
     if (const std::string sites = view_epoch_sites_report(); !sites.empty()) host_log("  %s", sites.c_str());
+    host_log("  %s", image_reuse_report_locked().c_str());
     return buf;
 }
 
@@ -4786,7 +4790,19 @@ GpuStats host_gpu_stats() {
     st.draw_calls = g.draw_calls.load();
     st.draw_failures = g.draw_failures.load();
     st.draws_empty = g.draws_empty.load();
+    for (int i = 0; i < kDrawPsCount; ++i) st.draws_ps[i] = g.draws_ps[i].load(std::memory_order_relaxed);
+    for (int i = 0; i < 16; ++i) st.draw_fail_why[i] = g.draw_fail_why[i].load(std::memory_order_relaxed);
     return st;
+}
+
+const char* host_gpu_draw_fail_name(int reason) {
+    static const char* const why[kFailCount] = {"tessellation off",  "tessellation plan",  "tessellation LS pass",
+                                                "primitive type",    "no vertex shader",   "vertex shader",
+                                                "pixel shader",      "fetch shader",       "pipeline build",
+                                                "descriptor set",    "set allocation",     "fallback bindings",
+                                                "pipeline creation", "index buffer",       "indirect arguments",
+                                                "no GPU (device lost)"};
+    return reason >= 0 && reason < kFailCount ? why[reason] : nullptr;
 }
 void host_gpu_phase_add(int phase, std::uint64_t ns) { g.phase_ns[phase & 7].fetch_add(ns, std::memory_order_relaxed); }
 
@@ -5705,6 +5721,7 @@ void host_gpu_set_loading(bool loading) {
 }
 
 void host_gpu_world_reached() { gpu::precompile_set_world_reached(); }
+std::size_t host_gpu_shader_backlog() { return gpu::translation_cache_cold() ? gpu::precompile_backlog() : 0; }
 
 std::string host_gpu_image_heap_report() {
     std::lock_guard<GpuMutex> lock(gpu::g.mu);
@@ -6251,16 +6268,10 @@ void host_gpu_report() {
              static_cast<unsigned long long>(g.gpu_us.load() / 1000));
     if (const std::string busy = busy_exit_report(); !busy.empty()) host_log("%s", busy.c_str());
     if (g.draw_failures.load()) {
-        static const char* const why[kFailCount] = {"tessellation off",  "tessellation plan",  "tessellation LS pass",
-                                                    "primitive type",    "no vertex shader",   "vertex shader",
-                                                    "pixel shader",      "fetch shader",       "pipeline build",
-                                                    "descriptor set",    "set allocation",     "fallback bindings",
-                                                    "pipeline creation", "index buffer",       "indirect arguments",
-                                                    "no GPU (device lost)"};
         std::string line;
         for (int k = 0; k < kFailCount; ++k) {
             if (const std::uint64_t n = g.draw_fail_why[k].load()) {
-                line += (line.empty() ? "" : ", ") + std::string(why[k]) + " " + std::to_string(n);
+                line += (line.empty() ? "" : ", ") + std::string(host_gpu_draw_fail_name(k)) + " " + std::to_string(n);
             }
         }
         host_log("gpu: draw failures by reason: %s", line.c_str());
