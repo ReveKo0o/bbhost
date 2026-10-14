@@ -12767,6 +12767,58 @@ static bool draw_impl(const GpuDraw& d) {
             }
         }
     }
+    // A colour target smaller than the area the draw renders to is left out of
+    // its pass: a pass is as large as its smallest attachment (begin_pass), so
+    // bound it made the render area its size and clipped the draw's scissor to
+    // it. Kyo's resolution patches make the glow buffer - the lighting
+    // composite's second target - 80x45; bound, it clipped the whole composite
+    // to the top-left 80x45: the lit world black on every GPU (NVIDIA players'
+    // screenshots, a headless frame here). The area is the draw's scissor
+    // within the largest target it writes (or, for one it does not write,
+    // writes or depth-tests). One the draw does not write (no channel in both
+    // CB_TARGET_MASK and CB_SHADER_MASK) goes whenever it is smaller - nothing
+    // of it changes; one it writes only when it is under half the area either
+    // way, and its writes are lost, where the hardware would have written its
+    // corner. The G-buffer's unwritten slots are the size of the rest and stay
+    // bound, so its pass is not split. BBHOST_KEEP_SMALL_TARGETS=1: bound as before.
+    {
+        static const bool keep_small = [] {
+            const char* e = std::getenv("BBHOST_KEEP_SMALL_TARGETS");
+            return e && e[0] == '1';
+        }();
+        std::uint32_t written_w = 0, written_h = 0;
+        for (int t = 0; t < 8; ++t) {
+            if (!s.color[t] || !s.color_mask[t]) continue;
+            written_w = std::max(written_w, s.color[t]->width);
+            written_h = std::max(written_h, s.color[t]->height);
+        }
+        const auto scissor_end = [](std::int32_t offset, std::uint32_t extent) {
+            return static_cast<std::uint32_t>(std::max<std::int64_t>(0, static_cast<std::int64_t>(offset) + extent));
+        };
+        const std::uint32_t sx = scissor_end(s.scissor.offset.x, s.scissor.extent.width);
+        const std::uint32_t sy = scissor_end(s.scissor.offset.y, s.scissor.extent.height);
+        const std::uint32_t used_w = std::min(std::max(written_w, s.depth ? s.depth->width : 0u), sx);
+        const std::uint32_t used_h = std::min(std::max(written_h, s.depth ? s.depth->height : 0u), sy);
+        written_w = std::min(written_w, sx);
+        written_h = std::min(written_h, sy);
+        for (int t = 0; t < 8 && !keep_small; ++t) {
+            RtImage* rt = s.color[t];
+            if (!rt) continue;
+            const bool written = s.color_mask[t] != 0;
+            if (!written && rt->width >= used_w && rt->height >= used_h) continue;
+            if (written && rt->width * 2 >= written_w && rt->height * 2 >= written_h) continue;
+            const std::uint32_t wide = written ? written_w : used_w, tall = written ? written_h : used_h;
+            static std::set<std::uint64_t> logged;
+            if (logged.size() < 16 && logged.insert(rt->base).second) {
+                host_log("render: colour target 0x%llx %ux%u (slot %d) is bound to a draw into %ux%u that %s: left out of the pass, "
+                         "which bound it would be %ux%u",
+                         static_cast<unsigned long long>(rt->base), rt->width, rt->height, t, wide, tall,
+                         written ? "writes it (its writes are lost)" : "writes none of it", std::min(rt->width, wide),
+                         std::min(rt->height, tall));
+            }
+            s.color[t] = nullptr;
+        }
+    }
     s.su_sc_mode = in.su_sc_mode;
     s.clip_cntl = in.clip_cntl;
     s.vte_cntl = in.vte_cntl;
