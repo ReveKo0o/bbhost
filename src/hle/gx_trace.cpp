@@ -2567,12 +2567,12 @@ std::uint64_t native_fill(const std::uint64_t* f) {
 // target by address, HTILE and CMASK fills included). 1 (checks): both - the
 // clear token is resolved without clearing and the fill token that follows
 // reports what it did with the same clear (the exit report's `checked
-// against the fill path`). 2: the clear token alone; the method's work (the
-// fills, the depth-stencil quad) does not run. A view the host cannot clear
-// keeps the fill path (counted by reason).
+// against the fill path`). 2 (the default): the clear token alone; the
+// method's work (the fills, the depth-stencil quad) does not run. A view the
+// host cannot clear keeps the fill path (counted by reason).
 const int g_clear_views = [] {
     const char* e = std::getenv("BBHOST_GX_CLEAR_VIEWS");
-    return e ? std::atoi(e) : 0;
+    return e ? std::atoi(e) : 2;
 }();
 std::mutex g_clear_views_mu;
 std::unordered_map<std::uint64_t, GpuClearView> g_clear_records;  // by token id, until the CP walks the token
@@ -2695,10 +2695,11 @@ bool clear_dsv_view(const std::uint64_t* f) {
 // be a counter word's and copied on the GPU's timeline. The token names the
 // two buffers; the command processor makes the same copy at the token
 // (hle_gnm_count_copy). 0: the packet as before; 1 (checks): both, and the
-// packet that follows is compared with the token; 2: the token alone.
+// packet that follows is compared with the token; 2 (the default): the token
+// alone.
 const int g_count_copies = [] {
     const char* e = std::getenv("BBHOST_GX_COUNT_COPIES");
-    return e ? std::atoi(e) : 0;
+    return e ? std::atoi(e) : 2;
 }();
 struct CountCopy {
     std::uint64_t dst = 0, src = 0;

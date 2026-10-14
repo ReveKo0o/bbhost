@@ -37,8 +37,10 @@ exit report counts those by reason.
 
 **The command processor.** bbhost still walks the game's command buffers, for
 what has not moved to tokens: labels and fences the game waits on, the
-counters the GPU particles keep in GDS, and some clears and copies recognised
-from their packets.
+counters the GPU particles keep in GDS, occlusion queries and the constant
+engine's tables. Clears and copies come as tokens from GX's own calls: a clear
+names its view, and is made as the next pass's load op, or as a transfer clear
+when something reads the image first.
 
 **Recording.** The command processor leaves the Vulkan calls to a thread of
 its own, `bb-record`. Each draw goes into a packet, and most of its other
@@ -116,7 +118,7 @@ path at all:
 | Menus (Scaleform) | native draw building from the HAL |
 | Fills and copies without a shader | recognised and performed directly |
 | Other compute dispatches | native: built at a token from the engine's objects (GX's compute stage) or the user data its writers set (YEBIS, GX's own passes); the game's shaders |
-| Clears and target copies | partly recognised from packets |
+| Clears and target copies | native: tokens from GX's calls, in the view's terms |
 | Labels and fences | emulated, on the command processor |
 | Shaders | decompiled (lifted) to SPIR-V; a few refused programs translated (see below) |
 | Resource identity | the game's memory addresses, plus write tracking |
@@ -147,8 +149,8 @@ A draw whose setup the lifter hasn't seen still falls back to the translator. Th
 
 - Resources identified by the engine's own objects and generations rather than
   by guest address and write tracking.
-- Clears and copies from their GX calls rather than from packets, after which
-  the PM4 command processor only orders work.
+- Labels, fences and occlusion queries from GX's own calls, after which the PM4
+  command processor only orders work.
 - HLSL from the lifted shaders (the table above).
 
 ## Tools
