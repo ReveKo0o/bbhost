@@ -1,7 +1,7 @@
 // The HLSL printer (gcn/hlsl.h) on hand-encoded programs the lifter takes:
 // quad swizzles in every quad pattern, v_cndmask_b32 with source modifiers, a
 // sample and a LOD query in a divergent region, a sample's run-time offset
-// (both ways the lift takes it), loops with per-lane exits
+// (both ways the lift takes it), a vertex shader's invariant position, loops with per-lane exits
 // (one inside a kill region, with the helper-lane query), a depth export and
 // image loads and sizes. Each lift is printed, the source checked for the
 // spellings that keep its instructions, and - where DXC is installed (host/
@@ -320,6 +320,39 @@ void samples_and_loops() {
     }
 }
 
+// A vertex shader (s_swappc to the fetch, the position from v4-v7, param 0
+// from v8-v11, two float4 elements) with its position Invariant
+// (BBHOST_VS_INVARIANT) and without: the member keeps the decoration.
+void vertex_invariant() {
+    std::vector<std::uint32_t> w = {0xbe800000u | 0u << 16 | 33u << 8 | 2u};  // s_swappc_b64 s[0:1], s[2:3]
+    const auto exp = [&](std::uint32_t tgt, std::uint32_t v, bool done) {
+        w.push_back(0xf8000000u | (done ? 1u << 11 : 0u) | tgt << 4 | 0xfu);
+        w.push_back((v + 3) << 24 | (v + 2) << 16 | (v + 1) << 8 | v);
+    };
+    exp(12, 4, true);
+    exp(32, 8, false);
+    w.push_back(kEndpgm);
+    for (const bool invariant : {false, true}) {
+        const gcn::Program p = gcn::decode(w.data(), w.size());
+        CHECK(p.errors.empty());
+        gcn::TranslateOptions o;
+        o.stage = gcn::Stage::Vertex;
+        o.rsrc1 = 3u << 24;  // VGPR_COMP_CNT 3
+        o.descriptor_set = 0;
+        o.cb_ssbo = true;
+        o.cb_no_fallback = true;
+        o.link_outputs = true;
+        for (std::uint8_t r = 0; r < 32; ++r) o.output_links.push_back(r);
+        o.vertex_input = {{0, 4, 4, 0u}, {1, 8, 4, 0u}};
+        o.vertex_formats_from_params = true;
+        o.invariant_position = invariant;
+        const gcn::TranslateResult ref = gcn::translate(p, o);
+        CHECK(ref.ok());
+        through_hlsl(gcn::lift_vertex_shader(p, o, ref), std::string("a vertex shader, position ") + (invariant ? "invariant" : "not invariant"),
+                     invariant ? std::vector<std::string>{"[[vk::ext_decorate(18 /* Invariant */)]]"} : std::vector<std::string>{"SV_Position"});
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -328,6 +361,7 @@ int main() {
     swizzles();
     cndmask();
     samples_and_loops();
+    vertex_invariant();
     std::printf("gcn_hlsl_test: %d lifts printed, %d compiled by DXC%s\n", g_printed, g_compiled, g_have_dxc ? "" : " (no DXC)");
     if (g_failures) {
         std::fprintf(stderr, "gcn_hlsl_test: %d check(s) failed\n", g_failures);
