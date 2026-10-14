@@ -13,6 +13,7 @@
 #include "engine/sprj_flipper.h"
 #include "engine/loading.h"
 #include "engine/menu_steps.h"
+#include "engine/patch_manifest.h"
 #include "engine/change_appearance.h"
 #include "engine/rebirth.h"
 
@@ -40,6 +41,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <iterator>
+#include <map>
+#include <string>
 #include <vector>
 
 namespace {
@@ -1518,13 +1521,28 @@ bool sites_hold(ElfImage* image, const Site (&sites)[N], const char* group) {
 // uncapped's do not. Never part of a group.
 int apply_rate(ElfImage* image, int want) {
     const auto va = [&](std::uint32_t bn) { return image->mem.slide + (bn - kPreferredGuestSlide); };
+    // A value a patch manifest the player turned on changed (Kyo's Movement +
+    // Roll-Dodge and Aerial Vectors write some of these) is the manifest's: left
+    // as it wrote it, and the rest converted around it - one such value used
+    // to refuse the whole conversion and leave the game at 30.
+    std::vector<std::uint32_t> skip;
+    std::map<std::string, int> owners;
+    const auto owned = [&](std::uint32_t at, std::size_t n) {
+        const char* o = patch_manifest_owner(at, n);
+        if (!o) return false;
+        skip.push_back(at);
+        ++owners[o];
+        return true;
+    };
     for (const Constant& c : kConstants) {
+        if (owned(c.at, 4)) continue;
         if (get<std::uint32_t>(va(c.at)) != c.was) {
             host_log("frame rate: refused, 0x%x holds 0x%08x, not 0x%08x", c.at, get<std::uint32_t>(va(c.at)), c.was);
             return 30;
         }
     }
     for (const Counted& c : kCounts) {
+        if (owned(c.at, c.n)) continue;
         std::uint8_t was[8];
         count_was(c, was);
         if (std::memcmp(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(va(c.at))), was, c.n) != 0) {
@@ -1533,11 +1551,16 @@ int apply_rate(ElfImage* image, int want) {
         }
     }
     for (const Bytes& b : kBytes) {
+        if (owned(b.at, b.n)) continue;
         if (std::memcmp(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(va(b.at))), b.was, b.n) != 0) {
             host_log("frame rate: refused, 0x%x does not hold the expected %u bytes", b.at, b.n);
             return 30;
         }
     }
+    for (const auto& [name, n] : owners) {
+        host_log("frame rate: %d of its values are patch %s's, left as it wrote them", n, name.c_str());
+    }
+    const auto skipped = [&](std::uint32_t at) { return std::find(skip.begin(), skip.end(), at) != skip.end(); };
     // The code rewrites, by group: all of a group or none of it. The
     // frame-time sites read the slot the 60 FPS++ cave keeps, so they go with
     // the 60 FPS++ sites; the cloth's caves are for rates above 60.
@@ -1590,6 +1613,7 @@ int apply_rate(ElfImage* image, int want) {
     // A rated constant's rule gives the table's own value at 60.
     std::size_t rated_fixed = 0, camera_kept = 0;
     for (const Constant& c : kConstants) {
+        if (skipped(c.at)) continue;
         if (original_camera && kyo_camera_constant(c.at)) {
             ++camera_kept;
             continue;
@@ -1602,11 +1626,14 @@ int apply_rate(ElfImage* image, int want) {
         write(c.at, &now, 4);
     }
     for (const Counted& c : kCounts) {
+        if (skipped(c.at)) continue;
         std::uint8_t now[8];
         count_bytes(c, c.kind == Count::Digits && mode == 0 ? kUncappedMaxFps : fps, now);
         write(c.at, now, c.n);
     }
-    for (const Bytes& b : kBytes) write(b.at, b.now, b.n);
+    for (const Bytes& b : kBytes) {
+        if (!skipped(b.at)) write(b.at, b.now, b.n);
+    }
     // After the constants: two frame-time sites rewrite instructions whose
     // immediates kConstants converts (0x1bf9b74, 0x222bcd7, for a run
     // without the code rewrites).
@@ -1697,7 +1724,13 @@ int apply_rate(ElfImage* image, int want) {
             const auto key_of = [](const DtLoad& d) {
                 return static_cast<std::uint64_t>(d.constant) << 16 | static_cast<std::uint64_t>(d.kind) << 8 | d.lanes;
             };
+            // A constant a patch manifest rewrote keeps its loads: they read
+            // the patch's value as it wrote it (Kyo's Aerial Vectors 1/480
+            // writes the momentum's 0.95 as its 480 fps value), not that
+            // value taken for the 30 fps one and followed by the frame time.
+            const auto dt_owned = [](const DtLoad& d) { return patch_manifest_owner(d.constant, 4u * d.lanes) != nullptr; };
             for (const DtLoad& d : kDtLoads) {
+                if (dt_owned(d)) continue;
                 if (std::none_of(keys.begin(), keys.end(), [&](const auto& k) { return k.first == key_of(d); })) keys.push_back({key_of(d), 0});
             }
             const std::uint64_t start = (image->tail_used + 15) & ~std::uint64_t(15);
@@ -1718,6 +1751,7 @@ int apply_rate(ElfImage* image, int want) {
                     g_dt_slots.push_back(slot);
                 }
                 for (const DtLoad& d : kDtLoads) {
+                    if (dt_owned(d)) continue;
                     const auto it = std::find_if(keys.begin(), keys.end(), [&](const auto& k) { return k.first == key_of(d); });
                     const std::int64_t nd = static_cast<std::int64_t>(it->second) - (static_cast<std::int64_t>(d.insn) + d.len);
                     if (nd < INT32_MIN || nd > INT32_MAX) continue;  // the tail is within reach of all of the code
@@ -1758,7 +1792,7 @@ int apply_rate(ElfImage* image, int want) {
     // to read-only (core/memory.h).
     std::vector<std::uint64_t> pages;
     for (const Rated& r : kRated) {
-        if (!r.each_frame) continue;
+        if (!r.each_frame || skipped(r.at)) continue;
         const Constant* c = std::find_if(std::begin(kConstants), std::end(kConstants), [&](const Constant& k) { return k.at == r.at; });
         g_each.push_back({va(r.at), bits_float(c->was), r.kind});
         pages.push_back(va(r.at) & ~0xfffull);
