@@ -1702,7 +1702,12 @@ private:
         case spv::GlslSqrt: return define(in, call("sqrt", rk));
         case spv::GlslInverseSqrt: return define(in, call("rsqrt", rk));
         case spv::GlslFClamp: return define(in, call("clamp", rk));
-        case spv::GlslFma: return define(in, call("mad", rk));
+        // Fma as inline SPIR-V: HLSL's mad() is GLSL.std.450 Fma decorated
+        // NoContraction (DXC decorates it whether or not it is precise),
+        // which a driver must fuse, while the lift's Fma carries no decoration
+        // and a driver may fuse it or not (lavapipe splits it) - the two would
+        // round differently.
+        case spv::GlslFma: return define(in, inline_op("spv_fma", spv::GlslFma, true, in.type, args));
         case spv::GlslNMin: return define(in, call("min", rk));
         case spv::GlslNMax: return define(in, call("max", rk));
         // (64-bit too: a compute lift's page-table walk clamps an address with UMin.)
@@ -2506,6 +2511,7 @@ Iface interface_of(const std::vector<std::uint32_t>& w) {
 struct OpCensus {
     std::map<std::string, std::size_t> ops;  // "op 129" / "glsl 79" -> count
     std::size_t contractible = 0;              // float arithmetic without NoContraction
+    std::size_t fused_fma = 0;                 // Fma decorated NoContraction (a driver must fuse it)
 };
 
 OpCensus op_census(const std::vector<std::uint32_t>& w) {
@@ -2520,7 +2526,7 @@ OpCensus op_census(const std::vector<std::uint32_t>& w) {
     std::uint32_t entry = 0, current = 0;
     OpCensus c;
     std::set<std::uint32_t> nocontract, consts, quad_results;
-    std::vector<std::uint32_t> float_arith;
+    std::vector<std::uint32_t> float_arith, fma_ids;
     std::uint32_t glsl_set = 0;
     for (std::size_t i = 5; i < w.size();) {
         const std::uint32_t n = w[i] >> 16, op = w[i] & 0xffff;
@@ -2556,7 +2562,10 @@ OpCensus op_census(const std::vector<std::uint32_t>& w) {
                 ops["op " + std::to_string(op)]++;
             }
         }
-        if (op == spv::OpExtInst && n >= 5 && a[2] == glsl_set) ops["glsl " + std::to_string(a[3])]++;
+        if (op == spv::OpExtInst && n >= 5 && a[2] == glsl_set) {
+            ops["glsl " + std::to_string(a[3])]++;
+            if (a[3] == spv::GlslFma) fma_ids.push_back(a[1]);
+        }
         if (op == spv::OpFAdd || op == spv::OpFSub || op == spv::OpFMul || op == spv::OpFDiv || (op == spv::OpFNegate && !consts.count(a[2]))) {
             // Float scalars and vectors only reach these opcodes. A negated
             // literal (-1.0f) is exact whether or not it may contract.
@@ -2565,6 +2574,7 @@ OpCensus op_census(const std::vector<std::uint32_t>& w) {
         i += n;
     }
     for (const std::uint32_t id : float_arith) c.contractible += nocontract.count(id) ? 0 : 1;
+    for (const std::uint32_t id : fma_ids) c.fused_fma += nocontract.count(id) ? 1 : 0;
     // The entry point's counts with every call's callee counted at the call (depth-limited).
     std::function<void(std::uint32_t, int)> add = [&](std::uint32_t f, int depth) {
         if (depth > 8 || !fns.count(f)) return;
@@ -2593,6 +2603,8 @@ std::string hlsl_operation_diff(const std::vector<std::uint32_t>& lifted, const 
         return k + ": " + std::to_string(n) + " where the lift has " + std::to_string(have);
     }
     if (b.contractible) return std::to_string(b.contractible) + " float operations without NoContraction";
+    // Fma the lift leaves to the driver (fused or not) must not be one DXC's module requires fused.
+    if (b.fused_fma > a.fused_fma) return std::to_string(b.fused_fma) + " Fma decorated NoContraction where the lift has " + std::to_string(a.fused_fma);
     return {};
 }
 

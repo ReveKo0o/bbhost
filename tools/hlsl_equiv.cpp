@@ -41,6 +41,9 @@
 #include <set>
 #include <stdexcept>
 #include <string>
+#include <atomic>
+#include <thread>
+#include <unistd.h>
 #include <vector>
 
 namespace fs = std::filesystem;
@@ -192,6 +195,7 @@ struct Device {
     VkPhysicalDeviceMemoryProperties mem{};
     std::string name;
     bool quad_ops = false;
+    std::string robust = "robustness2 unavailable";
 
     void init() {
         VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
@@ -232,9 +236,34 @@ struct Device {
         quad_ops = (sg.supportedOperations & VK_SUBGROUP_FEATURE_QUAD_BIT) && (sg.supportedStages & VK_SHADER_STAGE_FRAGMENT_BIT);
         VkPhysicalDeviceFeatures supported{};
         vkGetPhysicalDeviceFeatures(phys, &supported);
+        // Random words index buffers and texels out of range: every access
+        // bounds-checked, an out-of-range one reading 0 (robustness2), the same
+        // for both modules.
+        VkPhysicalDeviceVulkan13Features q13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
+        VkPhysicalDeviceRobustness2FeaturesEXT qr2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT};
+        q13.pNext = &qr2;
+        VkPhysicalDeviceFeatures2 q2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+        q2.pNext = &q13;
+        vkGetPhysicalDeviceFeatures2(phys, &q2);
+        std::uint32_t next = 0;
+        vkEnumerateDeviceExtensionProperties(phys, nullptr, &next, nullptr);
+        std::vector<VkExtensionProperties> props(next);
+        vkEnumerateDeviceExtensionProperties(phys, nullptr, &next, props.data());
+        bool r2 = false;
+        for (const VkExtensionProperties& e : props) r2 |= std::strcmp(e.extensionName, VK_EXT_ROBUSTNESS_2_EXTENSION_NAME) == 0;
+        std::vector<const char*> dext;
+        VkPhysicalDeviceRobustness2FeaturesEXT fr2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT};
+        if (r2) {
+            dext.push_back(VK_EXT_ROBUSTNESS_2_EXTENSION_NAME);
+            fr2.robustBufferAccess2 = qr2.robustBufferAccess2;
+            fr2.robustImageAccess2 = qr2.robustImageAccess2;
+            robust = std::string("robustness2 buffers ") + (qr2.robustBufferAccess2 ? "yes" : "no") + ", images " + (qr2.robustImageAccess2 ? "yes" : "no");
+        }
         VkPhysicalDeviceVulkan13Features f13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
         f13.dynamicRendering = VK_TRUE;
         f13.synchronization2 = VK_TRUE;
+        f13.robustImageAccess = q13.robustImageAccess;
+        if (r2) f13.pNext = &fr2;
         VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
         f2.pNext = &f13;
         f2.features.shaderInt64 = supported.shaderInt64;
@@ -253,6 +282,8 @@ struct Device {
         dci.pNext = &f2;
         dci.queueCreateInfoCount = 1;
         dci.pQueueCreateInfos = &qci;
+        dci.enabledExtensionCount = static_cast<std::uint32_t>(dext.size());
+        dci.ppEnabledExtensionNames = dext.data();
         check(vkCreateDevice(phys, &dci, nullptr, &device), "vkCreateDevice");
         vkGetDeviceQueue(device, family, 0, &queue);
         VkCommandPoolCreateInfo pci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
@@ -378,6 +409,9 @@ std::uint16_t half_bits(float f) {
 // ---- one program -----------------------------------------------------------------
 struct Inputs {
     std::uint64_t seed = 1;
+    // Buffer and params words small integers (0-63) rather than floats: a
+    // loop whose count a random float's bits give runs for ever.
+    bool small_ints = false;
     std::uint32_t size = 32;      // the pixel shader's target: size x size
     std::uint32_t vertices = 48;  // the vertex shader's points
 };
@@ -404,6 +438,16 @@ public:
         try {
             Run a = m.model == 4 ? run_pixel(m, lift, r, in) : run_vertex(m, lift, r, in);
             Run b = m.model == 4 ? run_pixel(m, other, r, in) : run_vertex(m, other, r, in);
+            if (const char* dump = std::getenv("HLSL_EQUIV_DUMP"); dump && *dump) {
+                // Both runs' targets, raw, for a closer look at a difference.
+                for (std::size_t t = 0; t < a.outputs.size(); ++t) {
+                    for (int k = 0; k < 2; ++k) {
+                        const auto& o = (k ? b : a).outputs[t];
+                        std::ofstream(std::string(dump) + "/" + (k ? "hlsl" : "lift") + "-" + std::to_string(t) + ".bin", std::ios::binary)
+                            .write(reinterpret_cast<const char*>(o.data()), static_cast<std::streamsize>(o.size()));
+                    }
+                }
+            }
             result = diff(a, b, m.model == 4 ? in.size : in.vertices);
         } catch (...) {
             free_resources(r);
@@ -451,9 +495,11 @@ private:
     Resources make_resources(const Module& m, const Inputs& in) {
         Resources r;
         std::mt19937_64 rng(in.seed);
-        const auto word = [&] { return static_cast<std::uint32_t>(rng()); };
+        const auto word_any = [&] { return static_cast<std::uint32_t>(rng()); };
+        const auto word = [&] { return in.small_ints ? static_cast<std::uint32_t>(rng() % 64) : word_any(); };
         // Floats mostly in [-2, 2], a few special values: the inputs a shader computes with.
         const auto float_word = [&] {
+            if (in.small_ints) return word();
             const std::uint32_t pick = word() % 64;
             float f;
             if (pick == 0) f = 0.0f;
@@ -980,6 +1026,11 @@ private:
 
     static std::string diff(const Run& a, const Run& b, std::uint32_t width) {
         if (a.outputs.size() != b.outputs.size()) return "different: target count";
+        // A word both runs wrote as a NaN, with another sign or payload: SPIR-V
+        // and Vulkan leave a NaN's bits to the implementation, and lavapipe's
+        // compiler moves them between equal computations of different shapes.
+        const auto nan = [](std::uint32_t v) { return (v & 0x7f800000u) == 0x7f800000u && (v & 0x7fffffu); };
+        std::size_t nan_only = 0;
         std::size_t texels = 0, first_target = 0, first_at = 0;
         bool found = false;
         for (std::size_t t = 0; t < a.outputs.size(); ++t) {
@@ -990,6 +1041,13 @@ private:
             (void)texel;
             for (std::size_t k = 0; k + 4 <= x.size(); k += 4) {
                 if (std::memcmp(&x[k], &y[k], 4) == 0) continue;
+                std::uint32_t xa, ya;
+                std::memcpy(&xa, &x[k], 4);
+                std::memcpy(&ya, &y[k], 4);
+                if (nan(xa) && nan(ya)) {
+                    ++nan_only;
+                    continue;
+                }
                 ++texels;
                 if (!found) {
                     found = true;
@@ -1013,7 +1071,12 @@ private:
                     if (distinct.size() < 100000) distinct.insert(v);
                 }
             }
-            char buf[120];
+            char buf[160];
+            if (nan_only) {
+                std::snprintf(buf, sizeof(buf), "nan-bits: identical but for %zu NaN words with other bits; %zu%% of %zu words written, %zu distinct", nan_only,
+                              words ? written * 100 / words : 0, words, distinct.size());
+                return buf;
+            }
             std::snprintf(buf, sizeof(buf), "identical: %zu%% of %zu words written, %zu distinct", words ? written * 100 / words : 0, words, distinct.size());
             return buf;
         }
@@ -1035,6 +1098,8 @@ int main(int argc, char** argv) {
     std::string only;
     const char* list_path = nullptr;
     bool verbose = false;
+    const char* progress_path = nullptr;  // the program being run, written before it runs: a crash names it
+    int timeout_s = 60;                   // a program still running after this is left out (a loop counting random words)
     std::vector<fs::path> dirs;
     for (int a = 1; a < argc; ++a) {
         const std::string arg = argv[a];
@@ -1045,6 +1110,9 @@ int main(int argc, char** argv) {
         else if (arg == "--only" && a + 1 < argc) only = argv[++a];
         else if (arg == "--list" && a + 1 < argc) list_path = argv[++a];
         else if (arg == "--verbose") verbose = true;
+        else if (arg == "--progress" && a + 1 < argc) progress_path = argv[++a];
+        else if (arg == "--small-ints") in.small_ints = true;
+        else if (arg == "--timeout" && a + 1 < argc) timeout_s = std::atoi(argv[++a]);
         else dirs.push_back(arg);
     }
     if (dirs.empty() || !shards) {
@@ -1072,8 +1140,19 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "%s\n", f.what());
         return 2;
     }
-    std::printf("device: %s; quad operations in pixel shaders: %s\n", dev.name.c_str(), dev.quad_ops ? "yes" : "no");
-    FILE* list = list_path ? std::fopen(list_path, "w") : nullptr;
+    std::printf("device: %s; quad operations in pixel shaders: %s; %s\n", dev.name.c_str(), dev.quad_ops ? "yes" : "no", dev.robust.c_str());
+    // --progress: a shard that crashed (a shader faulting inside the driver)
+    // resumes past the program its progress file names, which is listed as crashed.
+    std::string resume_after;
+    if (progress_path) {
+        if (FILE* f = std::fopen(progress_path, "r")) {
+            char line[4096] = {};
+            if (std::fgets(line, sizeof(line), f)) resume_after = line;
+            while (!resume_after.empty() && (resume_after.back() == '\n' || resume_after.back() == '\r')) resume_after.pop_back();
+            std::fclose(f);
+        }
+    }
+    FILE* list = list_path ? std::fopen(list_path, resume_after.empty() ? "w" : "a") : nullptr;
     Harness h(dev, dxc);
     std::map<std::string, std::size_t> totals;
     std::size_t index = 0;
@@ -1084,7 +1163,64 @@ int main(int argc, char** argv) {
         if (!only.empty() && ls.find(only) == std::string::npos) continue;
         const fs::path other = ls.substr(0, ls.size() - 9) + ".dxc.spv";
         if (!fs::exists(other)) continue;
+        if (!resume_after.empty()) {
+            if (ls == resume_after || "done:" + ls == resume_after) {
+                if (ls == resume_after) {
+                    const std::string name = fs::relative(lift, lift.parent_path().parent_path()).string();
+                    std::printf("%s crashed: the driver faulted running it\n", name.c_str());
+                    if (list) std::fprintf(list, "%s crashed: the driver faulted running it\n", name.c_str());
+                    totals["crashed"]++;
+                }
+                resume_after.clear();
+            }
+            continue;
+        }
+        if (progress_path) {
+            if (FILE* f = std::fopen(progress_path, "w")) {
+                std::fprintf(f, "%s\n", ls.c_str());
+                std::fclose(f);
+            }
+        }
         std::string result;
+        // The watchdog: a draw still running past the timeout (a loop over a
+        // random count) is listed as such and the process ends; the runner
+        // resumes past it (the progress file says it is done).
+        static std::atomic<std::uint64_t> deadline{0};
+        static std::string watched_name, watched_path;
+        static FILE* watched_list = nullptr;
+        static const char* watched_progress = nullptr;
+        static bool watchdog_started = false;
+        watched_name = fs::relative(lift, lift.parent_path().parent_path()).string();
+        watched_path = ls;
+        watched_list = list;
+        watched_progress = progress_path;
+        deadline = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count()) +
+                   static_cast<std::uint64_t>(timeout_s);
+        if (!watchdog_started) {
+            watchdog_started = true;
+            std::thread([] {
+                for (;;) {
+                    std::this_thread::sleep_for(std::chrono::seconds(1));
+                    const std::uint64_t now = static_cast<std::uint64_t>(
+                        std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+                    const std::uint64_t d = deadline.load();
+                    if (!d || now < d) continue;
+                    std::printf("%s timeout: still running after the time limit\n", watched_name.c_str());
+                    std::fflush(stdout);
+                    if (watched_list) {
+                        std::fprintf(watched_list, "%s timeout: still running after the time limit\n", watched_name.c_str());
+                        std::fflush(watched_list);
+                    }
+                    if (watched_progress) {
+                        if (FILE* f = std::fopen(watched_progress, "w")) {
+                            std::fprintf(f, "done:%s\n", watched_path.c_str());
+                            std::fclose(f);
+                        }
+                    }
+                    _exit(3);
+                }
+            }).detach();
+        }
         try {
             result = h.compare(lift, other, in);
         } catch (const Skip& s) {
@@ -1092,14 +1228,19 @@ int main(int argc, char** argv) {
         } catch (const Failure& f) {
             result = std::string("error: ") + f.what();
         }
+        deadline = 0;
         const std::string key = result.substr(0, result.find(':'));
         totals[key]++;
         const std::string name = fs::relative(lift, lift.parent_path().parent_path()).string();
         if (key != "identical" || verbose) std::printf("%s %s\n", name.c_str(), result.c_str());
-        if (list) std::fprintf(list, "%s %s\n", name.c_str(), result.c_str());
+        if (list) {
+            std::fprintf(list, "%s %s\n", name.c_str(), result.c_str());
+            std::fflush(list);
+        }
         std::fflush(stdout);
     }
     if (list) std::fclose(list);
+    if (progress_path) std::remove(progress_path);
     std::printf("totals (%.0f s):", std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
     for (const auto& [k, n] : totals) std::printf(" %s %zu;", k.c_str(), n);
     std::printf("\n");

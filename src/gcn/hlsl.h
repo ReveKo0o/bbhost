@@ -14,7 +14,9 @@
 //     written as inline SPIR-V (vk::ext_instruction) with a readable name:
 //     FSign (HLSL sign() returns an int), Ldexp (ldexp() is x * exp2(e)),
 //     PackHalf2x16, FMin/FMax (min()/max() are NMin/NMax, which the lift
-//     uses for v_min/v_max), bitfield extracts;
+//     uses for v_min/v_max), bitfield extracts, and Fma: mad() is Fma
+//     decorated NoContraction, which a driver must fuse, where the lift's Fma
+//     leaves fusing to the driver (lavapipe splits it: the rounding differs);
 //   * discard stays OpKill: the helper-lane query is the HelperInvocation
 //     built-in (vk::ext_builtin_input), not IsHelperLane(), which would turn
 //     every discard into a demote;
