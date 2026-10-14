@@ -871,12 +871,30 @@ std::atomic<std::uint64_t> g_prep_waits{0}, g_prep_wait_us{0}, g_prep_inline{0};
 // upload is not created ahead or prepped off it), against the prep pool's.
 std::atomic<std::uint64_t> g_tex_untile_inline_us{0}, g_tex_untile_inline{0};
 
+// The two hashes an upload keeps (refresh_surface_locked compares them): up to
+// kSampledAbove the sampled hash is already the whole surface's, and past
+// kExactMaxBytes no check ever hashes the whole surface - so a second pass is
+// read only between the two (and always with BBHOST_TEX_WATCH_VERIFY, which
+// compares the whole-surface hash).
+bool watch_verify_on() {
+    static const bool on = [] {
+        const char* e = std::getenv("BBHOST_TEX_WATCH_VERIFY");
+        return e && e[0] == '1';
+    }();
+    return on;
+}
+void upload_hashes(TexturePrep& p) {
+    p.content_hash = content_hash_of(p.base, p.total_src);
+    if (p.total_src <= kSampledAbove) p.exact_hash = p.content_hash;
+    else if (p.total_src <= kExactMaxBytes || watch_verify_on()) p.exact_hash = content_hash_of(p.base, p.total_src, true);
+    else p.exact_hash = 0;
+}
+
 void run_prep(TexturePrep& p) {
     auto t0 = std::chrono::steady_clock::now();
     bool untiled = true;
     if (p.hash_only) {
-        p.content_hash = content_hash_of(p.base, p.total_src);
-        p.exact_hash = content_hash_of(p.base, p.total_src, true);
+        upload_hashes(p);
         return;
     }
     for (std::size_t l = 0; l < p.levels.size() && untiled; ++l) {
@@ -897,8 +915,7 @@ void run_prep(TexturePrep& p) {
         g_unsupported.fetch_add(1);
         std::memset(p.dst, 0, p.total_dst);
     }
-    p.content_hash = content_hash_of(p.base, p.total_src);
-    p.exact_hash = content_hash_of(p.base, p.total_src, true);
+    upload_hashes(p);
 }
 
 class PrepPool {
@@ -1745,10 +1762,7 @@ std::atomic<std::uint64_t> g_hash_class_n[7] = {}, g_hash_class_us[7] = {};
 // A watch reads a page as written when anything stamped it: a fault, a
 // release before a copy (the game's memcpy, a read(2)) or a remap, over the
 // page whatever part of it the copy wrote.
-const bool g_watch_verify = [] {
-    const char* e = std::getenv("BBHOST_TEX_WATCH_VERIFY");
-    return e && e[0] == '1';
-}();
+const bool g_watch_verify = watch_verify_on();
 std::atomic<std::uint64_t> g_watch_verify_n[2][2] = {};
 
 // New surfaces on no GX resource, by why and by what resolved them first
