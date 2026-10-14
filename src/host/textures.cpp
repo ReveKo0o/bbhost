@@ -574,6 +574,7 @@ struct Surface {
     // That resource's generation (GxResourceInfo::gen) at the last upload: the
     // surface is that resource's image, and goes with it (retire_surfaces_locked).
     std::uint64_t gx_gen = 0;
+    std::uint8_t gx_type = 0;  // that resource's type (GxResourceInfo::type): 1 a buffer, 2-4 a texture
     bool gx_dirty = false;  // GX mapped it since its upload (textures_gx_written): upload it again
     // Created at the resource's creation, ahead of its first bind.
     bool ahead = false, ahead_used = false;
@@ -1075,6 +1076,10 @@ bool gpu_untile_plan(const Surface& sf, VkDeviceAddress dst, std::vector<UntileG
 void check_stale_upload(const Surface& sf);
 
 std::atomic<std::uint64_t> g_unwatched_uploads{0};  // uploads of a GX resource's image, not write-watched (identity)
+// Whether a surface is known by its GX resource's identity: on a live GX
+// texture (not a buffer a T# reads as an image - the CPU writes those after
+// every Map, and they keep the watch), with identity on.
+bool by_identity(const Surface& sf) { return res_identity_on() && sf.gx_registered && sf.gx_type >= 2; }
 bool upload_surface(Surface& sf, VkImageAspectFlags aspect, bool first) {
     // An earlier upload still being prepared fills its own staging span (the
     // submission waits for it); its hashes are superseded by this one's.
@@ -1095,9 +1100,9 @@ bool upload_surface(Surface& sf, VkImageAspectFlags aspect, bool first) {
     // re-upload of one but the 10 a GX write explained found its memory as it
     // was (5,200, from the game's copies releasing the pages around theirs).
     sf.watch.owner = kWatchOwnerTexture;
-    sf.watched = !sf.gpu_written && !(res_identity_on() && sf.gx_registered) && write_watch_enabled() &&
+    sf.watched = !sf.gpu_written && !by_identity(sf) && write_watch_enabled() &&
                  now_ms() >= sf.watch_pause_until_ms && hle_kernel_write_watch(sf.base, sf.total_src, sf.watch);
-    if (!sf.watched && !sf.gpu_written && res_identity_on() && sf.gx_registered) g_unwatched_uploads.fetch_add(1, std::memory_order_relaxed);
+    if (!sf.watched && !sf.gpu_written && by_identity(sf)) g_unwatched_uploads.fetch_add(1, std::memory_order_relaxed);
     if (!first && sf.base == tex_probe_base()) {
         static std::atomic<int> logs{0};
         if (logs.fetch_add(1) < 24) {
@@ -1663,6 +1668,7 @@ void census_upload(Surface& sf, const char* why) {
         sf.gx_seq = 0;
         sf.gx_registered = false;
         sf.gx_gen = 0;
+        sf.gx_type = 0;
         sf.cp_dirty = false;
         return;
     }
@@ -1711,6 +1717,7 @@ void census_upload(Surface& sf, const char* why) {
     sf.gx_seq = registered ? r.write_seq : 0;
     sf.gx_registered = registered;
     sf.gx_gen = registered ? r.gen : 0;
+    sf.gx_type = registered ? r.type : 0;
     sf.cp_dirty = false;
 }
 
@@ -1877,7 +1884,7 @@ void refresh_surface_locked(Surface& sf) {
     // not put it on the every-bind cadence the way it does an unwatched one.
     // The glyph atlas is the case: written every frame in menus, watched, and
     // hashed whole on every check, ~3% of the command processor.
-    const bool hot = sf.hot && !((sf.watched || (res_identity_on() && sf.gx_registered)) && !sf.gpu_written);
+    const bool hot = sf.hot && !((sf.watched || by_identity(sf)) && !sf.gpu_written);
     if (now_ms() - sf.checked_at_ms <
         (hot ? 0u : std::min<std::uint32_t>(2000u, 200u << std::min<std::uint32_t>(sf.unchanged / 10, 4u)))) {
         return;
@@ -1894,14 +1901,14 @@ void refresh_surface_locked(Surface& sf) {
     // change to it (a resource made there later has its own surface), and
     // hashing that memory - the surfaces a tour hashed most, 15,165 checks and
     // 3.2 s of the command processor - looked for nothing.
-    if (!g_hash_registered && res_identity_on() && sf.gx_registered && sf.gpu_written && !sf.cp_dirty) {
+    if (!g_hash_registered && by_identity(sf) && sf.gpu_written && !sf.cp_dirty) {
         g_census_hash_skipped_written.fetch_add(1, std::memory_order_relaxed);
         sf.checked_at_ms = now_ms();
         ++sf.unchanged;
         if (sf.hot) --sf.hot;
         return;
     }
-    if (!g_hash_registered && sf.gx_registered && (sf.watched || res_identity_on()) && !sf.gpu_written && !sf.cp_dirty) {
+    if (!g_hash_registered && sf.gx_registered && (sf.watched || by_identity(sf)) && !sf.gpu_written && !sf.cp_dirty) {
         if (g_census_hash_skipped.fetch_add(1, std::memory_order_relaxed) % 64 != 63) {
             sf.checked_at_ms = now_ms();
             ++sf.unchanged;
