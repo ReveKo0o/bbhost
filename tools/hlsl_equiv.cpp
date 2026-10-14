@@ -3,6 +3,11 @@
 //
 //   hlsl_equiv [--size N] [--vertices N] [--seed S] [--shard I/N] [--list FILE] [--only SUBSTR]
 //              [--small-ints] [--float-words] [--timeout S] [--progress FILE] <dir>...
+//   hlsl_equiv --compile [--only SUBSTR] [--list FILE] <dir>...
+//              every compute module (*.spv) under the folders built into a
+//              pipeline against a layout from its own bindings, the device's
+//              verdict printed: a driver that refuses DXC's module of a lift
+//              it takes shows here, before a player meets it.
 //
 // <dir> holds what `gcn2hlsl --out` writes: <bundle>/<program>.<stage>.lift.spv
 // and .dxc.spv. For each pixel or vertex shader pair the tool builds one
@@ -525,6 +530,18 @@ struct Device {
             robust = std::string("robustness2 buffers ") + (qr2.robustBufferAccess2 ? "yes" : "no") + ", images " + (qr2.robustImageAccess2 ? "yes" : "no");
         }
         VkPhysicalDeviceVulkan13Features f13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
+        // A compute lift's raw addresses (PhysicalStorageBuffer64): buffer device address.
+        VkPhysicalDeviceVulkan12Features q12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
+        {
+            VkPhysicalDeviceFeatures2 qf{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+            qf.pNext = &q12;
+            vkGetPhysicalDeviceFeatures2(phys, &qf);
+        }
+        VkPhysicalDeviceVulkan12Features f12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
+        f12.bufferDeviceAddress = q12.bufferDeviceAddress;
+        f12.shaderInt8 = q12.shaderInt8;
+        f12.shaderFloat16 = q12.shaderFloat16;
+        f12.storageBuffer8BitAccess = q12.storageBuffer8BitAccess;
         f13.dynamicRendering = VK_TRUE;
         f13.synchronization2 = VK_TRUE;
         f13.robustImageAccess = q13.robustImageAccess;
@@ -534,8 +551,12 @@ struct Device {
             f13.pNext = &fm8;
         }
         VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
-        f2.pNext = &f13;
+        f12.pNext = &f13;
+        f2.pNext = &f12;
         f2.features.shaderInt64 = supported.shaderInt64;
+        f2.features.shaderInt16 = supported.shaderInt16;
+        f2.features.shaderStorageImageReadWithoutFormat = supported.shaderStorageImageReadWithoutFormat;
+        f2.features.shaderStorageImageWriteWithoutFormat = supported.shaderStorageImageWriteWithoutFormat;
         f2.features.geometryShader = supported.geometryShader;
         f2.features.shaderClipDistance = supported.shaderClipDistance;
         f2.features.shaderTessellationAndGeometryPointSize = supported.shaderTessellationAndGeometryPointSize;
@@ -699,6 +720,73 @@ struct Run {
 class Harness {
 public:
     Harness(Device& d, gpu::Dxc& dxc) : dev(d), dxc_(dxc) {}
+
+    // --compile: a compute module's pipeline, built against a layout made from
+    // its own bindings - the driver's verdict, VK_SUCCESS or its error.
+    VkResult compile_compute(const std::vector<std::uint32_t>& words) {
+        const Module m = parse(words);
+        if (m.model != 5) throw Skip("not a compute shader");
+        std::map<std::uint32_t, std::vector<VkDescriptorSetLayoutBinding>> per_set;
+        std::set<std::pair<std::uint32_t, std::uint32_t>> seen;
+        for (const Var& v : m.vars) {
+            if (v.sc != 0 && v.sc != 2 && v.sc != 12) continue;
+            if (!v.has(34) || !v.has(33)) continue;
+            if (!seen.insert({v.get(34), v.get(33)}).second) continue;
+            std::uint32_t t = v.pointee, count = 1;
+            if (m.types.at(t).op == 28) {  // an array of descriptors
+                count = m.consts.at(m.types.at(t).w.at(1));
+                t = m.types.at(t).w.at(0);
+            }
+            const TypeInfo& ty = m.types.at(t);
+            VkDescriptorType type;
+            if (v.sc == 2) type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+            else if (v.sc == 12) type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            else if (ty.op == 26) type = VK_DESCRIPTOR_TYPE_SAMPLER;
+            else if (ty.op == 27) type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            else if (ty.op == 25 && ty.w.at(1) == 5) type = ty.w.at(5) == 2 ? VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER : VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER;
+            else if (ty.op == 25) type = ty.w.at(5) == 2 ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE : VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+            else throw Skip("a descriptor of another kind");
+            VkDescriptorSetLayoutBinding lb{};
+            lb.binding = v.get(33);
+            lb.descriptorType = type;
+            lb.descriptorCount = count;
+            lb.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+            per_set[v.get(34)].push_back(lb);
+        }
+        std::uint32_t max_set = 0;
+        for (const auto& [set, b] : per_set) max_set = std::max(max_set, set);
+        std::vector<VkDescriptorSetLayout> layouts;
+        for (std::uint32_t set = 0; set <= max_set; ++set) {
+            VkDescriptorSetLayoutCreateInfo li{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+            const auto it = per_set.find(set);
+            if (it != per_set.end()) {
+                li.bindingCount = static_cast<std::uint32_t>(it->second.size());
+                li.pBindings = it->second.data();
+            }
+            VkDescriptorSetLayout l;
+            check(vkCreateDescriptorSetLayout(dev.device, &li, nullptr, &l), "vkCreateDescriptorSetLayout");
+            layouts.push_back(l);
+        }
+        VkPipelineLayoutCreateInfo pli{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+        pli.setLayoutCount = static_cast<std::uint32_t>(layouts.size());
+        pli.pSetLayouts = layouts.data();
+        VkPipelineLayout layout;
+        check(vkCreatePipelineLayout(dev.device, &pli, nullptr, &layout), "vkCreatePipelineLayout");
+        const VkShaderModule sm = module(words);
+        VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+        ci.layout = layout;
+        ci.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        ci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+        ci.stage.module = sm;
+        ci.stage.pName = "main";
+        VkPipeline pipeline = VK_NULL_HANDLE;
+        const VkResult r = vkCreateComputePipelines(dev.device, VK_NULL_HANDLE, 1, &ci, nullptr, &pipeline);
+        if (pipeline) vkDestroyPipeline(dev.device, pipeline, nullptr);
+        vkDestroyShaderModule(dev.device, sm, nullptr);
+        vkDestroyPipelineLayout(dev.device, layout, nullptr);
+        for (VkDescriptorSetLayout l : layouts) vkDestroyDescriptorSetLayout(dev.device, l, nullptr);
+        return r;
+    }
 
     // "identical", "different: ...", or throws Skip / Failure.
     std::string compare(const fs::path& lift_path, const fs::path& dxc_path, const Inputs& in) {
@@ -1703,6 +1791,7 @@ int main(int argc, char** argv) {
     const char* progress_path = nullptr;  // the program being run, written before it runs: a crash names it
     int timeout_s = 60;                   // a program still running after this is left out (a loop counting random words)
     std::vector<fs::path> dirs;
+    bool compile_only = false;  // --compile: every compute module (*.spv) built into a pipeline, the driver's result printed
     for (int a = 1; a < argc; ++a) {
         const std::string arg = argv[a];
         if (arg == "--size" && a + 1 < argc) in.size = static_cast<std::uint32_t>(std::atoi(argv[++a]));
@@ -1716,11 +1805,12 @@ int main(int argc, char** argv) {
         else if (arg == "--small-ints") in.small_ints = true;
         else if (arg == "--float-words") in.float_words = true;
         else if (arg == "--timeout" && a + 1 < argc) timeout_s = std::atoi(argv[++a]);
+        else if (arg == "--compile") compile_only = true;
         else dirs.push_back(arg);
     }
     if (dirs.empty() || !shards) {
         std::fprintf(stderr, "usage: hlsl_equiv [--size N] [--vertices N] [--seed S] [--shard I/N] [--only SUBSTR] [--list FILE] [--small-ints] [--float-words] "
-                             "[--timeout S] [--progress FILE] <dir>...\n");
+                             "[--timeout S] [--progress FILE] [--compile] <dir>...\n");
         return 2;
     }
     std::vector<fs::path> lifts;
@@ -1761,6 +1851,39 @@ int main(int argc, char** argv) {
     }
     FILE* list = list_path ? std::fopen(list_path, resume_after.empty() ? "w" : "a") : nullptr;
     Harness h(dev, dxc);
+    if (compile_only) {
+        // Every compute module under the folders, the lift's and DXC's (or any
+        // other variant), each built into a pipeline on this device.
+        std::vector<fs::path> modules;
+        for (const fs::path& d : dirs) {
+            for (const auto& e : fs::recursive_directory_iterator(d)) {
+                const std::string n = e.path().filename().string();
+                if (n.size() > 4 && n.compare(n.size() - 4, 4, ".spv") == 0 && (only.empty() || e.path().string().find(only) != std::string::npos))
+                    modules.push_back(e.path());
+            }
+        }
+        std::sort(modules.begin(), modules.end());
+        std::map<std::string, std::size_t> results;
+        for (const fs::path& f : modules) {
+            std::string r;
+            try {
+                const VkResult v = h.compile_compute(read_words(f));
+                r = v == VK_SUCCESS ? "compiled" : "refused: VkResult " + std::to_string(static_cast<int>(v));
+            } catch (const Skip&) {
+                continue;
+            } catch (const std::exception& e) {
+                r = std::string("error: ") + e.what();
+            }
+            std::printf("%s %s\n", f.string().c_str(), r.c_str());
+            if (list) std::fprintf(list, "%s %s\n", f.string().c_str(), r.c_str());
+            results[r.substr(0, r.find(':'))]++;
+        }
+        std::printf("totals:");
+        for (const auto& [k, n] : results) std::printf(" %s %zu;", k.c_str(), n);
+        std::printf("\n");
+        if (list) std::fclose(list);
+        return results.count("refused") || results.count("error") ? 1 : 0;
+    }
     std::map<std::string, std::size_t> totals;
     std::size_t index = 0;
     const auto t0 = std::chrono::steady_clock::now();
