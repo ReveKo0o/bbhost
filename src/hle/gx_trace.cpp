@@ -152,6 +152,10 @@ enum Kind : std::uint8_t {
     kCreateShader15,     // 0x2566f20: types 1 and 5
     kCreatePixelShader,  // 0x25672d0: type 2
     kCreateComputeShader,  // 0x25673e0: type 4
+    // Gnm's DMA_DATA writer (0x1473e60: cb, dst select, dst, src select,
+    // src/data, bytes, blocking), hooked only for BBHOST_CP_CENSUS, which
+    // names who emits the DMA packets the command processor still runs.
+    kEmitDma,
     kKinds
 };
 const char* const kKindName[kKinds] = {
@@ -167,7 +171,7 @@ const char* const kKindName[kKinds] = {
     "set clip control", "set primitive setup", "set shader stages", "set colour control", "set render control", "set stencil clear",
     "set viewport scissor", "set index offset", "set CS", "set base", "set CS user data (n)", "set CS user data (8)", "set CS user data (4)",
     "set CS user data (1)", "set CS user data pointer", "set CS user data (8, compute ring)", "set CS (compute ring)", "depth decompress pass", "depth-stencil clear pass",
-    "create shader (types 1, 5, 6)", "create shader (types 1, 5)", "create pixel shader", "create compute shader"};
+    "create shader (types 1, 5, 6)", "create shader (types 1, 5)", "create pixel shader", "create compute shader", "emit DMA_DATA"};
 const char* const kStageName[6] = {"VS", "HS", "DS", "GS", "PS", "CS"};
 bool is_dispatch(int k) { return k == kDispatch || k == kDispatchIndirect; }
 
@@ -266,6 +270,7 @@ const Hook kHooks[kKinds] = {
     {0x2566f20, 16, {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x53, 0x48, 0x81, 0xec, 0x28, 0x01, 0x00, 0x00}},
     {0x25672d0, 16, {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x53, 0x48, 0x81, 0xec, 0x28, 0x01, 0x00, 0x00}},
     {0x25673e0, 16, {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x53, 0x48, 0x81, 0xec, 0x28, 0x01, 0x00, 0x00}},
+    {0x1473e60, 14, {BB_PUSH6, 0x50}},  // the DMA_DATA writer
 };
 #undef BB_PUSH6
 #undef BB_PUSH4_ECX
@@ -2421,6 +2426,18 @@ struct GuestCopy {
 };
 std::mutex g_copies_mu;
 std::unordered_map<std::uint64_t, std::vector<GuestCopy>> g_copies;  // by token id, until the CP walks the token
+// BBHOST_CP_CENSUS: GX's buffer-copy passes by kind and caller (CopyResource,
+// CopySubresourceRegion, the map resolves' copy-backs, the movie player).
+extern const bool g_cp_census_hooks = [] {
+    const char* e = std::getenv("BBHOST_CP_CENSUS");
+    return e && e[0] == '1';
+}();
+std::mutex g_copy_callers_mu;
+std::map<std::pair<int, std::uint64_t>, std::uint64_t> g_copy_callers;
+void census_copy_caller(Kind kind, std::uint64_t caller) {
+    std::lock_guard<std::mutex> lk(g_copy_callers_mu);
+    if (g_copy_callers.size() < 256) ++g_copy_callers[{static_cast<int>(kind), caller}];
+}
 std::atomic<std::uint64_t> g_copy_calls{0}, g_copy_tokens{0}, g_copy_ranges{0}, g_copy_bytes{0}, g_copy_failed{0},
     g_copy_unmatched{0}, g_copy_unwritten{0};
 
@@ -2451,6 +2468,7 @@ std::uint64_t native_copy(Kind kind, const std::uint64_t* f) {
         host_log("gx-copy: %s from 0x%llx: %zu copies, first 0x%llx -> 0x%llx, %llu bytes", kKindName[kind], static_cast<ull>(bn(f[6])),
                  copies.size(), static_cast<ull>(copies[0].src), static_cast<ull>(copies[0].dst), static_cast<ull>(copies[0].bytes));
     }
+    if (g_cp_census_hooks) census_copy_caller(kind, bn(f[6]));
     if (g_gnm_sources) note_source(cb, rd64(cb + 0x10), rd64(cb + 0x8), kSourceCopy);
     const std::uint64_t id = write_native_token(cb - 0x10, kGxCopyMagic);
     if (!id) {
@@ -5020,6 +5038,19 @@ GUEST_ABI std::uint64_t gx_hook(std::uint64_t id, const std::uint64_t* f) {
         note_update(f);
         return 0;
     }
+    if (id == kEmitDma) {
+        // Where the packet goes and who asked for it (hle_gx_emitter_caller).
+        const std::uint64_t cmd = rd64(f[5] + 0x10);
+        std::lock_guard<std::mutex> lk(g_mu);
+        if (g_by_packet.size() > (1u << 20)) g_by_packet.clear();
+        EmitRec& e = g_by_packet[cmd];
+        e.kind = kEmitDma;
+        e.ret = f[6];
+        e.flip = hle_video_flip_count();
+        e.gx = false;
+        e.records.reset();
+        return 0;
+    }
     if (id == kCopyBuffers || id == kCopyBuffer) return native_copy(static_cast<Kind>(id), f);
     if (id == kYebisDraw) return native_yebis(f);
     if (id == kClearColour) {
@@ -5701,6 +5732,7 @@ void hle_gx_trace_arm(GuestMemory* mem) {
     int hooked = 0;
     for (std::uint64_t id = 0; id < kKinds; ++id) {
         if (id == kUpdateSubresource && !g_trace && !g_gx_cost_enabled && !g_watch_update && !g_upload_census) continue;
+        if (id == kEmitDma && !g_cp_census_hooks) continue;
         const Hook& h = kHooks[id];
         const std::uint64_t va = g_slide + (h.va - kPreferredGuestSlide);
         if (va < mem->slide || va + h.n > mem->slide + mem->size) continue;
@@ -6378,6 +6410,29 @@ std::string hle_gx_scaleform_last() {
     return out;
 }
 
+// The exit report's line on GX's clears, fills and copies (the periodic
+// gx-fill / gx-copy lines stop at the last 100,000th draw).
+void report_clears_and_copies() {
+    host_log("gx-clears-copies: fill calls %llu (colour clears by slice %llu, CMASK fast clears %llu), fill tokens %llu; buffer-copy calls %llu, "
+             "tokens %llu; image-copy calls %llu, tokens %llu; upload calls %llu, tokens %llu; depth-stencil clear-pass tokens %llu",
+             static_cast<ull>(g_fill_calls.load()), static_cast<ull>(g_fill_rtv_calls.load()), static_cast<ull>(g_fill_rtv_whole.load()),
+             static_cast<ull>(g_fill_tokens.load()), static_cast<ull>(g_copy_calls.load()), static_cast<ull>(g_copy_tokens.load()),
+             static_cast<ull>(g_icopy_calls.load()), static_cast<ull>(g_icopy_tokens.load()), static_cast<ull>(g_upload_calls.load()),
+             static_cast<ull>(g_upload_tokens.load()), static_cast<ull>(g_wd_clear_tokens.load()));
+    if (g_cp_census_hooks) {
+        std::string by;
+        std::lock_guard<std::mutex> lk(g_copy_callers_mu);
+        std::vector<std::pair<std::uint64_t, std::pair<int, std::uint64_t>>> rows;
+        for (const auto& [k, n] : g_copy_callers) rows.push_back({n, k});
+        std::sort(rows.rbegin(), rows.rend());
+        for (std::size_t i = 0; i < rows.size() && i < 16; ++i) {
+            appendf(by, " %s from 0x%llx %llu;", kKindName[rows[i].second.first], static_cast<ull>(rows[i].second.second),
+                    static_cast<ull>(rows[i].first));
+        }
+        host_log("gx-clears-copies: buffer-copy passes by caller:%s", by.empty() ? " none" : by.c_str());
+    }
+}
+
 void hle_gx_scaleform_report() {
     if (g_sf_uniforms_placed.load()) {
         host_log("gx-scaleform: %llu uniform blocks taken at the call and read from there (BBHOST_SF_UNIFORMS)",
@@ -6394,6 +6449,7 @@ void hle_gx_scaleform_report() {
     report_wrapper_draws();
     report_dispatch_tokens();
     report_state_packets();
+    report_clears_and_copies();
 }
 // Whether dispatches are made into tokens at all: native dispatch tokens need
 // native draws and the GX backend (wrapper_dispatch).

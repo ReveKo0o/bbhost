@@ -8,6 +8,7 @@
 #include "engine/yebis_bind.h"
 #include "host/frame_stats.h"
 #include "hle/modules.h"
+#include "engine/gx_resources.h"
 #include "host/gpu.h"
 
 #include <atomic>
@@ -240,8 +241,14 @@ void note_gpu_args(std::uint64_t va, std::size_t bytes);
 // each DMA_DATA by kind (defined with the packet census below).
 extern const bool g_cp_census;
 void census_dispatch(std::uint64_t packet_va);
-enum CensusDma { kCdFillTarget, kCdFillMemory, kCdCopy, kCdGds, kCdCounter, kCdOther, kCdKinds };
+enum CensusDma { kCdFillTarget, kCdFillResource, kCdFillMemory, kCdCopyResource, kCdCopy, kCdRegister, kCdGds, kCdCounter, kCdKinds };
 void census_dma(CensusDma kind, std::size_t bytes);
+// The top-level command buffer being walked is a snapshot of the guest's
+// (BBHOST_CP_COPY): where its packets were written, for the emitter lookups.
+thread_local std::uint64_t t_top_snap_lo = 0, t_top_snap_hi = 0, t_top_guest_lo = 0;
+std::uint64_t census_guest_va(std::uint64_t va) {
+    return va >= t_top_snap_lo && va < t_top_snap_hi ? va - t_top_snap_lo + t_top_guest_lo : va;
+}
 
 void run_dispatch(const char* kind, std::uint32_t x, std::uint32_t y, std::uint32_t z, std::uint64_t indirect_va = 0) {
     GpuDispatch d;
@@ -295,7 +302,7 @@ void run_dispatch(const char* kind, std::uint32_t x, std::uint32_t y, std::uint3
     bind_gds_counters(d);
     const bool ran = host_gpu_dispatch(d);
     if (shadow.d) shadow.reads = host_gpu_dispatch_user_reads();
-    if (g_cp_census) census_dispatch(t_packet_va);
+    if (g_cp_census) census_dispatch(census_guest_va(t_packet_va));
     if (!ran) {
         g_dispatch_failed.fetch_add(1);
         static std::atomic<int> logs{0};
@@ -1126,11 +1133,13 @@ struct DispatchCensusKey {
 };
 std::map<DispatchCensusKey, std::uint64_t> g_census_dispatches;
 std::atomic<std::uint64_t> g_census_dma[kCdKinds] = {}, g_census_dma_bytes[kCdKinds] = {};
+std::map<std::pair<int, std::uint64_t>, std::uint64_t> g_census_dma_callers;  // (kind, emitter caller) -> packets, under g_census_dispatch_mu
 const char* const kDispatchClassName[kDcClasses] = {"none", "fill (no shader)", "render-target copy (no shader)", "image copy shader",
                                                     "buffer-to-image shader", "fill shader (not a target)", "copy shader (as memory)",
                                                     "shader", "failed"};
-const char* const kCensusDmaName[kCdKinds] = {"fill clearing a render target", "fill of memory", "copy", "through GDS",
-                                              "counter word", "other"};
+const char* const kCensusDmaName[kCdKinds] = {"fill clearing a render target", "fill of a GX resource", "fill of other memory",
+                                              "copy into a GX resource", "copy into other memory", "into a register (a prefetch)",
+                                              "through GDS", "counter word"};
 void census_dispatch(std::uint64_t packet_va) {
     const char* program = nullptr;
     const GpuDispatchClass cls = host_gpu_last_dispatch_class(&program);
@@ -1141,6 +1150,9 @@ void census_dispatch(std::uint64_t packet_va) {
 void census_dma(CensusDma kind, std::size_t bytes) {
     g_census_dma[kind].fetch_add(1, std::memory_order_relaxed);
     g_census_dma_bytes[kind].fetch_add(bytes, std::memory_order_relaxed);
+    const std::uint64_t caller = hle_gx_emitter_caller(census_guest_va(t_packet_va));
+    std::lock_guard<std::mutex> lk(g_census_dispatch_mu);
+    if (g_census_dma_callers.size() < 1024) ++g_census_dma_callers[{static_cast<int>(kind), caller}];
 }
 std::atomic<std::uint64_t> g_census_packets[0x100] = {}, g_census_dwords[0x100] = {};
 std::mutex g_census_mu;
@@ -1649,6 +1661,9 @@ void execute_packet(std::uint32_t op, const std::uint32_t* b, std::size_t n, int
                     if (logs.fetch_add(1) < 4) host_log("gnm exec: DMA_DATA to select %u (reserved) dropped", dst_sel);
                     break;
                 }
+                // DAS (bit 27 of the command): the destination is a register -
+                // Gnm's shader prefetch reads the program through L2 into one.
+                if (g_cp_census && ((b[5] >> 27) & 1)) census_dma(kCdRegister, bytes);
                 // Into or out of a GDS counter's word: on the GPU's timeline,
                 // where the word's value is (CopyStructureCount, a reset).
                 if (host_gpu_gds_counters() && (covers_counter_word(dst, bytes) || (src_sel != 2 && covers_counter_word(gpu_va(b[1], b[2]), bytes)))) {
@@ -1683,7 +1698,10 @@ void execute_packet(std::uint32_t op, const std::uint32_t* b, std::size_t n, int
                             host_log("gnm exec: DMA fill 0x%llx %zu bytes with 0x%08x", static_cast<unsigned long long>(dst), bytes, b[1]);
                         }
                         const bool target = host_gpu_clear_target(dst, b[1], bytes);
-                        if (g_cp_census) census_dma(target ? kCdFillTarget : kCdFillMemory, bytes);
+                        if (g_cp_census) {
+                            GxResourceInfo info;
+                            census_dma(target ? kCdFillTarget : gx_resource_at(dst, bytes, &info) ? kCdFillResource : kCdFillMemory, bytes);
+                        }
                         if (!target) {
                             // After a passed wait: the words on the GPU's timeline (cp_write_after_waits).
                             thread_local std::vector<std::uint32_t> words;
@@ -1702,7 +1720,10 @@ void execute_packet(std::uint32_t op, const std::uint32_t* b, std::size_t n, int
                     }
                 } else if (src_sel == 0 || src_sel == 3) {
                     const std::uint64_t src = gpu_va(b[1], b[2]);
-                    if (g_cp_census) census_dma(kCdCopy, bytes);
+                    if (g_cp_census && !((b[5] >> 27) & 1)) {
+                        GxResourceInfo info;
+                        census_dma(gx_resource_at(dst, bytes, &info) ? kCdCopyResource : kCdCopy, bytes);
+                    }
                     warn_if_over_command_buffer("DMA copy", dst, bytes);
                     if (hle_kernel_va_mapped(src, bytes) && hle_kernel_va_mapped(dst, bytes)) {
                         // After a passed wait: the bytes on the GPU's timeline
@@ -2502,7 +2523,13 @@ void cp_thread(Queue* q, int id) {
                  hle_kernel_va_mapped(reinterpret_cast<std::uintptr_t>(job.ce_cbs[i].first), job.ce_cbs[i].second))) {
                 t_ce_stack.push_back({static_cast<const std::uint32_t*>(job.ce_cbs[i].first), job.ce_cbs[i].second / 4});
             }
+            if (g_cp_census && !job.owned.empty() && i < job.guest.size()) {
+                t_top_snap_lo = reinterpret_cast<std::uintptr_t>(job.cbs[i].first);
+                t_top_snap_hi = t_top_snap_lo + job.cbs[i].second;
+                t_top_guest_lo = reinterpret_cast<std::uintptr_t>(job.guest[i].first);
+            }
             execute_one(job.cbs[i].first, job.cbs[i].second, !job.owned.empty());
+            t_top_snap_lo = t_top_snap_hi = 0;
             // With a snapshot, compare it against guest memory afterwards: if
             // they differ, something rewrote the buffer while we walked it.
             if (!job.owned.empty() && i < job.guest.size() && job.guest[i].first) {
@@ -3308,6 +3335,19 @@ void hle_gnm_cp_report() {
         }
         host_log("cp-census: DMA_DATA by kind:%s", dma.empty() ? " none" : dma.c_str());
         std::lock_guard<std::mutex> dlk(g_census_dispatch_mu);
+        {
+            std::vector<std::pair<std::uint64_t, std::pair<int, std::uint64_t>>> rows;
+            for (const auto& [k, n] : g_census_dma_callers) rows.push_back({n, k});
+            std::sort(rows.rbegin(), rows.rend());
+            std::string by;
+            for (std::size_t i = 0; i < rows.size() && i < 24; ++i) {
+                char buf[128];
+                std::snprintf(buf, sizeof(buf), " %s from 0x%llx: %llu;", kCensusDmaName[rows[i].second.first],
+                              static_cast<unsigned long long>(rows[i].second.second), static_cast<unsigned long long>(rows[i].first));
+                by += buf;
+            }
+            host_log("cp-census: DMA_DATA by kind and emitter caller (0: no emitter record):%s", by.empty() ? " none" : by.c_str());
+        }
         std::vector<std::pair<std::uint64_t, const DispatchCensusKey*>> ds;
         std::uint64_t by_class[kDcClasses] = {};
         for (const auto& [k, n] : g_census_dispatches) {
