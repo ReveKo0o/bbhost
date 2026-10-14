@@ -610,8 +610,8 @@ std::string hlsl_validate(const std::vector<std::uint32_t>& spirv) {
 #endif
 }
 // Prints, compiles and checks one lifted module: DXC's SPIR-V, or empty with `why`.
-std::vector<std::uint32_t> hlsl_compile(const std::vector<std::uint32_t>& lifted, const Dxc& dxc, std::string& why) {
-    const gcn::HlslResult h = gcn::emit_hlsl(lifted);
+std::vector<std::uint32_t> hlsl_compile(const std::vector<std::uint32_t>& lifted, const gcn::HlslOptions& hopt, const Dxc& dxc, std::string& why) {
+    const gcn::HlslResult h = gcn::emit_hlsl(lifted, hopt);
     if (!h.ok()) {
         why = "the printer does not take it: " + (h.errors.empty() ? std::string("no source") : h.errors[0]);
         return {};
@@ -652,8 +652,10 @@ void hlsl_keep(const std::string& why) {
     std::lock_guard<std::mutex> lk(g_hlsl.mu);
     g_hlsl.reasons[hlsl_reason_key(why)]++;
 }
-// BBHOST_HLSL: `l`'s module through HLSL and DXC, cached; unchanged where that fails.
-void hlsl_stage(gcn::LiftResult& l);
+// BBHOST_HLSL: `l`'s module through HLSL and DXC, cached; unchanged where that
+// fails. `o`: a tessellation stage's options (a hull's domain, partitioning
+// and winding are HLSL's to declare).
+void hlsl_stage(gcn::LiftResult& l, const gcn::TranslateOptions* o = nullptr);
 }  // namespace
 
 bool hlsl_on() {
@@ -665,8 +667,14 @@ bool hlsl_on() {
 }
 
 namespace {
-void hlsl_stage(gcn::LiftResult& l) {
+void hlsl_stage(gcn::LiftResult& l, const gcn::TranslateOptions* to) {
     if (!hlsl_on() || !l.ok()) return;
+    gcn::HlslOptions hopt;
+    if (to) {
+        hopt.tess_quads = to->tess_quads;
+        hopt.tess_spacing = to->tess_spacing;
+        hopt.tess_cw = to->tess_cw;
+    }
     const Dxc& dxc = hlsl_dxc();
     if (!dxc.loaded()) {
         hlsl_keep("DXC not found");
@@ -680,6 +688,9 @@ void hlsl_stage(gcn::LiftResult& l) {
     DxcOptions o;
     o.optimize = hlsl_level();
     for (const std::string& a : dxc_arguments(o)) h.str(a);
+    h.flag(hopt.tess_quads);
+    h.i32(hopt.tess_spacing);
+    h.flag(hopt.tess_cw);
     h.u32(static_cast<std::uint32_t>(l.spirv.size()));
     for (const std::uint32_t w : l.spirv) h.u32(w);
     const Key key{h.a, h.b};
@@ -699,7 +710,7 @@ void hlsl_stage(gcn::LiftResult& l) {
         g_hlsl.cached.fetch_add(1, std::memory_order_relaxed);
     } else {
         const auto t0 = std::chrono::steady_clock::now();
-        spirv = hlsl_compile(l.spirv, dxc, why);
+        spirv = hlsl_compile(l.spirv, hopt, dxc, why);
         g_hlsl.compiled.fetch_add(1, std::memory_order_relaxed);
         g_hlsl.compile_us.fetch_add(us_since(t0), std::memory_order_relaxed);
         if (cache) {
@@ -745,7 +756,7 @@ gcn::LiftResult lift_tess_cached(TranslationUse use, const gcn::Program& prog, c
     };
     if (!g_tc.ready.load(std::memory_order_acquire) || !g_tc.on) {
         gcn::LiftResult l = lift();
-        hlsl_stage(l);
+        hlsl_stage(l, &o);
         return l;
     }
     KeyHasher h;
@@ -761,7 +772,7 @@ gcn::LiftResult lift_tess_cached(TranslationUse use, const gcn::Program& prog, c
     h.str(tess.constants_path);
     for (const std::uint32_t v : tess.constants) h.u32(v);
     gcn::LiftResult l = lift_through_cache(Key{h.a, h.b}, lift);
-    hlsl_stage(l);
+    hlsl_stage(l, &o);
     return l;
 }
 

@@ -3,6 +3,10 @@
 //
 //   gcn2hlsl [--ps] [--vs] [--clip] [--O0] [--jobs N] [--only NAME[,NAME]]
 //            [--out DIR] [--list FILE] [--no-dxc] [--sample N] [--oconfig PASSES] <bundle.dcx>...
+//   gcn2hlsl --spv <lifted.spv> --out <prefix> [--O0]
+//            one lifted module (a draw capture's bound one, tools/hlsl_verify.py):
+//            writes <prefix>.hlsl and <prefix>.dxc.spv; exit 0 when the module
+//            compiled, validated and kept the lift's interface and operations.
 //
 // Each program is translated and lifted with the options the renderer uses
 // when GX creates it (render.cpp precompile_ps / precompile_vs: the
@@ -95,14 +99,266 @@ std::string reason_key(const std::string& r) {
     return k;
 }
 
+enum class Kind { Pixel, Vertex, Ls, Hull, Domain };
+const char* kind_name(Kind k) {
+    switch (k) {
+    case Kind::Pixel: return "ps";
+    case Kind::Vertex: return "vs";
+    case Kind::Ls: return "ls";
+    case Kind::Hull: return "hs";
+    case Kind::Domain: return "ds";
+    }
+    return "?";
+}
 struct Job {
     std::string bundle;  // the bundle's file name without its extensions
     std::string name;    // the program's name in its bundle
-    bool vertex = false;
+    Kind kind = Kind::Pixel;
     gcn::Program program;
     gcn::TranslateOptions options;
+    gcn::TessLift tess;
     std::vector<std::uint8_t> container;
 };
+
+// ---- tessellation: the stages as tests/gcn_tess_lift_test.cpp lifts them ----
+struct TessShader {
+    std::string name;
+    gcn::ShaderCode code;
+    gcn::Program program;
+    std::uint32_t regs[16] = {};
+    std::vector<std::uint8_t> data;
+};
+std::size_t block_of(const TessShader& s) {
+    std::size_t shdr = 0;
+    while (shdr + 0x60 <= s.data.size() && shdr < 0x100 && std::memcmp(s.data.data() + shdr, "Shdr", 4) != 0) ++shdr;
+    return shdr + 16;
+}
+// The constant buffer a stage reads the tessellation constants through (API slot 0x13).
+std::string tess_constants_path(const TessShader& s) {
+    std::uint32_t reg = ~0u, table = ~0u;
+    for (std::size_t at = block_of(s) + 24; at + 4 <= s.code.offset && at + 4 <= s.data.size(); at += 4) {
+        std::uint32_t w;
+        std::memcpy(&w, s.data.data() + at, 4);
+        if ((w & 0xff) == 0x02 && ((w >> 8) & 0xff) == 0x13 && reg == ~0u) reg = (w >> 16) & 0xff;
+        if ((w & 0xff) == 0x1b && table == ~0u) table = (w >> 16) & 0xff;
+    }
+    if (reg < 16) return "user_sgpr[" + std::to_string(reg) + "]";
+    if (reg != ~0u && table < 16) return "user_sgpr[" + std::to_string(table) + "]->load(+" + std::to_string((reg - 16) * 4) + ")";
+    return std::string();
+}
+// An LS's vertex inputs from its container's input table, as 32-bit floats.
+std::vector<gcn::VertexElement> tess_ls_inputs(const TessShader& s) {
+    for (std::size_t first = block_of(s) + 24; first + 4 <= s.code.offset; first += 4) {
+        std::vector<gcn::VertexElement> els;
+        for (std::size_t at = first; at + 4 <= s.code.offset && els.size() < 16; at += 4) {
+            const std::uint8_t sem = s.data[at], vgpr = s.data[at + 1], cnt = s.data[at + 2], pad = s.data[at + 3];
+            if (sem != els.size() || !cnt || cnt > 4 || vgpr < 4 || pad) break;
+            gcn::VertexElement el;
+            el.location = static_cast<std::uint32_t>(els.size());
+            el.vdata = vgpr;
+            el.count = cnt;
+            const std::uint32_t dfmt = cnt == 1 ? 4 : cnt == 2 ? 11 : cnt == 3 ? 13 : 14;
+            el.w3 = dfmt << 15 | 7u << 12 | 0xfacu;
+            els.push_back(el);
+        }
+        if (!els.empty()) return els;
+    }
+    return {};
+}
+bool tess_reads_lds(const gcn::Program& p) {
+    for (const gcn::Inst& in : p.insts) {
+        if (in.enc == gcn::Enc::DS && in.op != 53) return true;  // not ds_swizzle_b32
+    }
+    return false;
+}
+// The particles' LS and domain shaders (one control point, carried as stage
+// attributes) and every game hull's LS, hull and domain shader in its window.
+void tess_jobs(const std::string& bundle_path, std::vector<gcn::BundleEntry>& entries, std::vector<Job>& out) {
+    std::string bundle = fs::path(bundle_path).filename().string();
+    bundle = bundle.substr(0, bundle.find('.'));
+    std::vector<TessShader> all;
+    for (gcn::BundleEntry& e : entries) {
+        TessShader s;
+        s.name = e.name;
+        if (!gcn::shader_code(e.data, s.code)) continue;
+        std::size_t shdr = 0;
+        while (shdr + 0x60 <= e.data.size() && shdr < 0x100 && std::memcmp(e.data.data() + shdr, "Shdr", 4) != 0) ++shdr;
+        if (shdr + 0x60 > e.data.size()) continue;
+        std::memcpy(s.regs, e.data.data() + shdr + 16, sizeof(s.regs));
+        s.data = e.data;
+        s.program = gcn::decode(s.code.words.data(), s.code.words.size());
+        all.push_back(std::move(s));
+    }
+    const auto flat = [](std::string n) {
+        for (char& c : n) {
+            if (c == '\\' || c == '/') c = '~';
+        }
+        return n;
+    };
+    std::set<std::vector<std::uint32_t>> seen;
+    for (const TessShader& s : all) {
+        if (s.name.find("tessellate") == std::string::npos || !seen.insert(s.code.words).second) continue;
+        if (s.code.type == 6) {
+            const std::vector<gcn::VertexElement> els = tess_ls_inputs(s);
+            if (els.empty()) continue;
+            Job j;
+            j.bundle = bundle;
+            j.name = flat(s.name);
+            j.kind = Kind::Ls;
+            j.program = s.program;
+            gcn::TranslateOptions& o = j.options;
+            o.stage = gcn::Stage::Vertex;
+            o.tess_role = gcn::TranslateOptions::TessRole::LsVertex;
+            o.tess_lds_attributes = true;
+            o.tess_attr_vec4s = 16;
+            o.rsrc1 = s.regs[4];
+            o.rsrc2 = s.regs[5];
+            o.vertex_input = els;
+            o.cb_ssbo = true;
+            o.cb_no_fallback = true;
+            j.tess.attr_vec4s = 16;
+            out.push_back(std::move(j));
+            continue;
+        }
+        if (s.code.type != 1 || !tess_reads_lds(s.program)) continue;
+        Job j;
+        j.bundle = bundle;
+        j.name = flat(s.name);
+        j.kind = Kind::Domain;
+        j.program = s.program;
+        gcn::TranslateOptions& o = j.options;
+        o.stage = gcn::Stage::TessEval;
+        o.tess_role = gcn::TranslateOptions::TessRole::DomainTes;
+        o.tess_lds_attributes = true;
+        o.tess_attr_vec4s = 16;
+        o.tess_patch_control_points = 1;
+        o.rsrc1 = s.regs[4];
+        o.rsrc2 = s.regs[5];
+        o.vs_out_cntl = s.regs[8];
+        o.cb_descriptor_set = 2;
+        o.cb_ssbo = true;
+        o.link_outputs = true;
+        for (std::uint8_t k = 0; k < 32; ++k) o.output_links.push_back(k);
+        const gcn::TranslateResult paths = gcn::translate(s.program, o);
+        for (const gcn::PredictedImage& pi : gcn::predict_image_dims(s.program, paths)) o.image_dims.emplace_back(pi.dim, pi.arrayed);
+        o.sampler_force_unnormalized.assign(paths.samplers.size(), false);
+        o.cb_no_fallback = true;
+        j.tess.attr_vec4s = 16;
+        out.push_back(std::move(j));
+    }
+    std::set<std::string> sets;
+    for (const TessShader& hs : all) {
+        if (hs.code.type != 7 || hs.code.words.size() < 300) continue;  // past the particles' constant hulls
+        const std::string stem = hs.name.substr(0, hs.name.rfind('.'));
+        const TessShader *ls = nullptr, *ds = nullptr;
+        for (const TessShader& s : all) {
+            if (s.name == stem + ".vpo") ls = &s;
+            if (s.name == stem + ".dpo") ds = &s;
+        }
+        if (!ls || !ds) continue;
+        std::string key;
+        for (const TessShader* s : {ls, &hs, ds}) key.append(reinterpret_cast<const char*>(s->code.words.data()), s->code.words.size() * 4).push_back('|');
+        if (!sets.insert(key).second) continue;
+        const std::uint32_t ls_stride = ls->regs[7], cp = hs.regs[9], npc = hs.regs[11], cp_stride = hs.regs[12];
+        const std::uint32_t inputs = cp * ls_stride, outputs = cp * cp_stride, consts = npc * 16;
+        const std::uint32_t tc[12] = {ls_stride, cp_stride, 1, inputs, consts, inputs + outputs, outputs, 0, hs.regs[15], 0, 0, 0};
+        const std::uint32_t window = (inputs + outputs + consts + 15) & ~15u;
+        gcn::TessLift tl;
+        tl.window = true;
+        tl.control_points = cp;
+        tl.ls_stride = ls_stride;
+        tl.cp_stride = cp_stride;
+        tl.patch_constants = npc;
+        std::memcpy(tl.constants, tc, sizeof(tc));
+        const std::uint32_t tf = hs.regs[6];
+        const bool quads = (tf & 3) == 2;
+        const int spacing = ((tf >> 2) & 7) == 2 ? 1 : ((tf >> 2) & 7) == 3 ? 2 : 0;
+        const bool cw = ((tf >> 5) & 7) != 3;
+        {
+            Job j;
+            j.bundle = bundle;
+            j.name = flat(hs.name);
+            j.kind = Kind::Hull;
+            j.program = hs.program;
+            gcn::TranslateOptions& o = j.options;
+            o.stage = gcn::Stage::TessControl;
+            o.tess_role = gcn::TranslateOptions::TessRole::HullTcs;
+            o.rsrc1 = hs.regs[4];
+            o.rsrc2 = hs.regs[5];
+            o.tess_patch_control_points = cp;
+            o.tess_window = window;
+            o.tess_lds_bound = true;
+            o.tess_quads = quads;
+            o.tess_spacing = spacing;
+            o.tess_cw = cw;
+            o.descriptor_set = 4;
+            o.cb_ssbo = true;
+            o.cb_no_fallback = true;
+            o.cb_descriptor_set = 4;
+            o.cb_binding_base = 32;
+            j.tess = tl;
+            j.tess.own_params = true;
+            j.tess.params_binding = 1;
+            j.tess.constants_path = tess_constants_path(hs);
+            out.push_back(std::move(j));
+        }
+        {
+            Job j;
+            j.bundle = bundle;
+            j.name = flat(ds->name);
+            j.kind = Kind::Domain;
+            j.program = ds->program;
+            gcn::TranslateOptions& o = j.options;
+            o.stage = gcn::Stage::TessEval;
+            o.tess_role = gcn::TranslateOptions::TessRole::DomainTes;
+            o.rsrc1 = ds->regs[4];
+            o.rsrc2 = ds->regs[5];
+            o.vs_out_cntl = ds->regs[8];
+            o.tess_patch_control_points = cp;
+            o.tess_window = window;
+            o.tess_lds_bound = true;
+            o.tess_quads = quads;
+            o.tess_spacing = spacing;
+            o.tess_cw = cw;
+            o.cb_descriptor_set = 2;
+            o.cb_ssbo = true;
+            o.link_outputs = true;
+            for (std::uint8_t k = 0; k < 32; ++k) o.output_links.push_back(k);
+            const gcn::TranslateResult dpaths = gcn::translate(ds->program, o);
+            for (const gcn::PredictedImage& pi : gcn::predict_image_dims(ds->program, dpaths)) o.image_dims.emplace_back(pi.dim, pi.arrayed);
+            o.sampler_force_unnormalized.assign(dpaths.samplers.size(), false);
+            o.cb_no_fallback = true;
+            j.tess = tl;
+            j.tess.constants_path = tess_constants_path(*ds);
+            out.push_back(std::move(j));
+        }
+        {
+            Job j;
+            j.bundle = bundle;
+            j.name = flat(ls->name);
+            j.kind = Kind::Ls;
+            j.program = ls->program;
+            gcn::TranslateOptions& o = j.options;
+            o.stage = gcn::Stage::Vertex;
+            o.tess_role = gcn::TranslateOptions::TessRole::LsVertex;
+            o.tess_lds_attributes = true;
+            o.tess_attr_vec4s = ls_stride / 16;
+            o.rsrc1 = ls->regs[4];
+            o.rsrc2 = ls->regs[5];
+            o.vertex_input = tess_ls_inputs(*ls);
+            o.cb_ssbo = true;
+            o.cb_no_fallback = true;
+            o.descriptor_set = 4;
+            o.cb_descriptor_set = 4;
+            o.cb_binding_base = 16;
+            j.tess = tl;
+            j.tess.attr_vec4s = ls_stride / 16;
+            j.tess.own_params = true;
+            j.tess.params_binding = 0;
+            if (!o.vertex_input.empty()) out.push_back(std::move(j));
+        }
+    }
+}
 
 struct Totals {
     std::mutex mu;
@@ -116,8 +372,60 @@ struct Totals {
 
 }  // namespace
 
+// --spv: one module from a file.
+int one_module(const char* in, const char* prefix, int opt_level) {
+    std::vector<std::uint8_t> bytes;
+    if (!gcn::read_file(in, bytes) || bytes.size() < 20 || bytes.size() % 4) {
+        std::fprintf(stderr, "cannot read %s as SPIR-V\n", in);
+        return 2;
+    }
+    std::vector<std::uint32_t> lifted(bytes.size() / 4);
+    std::memcpy(lifted.data(), bytes.data(), bytes.size());
+    gcn::HlslOptions hopt;
+    hopt.title = fs::path(in).filename().string();
+    const gcn::HlslResult h = gcn::emit_hlsl(lifted, hopt);
+    if (!h.source.empty()) write_bytes(std::string(prefix) + ".hlsl", h.source.data(), h.source.size());
+    if (!h.ok()) {
+        std::printf("not emitted: %s\n", h.errors[0].c_str());
+        return 1;
+    }
+    gpu::Dxc dxc;
+    if (!dxc.load()) {
+        std::fprintf(stderr, "DXC: %s\n", dxc.error().c_str());
+        return 2;
+    }
+    gpu::DxcOptions dopt;
+    dopt.optimize = opt_level;
+    std::vector<std::uint32_t> spirv;
+    std::string error;
+    const auto t0 = std::chrono::steady_clock::now();
+    if (!dxc.compile(h, dopt, spirv, error)) {
+        std::printf("not compiled: %s\n", error.c_str());
+        return 1;
+    }
+    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    write_bytes(std::string(prefix) + ".dxc.spv", spirv.data(), spirv.size() * 4);
+    if (const std::string v = validate(spirv); !v.empty()) {
+        std::printf("invalid: %s\n", v.c_str());
+        return 1;
+    }
+    if (const std::string d = gcn::hlsl_interface_diff(lifted, spirv); !d.empty()) {
+        std::printf("interface: %s\n", d.c_str());
+        return 1;
+    }
+    if (const std::string d = gcn::hlsl_operation_diff(lifted, spirv); !d.empty()) {
+        std::printf("operations: %s\n", d.c_str());
+        return 1;
+    }
+    std::printf("ok %.0f ms, %zu words (lifted %zu)\n", ms, spirv.size(), lifted.size());
+    return 0;
+}
+
 int main(int argc, char** argv) {
-    bool ps = false, vs = false, clip = false, use_dxc = true;
+    if (argc >= 5 && std::string(argv[1]) == "--spv" && std::string(argv[3]) == "--out") {
+        return one_module(argv[2], argv[4], argc >= 6 && std::string(argv[5]) == "--O0" ? 0 : 3);
+    }
+    bool ps = false, vs = false, clip = false, use_dxc = true, tess = false;
     int opt_level = 3;
     int sample = 1;  // every n-th program
     std::string passes;
@@ -131,6 +439,7 @@ int main(int argc, char** argv) {
         if (arg == "--ps") ps = true;
         else if (arg == "--vs") vs = true;
         else if (arg == "--clip") clip = true;
+        else if (arg == "--tess") tess = true;
         else if (arg == "--O0") opt_level = 0;
         else if (arg == "--oconfig" && a + 1 < argc) passes = argv[++a];
         else if (arg == "--sample" && a + 1 < argc) sample = std::max(1, std::atoi(argv[++a]));
@@ -156,7 +465,7 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "usage: gcn2hlsl [--ps] [--vs] [--clip] [--O0] [--jobs N] [--only NAME,..] [--out DIR] [--list FILE] [--no-dxc] <bundle.dcx>...\n");
         return 2;
     }
-    if (!ps && !vs) ps = vs = true;
+    if (!ps && !vs && !tess) ps = vs = true;
     if (out_dir) fs::create_directories(out_dir);
     gpu::Dxc dxc;
     if (use_dxc && !dxc.load()) {
@@ -171,6 +480,14 @@ int main(int argc, char** argv) {
     for (const std::string& path : bundles) {
         std::vector<gcn::BundleEntry> entries;
         if (!load_bundle(path, entries)) return 1;
+        if (tess) {
+            std::vector<Job> t;
+            tess_jobs(path, entries, t);
+            for (Job& j : t) {
+                if (!only.empty() && !only.count(j.name)) continue;
+                if (seen++ % static_cast<std::size_t>(sample) == 0) work.push_back(std::move(j));
+            }
+        }
         for (gcn::BundleEntry& e : entries) {
             gcn::ShaderCode code;
             if (!gcn::shader_code(e.data, code)) continue;
@@ -193,7 +510,7 @@ int main(int argc, char** argv) {
             j.bundle = fs::path(path).filename().string();
             j.bundle = j.bundle.substr(0, j.bundle.find('.'));
             j.name = full;
-            j.vertex = is_vs;
+            j.kind = is_vs ? Kind::Vertex : Kind::Pixel;
             j.program = gcn::decode(code.words.data(), code.words.size());
             const std::size_t gnm = shdr + 16;
             if (is_ps) {
@@ -318,7 +635,7 @@ int main(int argc, char** argv) {
             const std::size_t i = next.fetch_add(1);
             if (i >= work.size()) return;
             const Job& j = work[i];
-            const char* stage = j.vertex ? "vs" : "ps";
+            const char* stage = kind_name(j.kind);
             std::string result, reason;
             std::uint64_t ms = 0;
             const auto line = [&] {
@@ -337,7 +654,14 @@ int main(int argc, char** argv) {
                 line();
                 continue;
             }
-            gcn::LiftResult l = j.vertex ? gcn::lift_vertex_shader(j.program, j.options, ref) : gcn::lift_pixel_shader(j.program, j.options, ref);
+            gcn::LiftResult l;
+            switch (j.kind) {
+            case Kind::Pixel: l = gcn::lift_pixel_shader(j.program, j.options, ref); break;
+            case Kind::Vertex: l = gcn::lift_vertex_shader(j.program, j.options, ref); break;
+            case Kind::Ls: l = gcn::lift_ls_shader(j.program, j.options, ref, j.tess); break;
+            case Kind::Hull: l = gcn::lift_hull_shader(j.program, j.options, ref, j.tess); break;
+            case Kind::Domain: l = gcn::lift_domain_shader(j.program, j.options, ref, j.tess); break;
+            }
             if (!l.ok()) {
                 result = "not-lifted", reason = l.rejections.empty() ? "no module" : l.rejections[0];
                 std::lock_guard<std::mutex> lk(t.mu);
@@ -359,7 +683,12 @@ int main(int argc, char** argv) {
             if (out_dir) write_bytes(stem.string() + ".lift.spv", l.spirv.data(), l.spirv.size() * 4);
             const auto e0 = std::chrono::steady_clock::now();
             gcn::HlslOptions hopt;
-            hopt.title = j.name + " (" + (j.vertex ? "vertex" : "pixel") + " shader)";
+            static const char* const what[] = {"pixel shader", "vertex shader", "LS as the vertex stage", "hull shader as the control stage",
+                                               "domain shader as the evaluation stage"};
+            hopt.title = j.name + " (" + what[static_cast<int>(j.kind)] + ")";
+            hopt.tess_quads = j.options.tess_quads;
+            hopt.tess_spacing = j.options.tess_spacing;
+            hopt.tess_cw = j.options.tess_cw;
             const gcn::HlslResult h = gcn::emit_hlsl(l.spirv, hopt);
             const std::uint64_t emit_us = static_cast<std::uint64_t>(
                 std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - e0).count());

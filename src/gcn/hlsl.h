@@ -21,6 +21,21 @@
 //   * quad operations are QuadReadLaneAt / QuadReadAcross*, which DXC lowers
 //     to the lift's OpGroupNonUniformQuadBroadcast / QuadSwap.
 //
+// Tessellation: the LS is a vertex shader whose control point is an array
+// output; the domain shader takes its control points as an OutputPatch and
+// its patch constants beside the factors HLSL requires, with the spacing and
+// winding the lift declares as inline execution modes. The game's hull - one
+// function an output control point runs, then a barrier, then the patch's
+// constants and factors written by the invocation that holds the patch - is
+// HLSL's two phases from that one body: the control-point function runs it
+// for its invocation and returns at the barrier with the control point it
+// wrote; the patch-constant function runs it again as invocation 0, reading
+// every control point's output from the OutputPatch after the barrier, and
+// returns the constants and factors it wrote. That is the lift's result as
+// long as the patch's values are written by invocation 0 only, which the
+// game's hulls do (their stores are under a test of the control point index
+// against 1); the replays check it.
+//
 // Constant buffers are ByteAddressBuffers read a dword at a time, as the lift
 // reads them; the params block is a ConstantBuffer with the lift's offsets.
 // Values keep the module's ids (v123), so the HLSL can be read beside the
@@ -39,6 +54,13 @@ namespace gcn {
 
 struct HlslOptions {
     std::string title;  // the program's name, for the header comment
+    // A hull shader (the control stage): the domain, partitioning and winding
+    // HLSL declares on it, as VGT_TF_PARAM gives them to the evaluation stage
+    // (TranslateOptions tess_quads, tess_spacing, tess_cw). The lift's control
+    // stage declares none of them; DXC's does, and they must agree.
+    bool tess_quads = false;
+    int tess_spacing = 0;  // 0 integer, 1 fractional-odd, 2 fractional-even
+    bool tess_cw = true;
 };
 
 struct HlslResult {

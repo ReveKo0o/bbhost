@@ -620,6 +620,12 @@ private:
     std::map<std::uint32_t, std::string> buffer_names;  // storage buffer variable -> name
     std::string helper_invocation_name;
     bool early_tests = false;
+    std::string tess_domain;                // [domain(...)] of a domain shader
+    std::vector<std::uint32_t> tess_modes;  // spacing, winding, point mode
+    std::uint32_t output_vertices = 0;      // a hull's OutputVertices
+    // The hull: its per-control-point output and the barrier its body crosses.
+    std::uint32_t cp_out_var = 0, invocation_var = 0;
+    bool past_barrier = false;
 
     std::vector<std::uint32_t> decoration(std::uint32_t id, std::uint32_t d) const {
         const auto it = decos.find(id);
@@ -651,12 +657,14 @@ private:
         switch (exec_model) {
         case spv::EmFragment: profile = "ps_6_6"; break;
         case spv::EmVertex: profile = "vs_6_6"; break;
+        case spv::EmTessellationEvaluation: profile = "ds_6_6"; break;
+        case spv::EmTessellationControl: profile = "hs_6_6"; break;
         default: fail("execution model " + std::to_string(exec_model));
         }
         for (const std::uint32_t c : capabilities) {
             switch (c) {
             case spv::CapShader: case spv::CapInt64: case spv::CapClipDistance: case spv::CapImageQuery: case spv::CapGroupNonUniform:
-            case spv::CapGroupNonUniformQuad: case spv::CapDerivativeControl: case spv::CapSampled1D: case spv::CapImage1D:
+            case spv::CapGroupNonUniformQuad: case spv::CapDerivativeControl: case spv::CapSampled1D: case spv::CapImage1D: case spv::CapTessellation:
             case spv::CapSampledCubeArray: case spv::CapImageCubeArray: case spv::CapStorageImageReadWithoutFormat:
             case spv::CapStorageImageWriteWithoutFormat: case spv::CapImageGatherExtended:
                 break;
@@ -670,6 +678,20 @@ private:
             switch (m[1]) {
             case spv::ExOriginUpperLeft: case spv::ExDepthReplacing: break;  // DXC's own for a pixel shader (with SV_Depth)
             case spv::ExEarlyFragmentTests: early_tests = true; break;
+            // Tessellation: the domain is the domain shader's attribute; the
+            // spacing, winding and point mode HLSL gives the hull shader, so
+            // the evaluation stage declares them as inline SPIR-V, as the lift does.
+            case spv::ExQuads: tess_domain = "quad"; break;
+            case spv::ExTriangles: tess_domain = "tri"; break;
+            case spv::ExIsolines: tess_domain = "isoline"; break;
+            case spv::ExSpacingEqual: case spv::ExSpacingFractionalEven: case spv::ExSpacingFractionalOdd: case spv::ExVertexOrderCw:
+            case spv::ExVertexOrderCcw: case spv::ExPointMode:
+                tess_modes.push_back(m[1]);
+                break;
+            case spv::ExOutputVertices:
+                if (m.size() < 3) fail("OutputVertices without a count");
+                output_vertices = m[2];
+                break;
             default: fail("execution mode " + std::to_string(m[1]));
             }
         }
@@ -795,7 +817,9 @@ private:
             if (decorated(v, spv::DecCentroid)) s.interp += "centroid ";
             if (decorated(v, 17 /* Sample */)) s.interp += "sample ";
             if (decorated(v, spv::DecInvariant)) fail("an invariant output");
-            if (decorated(v, spv::DecPatch)) fail("a patch variable");
+            s.patch = decorated(v, spv::DecPatch);
+            if (s.patch && !(exec_model == spv::EmTessellationEvaluation && s.input) && !(exec_model == spv::EmTessellationControl && !s.input))
+                fail("a patch variable outside a domain shader's inputs or a hull shader's outputs");
             if (decorated(v, 4 /* Component */)) fail("a component decoration");
             std::string base = given;
             if (s.builtin >= 0) base = builtin_name(s.builtin, s.input);
@@ -806,8 +830,20 @@ private:
                 // write every discard as a demote.
                 s.name = helper_invocation_name = unique("gl_HelperInvocation_");
                 helper_decls.push_back("[[vk::ext_builtin_input(23 /* HelperInvocation */)]] static const bool " + s.name + ";");
+            } else if (s.builtin == spv::BiTessCoord) {
+                // The tessellation coordinate as the module reads it (SV_DomainLocation is two components of a quad's).
+                if (type(pointee).k != TK::Vector || type(pointee).count != 3) fail("a tessellation coordinate that is not a float3");
+                s.name = unique("gl_TessCoord_");
+                helper_decls.push_back("[[vk::ext_builtin_input(13 /* TessCoord */)]] static const float3 " + s.name + ";");
             } else {
                 s.name = unique(base);
+            }
+            if (exec_model == spv::EmTessellationControl) {
+                if (!s.input && s.location >= 0 && !s.patch) {
+                    if (cp_out_var) fail("a hull shader with two control-point outputs");
+                    cp_out_var = v;
+                }
+                if (s.input && s.builtin == spv::BiInvocationId) invocation_var = v;
             }
             stage_index[v] = stage_vars.size();
             global_names[v] = s.name;
@@ -819,6 +855,8 @@ private:
     }
     std::map<std::pair<std::uint32_t, std::uint32_t>, std::string> member_field;
     std::map<std::uint32_t, std::string> compare_name;
+    std::set<std::uint32_t> hull_late_cp_access;  // access chains into the output patch after the barrier
+    std::map<std::uint32_t, std::uint32_t> hull_early_cp_read;  // ... before it, at an index not the invocation's: chain -> index
 
     std::string builtin_name(int b, bool input) const {
         switch (b) {
@@ -831,6 +869,11 @@ private:
         case spv::BiHelperInvocation: return "gl_HelperInvocation_";
         case spv::BiVertexIndex: return "gl_VertexIndex_";
         case spv::BiInstanceIndex: return "gl_InstanceIndex_";
+        case spv::BiTessCoord: return "gl_TessCoord_";
+        case spv::BiPrimitiveId: return "gl_PrimitiveID_";
+        case spv::BiTessLevelOuter: return "gl_TessLevelOuter_";
+        case spv::BiTessLevelInner: return "gl_TessLevelInner_";
+        case spv::BiInvocationId: return "gl_InvocationID_";
         default: fail("built-in " + std::to_string(b));
         }
     }
@@ -1054,6 +1097,17 @@ private:
             return define(in, ref(in.a.at(0)));
         case spv::OpUndef: return define(in, zero(in.type));
         case spv::OpNop: return;
+        case spv::OpControlBarrier: {
+            // The hull's barrier between its control point and its patch: the
+            // control-point phase ends here (see hlsl.h).
+            if (exec_model != spv::EmTessellationControl) fail("a barrier outside a hull shader");
+            if (scope != 0) fail("a barrier inside a loop or a branch");
+            if (past_barrier) fail("a second barrier");
+            past_barrier = true;
+            line("// The barrier: every control point is written. The control-point phase ends here.");
+            line("if (hull_phase_cp) return;");
+            return;
+        }
         default: break;
         }
         if (in.op >= spv::OpImageSampleImplicitLod && in.op <= spv::OpImageQueryLevels) return image_op(in);
@@ -1101,6 +1155,17 @@ private:
             return define(in, k == 'u' ? e : k == 'i' ? "asint(" + e + ")" : k == 'f' ? "asfloat(" + e + ")" : (fail("a buffer load of this type"), ""));
         }
         for (const std::uint32_t u : h->second.uses) use(u);
+        if (const auto e = hull_early_cp_read.find(p); e != hull_early_cp_read.end()) {
+            // mine<suffix> where the index is this invocation's, the output patch's element otherwise.
+            const std::string own = h->second.lvalue, mine = global_names.at(cp_out_var) + "_mine";
+            const std::string suffix = own.substr(mine.size());
+            std::string inv;
+            for (const StageVar& v : stage_vars) {
+                if (v.builtin == spv::BiInvocationId) inv = v.name;
+            }
+            const std::string idx = as(e->second, 'u');
+            return define(in, "select(" + idx + " == " + inv + ", " + own + ", " + global_names.at(cp_out_var) + "[" + idx + "]" + suffix + ")");
+        }
         define(in, h->second.lvalue);
     }
 
@@ -1110,6 +1175,7 @@ private:
         if (var_type.count(p)) {
             const Type& pt = type(var_type.at(p));
             if (pt.sc != spv::ScOutput) fail("a store to a variable that is no output");
+            if (p == cp_out_var && cp_out_var) fail("a store to the whole output patch");
             if (type(pt.elem).k == TK::Array) {
                 // A whole array (clip distances): element by element.
                 const Type& at = type(pt.elem);
@@ -1123,6 +1189,8 @@ private:
         }
         const auto h = handles.find(p);
         if (h == handles.end()) fail("a store through a pointer that is no access chain");
+        if (hull_late_cp_access.count(p)) fail("a control point output written after the barrier");
+        if (hull_early_cp_read.count(p)) fail("a control point output written at an index other than the invocation's");
         for (const std::uint32_t u : h->second.uses) use(u);
         if (h->second.kind == Handle::Kind::BufferWord) {
             line(h->second.lvalue + ".Store(4u * " + as(h->second.index, 'u') + ", " + as(v, 'u') + ");");
@@ -1151,7 +1219,30 @@ private:
         if (pt.sc != spv::ScUniform && pt.sc != spv::ScInput && pt.sc != spv::ScOutput) fail("an access chain into storage class " + std::to_string(pt.sc));
         h.kind = Handle::Kind::Lvalue;
         h.lvalue = global_names.at(base);
-        for (std::size_t k = 1; k < in.a.size(); ++k) {
+        std::size_t first = 1;
+        if (base == cp_out_var && cp_out_var) {
+            // Before the barrier an invocation reaches only its own control
+            // point (control_point_out_mine), after it every one (the output patch).
+            if (in.a.size() < 2) fail("an access to the whole output patch");
+            if (!past_barrier) {
+                const auto d = defs.find(in.a[1]);
+                const bool own = d != defs.end() && d->second->op == spv::OpLoad && d->second->a.at(0) == invocation_var && invocation_var;
+                if (!own) {
+                    // A read at an index worked out at run time (an LDS address
+                    // decoded region by region): its own control point where the
+                    // index is the invocation's, another's (unsynchronized in the
+                    // lift as well) from the output patch. A store must be its own.
+                    hull_early_cp_read[in.id] = in.a[1];
+                    h.uses.push_back(in.a[1]);
+                }
+                h.lvalue = global_names.at(base) + "_mine";
+                first = 2;
+                t = type(t).elem;
+            } else {
+                hull_late_cp_access.insert(in.id);
+            }
+        }
+        for (std::size_t k = first; k < in.a.size(); ++k) {
             const std::uint32_t idx = in.a[k];
             const Type& ty = type(t);
             const auto c = consts.find(idx);
@@ -1664,6 +1755,9 @@ private:
         handles.clear();
         parts.clear();
         printed_blocks.clear();
+        past_barrier = false;
+        hull_late_cp_access.clear();
+        hull_early_cp_read.clear();
         scope = 0;
         scope_count = 0;
         scope_parent.assign(1, 0);
@@ -1795,6 +1889,100 @@ private:
     }
 
     // ---- the whole source -----------------------------------------------------------------
+    // The hull shader's two phases from the one body (hlsl.h).
+    std::string assemble_hull(const std::string& top) {
+        if (!output_vertices) fail("a hull shader without OutputVertices");
+        if (!cp_out_var || !invocation_var) fail("a hull shader without its control-point output or invocation id");
+        if (!past_barrier) fail("a hull shader without a barrier");
+        const std::string n = std::to_string(output_vertices);
+        std::string s, cp_in, cp_out, pc, copy_in, copy_out_cp, copy_pc, params, call_params;
+        const bool quads = opt.tess_quads;
+        for (const StageVar& v : stage_vars) {
+            if (v.builtin == spv::BiInvocationId) {
+                s += "static " + declare(v.pointee, v.name) + ";\n";
+                continue;
+            }
+            if (v.input && v.builtin == spv::BiPrimitiveId) {
+                s += "static " + declare(v.pointee, v.name) + ";\n";
+                params += ", " + declare(v.pointee, "si_" + v.name) + " : SV_PrimitiveID";
+                copy_in += "    " + v.name + " = si_" + v.name + ";\n";
+                continue;
+            }
+            if (v.input && v.location >= 0) {
+                // An input of each control point (the LS's): the input patch.
+                const Type& at = type(v.pointee);
+                if (at.k != TK::Array || at.count != output_vertices) fail("a hull input that is not an array of the patch's control points");
+                s += "static " + declare(v.pointee, v.name) + ";\n";
+                cp_in += "    [[vk::location(" + std::to_string(v.location) + ")]] " + v.interp + declare(at.elem, v.name) + " : CP" +
+                         std::to_string(v.location) + ";\n";
+                for (std::uint32_t k = 0; k < at.count; ++k)
+                    copy_in += "    " + v.name + "[" + std::to_string(k) + "] = ip[" + std::to_string(k) + "]." + v.name + ";\n";
+                continue;
+            }
+            if (!v.input && v.id == cp_out_var) {
+                const Type& at = type(v.pointee);
+                if (at.k != TK::Array || at.count != output_vertices) fail("a hull output that is not an array of the patch's control points");
+                s += "static " + declare(v.pointee, v.name) + ";  // the output patch, after the barrier\n";
+                s += "static " + declare(at.elem, v.name + "_mine") + ";  // this invocation's control point\n";
+                cp_out += "    [[vk::location(" + std::to_string(v.location) + ")]] " + declare(at.elem, v.name) + " : CPO" + std::to_string(v.location) + ";\n";
+                copy_out_cp += "    o." + v.name + " = " + v.name + "_mine;\n";
+                for (std::uint32_t k = 0; k < at.count; ++k)
+                    copy_pc += "    " + v.name + "[" + std::to_string(k) + "] = op[" + std::to_string(k) + "]." + v.name + ";\n";
+                continue;
+            }
+            if (!v.input && v.patch && v.location >= 0) {
+                s += "static " + declare(v.pointee, v.name) + ";\n";
+                pc += "    [[vk::location(" + std::to_string(v.location) + ")]] " + declare(v.pointee, v.name) + " : PC" + std::to_string(v.location) + ";\n";
+                continue;
+            }
+            if (!v.input && (v.builtin == spv::BiTessLevelOuter || v.builtin == spv::BiTessLevelInner)) {
+                s += "static " + declare(v.pointee, v.name) + ";\n";
+                continue;
+            }
+            fail("a hull shader variable HLSL has no place for");
+        }
+        // The factors HLSL declares for the domain, from the lift's four outer and two inner levels.
+        std::string factor_copy;
+        std::string outer, inner;
+        for (const StageVar& v : stage_vars) {
+            if (v.builtin == spv::BiTessLevelOuter) outer = v.name;
+            if (v.builtin == spv::BiTessLevelInner) inner = v.name;
+        }
+        if (outer.empty() || inner.empty()) fail("a hull shader that writes no tessellation levels");
+        const std::uint32_t n_outer = quads ? 4 : 3;
+        for (std::uint32_t k = 0; k < n_outer; ++k) factor_copy += "    pc.tess_outer[" + std::to_string(k) + "] = " + outer + "[" + std::to_string(k) + "];\n";
+        if (quads) factor_copy += "    pc.tess_inner[0] = " + inner + "[0];\n    pc.tess_inner[1] = " + inner + "[1];\n";
+        else factor_copy += "    pc.tess_inner = " + inner + "[0];\n";
+        for (const StageVar& v : stage_vars) {
+            if (!v.input && v.patch && v.location >= 0) factor_copy += "    pc." + v.name + " = " + v.name + ";\n";
+        }
+        s += "static bool hull_phase_cp;  // the control-point phase: the body returns at the barrier\n\n";
+        s += "struct ControlPointIn {\n" + cp_in + "};\n";
+        s += "struct ControlPointOut {\n" + cp_out + "};\n";
+        s += "struct PatchConstants {\n";
+        s += quads ? "    float tess_outer[4] : SV_TessFactor;\n    float tess_inner[2] : SV_InsideTessFactor;\n"
+                   : "    float tess_outer[3] : SV_TessFactor;\n    float tess_inner : SV_InsideTessFactor;\n";
+        s += pc + "};\n";
+        std::string invocation;
+        for (const StageVar& v : stage_vars) {
+            if (v.builtin == spv::BiInvocationId) invocation = v.name;
+        }
+        s += "\nvoid lifted_main() {\n" + top + body_text + "}\n\n";
+        s += "// The patch's constants and factors: the body again as invocation 0, with every control point's output.\n";
+        s += "PatchConstants patch_main(InputPatch<ControlPointIn, " + n + "> ip, OutputPatch<ControlPointOut, " + n + "> op" + params + ") {\n";
+        s += copy_in + copy_pc;
+        s += "    " + invocation + " = 0u;\n    hull_phase_cp = false;\n    lifted_main();\n    PatchConstants pc;\n" + factor_copy + "    return pc;\n}\n\n";
+        static const char* const partitioning[] = {"integer", "fractional_odd", "fractional_even"};
+        s += std::string("[domain(\"") + (quads ? "quad" : "tri") + "\")]\n";
+        s += std::string("[partitioning(\"") + partitioning[std::clamp(opt.tess_spacing, 0, 2)] + "\")]\n";
+        s += std::string("[outputtopology(\"") + (opt.tess_cw ? "triangle_cw" : "triangle_ccw") + "\")]\n";
+        s += "[outputcontrolpoints(" + n + ")]\n[patchconstantfunc(\"patch_main\")]\n";
+        s += "ControlPointOut main(InputPatch<ControlPointIn, " + n + "> ip, uint id : SV_OutputControlPointID" + params + ") {\n";
+        s += copy_in + "    " + invocation + " = id;\n    hull_phase_cp = true;\n    lifted_main();\n    ControlPointOut o;\n" + copy_out_cp + "    return o;\n}\n";
+        if (uses_half) arguments.push_back("-enable-16bit-types");
+        return s;
+    }
+
     std::string assemble() {
         // The phis and the values a use outside their scope reaches, declared at the top.
         std::string top;
@@ -1823,11 +2011,42 @@ private:
         for (const std::string& d : spec_decls) s += d + "\n";
         if (!spec_decls.empty()) s += "\n";
 
+        if (exec_model == spv::EmTessellationControl) return s + assemble_hull(top);
+
         // Stage variables: statics, filled from and written to the entry point's.
-        std::string in_struct, out_struct, copy_in, copy_out;
+        const bool tes = exec_model == spv::EmTessellationEvaluation;
+        std::string in_struct, out_struct, copy_in, copy_out, cp_struct, pc_struct, params;
+        std::uint32_t patch_size = 0;
         for (const StageVar& v : stage_vars) {
-            if (v.builtin == spv::BiHelperInvocation) continue;  // a built-in input of its own (helper_decls)
+            if (v.builtin == spv::BiHelperInvocation || v.builtin == spv::BiTessCoord) continue;  // built-in inputs of their own (helper_decls)
             s += "static " + declare(v.pointee, v.name) + ";\n";
+            if (tes && v.input && v.location >= 0 && !v.patch) {
+                // An input of each control point: the patch's array of it, one member of a control point.
+                const Type& at = type(v.pointee);
+                if (at.k != TK::Array) fail("a domain shader input that is not an array of control points");
+                if (patch_size && patch_size != at.count) fail("control-point inputs of different patch sizes");
+                patch_size = at.count;
+                cp_struct += "    [[vk::location(" + std::to_string(v.location) + ")]] " + v.interp + declare(at.elem, v.name) + " : CP" +
+                             std::to_string(v.location) + ";\n";
+                for (std::uint32_t k = 0; k < at.count; ++k)
+                    copy_in += "    " + v.name + "[" + std::to_string(k) + "] = patch[" + std::to_string(k) + "]." + v.name + ";\n";
+                continue;
+            }
+            if (tes && v.input && v.patch && v.location >= 0) {
+                pc_struct += "    [[vk::location(" + std::to_string(v.location) + ")]] " + declare(v.pointee, v.name) + " : PC" + std::to_string(v.location) + ";\n";
+                copy_in += "    " + v.name + " = pc." + v.name + ";\n";
+                continue;
+            }
+            if (tes && v.input && (v.builtin == spv::BiTessLevelOuter || v.builtin == spv::BiTessLevelInner)) {
+                copy_in += "    " + v.name + " = pc." + (v.builtin == spv::BiTessLevelOuter ? "tess_outer" : "tess_inner") + ";\n";
+                continue;
+            }
+            if (tes && v.input && v.builtin == spv::BiPrimitiveId) {
+                params += ", " + declare(v.pointee, "si_" + v.name) + " : SV_PrimitiveID";
+                copy_in += "    " + v.name + " = si_" + v.name + ";\n";
+                continue;
+            }
+            if (v.patch) fail("a patch variable");
             std::string sem, attr;
             if (v.location >= 0) {
                 attr = "[[vk::location(" + std::to_string(v.location) + ")]] ";
@@ -1864,16 +2083,42 @@ private:
                 }
                 continue;
             }
-            if (type(v.pointee).k == TK::Array) fail("an array stage variable");
+            if (type(v.pointee).k == TK::Array && (v.location < 0 || type(type(v.pointee).elem).k == TK::Array)) fail("an array stage variable");
             st += "    " + attr + v.interp + declare(v.pointee, v.name) + " : " + sem + ";\n";
             cp += "    " + (v.input ? v.name + " = si." + v.name : "so." + v.name + " = " + v.name) + ";\n";
         }
         s += "\n";
-        if (!in_struct.empty()) s += "struct StageInput {\n" + in_struct + "};\n";
+        if (!in_struct.empty()) {
+            if (tes) fail("a domain shader input HLSL has no place for");
+            s += "struct StageInput {\n" + in_struct + "};\n";
+        }
+        if (tes) {
+            // The patch constants a domain shader takes, with the factors HLSL requires there.
+            if (tess_domain.empty()) fail("a domain shader without a domain");
+            const char* factors = tess_domain == "quad" ? "    float tess_outer[4] : SV_TessFactor;\n    float tess_inner[2] : SV_InsideTessFactor;\n"
+                                  : tess_domain == "tri" ? "    float tess_outer[3] : SV_TessFactor;\n    float tess_inner : SV_InsideTessFactor;\n"
+                                                         : "    float tess_outer[2] : SV_TessFactor;\n";
+            s += "struct PatchConstants {\n" + std::string(factors) + pc_struct + "};\n";
+            if (patch_size) s += "struct ControlPoint {\n" + cp_struct + "};\n";
+        }
         if (!out_struct.empty()) s += "struct StageOutput {\n" + out_struct + "};\n";
         s += "\nvoid lifted_main() {\n" + top + body_text + "}\n\n";
         if (early_tests) s += "[earlydepthstencil]\n";
-        s += std::string(out_struct.empty() ? "void" : "StageOutput") + " main(" + (in_struct.empty() ? "" : "StageInput si") + ") {\n";
+        std::string args = in_struct.empty() ? "" : "StageInput si";
+        if (tes) {
+            s += "[domain(\"" + tess_domain + "\")]\n";
+            args = "PatchConstants pc";
+            if (patch_size) args += ", const OutputPatch<ControlPoint, " + std::to_string(patch_size) + "> patch";
+            args += params;
+        }
+        s += std::string(out_struct.empty() ? "void" : "StageOutput") + " main(" + args + ") {\n";
+        for (const std::uint32_t m : tess_modes) {
+            static const std::map<std::uint32_t, const char*> mode_names = {
+                {spv::ExSpacingEqual, "SpacingEqual"}, {spv::ExSpacingFractionalEven, "SpacingFractionalEven"},
+                {spv::ExSpacingFractionalOdd, "SpacingFractionalOdd"}, {spv::ExVertexOrderCw, "VertexOrderCw"},
+                {spv::ExVertexOrderCcw, "VertexOrderCcw"}, {spv::ExPointMode, "PointMode"}};
+            s += "    vk::ext_execution_mode(" + std::to_string(m) + ");  // " + mode_names.at(m) + "\n";
+        }
         s += copy_in;
         s += "    lifted_main();\n";
         if (!out_struct.empty()) {
@@ -2034,7 +2279,9 @@ OpCensus op_census(const std::vector<std::uint32_t>& w) {
         if (op == spv::OpGroupNonUniformQuadSwap || op == spv::OpGroupNonUniformQuadBroadcast) quad_results.insert(a[1]);
         if (op == spv::OpConstant || op == spv::OpConstantComposite || op == spv::OpConstantNull || op == spv::OpSpecConstant) consts.insert(a[1]);
         if (op == spv::OpDecorate && n >= 3 && a[1] == spv::DecNoContraction) nocontract.insert(a[0]);
-        const bool semantic = (op >= spv::OpConvertFToU && op <= spv::OpFConvert) || op == 116 /* QuantizeToF16 */ ||
+        // (Conversions between float and integer and between float widths: not
+        // UConvert/SConvert, which are exact whatever spells them.)
+        const bool semantic = (op >= spv::OpConvertFToU && op <= spv::OpConvertUToF) || op == spv::OpFConvert || op == 116 /* QuantizeToF16 */ ||
                               (op >= spv::OpFNegate && op <= 141 && (op == spv::OpFNegate || op == spv::OpFAdd || op == spv::OpFSub || op == spv::OpFMul ||
                                                                     op == spv::OpFDiv || op == 140 || op == 141)) ||
                               op == spv::OpIsNan || op == spv::OpIsInf || (op >= spv::OpFOrdEqual && op <= spv::OpFUnordGreaterThanEqual) ||
@@ -2070,9 +2317,11 @@ OpCensus op_census(const std::vector<std::uint32_t>& w) {
 
 std::string hlsl_operation_diff(const std::vector<std::uint32_t>& lifted, const std::vector<std::uint32_t>& compiled) {
     const OpCensus a = op_census(lifted), b = op_census(compiled);
+    // A hull runs its body in both of HLSL's phases (hlsl.h): each operation up to twice.
+    const std::size_t copies = interface_of(lifted).model == spv::EmTessellationControl ? 2 : 1;
     for (const auto& [k, n] : b.ops) {
         const auto it = a.ops.find(k);
-        const std::size_t have = it == a.ops.end() ? 0 : it->second;
+        const std::size_t have = (it == a.ops.end() ? 0 : it->second) * copies;
         if (n <= have) continue;
         // GetDimensions(mip, ...) asks for the level count too; CalculateLevelOfDetail
         // and its unclamped twin are one OpImageQueryLod each before DXC merges them.
@@ -2094,7 +2343,13 @@ std::string hlsl_interface_diff(const std::vector<std::uint32_t>& lifted, const 
         if (!b.modes.count(m)) return "execution mode " + std::to_string(m) + " missing";
     }
     for (const std::uint32_t m : b.modes) {
-        if (!a.modes.count(m)) return "execution mode " + std::to_string(m) + " added";
+        // HLSL declares a hull's domain, partitioning and winding (the
+        // evaluation stage declares the same; HlslOptions passes them).
+        const bool hull_tess_mode = b.model == spv::EmTessellationControl &&
+                                    (m == spv::ExTriangles || m == spv::ExQuads || m == spv::ExIsolines || m == spv::ExSpacingEqual ||
+                                     m == spv::ExSpacingFractionalEven || m == spv::ExSpacingFractionalOdd || m == spv::ExVertexOrderCw ||
+                                     m == spv::ExVertexOrderCcw);
+        if (!a.modes.count(m) && !hull_tess_mode) return "execution mode " + std::to_string(m) + " added";
     }
     for (const auto& [k, v] : a.bindings) {
         const auto it = b.bindings.find(k);
@@ -2114,6 +2369,8 @@ std::string hlsl_interface_diff(const std::vector<std::uint32_t>& lifted, const 
         if (it->second != v) return k + ": " + v + " against " + it->second;
     }
     for (const auto& [k, v] : b.io) {
+        // HLSL's domain shader declares its patch's factors whether it reads them or not.
+        if (b.model == spv::EmTessellationEvaluation && (k == "in builtin 11" || k == "in builtin 12")) continue;
         if (!a.io.count(k)) return k + " (" + v + ") added";
     }
     if (a.spec_ids != b.spec_ids) return "specialization constant ids differ";
