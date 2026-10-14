@@ -307,6 +307,7 @@ public:
         begin_recording_locked();
         transfer_flush_locked();
         render_end_pass_locked();
+        view_clears_flush_locked();  // a capture reads what every clear so far made
         VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
         mb.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
         mb.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
@@ -330,6 +331,7 @@ public:
         begin_recording_locked();
         transfer_flush_locked();
         render_end_pass_locked();
+        view_clears_flush_locked();  // a capture reads what every clear so far made
         VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
         mb.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
         mb.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;

@@ -1077,9 +1077,7 @@ void clear_image_locked(RtImage& r, const float rgba[4], std::uint32_t first_lay
 std::vector<std::uint64_t> g_view_clear_list;  // bases with a pending view clear (some may be stale), under g.mu
 bool g_in_view_flush = false;
 std::uint64_t g_vc_set = 0, g_vc_load = 0, g_vc_transfer = 0, g_vc_merged = 0, g_vc_dropped = 0, g_vc_flushes = 0, g_vc_sampled = 0;  // under g.mu
-// A pass ended because the next draw begins another (begin_pass): the owed
-// clears stay owed - the draw has already made the ones it reads.
-bool g_pass_end_for_draw = false;
+
 void view_clears_flush_locked();
 void view_clear_apply_locked(RtImage& r);
 
@@ -6822,9 +6820,7 @@ void begin_pass(const DrawState& s, std::uint64_t key, bool hazard = false) {
     if (g_pass.active && g_pass.key == key && !hazard) return;
     transfer_flush_locked();
     if (hazard && g_pass.active && g_pass.key == key) g_barriers_mid_pass.fetch_add(1, std::memory_order_relaxed);
-    g_pass_end_for_draw = true;
     end_pass_for_draw_locked();
-    g_pass_end_for_draw = false;
     if (g_hazards.owed) {
         bool need = hazard;
         for (int t = 0; t < 8 && !need; ++t) {
@@ -6939,6 +6935,7 @@ std::uint64_t pass_key(const DrawState& s) {
 }
 
 void clear_depth(RtImage& r, bool depth, bool stencil, float dval, std::uint32_t sval) {
+    if (r.view_clear && !g_in_view_flush) view_clear_apply_locked(r);  // an owed clear is older than this one
     static std::atomic<int> logs{0};
     if (logs.fetch_add(1) < 12) {
         host_log("render: DB_RENDER_CONTROL clear of 0x%llx: depth=%d (%g) stencil=%d (%u)", static_cast<unsigned long long>(r.base),
@@ -7438,11 +7435,6 @@ DrawCmds* draw_packet_early_locked() {
 }
 
 void render_end_pass_locked() {
-    struct FlushAfter {
-        ~FlushAfter() {
-            if (!g_view_clear_list.empty() && !g_in_view_flush && !g_pass_end_for_draw) view_clears_flush_locked();
-        }
-    } flush_after;
     if (g_pass.active) {
         g_pass.active = false;
         // Into the open draw's packet when it can take it (recorder.cpp).
@@ -7617,6 +7609,7 @@ std::size_t rt_bytes_per_pixel(const RtImage& r) { return format_bytes_per_pixel
 // is the tiled allocation, often a few rows larger (or a 1024² slice) than
 // width*height*bpp of the unpadded image, so there is no size check here.
 void clear_image_locked(RtImage& r, const float rgba[4], std::uint32_t first_layer = 0, std::uint32_t layer_count = ~0u, bool barrier) {
+    if (r.view_clear && !g_in_view_flush) view_clear_apply_locked(r);  // an owed clear is older than this one
     if (r.base == g_order_target && hle_video_flip_count() >= 2000 && g_order_logs.load() < 120) {
         g_order_logs.fetch_add(1);
         host_log("order: CLEAR 0x%llx rgba=%.3f %.3f %.3f %.3f", static_cast<unsigned long long>(r.base), rgba[0], rgba[1], rgba[2],
@@ -8485,6 +8478,9 @@ RtImage* make_copy_snapshot_locked(std::uint64_t src_base, std::uint64_t dst_bas
 // made for it, else through a buffer. False when that buffer could not be
 // made.
 bool record_target_copy_locked(RtImage& src, RtImage& dst, std::uint32_t width, std::uint32_t height) {
+    // Clears owed to either image go first (lazy clears).
+    if (src.view_clear) view_clear_apply_locked(src);
+    if (dst.view_clear) view_clear_apply_locked(dst);
     const bool from_depth = src.depth;
     rt_written(dst);
     begin_recording_locked();
@@ -10887,6 +10883,7 @@ RtImage* clear_view_target_locked(const GpuClearView& c, bool create, std::uint3
 // Depth and stencil cleared over layers [first, first + count).
 void clear_depth_layers_locked(RtImage& r, bool depth, bool stencil, float dval, std::uint32_t sval, std::uint32_t first, std::uint32_t count,
                                bool barrier = true) {
+    if (r.view_clear && !g_in_view_flush) view_clear_apply_locked(r);  // an owed clear is older than this one
     begin_recording_locked();
     render_end_pass_locked();
     ensure_initialised(r);
@@ -15685,11 +15682,7 @@ static bool draw_impl(const GpuDraw& d) {
             rec().pipeline_barrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
         }
         // A pass with these targets already open began before the clear.
-        if (load && g_pass.active) {
-            g_pass_end_for_draw = true;
-            render_end_pass_locked();
-            g_pass_end_for_draw = false;
-        }
+        if (load && g_pass.active) render_end_pass_locked();
     }
     g_pass_profile_name = &bind_pl->profile_name;
     begin_pass(s, pass_key(s), sample_hazard);
@@ -17171,6 +17164,7 @@ std::string image_beside(const std::string& stem, const char* kind, std::uint64_
 bool host_gpu_dump_display(std::uint64_t display_va, const char* path, bool all_targets) {
     std::lock_guard<GpuMutex> lock(g.mu);
     if (!g.ok) return false;
+    view_clears_flush_locked();  // what the dump reads holds every clear made so far
     flush_locked();
     // BBHOST_DUMP_ALL=1 keeps the default window of recorded draws;
     // BBHOST_DUMP_ALL=<n> lists the last n, up to the ring size, which is what
@@ -17497,6 +17491,7 @@ namespace {
 // Records the copy of r into a new host-visible staging buffer; the caller
 // flushes once for all of them and takes the bytes (take_target_pixels).
 bool record_target_readback(RtImage& r, DevBuffer& staging, TargetPixels& out) {
+    if (r.view_clear) view_clear_apply_locked(r);
     const bool depth = r.depth;
     if (depth && r.format != VK_FORMAT_D32_SFLOAT && r.format != VK_FORMAT_D32_SFLOAT_S8_UINT) return false;
     out.width = r.width;
@@ -17517,6 +17512,7 @@ bool record_target_readback(RtImage& r, DevBuffer& staging, TargetPixels& out) {
 // The stencil plane of a depth target with one, layer 0 (F12 with BBHOST_F12_DEPTH).
 bool record_stencil_readback(RtImage& r, DevBuffer& staging, TargetPixels& out) {
     if (!r.depth || r.format == VK_FORMAT_D32_SFLOAT || r.format == VK_FORMAT_D16_UNORM) return false;
+    if (r.view_clear) view_clear_apply_locked(r);
     out.width = r.width;
     out.height = r.height;
     out.format = r.format;

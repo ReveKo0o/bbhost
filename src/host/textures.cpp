@@ -1529,6 +1529,7 @@ std::atomic<std::uint64_t> g_rt_unlisted_reads{0};
 
 VkImageView render_target_view(RtImage& r, const std::uint32_t* tsharp, std::uint32_t first_layer, std::uint32_t layer_count,
                                bool arrayed) {
+    if (r.view_clear) view_clear_apply_locked(r);  // about to be sampled: a clear owed to it goes first (render.cpp lazy clears)
     first_layer = std::min(first_layer, r.layers - 1);
     layer_count = std::max(1u, std::min(layer_count, r.layers - first_layer));
     VkFormat format = r.format;
@@ -2029,6 +2030,7 @@ void record_region_copy(VkCommandBuffer cmd, VkImage src, VkImage dst, std::uint
 // at every bind, and the T#'s view of that (rt_region_view; a format the
 // target's view list leaves out, render_target_view).
 VkImageView rt_copied_view(RtImage& rt, const std::uint32_t* w, std::uint32_t width, std::uint32_t height) {
+    if (rt.view_clear) view_clear_apply_locked(rt);
     const auto key = std::make_tuple(rt.base, width, height, static_cast<int>(rt.format));
     auto it = g_rt_regions.find(key);
     if (it != g_rt_regions.end() && it->second.source != rt.image) {
@@ -3248,6 +3250,8 @@ bool textures_copy_image_region_locked(const GpuImageCopy& c) {
         refused(why);
         return false;
     }
+    if (src.rt && src.rt->view_clear) view_clear_apply_locked(*src.rt);  // owed clears first (render.cpp lazy clears)
+    if (dst.rt && dst.rt->view_clear) view_clear_apply_locked(*dst.rt);
     if (src.rt) g_image_copy_rt_src.fetch_add(1, std::memory_order_relaxed);
     if (dst.rt) {
         g_image_copy_rt_dst.fetch_add(1, std::memory_order_relaxed);

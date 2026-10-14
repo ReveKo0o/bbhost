@@ -978,6 +978,11 @@ struct RtImage {
 };
 // The bytes a target covers in guest memory (render.cpp).
 std::size_t rt_size_bytes(const RtImage& r);
+// Lazy clears (render.cpp): a clear token's clear owed to `r` made now, by
+// transfer, before something reads or writes the image; every owed clear
+// (a dispatch, the submission, a frame dump).
+void view_clear_apply_locked(RtImage& r);
+void view_clears_flush_locked();
 // Images over memory the game has given to something newer. On the console a
 // render target, a copy's snapshot or a shader-written texture is only memory:
 // when the game frees it and makes a newer object there, the old contents are
