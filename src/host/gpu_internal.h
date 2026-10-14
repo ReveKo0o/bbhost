@@ -692,6 +692,11 @@ std::uint32_t alloc_params_slot_locked(const gcn::StageParams& params, VkDescrip
 VkDescriptorSet alloc_set_locked(VkDescriptorSetLayout layout = VK_NULL_HANDLE);  // the shared layout when null
 bool rebuild_page_tables();
 bool create_dev_buffer(DevBuffer& b, std::uint64_t size, bool host_visible, bool cached = false);  // cached: host-cached memory, for readbacks
+// A host-visible buffer the CPU writes and shaders read every draw: in video
+// memory the CPU can write on a discrete GPU (rings_in_vram), else as
+// create_dev_buffer(b, size, true). `what` names it in the log.
+bool create_upload_buffer(DevBuffer& b, std::uint64_t size, const char* what);
+bool rings_in_vram();
 std::uint32_t find_memory_type(std::uint32_t type_bits, VkMemoryPropertyFlags want);
 bool extract_program(std::uint64_t code_va, std::vector<std::uint32_t>& words, std::string& name);
 // A GX shader creator ran (render.cpp; host_gpu_note_shader_created).
@@ -1224,9 +1229,16 @@ extern std::atomic<std::uint64_t> g_fill_surfaces, g_fill_surfaces_skipped;
 void invalidate_rt_views(std::uint64_t base);
 // Marks where the GPU is: on a device loss the driver reports the last
 // checkpoint each queue stage reached, which names the draw that faulted.
-// kind 1 = draw, 2 = dispatch. AMD's markers go through the stream (an op,
-// or a draw's packet: DrawCmds::marker), NVIDIA's checkpoints in place.
+// kind 1 = draw, 2 = dispatch, kGpuMarkSubmission = a submission's edges:
+// index = serial * 4 + 0 its buffer-shadow uploads (they run after the wait
+// for their sparse binds), 1 its recording's start, 2 its recording's end -
+// so a loss between one frame's last draw and the next one's first says
+// whether the GPU was in a submission's tail, its wait or its uploads.
+// AMD's markers go through the stream (an op, or a draw's packet:
+// DrawCmds::marker), NVIDIA's checkpoints in place.
+constexpr unsigned kGpuMarkSubmission = 3;
 void gpu_checkpoint(unsigned kind, std::uint64_t index);
+void gpu_checkpoint_cmd(VkCommandBuffer cmd, unsigned kind, std::uint64_t index);
 // AMD's buffer markers: the 32-bit value for a kind and index, and the two
 // writes (the top of the pipe, then the bottom) into g.marker_buf.
 std::uint32_t gpu_marker_value(unsigned kind, std::uint64_t index);

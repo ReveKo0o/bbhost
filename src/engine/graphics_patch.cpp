@@ -971,10 +971,36 @@ void light_grid_apply(std::uint32_t fw, std::uint32_t fh) {
     static_assert(kLightTileH == kLightTileW + 4, "the tile's height follows its width");
 }
 
+// The presented image's size (light_grid_window) and the render size the tile
+// was last made for, under g_tile_mu.
+std::uint32_t g_window_px[2] = {0, 0};
+std::uint32_t g_render_px[2] = {0, 0};
+
+// The tile for the larger of the presented image and the render size on each
+// side: sized to the window alone, a window a little smaller than the render
+// (a 1910x1015 one over 1920x1080, a Linux player's) made the grid 2x2 tiles,
+// every light drawn once a tile it touches and each tile's lights a pass of
+// their own - ~100 render passes a frame against ~25.
+void light_grid_refresh_locked() {
+    g_render_px[0] = g_res_words ? g_res_words[0] : 0;
+    g_render_px[1] = g_res_words ? g_res_words[1] : 0;
+    light_grid_apply(std::max(g_window_px[0], g_render_px[0]), std::max(g_window_px[1], g_render_px[1]));
+}
+
 // The window's pixel size, now and whenever it changes (host_window_on_pixels).
 void light_grid_window(int w, int h) {
     std::lock_guard<std::mutex> lock(g_tile_mu);
-    light_grid_apply(static_cast<std::uint32_t>(w), static_cast<std::uint32_t>(h));
+    g_window_px[0] = static_cast<std::uint32_t>(std::max(w, 0));
+    g_window_px[1] = static_cast<std::uint32_t>(std::max(h, 0));
+    light_grid_refresh_locked();
+}
+
+// A view's check that the render size is the one the tile was made for (a
+// live resolution change, PC Graphics' Resolution): two words a view.
+void light_grid_render_size_tick() {
+    if (!g_res_words || (g_res_words[0] == g_render_px[0] && g_res_words[1] == g_render_px[1])) return;
+    std::lock_guard<std::mutex> lock(g_tile_mu);
+    light_grid_refresh_locked();
 }
 
 // Model detail. Every mesh draw (sub_216f9d0, 0x216fc09) picks its level as
@@ -1092,11 +1118,12 @@ void light_grid_install(ElfImage* image) {
     {
         // The render size until the window says otherwise (headless, it stays).
         std::lock_guard<std::mutex> lock(g_tile_mu);
-        light_grid_apply(g_res_words[0], g_res_words[1]);
+        light_grid_refresh_locked();
     }
     host_window_on_pixels(&light_grid_window);
-    host_log("graphics: light grid - one job of %ux%u tiles sized to the window, set by the manager's constructor and again only "
-             "when the window's size changes (was 3x3 jobs of 128x128 tiles%s; BBHOST_LIGHT_GRID=window: one window-sized tile, =0: the game's)",
+    host_log("graphics: light grid - one job of %ux%u tiles sized to the larger of the window and the render size, set by the "
+             "manager's constructor and again only when either changes (was 3x3 jobs of 128x128 tiles%s; BBHOST_LIGHT_GRID=window: "
+             "one tile, =0: the game's)",
              g_tiles_per_axis, g_tiles_per_axis, patched ? "; the split was 1x1 already, a patch's" : "");
 }
 
@@ -1109,6 +1136,7 @@ GUEST_ABI std::int64_t render_view_hook(std::uint64_t, const std::uint64_t* save
     camera_tick();
     lod_bias_tick();
     if (g_task_steal) task_steal_tick();
+    if (g_graphics_manager) light_grid_render_size_tick();
     drawparam_probe(reinterpret_cast<const std::uint8_t*>(static_cast<std::uintptr_t>(saved[5])),
                     reinterpret_cast<const std::uint8_t*>(static_cast<std::uintptr_t>(saved[0])));
     if (g_ca_amount) {

@@ -399,6 +399,7 @@ VkCommandBuffer upload_cmd_locked() {
     VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     vkBeginCommandBuffer(cmd, &bi);
+    gpu_checkpoint_cmd(cmd, kGpuMarkSubmission, g.flushes * 4 + 0);
     stage_release_slot(g.slot);  // the slot's last uploads have run: their staged copies are free
     // Earlier submissions' reads of the mirror finish before these writes.
     VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};

@@ -9254,7 +9254,7 @@ void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t
             static std::uint64_t scratch_lap = 1;
             // (A snapshot's range was located in imported memory: mapped.)
             if (realign && bytes && bytes <= (1u << 20) && (snapshot || hle_kernel_va_mapped(base, bytes))) {
-                if (!scratch.buffer) create_dev_buffer(scratch, kScratch, true);
+                if (!scratch.buffer) create_upload_buffer(scratch, kScratch, "the constant-buffer copies' ring");
                 if (scratch.map) {
                     if (scratch_next + bytes + 256 > kScratch) {
                         scratch_next = 0;

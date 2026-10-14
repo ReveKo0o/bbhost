@@ -989,6 +989,58 @@ bool create_dev_buffer(DevBuffer& b, std::uint64_t size, bool host_visible, bool
     return true;
 }
 
+// Whether the rings the CPU writes and every draw's shaders read - the
+// constant-buffer copies (render.cpp's scratch ring: 87% of the constant
+// buffers bound in an RTX 5090's log) and the params ring - go in video
+// memory the CPU can write, on a discrete GPU. In host memory (as on the
+// integrated GPU they were measured on, where it is the same RAM) every
+// shader's constant reads crossed the bus. BBHOST_RINGS_IN_VRAM=0: host memory.
+bool rings_in_vram() {
+    static const bool on = [] {
+        const char* e = std::getenv("BBHOST_RINGS_IN_VRAM");
+        if (e && *e) return e[0] == '1';
+        return !g.integrated;
+    }();
+    return on;
+}
+
+bool create_upload_buffer(DevBuffer& b, std::uint64_t size, const char* what) {
+    if (rings_in_vram()) {
+        VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+        bci.size = size;
+        bci.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                    VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+        if (vkCreateBuffer(g.device, &bci, nullptr, &b.buffer) == VK_SUCCESS) {
+            VkMemoryRequirements req{};
+            vkGetBufferMemoryRequirements(g.device, b.buffer, &req);
+            VkMemoryAllocateFlagsInfo flags{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO};
+            flags.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
+            VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+            mai.pNext = &flags;
+            mai.allocationSize = req.size;
+            mai.memoryTypeIndex = find_memory_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT |
+                                                                           VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                                                           VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+            if (mai.memoryTypeIndex != UINT32_MAX && vkAllocateMemory(g.device, &mai, nullptr, &b.memory) == VK_SUCCESS) {
+                vkBindBufferMemory(g.device, b.buffer, b.memory, 0);
+                VkBufferDeviceAddressInfo bai{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
+                bai.buffer = b.buffer;
+                b.address = vkGetBufferDeviceAddress(g.device, &bai);
+                b.size = size;
+                vkMapMemory(g.device, b.memory, 0, VK_WHOLE_SIZE, 0, &b.map);
+                host_log("gpu: %s in video memory the CPU writes (memory type %u, heap %u; BBHOST_RINGS_IN_VRAM=0: host memory)", what,
+                         mai.memoryTypeIndex, g.mem_props.memoryTypes[mai.memoryTypeIndex].heapIndex);
+                return true;
+            }
+            vkDestroyBuffer(g.device, b.buffer, nullptr);
+            b.buffer = VK_NULL_HANDLE;
+            host_log("gpu: %s: no room in video memory the CPU writes (%s); in host memory, read across the bus", what,
+                     mai.memoryTypeIndex == UINT32_MAX ? "the GPU has none" : "it is full");
+        }
+    }
+    return create_dev_buffer(b, size, true);
+}
+
 std::atomic<std::size_t> g_pipeline_cache_bytes{0};  // the cache's size when last loaded or saved
 std::atomic<bool> g_cache_divert{false};             // PipelineCacheUse (gpu_internal.h)
 std::atomic<int> g_cache_users{0};
@@ -2485,9 +2537,23 @@ bool init_locked() {
     if (mai.memoryTypeIndex == UINT32_MAX) {
         mai.memoryTypeIndex = find_memory_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
     }
+    // A discrete GPU's shaders read every draw's params block: in its video
+    // memory rather than across the bus, where it has some the CPU can write
+    // (rings_in_vram); host memory if that is full.
+    bool params_allocated = false;
+    if (rings_in_vram()) {
+        const std::uint32_t vram = find_memory_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                                                             VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        if (vram != UINT32_MAX) {
+            const std::uint32_t host_type = mai.memoryTypeIndex;
+            mai.memoryTypeIndex = vram;
+            params_allocated = vkAllocateMemory(g.device, &mai, nullptr, &g.ubo_mem) == VK_SUCCESS;
+            if (!params_allocated) mai.memoryTypeIndex = host_type;
+        }
+    }
     host_log("gpu: params ring in memory type %u (flags 0x%x)", mai.memoryTypeIndex,
              mai.memoryTypeIndex < g.mem_props.memoryTypeCount ? g.mem_props.memoryTypes[mai.memoryTypeIndex].propertyFlags : 0u);
-    if (vkAllocateMemory(g.device, &mai, nullptr, &g.ubo_mem) != VK_SUCCESS) {
+    if (!params_allocated && vkAllocateMemory(g.device, &mai, nullptr, &g.ubo_mem) != VK_SUCCESS) {
         host_log("gpu: params buffer allocation failed");
         return false;
     }
@@ -2602,6 +2668,7 @@ void begin_recording_locked() {
         ++g.record_serial;  // dynamic state recorded so far is gone
         g.recording = true;
         busy_begin_locked(g.slots[g.slot]);
+        gpu_checkpoint(kGpuMarkSubmission, g.flushes * 4 + 1);
         glitch_begin_recording_locked();
         occlusion_begin_recording_locked();
         if (g.profile) {
@@ -3665,6 +3732,24 @@ void gpu_checkpoint(unsigned kind, std::uint64_t index) {
     g.cmd_checkpoint(g_cmd(), reinterpret_cast<void*>(static_cast<std::uintptr_t>((static_cast<std::uint64_t>(kind) << 56) | index)));
 }
 
+// The same into a command buffer of its own (the buffer shadow's uploads,
+// recorded on the command processor beside the stream).
+void gpu_checkpoint_cmd(VkCommandBuffer cmd, unsigned kind, std::uint64_t index) {
+    if (g.cmd_buffer_marker) {
+        gpu_write_markers(cmd, gpu_marker_value(kind, index));
+        return;
+    }
+    if (!g.cmd_checkpoint) return;
+    g.cmd_checkpoint(cmd, reinterpret_cast<void*>(static_cast<std::uintptr_t>((static_cast<std::uint64_t>(kind) << 56) | index)));
+}
+
+// A kGpuMarkSubmission mark's words: the submission and where in it.
+std::string submission_mark(std::uint64_t which) {
+    static const char* const kWhere[4] = {"its vertex and index uploads (after its wait for their sparse binds)",
+                                          "its recording's start", "its recording's end", "?"};
+    return "submission " + std::to_string(which >> 2) + ", " + kWhere[which & 3];
+}
+
 // The last dispatches by index, for a device-loss report to name.
 const char* g_dispatch_names[256] = {};
 void note_dispatch_name(std::uint64_t index, const char* name) { g_dispatch_names[index % 256] = name; }
@@ -3680,6 +3765,10 @@ void report_checkpoints() {
         const auto say = [](const char* what, std::uint32_t v) {
             const unsigned kind = v >> 30;
             const std::uint64_t which = v & 0x3fffffff;
+            if (kind == kGpuMarkSubmission) {
+                host_log("gpu: AMD marker: the GPU had %s %s", what, submission_mark(which).c_str());
+                return;
+            }
             host_log("gpu: AMD marker: the GPU had %s %s %llu", what, kind == 1 ? "draw" : kind == 2 ? "dispatch" : "(none yet)",
                      static_cast<unsigned long long>(which));
             if (kind == 1) describe_draw_record(which);
@@ -3708,6 +3797,10 @@ void report_checkpoints() {
         const std::uint64_t m = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(data[i].pCheckpointMarker));
         const unsigned kind = static_cast<unsigned>(m >> 56);
         const std::uint64_t which = m & 0xffffffffffffffull;
+        if (kind == kGpuMarkSubmission) {
+            host_log("  stage 0x%x: %s", data[i].stage, submission_mark(which).c_str());
+            continue;
+        }
         host_log("  stage 0x%x: %s %llu", data[i].stage, kind == 1 ? "draw" : kind == 2 ? "dispatch" : "?",
                  static_cast<unsigned long long>(which));
         if (kind == 1) describe_draw_record(which);
@@ -5268,6 +5361,7 @@ void submit_locked() {
         rec().write_timestamp(VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, g.slots[g.slot].qpool, kQueriesPerSlot - 1);
         g_in_profiler = false;
     }
+    gpu_checkpoint(kGpuMarkSubmission, g.flushes * 4 + 2);
     busy_end_locked(g.slots[g.slot]);
     bump(g_stream_stats.submits);
     // With the stream the recorder ends the command buffer and hands it to
