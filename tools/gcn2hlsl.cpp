@@ -671,7 +671,7 @@ int main(int argc, char** argv) {
                 line();
                 continue;
             }
-            {
+            if (j.kind == Kind::Pixel || j.kind == Kind::Vertex) {
                 gcn::ShaderReflection refl;
                 if (gcn::parse_reflection(j.container, refl)) gcn::name_lift(l, ref, refl);
             }
@@ -688,6 +688,7 @@ int main(int argc, char** argv) {
             static const char* const what[] = {"pixel shader", "vertex shader", "LS as the vertex stage", "hull shader as the control stage",
                                                "domain shader as the evaluation stage"};
             hopt.title = j.name + " (" + what[static_cast<int>(j.kind)] + ")";
+            hopt.names = l.names.buffers.empty() && l.names.images.empty() ? nullptr : &l.names;
             hopt.tess_quads = j.options.tess_quads;
             hopt.tess_spacing = j.options.tess_spacing;
             hopt.tess_cw = j.options.tess_cw;

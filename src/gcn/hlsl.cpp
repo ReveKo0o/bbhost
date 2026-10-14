@@ -16,6 +16,7 @@
 // written. The lifted function itself is `lifted_main`, which DXC inlines.
 #include "gcn/hlsl.h"
 
+#include "gcn/names.h"
 #include "gcn/spirv.h"
 
 #include <algorithm>
@@ -656,6 +657,7 @@ private:
     std::set<std::uint32_t> compare_samplers, plain_samplers;  // samplers used for depth-compare / other samples
     std::set<std::uint32_t> written_buffers;
     std::map<std::uint32_t, std::string> buffer_names;  // storage buffer variable -> name
+    std::map<std::string, const std::vector<ReflectedElement>*> buffer_members;  // its constant-buffer members (HlslOptions::names)
     std::string helper_invocation_name;
     bool early_tests = false;
     std::string tess_domain;                // [domain(...)] of a domain shader
@@ -833,6 +835,11 @@ private:
             const std::string n = unique(given.empty() ? "buffer" : given);
             global_names[v] = n;
             buffer_names[v] = n;
+            if (opt.names) {
+                for (const BindingName& b : opt.names->buffers) {
+                    if (!b.name.empty() && b.name == given && !b.elements.empty()) buffer_members[n] = &b.elements;
+                }
+            }
             resource_decls.push_back(binding_attr() + (written_buffers.count(v) ? "RWByteAddressBuffer " : "ByteAddressBuffer ") + n + ";");
             return;
         }
@@ -1089,14 +1096,49 @@ private:
     }
 
     // Declares (or, hoisted, assigns) value `id` = `expr`.
-    void define(const Ins& in, const std::string& expr) {
+    void define(const Ins& in, const std::string& expr, const std::string& comment = {}) {
         const std::uint32_t t = in.type;
         const char k = kind_of(t);
+        const std::string tail = comment.empty() ? std::string(";") : ";  // " + comment;
         if (hoisted.count(in.id)) {
-            line(value_name(in.id) + " = " + expr + ";");
+            line(value_name(in.id) + " = " + expr + tail);
             return;
         }
-        line(std::string(k == 'f' || k == 'h' ? "precise " : "") + type_name(t) + " " + value_name(in.id) + " = " + expr + ";");
+        line(std::string(k == 'f' || k == 'h' ? "precise " : "") + type_name(t) + " " + value_name(in.id) + " = " + expr + tail);
+    }
+    // The member a constant-buffer load reads, where its index is the
+    // buffer's base (params.cb_bias_dw) plus a constant: "cbSceneParam.FC_MatrixProj[2].w".
+    std::string member_comment(const std::string& buffer, std::uint32_t index) {
+        const auto members = buffer_members.find(buffer);
+        if (members == buffer_members.end()) return {};
+        const auto d = defs.find(index);
+        if (d == defs.end() || d->second->op != spv::OpIAdd) return {};
+        std::uint32_t k = 0, other = 0;
+        if (consts.count(d->second->a.at(1)) && !consts.at(d->second->a[1]).spec) {
+            k = static_cast<std::uint32_t>(const_bits(consts.at(d->second->a[1])));
+            other = d->second->a.at(0);
+        } else if (consts.count(d->second->a.at(0)) && !consts.at(d->second->a[0]).spec) {
+            k = static_cast<std::uint32_t>(const_bits(consts.at(d->second->a[0])));
+            other = d->second->a.at(1);
+        } else {
+            return {};
+        }
+        // The other operand: the buffer's base dword, a load of params.cb_bias_dw.
+        const auto o = defs.find(other);
+        if (o == defs.end() || o->second->op != spv::OpLoad) return {};
+        const auto h = handles.find(o->second->a.at(0));
+        if (h == handles.end() || h->second.lvalue.find(".cb_bias_dw[") == std::string::npos) return {};
+        const std::uint32_t byte = 4 * k;
+        for (const ReflectedElement& e : *members->second) {
+            if (byte < e.offset || byte >= e.offset + e.size) continue;
+            const std::uint32_t at = byte - e.offset;
+            static const char* comp[] = {".x", ".y", ".z", ".w"};
+            std::string s = buffer + "." + e.name;
+            if (e.size > 16) s += "[" + std::to_string(at / 16) + "]";
+            if (e.size > 4) s += comp[(at % 16) / 4];
+            return s;
+        }
+        return {};
     }
 
     // Inline SPIR-V helpers, declared once per signature.
@@ -1255,7 +1297,8 @@ private:
             const std::string e = h->second.lvalue + ".Load(4u * " + as(h->second.index, 'u') + ")";
             const char k = kind_of(in.type);
             if (lanes_of(in.type) != 1) fail("a buffer load of a vector");
-            return define(in, k == 'u' ? e : k == 'i' ? "asint(" + e + ")" : k == 'f' ? "asfloat(" + e + ")" : (fail("a buffer load of this type"), ""));
+            return define(in, k == 'u' ? e : k == 'i' ? "asint(" + e + ")" : k == 'f' ? "asfloat(" + e + ")" : (fail("a buffer load of this type"), ""),
+                          member_comment(h->second.lvalue, h->second.index));
         }
         for (const std::uint32_t u : h->second.uses) use(u);
         if (const auto e = hull_early_cp_read.find(p); e != hull_early_cp_read.end()) {

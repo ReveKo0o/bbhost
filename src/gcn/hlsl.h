@@ -54,8 +54,14 @@
 
 namespace gcn {
 
+struct ShaderNames;
+
 struct HlslOptions {
     std::string title;  // the program's name, for the header comment
+    // The engine's names (gcn::name_lift): each constant-buffer load at the
+    // buffer's base plus a constant gets the member it reads as a comment
+    // (`// cbSceneParam.FC_MatrixProj[2].w`). Null: no comments.
+    const ShaderNames* names = nullptr;
     // A hull shader (the control stage): the domain, partitioning and winding
     // HLSL declares on it, as VGT_TF_PARAM gives them to the evaluation stage
     // (TranslateOptions tess_quads, tess_spacing, tess_cw). The lift's control
