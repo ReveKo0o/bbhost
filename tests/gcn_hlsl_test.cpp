@@ -1,9 +1,9 @@
 // The HLSL printer (gcn/hlsl.h) on hand-encoded programs the lifter takes:
 // quad swizzles in every quad pattern, v_cndmask_b32 with source modifiers, a
 // sample and a LOD query in a divergent region, a sample's run-time offset
-// (both ways the lift takes it), a vertex shader's invariant position, loops with per-lane exits
-// (one inside a kill region, with the helper-lane query), a depth export and
-// image loads and sizes. Each lift is printed, the source checked for the
+// (both ways the lift takes it), loops with per-lane exits (one inside a kill
+// region, with the helper-lane query), and a vertex shader's position with
+// and without Invariant. Each lift is printed, the source checked for the
 // spellings that keep its instructions, and - where DXC is installed (host/
 // dxc.h) - compiled: valid SPIR-V with the lift's interface and operations.
 // Synthetic programs only: no game shader is read.
