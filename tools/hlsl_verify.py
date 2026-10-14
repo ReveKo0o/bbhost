@@ -2,7 +2,8 @@
 """Check the HLSL path against the direct one, one captured draw at a time.
 
 For each draw capture under CAPTURES (a directory of capture directories, as
-`BBHOST_CAPTURE_DRAW='*ps'` or `'*'` writes them) whose bound pixel or vertex
+`BBHOST_CAPTURE_DRAW='*ps'` or `'*'` writes them, or of folders of them, as
+tools/area_check.py keeps a place's) whose bound pixel or vertex
 shader is a lift (the manifest's translate.ps_lifted / vs_lifted), and each
 dispatch capture (BBHOST_CAPTURE_DISPATCH) whose compute shader is one
 (translate.lifted; stage cs), runs
@@ -163,7 +164,9 @@ def main():
         env["VK_ICD_FILENAMES"] = str(args.lavapipe)
         env.setdefault("LP_NUM_THREADS", "1")
     args.out.mkdir(parents=True, exist_ok=True)
-    captures = sorted(p for p in args.captures.iterdir() if (p / "manifest.json").is_file())
+    # Capture directories here or one level down (area_check keeps a place's in a folder of its own).
+    captures = sorted(p for p in list(args.captures.iterdir()) + [q for d in args.captures.iterdir() if d.is_dir() for q in d.iterdir()]
+                      if p.is_dir() and (p / "manifest.json").is_file())
     stages = ("ps", "vs", "cs") if args.stage == "all" else (args.stage,)
     rows = []
     for capture in captures:
