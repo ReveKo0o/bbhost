@@ -4149,7 +4149,11 @@ bool surfaces_may_cover_locked(std::uint64_t va, std::size_t bytes) {
 
 std::atomic<std::uint64_t> g_fill_marks_skipped{0};  // surfaces under a fill, not marked dirty (the fill wrote no memory)
 std::atomic<std::uint64_t> g_marks_outside_resource{0};  // GX textures a write reached only past their resource's memory
-int mark_surfaces_dirty_locked(std::uint64_t va, std::size_t bytes, bool memory_written) {
+// The census of what marks GX textures written: by source, with the first
+// ones logged (surface, write range, resource range).
+std::map<const char*, std::uint64_t> g_identity_marks;  // under g.mu; the sources are literals
+int g_identity_marks_logged = 0;
+int mark_surfaces_dirty_locked(std::uint64_t va, std::size_t bytes, bool memory_written, const char* source) {
     if (!bytes) return 0;
     shadow_written_locked(va, bytes, true);  // GPU copies and fills land here too
     if (!surface_pages(va, va + bytes)) {
@@ -4189,6 +4193,17 @@ int mark_surfaces_dirty_locked(std::uint64_t va, std::size_t bytes, bool memory_
         if (by_identity(sf) && sf.gx_bytes && (va >= sf.gx_memory + sf.gx_bytes || va + bytes <= sf.gx_memory)) {
             g_marks_outside_resource.fetch_add(1, std::memory_order_relaxed);
             continue;
+        }
+        if (by_identity(sf)) {
+            ++g_identity_marks[source ? source : "other"];  // a literal: its pointer is the key
+            if (g_identity_marks_logged++ < 24) {
+                host_log("texture: census: %s over GX texture 0x%llx %ux%u vkformat %d (resource [0x%llx, +0x%llx), %s) writes [0x%llx, +0x%zx) "
+                         "at flip %llu",
+                         source ? source : "other", static_cast<unsigned long long>(sf.base), sf.width, sf.height, static_cast<int>(sf.format),
+                         static_cast<unsigned long long>(sf.gx_memory), static_cast<unsigned long long>(sf.gx_bytes),
+                         sf.gpu_written ? "shader-written" : "uploaded", static_cast<unsigned long long>(va), bytes,
+                         static_cast<unsigned long long>(hle_video_flip_count()));
+            }
         }
         // Only lift the throttle - the content hash still decides whether the
         // surface really changed. Forcing the upload instead made a single
@@ -4489,6 +4504,11 @@ void textures_report() {
              static_cast<unsigned long long>(g_view_other_gen.load()), static_cast<unsigned long long>(g_view_other_gen_kept.load()),
              static_cast<unsigned long long>(g_view_other_gen_adopted.load()), static_cast<unsigned long long>(g_ahead_adopted.load()),
              static_cast<unsigned long long>(g_unwatched_uploads.load()), static_cast<unsigned long long>(g_census_hash_skipped_written.load()));
+    {
+        std::string by;
+        for (const auto& [k, n] : g_identity_marks) by += std::string(" ") + k + " " + std::to_string(n) + ";";
+        host_log("texture: GX textures marked written by the command processor, by source:%s", by.empty() ? " none" : by.c_str());
+    }
     host_log("texture: surfaces under a fill or an image copy not marked dirty (no memory written) %llu, GX textures a write reached only "
              "past their resource's memory %llu; GX textures the command processor wrote found whole as uploaded, in step again %llu",
              static_cast<unsigned long long>(g_fill_marks_skipped.load()), static_cast<unsigned long long>(g_marks_outside_resource.load()),

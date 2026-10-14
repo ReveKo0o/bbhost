@@ -1355,7 +1355,8 @@ bool tsharp_sample_as_2d(std::uint32_t type, std::uint32_t base_array, std::uint
 // the textures it clears) and never the guest memory, and for a copy made
 // image to image: the surfaces under it are not marked, so nothing hashes
 // their memory for a change that is not there.
-int mark_surfaces_dirty_locked(std::uint64_t va, std::size_t bytes, bool memory_written = true);
+// `source` names the writer for the census of what marks GX textures.
+int mark_surfaces_dirty_locked(std::uint64_t va, std::size_t bytes, bool memory_written = true, const char* source = "other");
 // Whether a cached surface overlaps the range. Caller holds the GPU lock.
 bool surfaces_may_cover_locked(std::uint64_t va, std::size_t bytes);
 // GX's dynamic-buffer copy-backs as copy versions (gpu.cpp): the bytes
