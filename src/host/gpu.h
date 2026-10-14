@@ -41,6 +41,9 @@ struct GpuDispatch {
     static constexpr std::uint32_t kGdsCounters = 8;  // gcn::kGdsCounters
     std::uint32_t gds_base = 0;
     GdsCounter gds[kGdsCounters] = {};
+    // The dispatch-token shadow: work out which user-data dwords the program
+    // reads (host_gpu_dispatch_user_reads), to compare only those.
+    bool want_user_reads = false;
 };
 
 // Everything a draw is decoded from, in register encodings. The PM4 path
@@ -262,6 +265,10 @@ bool host_gpu_small_vram();
 // translated or queued (the caller logs and continues). Queued work runs at
 // the next host_gpu_flush().
 bool host_gpu_dispatch(const GpuDispatch& d);
+// The user-data dwords (bit n: user SGPR n) the program of this thread's last
+// host_gpu_dispatch touches, when it asked (GpuDispatch::want_user_reads) and
+// its pipeline was found; 0xffff otherwise.
+std::uint32_t host_gpu_dispatch_user_reads();
 // Queues one draw.
 bool host_gpu_draw(const GpuDraw& d);
 // Runs queued work and waits for it; call before the command processor

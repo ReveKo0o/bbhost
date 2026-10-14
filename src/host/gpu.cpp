@@ -6224,7 +6224,11 @@ bool host_gpu_gds_counters() {
     return on;
 }
 
+thread_local std::uint32_t t_dispatch_user_reads = 0xffff;
+std::uint32_t host_gpu_dispatch_user_reads() { return t_dispatch_user_reads; }
+
 bool host_gpu_dispatch(const GpuDispatch& d) {
+    t_dispatch_user_reads = 0xffff;
     DispatchStamp stamp;
     GpuPhaseTimer timer(kPhaseLock);
     std::lock_guard<GpuMutex> lock(g.mu);
@@ -6277,6 +6281,29 @@ bool host_gpu_dispatch(const GpuDispatch& d) {
     stamp.to(kDpPaths);
     const std::uint64_t key = compute_key(code_hash, d.rsrc1, d.rsrc2, d.threads, dims, sampler_modes);
     ComputePipeline& pl = pipeline_for(d, key, words, name, dims, sampler_modes);
+    t_dispatch_user_reads = 0xffff;
+    if (d.want_user_reads && !pl.failed) {
+        if (!pl.user_reads_known) {
+            // What the program's translation touches, and what the host reads
+            // to bind its resources: each path's root - the descriptor's words
+            // when they sit in user data, the pointer when the path loads
+            // through memory.
+            std::uint32_t tables = 0, any = 0xffff;
+            std::uint32_t reads = table_slots_read(pl.meta, tables, &any) ? (any & 0xffff) : 0xffff;
+            const auto root = [&](const gcn::ResourcePath& p, int words) {
+                if (p.user_sgpr < 0 || p.user_sgpr >= 16) return;
+                const int n = p.immediate ? words : 2;
+                for (int k = 0; k < n && p.user_sgpr + k < 16; ++k) reads |= 1u << (p.user_sgpr + k);
+            };
+            for (const gcn::ImageBinding& b : pl.meta.images) root(b.path, b.r128 ? 4 : 8);
+            for (const gcn::SamplerBinding& b : pl.meta.samplers) root(b.path, 4);
+            for (const gcn::BufferBinding& b : pl.meta.buffers) root(b.path, b.pointer ? 2 : 4);
+            for (const gcn::ResourcePath& p : pl.meta.store_buffers) root(p, 4);
+            pl.user_reads = reads;
+            pl.user_reads_known = true;
+        }
+        t_dispatch_user_reads = pl.user_reads;
+    }
     if (pl.failed) {
         g.failures.fetch_add(1);
         return false;

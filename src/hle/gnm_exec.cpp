@@ -133,7 +133,9 @@ bool drop_draw_packet(DroppedDraw kind, std::uint32_t count) {
     }
     return true;
 }
-thread_local std::uint32_t t_cs_writers[32] = {};  // checks: per compute user-data slot, the last SET_SH_REG header and the marker before it
+thread_local std::uint64_t t_cb_lo = 0, t_cb_hi = 0;  // the command buffer the walker is in (see defer_if_in_command_buffer)
+thread_local GpuDispatchWriters t_cs_writers;  // checks: per compute user-data slot, the packet that last wrote it
+thread_local bool t_in_ce = false;  // the packet being executed is the constant engine's
 thread_local std::uint64_t t_index_base = 0;
 thread_local std::uint32_t t_index_size = 0;
 thread_local std::uint32_t t_index_type = 0;
@@ -243,8 +245,22 @@ void run_dispatch(const char* kind, std::uint32_t x, std::uint32_t y, std::uint3
     note_gpu_args(indirect_va, 12);
     d.depth_clear = t_regs.ctx[0x0B];
     d.stencil_clear = t_regs.ctx[0x0A];
-    // A dispatch token in shadow mode: this packet is the dispatch it described.
-    if (hle_gx_dispatch_pending()) hle_gx_dispatch_check(d, t_cs_writers);
+    // A dispatch token in shadow mode: this packet is the dispatch it
+    // described. Compared once the dispatch has run, whose pipeline says which
+    // user data the program reads (0xffff: not known - not run).
+    struct ShadowCheck {
+        const GpuDispatch* d = nullptr;
+        std::uint32_t reads = 0xffff;
+        ~ShadowCheck() {
+            if (d) hle_gx_dispatch_check(*d, &t_cs_writers, reads);
+        }
+    } shadow;
+    if (hle_gx_dispatch_pending()) {
+        t_cs_writers.dispatch_packet = t_packet_va;
+        t_cs_writers.dispatch_buffer = t_cb_lo;
+        d.want_user_reads = true;
+        shadow.d = &d;
+    }
     if (!cp_dispatch_packets()) {
         if (g_dispatch_packets_dropped[indirect_va ? 1 : 0].fetch_add(1, std::memory_order_relaxed) < 4) {
             host_log("cp: %s %ux%ux%u at flip %llu not run: every dispatch is a token and the register file is not kept "
@@ -257,7 +273,9 @@ void run_dispatch(const char* kind, std::uint32_t x, std::uint32_t y, std::uint3
     if ((!x || !y || !z) && !indirect_va) return;
     if (!d.threads[0]) return;
     bind_gds_counters(d);
-    if (!host_gpu_dispatch(d)) {
+    const bool ran = host_gpu_dispatch(d);
+    if (shadow.d) shadow.reads = host_gpu_dispatch_user_reads();
+    if (!ran) {
         g_dispatch_failed.fetch_add(1);
         static std::atomic<int> logs{0};
         if (logs.fetch_add(1) < 6) {
@@ -663,12 +681,11 @@ const std::uint64_t g_trace_label = [] {
 }();
 std::atomic<std::uint64_t> g_trace_label_writes{0};
 
-// The command buffer the walker is in. The engine reserves its fences *inside*
+// The command buffer the walker is in (t_cb_lo, t_cb_hi). The engine reserves its fences *inside*
 // the command buffer - legal on hardware, where the CP has long since fetched
 // past them by the time the event retires - so writing one while we are still
 // walking would rewrite packets we have not read yet. Those writes are held
 // back and applied when the walk finishes.
-thread_local std::uint64_t t_cb_lo = 0, t_cb_hi = 0;
 struct DeferredWrite {
     std::uint64_t va;
     std::uint64_t value;
@@ -1042,7 +1059,9 @@ bool ce_step() {
             return true;
         }
         t_cur_op = op;
+        t_in_ce = true;
         execute_packet(op, b, n, 1);
+        t_in_ce = false;
         return true;
     }
     return false;
@@ -1816,11 +1835,15 @@ void execute_packet(std::uint32_t op, const std::uint32_t* b, std::size_t n, int
                     t_regs.sh[b[0] + k - 1] = b[k];
                     // Checks: which packet last wrote each compute user-data slot.
                     const std::uint32_t slot = b[0] + static_cast<std::uint32_t>(k) - 1;
-                    if (slot >= 0x240 && slot < 0x250) {
-                        t_cs_writers[2 * (slot - 0x240)] = b[-1];
-                        t_cs_writers[2 * (slot - 0x240) + 1] = t_packet_va >= 8 && hle_kernel_va_mapped(t_packet_va - 8, 8)
-                                                                  ? reinterpret_cast<const std::uint32_t*>(static_cast<std::uintptr_t>(t_packet_va - 8))[1]
-                                                                  : 0;
+                    if (slot >= 0x240 && slot < 0x250 && hle_gx_dispatch_shadow()) {
+                        const std::uint32_t i = slot - 0x240;
+                        t_cs_writers.header[i] = b[-1];
+                        t_cs_writers.marker[i] = t_packet_va >= 8 && hle_kernel_va_mapped(t_packet_va - 8, 8)
+                                                     ? reinterpret_cast<const std::uint32_t*>(static_cast<std::uintptr_t>(t_packet_va - 8))[1]
+                                                     : 0;
+                        t_cs_writers.packet[i] = t_packet_va;
+                        t_cs_writers.buffer[i] = t_cb_lo;
+                        t_cs_writers.ce[i] = t_in_ce;
                     }
                 }
             }

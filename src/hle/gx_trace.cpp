@@ -139,6 +139,12 @@ enum Kind : std::uint8_t {
     kCsUd4,
     kCsUd1,
     kCsUdPtr,
+    // The asynchronous compute ring's own setters (gx_upload_initial_data,
+    // texture initial data): an 8-dword compute-typed user-data writer
+    // (0x148ab60, a T#) and the program bind (0x148a870, through the
+    // library's sceGnmSetCsShader rather than 0x1475840).
+    kCsUd8b,
+    kSetCsQueue,
     kDepthDecompress,
     kDepthStencilClearPass,
     // GX shader creators (per-shader compiles, step 4): the Sony shader container.
@@ -160,7 +166,7 @@ const char* const kKindName[kKinds] = {
     "set depth-stencil control", "set stencil control", "set stencil ref", "set primitive type", "set instances", "set index size",
     "set clip control", "set primitive setup", "set shader stages", "set colour control", "set render control", "set stencil clear",
     "set viewport scissor", "set index offset", "set CS", "set base", "set CS user data (n)", "set CS user data (8)", "set CS user data (4)",
-    "set CS user data (1)", "set CS user data pointer", "depth decompress pass", "depth-stencil clear pass",
+    "set CS user data (1)", "set CS user data pointer", "set CS user data (8, compute ring)", "set CS (compute ring)", "depth decompress pass", "depth-stencil clear pass",
     "create shader (types 1, 5, 6)", "create shader (types 1, 5)", "create pixel shader", "create compute shader"};
 const char* const kStageName[6] = {"VS", "HS", "DS", "GS", "PS", "CS"};
 bool is_dispatch(int k) { return k == kDispatch || k == kDispatchIndirect; }
@@ -250,6 +256,9 @@ const Hook kHooks[kKinds] = {
     {0x148aad0, 16, {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x53, 0x50, 0x49, 0x89, 0xd6, 0x41, 0x89, 0xf7}},
     {0x148ada0, 16, {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x53, 0x50, 0x41, 0x89, 0xd6, 0x41, 0x89, 0xf7}},
     {0x148ac90, 16, {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x53, 0x50, 0x49, 0x89, 0xd6, 0x41, 0x89, 0xf7}},
+    {0x148ab60, 16, {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x53, 0x50, 0x49, 0x89, 0xd6, 0x41, 0x89, 0xf7}},
+    // push rbp; mov rbp, rsp; push r14; push rbx; mov r14, rsi; mov rbx, rdi; mov rax, [rbx+8]
+    {0x148a870, 17, {0x55, 0x48, 0x89, 0xe5, 0x41, 0x56, 0x53, 0x49, 0x89, 0xf6, 0x48, 0x89, 0xfb, 0x48, 0x8b, 0x43, 0x08}},
     {0x2ab6810, 20, {BB_PUSH6, 0x48, 0x81, 0xec, 0x88, 0x00, 0x00, 0x00}},  // the depth decompress pass (sub rsp, 0x88)
     {0x2ab5f50, 20, {BB_PUSH6, 0x48, 0x81, 0xec, 0xe8, 0x00, 0x00, 0x00}},  // the depth-stencil clear pass (sub rsp, 0xe8)
     // push rbp; mov rbp, rsp; push r15; push r14; push rbx; sub rsp, 0x138 / 0x128
@@ -3463,8 +3472,22 @@ void ud_trace(const char* what, std::uint64_t cb, std::uint32_t stage, std::uint
 struct ComputeUserData {
     std::uint32_t user[16] = {};
     std::uint16_t set = 0;
+    // Shadow only (BBHOST_GX_NATIVE_DISPATCH=1): per slot, the command buffer
+    // its last write went to and that buffer's write pointer then - where the
+    // writer's packet starts (after a marker NOP for the 4-dword writers) - so
+    // the compare can tell which packet the register file's value came from.
+    std::uint64_t cb[16] = {};
+    std::uint64_t wp[16] = {};
 };
 thread_local ComputeUserData t_cs_user;
+void note_cs_writer(std::uint64_t cb, std::uint32_t sgpr, std::uint32_t count) {
+    if (g_native_dispatch != 1) return;
+    const std::uint64_t wp = rd64(cb + 0x10);
+    for (std::uint32_t k = 0; k < count && sgpr + k < 16; ++k) {
+        t_cs_user.cb[sgpr + k] = cb;
+        t_cs_user.wp[sgpr + k] = wp;
+    }
+}
 void note_user_data(std::uint64_t cb, std::uint32_t stage, std::uint32_t sgpr, std::uint64_t data, std::uint32_t count) {
     ud_trace("data", cb, stage, sgpr, count);
     if (stage >= 8 || sgpr >= 16 || !count || count > 16 || sgpr + count > 16 || !data) return;
@@ -3473,6 +3496,7 @@ void note_user_data(std::uint64_t cb, std::uint32_t stage, std::uint32_t sgpr, s
     if (stage == 0) {
         std::memcpy(t_cs_user.user + sgpr, words, static_cast<std::size_t>(count) * 4);
         t_cs_user.set |= static_cast<std::uint16_t>(((1u << count) - 1) << sgpr);
+        note_cs_writer(cb, sgpr, count);
     }
     std::lock_guard<std::mutex> lk(g_ws_mu);
     WrapperState& w = wrapper_state_locked(cb);
@@ -3487,6 +3511,7 @@ void note_user_value(std::uint64_t cb, std::uint32_t stage, std::uint32_t sgpr, 
         t_cs_user.user[sgpr] = static_cast<std::uint32_t>(value);
         if (count == 2) t_cs_user.user[sgpr + 1] = static_cast<std::uint32_t>(value >> 32);
         t_cs_user.set |= static_cast<std::uint16_t>(((1u << count) - 1) << sgpr);
+        note_cs_writer(cb, sgpr, count);
     }
     std::lock_guard<std::mutex> lk(g_ws_mu);
     WrapperState& w = wrapper_state_locked(cb);
@@ -3626,6 +3651,7 @@ std::uint64_t wrapper_note(Kind id, const std::uint64_t* f) {
         case kCsUd4: note_user_data(cb, 0, u32(4), f[3], 4); return 0;
         case kCsUd1: note_user_value(cb, 0, u32(4), f[3], 1); return 0;
         case kCsUdPtr: note_user_value(cb, 0, u32(4), f[3], 2); return 0;
+        case kCsUd8b: note_user_data(cb, 0, u32(4), f[3], 8); return 0;
         default: break;
     }
     // The state setters: the guest reads below happen before the lock.
@@ -3716,7 +3742,7 @@ std::uint64_t wrapper_note(Kind id, const std::uint64_t* f) {
             break;
         }
         case kSetIndxOffset: wrapper_state(cb).indx_offset = u32(4); break;
-        case kSetCs: wrapper_state(cb).cs_gnm = f[4] ? f[4] - 8 : 0; break;
+        case kSetCs: case kSetCsQueue: wrapper_state(cb).cs_gnm = f[4] ? f[4] - 8 : 0; break;
         case kSetBase: wrapper_state(cb).indirect_base = f[4] & ~7ull; break;
         case kSetIndexBuffer: wrapper_state(cb).index_base = f[4]; break;
         default: break;
@@ -4267,31 +4293,100 @@ struct DispatchRecord {
     GpuDispatch d;
     std::uint64_t caller = 0;
     bool shadow = false;
+    // Shadow diagnostics: the buffer the dispatch is emitted on, its write
+    // pointer at the token, the recording thread's image's set slots and their
+    // writers (ComputeUserData), and the per-buffer image's.
+    std::uint64_t cb = 0, token_wp = 0;
+    std::uint16_t thr_set = 0, buf_set = 0;
+    std::uint64_t slot_cb[16] = {}, slot_wp[16] = {};
+    std::uint32_t buf_user[16] = {};
+    int tid = 0;
 };
 std::mutex g_ds_mu;
 std::unordered_map<std::uint64_t, DispatchRecord> g_ds_records;
 std::map<std::uint64_t, std::uint64_t> g_ds_callers, g_ds_refused_callers;  // under g_ds_mu
 std::atomic<std::uint64_t> g_ds_tokens{0}, g_ds_refused{0}, g_ds_unmatched{0}, g_ds_run{0}, g_ds_compared{0}, g_ds_bad[6] = {};
-const char* const kDsFieldName[6] = {"the program", "RSRC1/2", "the thread counts", "the user data", "the workgroup counts", "the indirect address"};
+const char* const kDsFieldName[6] = {"the program", "RSRC1/2", "the thread counts", "the user data the program reads", "the workgroup counts",
+                                     "the indirect address"};
+// Shadow: dispatches that differ only in user-data registers the program
+// does not load (past COMPUTE_PGM_RSRC2's USER_SGPR), which hold what an
+// earlier program left; and, per caller, compares and loaded differences.
+std::atomic<std::uint64_t> g_ds_unloaded{0};
+struct DsCallerStats {
+    std::uint64_t compared = 0, loaded_bad = 0, unloaded_only = 0, other_bad = 0, buf_would_match = 0;
+};
+std::map<std::uint64_t, DsCallerStats> g_ds_by_caller;  // under g_ds_mu
+// Where a loaded register's value came from when the token's differs (the
+// writer packet the register file took against the one the image took).
+enum DsWhy {
+    kDsWhyNeverSet,      // the slot was never written on the recording thread
+    kDsWhySamePacket,    // the same packet: the token read other data than the packet carried
+    kDsWhyCe,            // the constant engine's stream wrote the register
+    kDsWhyLaterSameBuf,  // a later packet in the dispatch's own walked buffer the hooks did not see
+    kDsWhyOtherBuf,      // a packet in another walked buffer (submission order against call order)
+    kDsWhyNoWriter,      // the register was never written on this CP thread
+    kDsWhys
+};
+const char* const kDsWhyName[kDsWhys] = {"never written on the recording thread", "the same packet, other data",
+                                         "written by the constant engine", "a later packet in the dispatch's buffer the hooks missed",
+                                         "a packet in another walked buffer", "never written on the CP thread"};
+std::atomic<std::uint64_t> g_ds_why[kDsWhys] = {};
+// Of kDsWhyOtherBuf: the image's writer was on the dispatch's own command
+// buffer (the token has what this context wrote, the register file another
+// context's), or on another command buffer.
+std::atomic<std::uint64_t> g_ds_other_own{0}, g_ds_other_foreign{0};
+// Why a dispatch got no token and runs from its packet and the register
+// file (the fallback): no compute program seen on its command buffer, an
+// indirect dispatch whose arguments' base was not seen, no room for the token.
+enum DsRefusal { kDsRefNoProgram, kDsRefNoBase, kDsRefNotWritten, kDsRefusals };
+const char* const kDsRefusalName[kDsRefusals] = {"no compute program seen on its command buffer", "no indirect-argument base seen",
+                                                 "the token could not be written"};
+std::atomic<std::uint64_t> g_ds_refused_why[kDsRefusals] = {};
+// What a dispatch token takes of its command buffer's wrapper state: the
+// compute program, the indirect arguments' base and (shadow diagnostics)
+// the compute stage's user data written on it - not the ~1.6 KiB of graphics
+// state a copy of the whole WrapperState was.
+struct ComputeWrapperState {
+    std::uint64_t cs_gnm = 0, indirect_base = 0;
+    std::uint32_t user[16] = {};
+    std::uint16_t set = 0;
+};
+bool wrapper_compute_copy(std::uint64_t cb, ComputeWrapperState& out) {
+    std::lock_guard<std::mutex> lk(g_ws_mu);
+    const WrapperState* w = wrapper_state_of_locked(cb);
+    if (!w) return false;
+    out.cs_gnm = w->cs_gnm;
+    out.indirect_base = w->indirect_base;
+    std::memcpy(out.user, w->user[0], sizeof(out.user));
+    out.set = w->set[0];
+    return true;
+}
+void refuse_dispatch(DsRefusal why, std::uint64_t caller) {
+    g_ds_refused.fetch_add(1, std::memory_order_relaxed);
+    g_ds_refused_why[why].fetch_add(1, std::memory_order_relaxed);
+    std::lock_guard<std::mutex> lk(g_ds_mu);
+    if (g_ds_refused_callers.size() < 64 || g_ds_refused_callers.count(caller)) ++g_ds_refused_callers[caller];
+}
 int wrapper_dispatch(Kind kind, const std::uint64_t* f, std::uint64_t caller) {
     if (!g_native_dispatch || g_backend != 1) return 0;
     if (kind != kEmitDispatch && kind != kEmitDispatchQueue && kind != kEmitDispatchIndirect) return 0;
     if (g_native_dispatch == 2 && g_native != 2) return 0;
     const std::uint64_t cb = f[5];
-    WrapperState w_copy;
-    const WrapperState* w = wrapper_state_copy(cb, w_copy) ? &w_copy : nullptr;
-    const bool ok = w && w->cs_gnm && (kind != kEmitDispatchIndirect || w->indirect_base);
-    if (!ok) {
-        g_ds_refused.fetch_add(1, std::memory_order_relaxed);
-        std::lock_guard<std::mutex> lk(g_ds_mu);
-        if (g_ds_refused_callers.size() < 64 || g_ds_refused_callers.count(caller)) ++g_ds_refused_callers[caller];
+    ComputeWrapperState w_copy;
+    const ComputeWrapperState* w = wrapper_compute_copy(cb, w_copy) ? &w_copy : nullptr;
+    if (!w || !w->cs_gnm) {
+        refuse_dispatch(kDsRefNoProgram, caller);
+        return 0;
+    }
+    if (kind == kEmitDispatchIndirect && !w->indirect_base) {
+        refuse_dispatch(kDsRefNoBase, caller);
         return 0;
     }
     if (g_ud_trace) {
         static std::atomic<int> logs{0};
         if (logs.fetch_add(1, std::memory_order_relaxed) < 20) {
             host_log("ud-trace: dispatch from 0x%llx cb 0x%llx, compute slots set %04x (this buffer's %04x)", static_cast<ull>(caller),
-                     static_cast<ull>(cb), t_cs_user.set, w->set[0]);
+                     static_cast<ull>(cb), t_cs_user.set, w->set);
         }
     }
     DispatchRecord r;
@@ -4302,7 +4397,12 @@ int wrapper_dispatch(Kind kind, const std::uint64_t* f, std::uint64_t caller) {
     r.d.threads[0] = rd32(regs + 16);
     r.d.threads[1] = rd32(regs + 20);
     r.d.threads[2] = rd32(regs + 24);
+    // The user data the program loads (USER_SGPR, RSRC2 bits 1-5), as this
+    // thread's compute writers wrote it in call order; the registers past them
+    // are not the program's, and stay 0.
+    const unsigned loaded = (r.d.rsrc2 >> 1) & 0x1f;
     std::memcpy(r.d.user_data, t_cs_user.user, sizeof(r.d.user_data));
+    for (unsigned k = loaded; k < 16; ++k) r.d.user_data[k] = 0;
     if (kind == kEmitDispatchIndirect) {
         r.d.indirect_va = w->indirect_base + (f[4] & 0xffffffff);
         r.d.dim[0] = r.d.dim[1] = r.d.dim[2] = 1;
@@ -4313,17 +4413,35 @@ int wrapper_dispatch(Kind kind, const std::uint64_t* f, std::uint64_t caller) {
     }
     r.caller = caller;
     r.shadow = g_native_dispatch != 2;
+    if (r.shadow) {
+        r.cb = cb;
+        r.token_wp = rd64(cb + 0x10);
+        r.thr_set = t_cs_user.set;
+        r.buf_set = w->set;
+        std::memcpy(r.slot_cb, t_cs_user.cb, sizeof(r.slot_cb));
+        std::memcpy(r.slot_wp, t_cs_user.wp, sizeof(r.slot_wp));
+        std::memcpy(r.buf_user, w->user, sizeof(r.buf_user));
+        r.tid = tid();
+    }
     // The record first, then the token, the lock not held over the write
     // (as for Scaleform's: the refill can wait for the command processor).
     const std::uint64_t id = next_native_id();
     {
         std::lock_guard<std::mutex> lk(g_ds_mu);
-        if (g_ds_records.size() > 16384) g_ds_records.clear();
-        g_ds_records[id] = r;
+        // The command processor takes each record as it walks the token; this
+        // many outstanding would be thousands of flips behind.
+        if (g_ds_records.size() > 65536) {
+            host_log("gx-dispatch: %zu dispatch records outstanding: dropped (their dispatches will not run)", g_ds_records.size());
+            g_ds_records.clear();
+        }
+        g_ds_records[id] = std::move(r);
     }
     if (!write_native_token(cb - 0x10, kGxDispatchMagic, id)) {
-        std::lock_guard<std::mutex> lk(g_ds_mu);
-        g_ds_records.erase(id);
+        {
+            std::lock_guard<std::mutex> lk(g_ds_mu);
+            g_ds_records.erase(id);
+        }
+        refuse_dispatch(kDsRefNotWritten, caller);
         return 0;
     }
     {
@@ -4345,11 +4463,11 @@ const GpuDispatch* dispatch_token_impl(std::uint64_t id) {
             g_ds_unmatched.fetch_add(1, std::memory_order_relaxed);
             return nullptr;
         }
-        r = it->second;
+        r = std::move(it->second);
         g_ds_records.erase(it);
     }
     if (r.shadow) {
-        t_ds_rec = r;
+        t_ds_rec = std::move(r);
         t_ds_pending = true;
         return nullptr;
     }
@@ -4359,14 +4477,73 @@ const GpuDispatch* dispatch_token_impl(std::uint64_t id) {
     return &t_ds;
 }
 bool dispatch_pending_impl() { return t_ds_pending; }
-void dispatch_check_impl(const GpuDispatch& regs, const std::uint32_t* writers) {
+// Which packet the register file's value of a loaded slot came from, against
+// the one the token's image took it from (DsWhy).
+DsWhy classify_slot(const DispatchRecord& rec, int k, const GpuDispatchWriters& w) {
+    if (!((rec.thr_set >> k) & 1)) return kDsWhyNeverSet;
+    if (!w.packet[k]) return kDsWhyNoWriter;
+    if (w.ce[k]) return kDsWhyCe;
+    // The writer's packet starts at the write pointer the hook saw, or after
+    // the 4-dword writers' marker NOP (two dwords) - well inside 32 bytes.
+    const std::uint64_t wp = rec.slot_wp[k];
+    if (wp && w.packet[k] >= wp && w.packet[k] < wp + 32) return kDsWhySamePacket;
+    if (w.buffer[k] == w.dispatch_buffer && w.packet[k] < w.dispatch_packet) return kDsWhyLaterSameBuf;
+    return kDsWhyOtherBuf;
+}
+// Shadow, per program: dispatches compared, those whose token differs in user
+// data the program reads, in user data it loads but never reads, and the
+// read mask (its translation's liveness) and registers loaded.
+struct DsProgramStats {
+    std::uint64_t compared = 0, read_bad = 0, loaded_bad = 0;
+    std::uint32_t reads = 0xffff;
+    unsigned loaded = 0;
+    std::uint64_t caller = 0;
+};
+std::map<std::uint64_t, DsProgramStats> g_ds_by_program;  // under g_ds_mu, by program address
+std::atomic<std::uint64_t> g_ds_loaded_unread{0};
+void dispatch_check_impl(const GpuDispatch& regs, const GpuDispatchWriters* writers, std::uint32_t user_reads) {
     t_ds_pending = false;
-    const GpuDispatch& d = t_ds_rec.d;
+    const DispatchRecord& rec = t_ds_rec;
+    const GpuDispatch& d = rec.d;
     bool bad[6] = {};
     bad[0] = d.code_va != regs.code_va;
     bad[1] = d.rsrc1 != regs.rsrc1 || d.rsrc2 != regs.rsrc2;
     bad[2] = std::memcmp(d.threads, regs.threads, sizeof(d.threads)) != 0;
-    bad[3] = std::memcmp(d.user_data, regs.user_data, sizeof(d.user_data)) != 0;
+    // The program loads COMPUTE_USER_DATA 0 .. USER_SGPR-1 (RSRC2 bits 1-5);
+    // the registers past them hold whatever an earlier program left. Of those
+    // it loads, it reads the ones its translation touches (user_reads): a
+    // register loaded and then overwritten before any read holds whatever the
+    // last program put there too.
+    const unsigned loaded = (regs.rsrc2 >> 1) & 0x1f;
+    const std::uint32_t read_mask = user_reads & ((1u << loaded) - 1);
+    bool unloaded = false, buf_match = true, loaded_unread = false;
+    std::uint16_t bad_slots = 0;
+    for (unsigned k = 0; k < 16; ++k) {
+        if (((read_mask >> k) & 1) && rec.buf_user[k] != regs.user_data[k]) buf_match = false;
+        if (d.user_data[k] == regs.user_data[k]) continue;
+        if ((read_mask >> k) & 1) {
+            bad[3] = true;
+            bad_slots = static_cast<std::uint16_t>(bad_slots | (1u << k));
+        } else if (k < loaded) {
+            loaded_unread = true;
+        } else {
+            unloaded = true;
+        }
+    }
+    if ((unloaded || loaded_unread) && !bad[3]) g_ds_unloaded.fetch_add(1, std::memory_order_relaxed);
+    if (loaded_unread && !bad[3]) g_ds_loaded_unread.fetch_add(1, std::memory_order_relaxed);
+    {
+        std::lock_guard<std::mutex> lk(g_ds_mu);
+        if (g_ds_by_program.size() < 256 || g_ds_by_program.count(regs.code_va)) {
+            DsProgramStats& p = g_ds_by_program[regs.code_va];
+            ++p.compared;
+            if (bad[3]) ++p.read_bad;
+            else if (loaded_unread) ++p.loaded_bad;
+            p.reads = user_reads;
+            p.loaded = loaded;
+            p.caller = rec.caller;
+        }
+    }
     // An indirect dispatch's counts come from memory at the token, so the
     // placeholder the call carries is not a difference.
     bad[4] = !d.indirect_va && std::memcmp(d.dim, regs.dim, sizeof(d.dim)) != 0;
@@ -4378,22 +4555,50 @@ void dispatch_check_impl(const GpuDispatch& regs, const std::uint32_t* writers) 
         any = true;
         g_ds_bad[k].fetch_add(1, std::memory_order_relaxed);
     }
+    DsWhy why[16] = {};
+    if (writers) {
+        for (std::uint16_t m = bad_slots; m; m &= m - 1) {
+            const int k = __builtin_ctz(m);
+            why[k] = classify_slot(rec, k, *writers);
+            g_ds_why[why[k]].fetch_add(1, std::memory_order_relaxed);
+            if (why[k] == kDsWhyOtherBuf) (rec.slot_cb[k] == rec.cb ? g_ds_other_own : g_ds_other_foreign).fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    {
+        std::lock_guard<std::mutex> lk(g_ds_mu);
+        if (g_ds_by_caller.size() < 64 || g_ds_by_caller.count(rec.caller)) {
+            DsCallerStats& s = g_ds_by_caller[rec.caller];
+            ++s.compared;
+            if (bad[3]) ++s.loaded_bad;
+            else if (unloaded) ++s.unloaded_only;
+            if (bad[0] || bad[1] || bad[2] || bad[4] || bad[5]) ++s.other_bad;
+            if (bad[3] && buf_match) ++s.buf_would_match;
+        }
+    }
     static std::atomic<int> logs{0};
-    if (any && logs.fetch_add(1, std::memory_order_relaxed) < 12) {
+    if (any && logs.fetch_add(1, std::memory_order_relaxed) < 40) {
         std::string what;
         for (int k = 0; k < 6; ++k) {
             if (bad[k]) appendf(what, " %s;", kDsFieldName[k]);
         }
         std::string ud;
         for (int k = 0; k < 16; ++k) {
-            if (d.user_data[k] != regs.user_data[k]) {
-                appendf(ud, " s[%d] %08x/%08x", k, d.user_data[k], regs.user_data[k]);
-                if (writers) appendf(ud, " (packet %08x marker %08x)", writers[2 * k], writers[2 * k + 1]);
+            if (d.user_data[k] == regs.user_data[k]) continue;
+            appendf(ud, " s[%d] %08x/%08x%s", k, d.user_data[k], regs.user_data[k],
+                    ((read_mask >> k) & 1) ? "" : k < static_cast<int>(loaded) ? " (loaded, not read)" : " (not loaded)");
+            if (writers && ((read_mask >> k) & 1)) {
+                const GpuDispatchWriters& w = *writers;
+                appendf(ud, " [%s; packet %08x marker %08x at 0x%llx in buffer 0x%llx; image's writer cb 0x%llx wp 0x%llx; buffer image %08x]",
+                        kDsWhyName[why[k]], w.header[k], w.marker[k], static_cast<ull>(w.packet[k]), static_cast<ull>(w.buffer[k]),
+                        static_cast<ull>(rec.slot_cb[k]), static_cast<ull>(rec.slot_wp[k]), rec.buf_user[k]);
             }
         }
-        host_log("gx-dispatch: token from 0x%llx differs from the packet:%s program %llx/%llx dim %u,%u,%u/%u,%u,%u%s",
-                 static_cast<ull>(t_ds_rec.caller), what.c_str(), static_cast<ull>(d.code_va), static_cast<ull>(regs.code_va), d.dim[0], d.dim[1],
-                 d.dim[2], regs.dim[0], regs.dim[1], regs.dim[2], ud.c_str());
+        host_log("gx-dispatch: token from 0x%llx (thread %d, cb 0x%llx, token at 0x%llx; dispatch packet at 0x%llx in buffer 0x%llx) differs "
+                 "from the packet:%s program %llx/%llx (loads %u user-data registers, reads %04x) dim %u,%u,%u/%u,%u,%u%s",
+                 static_cast<ull>(rec.caller), rec.tid, static_cast<ull>(rec.cb), static_cast<ull>(rec.token_wp),
+                 static_cast<ull>(writers ? writers->dispatch_packet : 0), static_cast<ull>(writers ? writers->dispatch_buffer : 0), what.c_str(),
+                 static_cast<ull>(d.code_va), static_cast<ull>(regs.code_va), loaded, user_reads, d.dim[0], d.dim[1], d.dim[2], regs.dim[0],
+                 regs.dim[1], regs.dim[2], ud.c_str());
     }
 }
 void report_state_packets() {
@@ -4438,11 +4643,47 @@ void report_dispatch_tokens() {
     for (int k = 0; k < 6; ++k) {
         if (const std::uint64_t n = g_ds_bad[k].load()) appendf(fields, " %s %llu;", kDsFieldName[k], static_cast<ull>(n));
     }
+    {
+        std::string why;
+        for (int k = 0; k < kDsRefusals; ++k) {
+            if (const std::uint64_t m = g_ds_refused_why[k].load()) appendf(why, " %s %llu;", kDsRefusalName[k], static_cast<ull>(m));
+        }
+        host_log("gx-dispatch: dispatches left to their packets and the register file (fallbacks) by reason:%s", why.empty() ? " none" : why.c_str());
+    }
     host_log("gx-dispatch: tokens %llu (run %llu, unmatched %llu) by caller:%s refused %llu by caller:%s",
              static_cast<ull>(g_ds_tokens.load()), static_cast<ull>(g_ds_run.load()), static_cast<ull>(g_ds_unmatched.load()),
              callers.empty() ? " none;" : callers.c_str(), static_cast<ull>(g_ds_refused.load()), refused.empty() ? " none" : refused.c_str());
     if (const std::uint64_t n = g_ds_compared.load()) {
-        host_log("gx-dispatch: shadow: %llu compared; fields differing:%s", static_cast<ull>(n), fields.empty() ? " none" : fields.c_str());
+        host_log("gx-dispatch: shadow: %llu compared; fields differing:%s; %llu more differ only in user data the program does not read "
+                 "(%llu of them in registers it loads)",
+                 static_cast<ull>(n), fields.empty() ? " none" : fields.c_str(), static_cast<ull>(g_ds_unloaded.load()),
+                 static_cast<ull>(g_ds_loaded_unread.load()));
+        std::string by_program;
+        {
+            std::lock_guard<std::mutex> lk(g_ds_mu);
+            for (const auto& [va, p] : g_ds_by_program) {
+                appendf(by_program, " %llx (from 0x%llx, loads %u, reads %04x) %llu: read %llu, loaded only %llu;", static_cast<ull>(va),
+                        static_cast<ull>(p.caller), p.loaded, p.reads, static_cast<ull>(p.compared), static_cast<ull>(p.read_bad),
+                        static_cast<ull>(p.loaded_bad));
+            }
+        }
+        host_log("gx-dispatch: shadow by program:%s", by_program.empty() ? " none" : by_program.c_str());
+        std::string by_caller, why;
+        {
+            std::lock_guard<std::mutex> lk(g_ds_mu);
+            for (const auto& [c, s] : g_ds_by_caller) {
+                appendf(by_caller, " 0x%llx %llu (loaded %llu, unloaded only %llu, other fields %llu, buffer image right %llu);", static_cast<ull>(c),
+                        static_cast<ull>(s.compared), static_cast<ull>(s.loaded_bad), static_cast<ull>(s.unloaded_only),
+                        static_cast<ull>(s.other_bad), static_cast<ull>(s.buf_would_match));
+            }
+        }
+        for (int k = 0; k < kDsWhys; ++k) {
+            if (const std::uint64_t m = g_ds_why[k].load()) appendf(why, " %s %llu;", kDsWhyName[k], static_cast<ull>(m));
+        }
+        host_log("gx-dispatch: shadow by caller:%s", by_caller.empty() ? " none" : by_caller.c_str());
+        host_log("gx-dispatch: shadow, loaded registers that differ, by the register's writer:%s (of another buffer's: the image's writer on the "
+                 "dispatch's own command buffer %llu, on another %llu)",
+                 why.empty() ? " none" : why.c_str(), static_cast<ull>(g_ds_other_own.load()), static_cast<ull>(g_ds_other_foreign.load()));
     }
 }
 
@@ -4575,7 +4816,7 @@ GUEST_ABI std::uint64_t gx_hook(std::uint64_t id, const std::uint64_t* f) {
     if (id == kUploadTexture) return native_upload(f);
     if (id == kCopyTexture) return native_copy_texture(f);
     if (id >= kScaleformDraw && id <= kScaleformDrawAuto) return native_scaleform_draw(static_cast<Kind>(id), f);
-    if (id >= kSetIndexBuffer && id <= kCsUdPtr) return wrapper_note(static_cast<Kind>(id), f);
+    if (id >= kSetIndexBuffer && id <= kSetCsQueue) return wrapper_note(static_cast<Kind>(id), f);
     if (id == kDepthDecompress) {
         if (!(g_native_passes & 1) || g_native != 2 || g_backend != 1) return 0;
         g_wd_skipped_depth.fetch_add(1, std::memory_order_relaxed);
@@ -5936,9 +6177,12 @@ void hle_gx_scaleform_report() {
     report_state_packets();
 }
 bool hle_gx_dispatch_native() { return g_native_dispatch == 2; }
+bool hle_gx_dispatch_shadow() { return g_native_dispatch == 1; }
 const GpuDispatch* hle_gx_dispatch_token(std::uint64_t id) { return dispatch_token_impl(id); }
 bool hle_gx_dispatch_pending() { return dispatch_pending_impl(); }
-void hle_gx_dispatch_check(const GpuDispatch& regs, const std::uint32_t* writers) { dispatch_check_impl(regs, writers); }
+void hle_gx_dispatch_check(const GpuDispatch& regs, const GpuDispatchWriters* writers, std::uint32_t user_reads) {
+    dispatch_check_impl(regs, writers, user_reads);
+}
 
 
 const GpuDrawInputs* hle_gx_native_token(std::uint64_t id, const std::uint32_t* sh, const std::uint32_t* ctx) {

@@ -259,11 +259,25 @@ struct GpuDispatch;
 // True when dispatches run from their tokens, so the command processor must
 // not also run the dispatch packet.
 bool hle_gx_dispatch_native();
+// True when dispatch tokens are shadowed (BBHOST_GX_NATIVE_DISPATCH=1): the
+// command processor notes which packet wrote each compute user-data slot.
+bool hle_gx_dispatch_shadow();
 const GpuDispatch* hle_gx_dispatch_token(std::uint64_t id);
 bool hle_gx_dispatch_pending();
-// writers: for each of the 16 compute user-data slots, the header of the
-// SET_SH_REG packet that last wrote it and the NOP marker before it (checks).
-void hle_gx_dispatch_check(const GpuDispatch& regs, const std::uint32_t* writers);
+// The packets that last wrote each of the 16 compute user-data slots on this
+// command-processor thread, for the shadow's compare (checks): the SET_SH_REG
+// header and the dword before it (a marker NOP's payload), the packet's
+// address (0: never written), the walked buffer it was in and whether the
+// constant engine's stream walked it; and the dispatch packet's own.
+struct GpuDispatchWriters {
+    std::uint32_t header[16] = {}, marker[16] = {};
+    std::uint64_t packet[16] = {}, buffer[16] = {};
+    bool ce[16] = {};
+    std::uint64_t dispatch_packet = 0, dispatch_buffer = 0;
+};
+// user_reads: the user-data dwords the program reads (its translation's
+// liveness; 0xffff when not known).
+void hle_gx_dispatch_check(const GpuDispatch& regs, const GpuDispatchWriters* writers, std::uint32_t user_reads);
 void hle_gx_scaleform_check(std::uint32_t count, std::uint64_t index_va, std::uint32_t index_type, std::uint32_t instances,
                             std::uint32_t prim, const std::uint32_t* sh, const std::uint32_t* ctx);
 void hle_gx_copy_token(std::uint64_t id);

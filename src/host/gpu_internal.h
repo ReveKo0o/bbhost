@@ -197,6 +197,11 @@ struct ComputePipeline {
     bool lifted = false;
     std::string lift_why;
     std::uint64_t dispatches = 0;
+    // The user-data dwords the translation touches at all (table_slots_read's
+    // `any`), worked out the first time a dispatch asks for it
+    // (GpuDispatch::want_user_reads: the dispatch-token shadow).
+    std::uint32_t user_reads = 0xffff;
+    bool user_reads_known = false;
 };
 
 // Guest VA -> (VkBuffer, offset) for index buffers.
