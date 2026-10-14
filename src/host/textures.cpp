@@ -1082,6 +1082,7 @@ bool upload_surface(Surface& sf, VkImageAspectFlags aspect, bool first) {
     check_stale_upload(sf);
     // Watch before reading: a write after this faults and marks the surface,
     // and one before it is in what is read below (core/write_watch.h).
+    sf.watch.owner = kWatchOwnerTexture;
     sf.watched = !sf.gpu_written && write_watch_enabled() && now_ms() >= sf.watch_pause_until_ms &&
                  hle_kernel_write_watch(sf.base, sf.total_src, sf.watch);
     if (!first && sf.base == tex_probe_base()) {
@@ -1697,6 +1698,55 @@ void census_upload(Surface& sf, const char* why) {
     sf.cp_dirty = false;
 }
 
+thread_local const char* t_resolve_kind = nullptr;
+
+// The content checks refresh_surface_locked makes, by the kind of surface:
+// on a GX resource [0] the 1-in-64 check of a watched one, [1] shader- or
+// copy-written, [2] written by the command processor since its upload, [3]
+// not watched; on none [4] shader-written, [5] watched, [6] not watched.
+std::atomic<std::uint64_t> g_hash_class_n[7] = {}, g_hash_class_us[7] = {};
+
+// BBHOST_TEX_WATCH_VERIFY=1: before a re-upload the write watch asked for,
+// whether the surface's memory really changed since its last upload - its
+// whole-surface hash against the one taken then - by [registered][changed].
+// A watch reads a page as written when anything stamped it: a fault, a
+// release before a copy (the game's memcpy, a read(2)) or a remap, over the
+// page whatever part of it the copy wrote.
+const bool g_watch_verify = [] {
+    const char* e = std::getenv("BBHOST_TEX_WATCH_VERIFY");
+    return e && e[0] == '1';
+}();
+std::atomic<std::uint64_t> g_watch_verify_n[2][2] = {};
+
+// New surfaces on no GX resource, by why and by what resolved them first
+// (t_resolve_kind), with their bytes; the first ones logged. Under g.mu.
+struct UnregCount {
+    std::uint64_t n = 0, bytes = 0;
+};
+std::map<std::pair<std::string, std::string>, UnregCount> g_unreg_new;
+int g_unreg_logged = 0;
+const char* unregistered_why(const Surface& sf, GxResourceInfo* r) {
+    if (!gx_resource_overlapping(sf.base, std::max<std::size_t>(sf.total_src, 1), r)) return "no GX resource";
+    if (r->type == 1) return "in a GX buffer";
+    if (r->memory <= sf.base && sf.base < r->memory + r->bytes) return "past its texture's end";
+    return "across resources";
+}
+void census_unregistered_new(const Surface& sf, std::uint32_t dfmt, std::uint32_t nfmt) {
+    GxResourceInfo r;
+    const char* why = unregistered_why(sf, &r);
+    const char* kind = t_force_async ? "made ahead" : t_resolve_kind ? t_resolve_kind : "other";
+    UnregCount& c = g_unreg_new[{why, kind}];
+    ++c.n;
+    c.bytes += sf.total_src;
+    if (g_unreg_logged++ < 40) {
+        host_log("texture: census: new surface 0x%llx %ux%u x%u dfmt %u nfmt %u type %u tiling %u (%zu KiB) on no GX resource: %s, first resolved by "
+                 "%s%s (resource id %u type %u [0x%llx, +0x%x)) at flip %llu",
+                 static_cast<unsigned long long>(sf.base), sf.width, sf.height, sf.slices, dfmt, nfmt, sf.type, sf.tiling, sf.total_src / 1024,
+                 why, kind, std::strcmp(why, "no GX resource") ? "" : " -", r.id, r.type, static_cast<unsigned long long>(r.memory), r.bytes,
+                 static_cast<unsigned long long>(hle_video_flip_count()));
+    }
+}
+
 // A surface on a registered GX resource that is watched
 // is not hashed. Over two soaks every change to one was noticed by the write
 // watch (93 and 186) or explained by a GX creation over the same memory, and
@@ -1768,6 +1818,11 @@ void refresh_surface_locked(Surface& sf) {
             const std::uint64_t sooner = due > waited ? due - waited : 0;
             g_watch_sooner_ms.fetch_add(sooner, std::memory_order_relaxed);
             g_watch_uploads.fetch_add(1, std::memory_order_relaxed);
+            if (g_watch_verify && hle_kernel_va_mapped(sf.base, sf.total_src)) {
+                settle_prep(sf);
+                const bool changed = content_hash_of(sf.base, sf.total_src, true) != sf.exact_hash;
+                g_watch_verify_n[sf.gx_registered ? 1 : 0][changed ? 1 : 0].fetch_add(1, std::memory_order_relaxed);
+            }
             census_upload(sf, "write watch");
             upload_surface(sf, VK_IMAGE_ASPECT_COLOR_BIT, false);
             sf.unchanged = 0;
@@ -1832,6 +1887,13 @@ void refresh_surface_locked(Surface& sf) {
     // every frame back onto the command processor.
     if (sf.prep && !prep_done(*sf.prep)) return;
     settle_prep(sf);
+    // The census of what is hashed: which kind of surface each check is for.
+    const int hash_class = !sf.gx_registered ? (sf.gpu_written ? 4 : sf.watched ? 5 : 6)
+                           : sf.gpu_written    ? 1
+                           : sf.cp_dirty       ? 2
+                           : !sf.watched       ? 3
+                                               : 0;
+    const auto t_hash = std::chrono::steady_clock::now();
     bool changed = content_hash_of(sf.base, sf.total_src) != sf.content_hash;
     // What the sampled hash cannot see: a change small enough to fall between
     // its samples (see content_hash_of). Nothing else would ever notice it, so
@@ -1865,6 +1927,8 @@ void refresh_surface_locked(Surface& sf) {
             g_exact_catches.fetch_add(1, std::memory_order_relaxed);
         }
     }
+    g_hash_class_n[hash_class].fetch_add(1, std::memory_order_relaxed);
+    g_hash_class_us[hash_class].fetch_add(us_since(t_hash), std::memory_order_relaxed);
     if (changed && check_only) g_census_check_missed.fetch_add(1, std::memory_order_relaxed);
     if (changed) {
         // On a watched surface this is a write that did not fault: through
@@ -2570,6 +2634,7 @@ VkImageView texture_view_uncached(const std::uint32_t* w, bool storage, bool& di
                       std::min(sf.levels.size(), replaced.levels.size()), sf.levels.size());
         }
         census_upload(sf, nullptr);
+        if (!sf.gx_registered) census_unregistered_new(sf, dfmt, nfmt);
         if (!carried && !upload_surface(sf, VK_IMAGE_ASPECT_COLOR_BIT, true)) {
             sf.failed = true;
             note_surface_added(g_surfaces[base] = sf);
@@ -3040,6 +3105,7 @@ std::atomic<std::uint64_t> g_region_uploads{0}, g_region_bytes{0}, g_region_crea
 
 bool textures_upload_region_locked(std::uint64_t base, const std::uint32_t* tsharp, std::uint32_t mip, std::uint32_t layer, std::uint32_t x,
                                    std::uint32_t y, std::uint32_t w, std::uint32_t h, const void* data, std::size_t bytes, std::uint32_t row_bytes) {
+    const ResolveKind resolve_kind("upload token");
     auto it = g_surfaces.find(base);
     if (it == g_surfaces.end() && tsharp) {
         if (textures_create_ahead_locked(tsharp)) g_region_created.fetch_add(1, std::memory_order_relaxed);
@@ -3214,6 +3280,7 @@ bool textures_carry_into_target_locked(std::uint64_t base, std::uint32_t width, 
 }
 
 bool textures_copy_image_region_locked(const GpuImageCopy& c) {
+    const ResolveKind resolve_kind("copy token");
     CopySide src, dst;
     if (tex_probe_base() && (tsharp_base(c.dst_tsharp) == tex_probe_base() || tsharp_base(c.src_tsharp) == tex_probe_base())) {
         host_log("texture probe: copy token 0x%llx mip %u layer %u -> 0x%llx mip %u layer %u, %ux%u (flip %llu)",
@@ -3954,7 +4021,126 @@ std::uint64_t textures_hash_count() { return g_hashes.load(); }
 std::uint64_t textures_hash_us() { return g_hash_us.load(); }
 std::uint64_t textures_replacements() { return g_surface_replacements.load(); }
 
+std::string textures_census_window_locked() {
+    using ull = unsigned long long;
+    static WriteWatchStats last{};
+    static std::uint64_t last_new[3] = {}, last_watch = 0, last_unexplained = 0, last_unreg = 0, last_check = 0, last_skipped = 0;
+    const WriteWatchStats ws = write_watch_stats();
+    char l1[512];
+    std::snprintf(l1, sizeof(l1),
+                  "resources: write watch: faults %llu (textures %llu, buffer mirrors %llu, both %llu, untagged %llu; handler %.1f ms), arms %llu "
+                  "(textures %llu, mirrors %llu; mprotect %.1f ms), pages released %llu (textures %llu, mirrors %llu), remaps %llu",
+                  static_cast<ull>(ws.faults - last.faults), static_cast<ull>(ws.faults_by_owner[1] - last.faults_by_owner[1]),
+                  static_cast<ull>(ws.faults_by_owner[2] - last.faults_by_owner[2]), static_cast<ull>(ws.faults_by_owner[3] - last.faults_by_owner[3]),
+                  static_cast<ull>(ws.faults_by_owner[0] - last.faults_by_owner[0]), (ws.fault_handler_ns - last.fault_handler_ns) / 1e6,
+                  static_cast<ull>(ws.arms - last.arms), static_cast<ull>(ws.arms_by_owner[1] - last.arms_by_owner[1]),
+                  static_cast<ull>(ws.arms_by_owner[2] - last.arms_by_owner[2]), (ws.arm_ns - last.arm_ns) / 1e6,
+                  static_cast<ull>([&] {
+                      std::uint64_t t = 0;
+                      for (int k = 0; k < 4; ++k) t += ws.released_pages_by_owner[k] - last.released_pages_by_owner[k];
+                      return t;
+                  }()),
+                  static_cast<ull>(ws.released_pages_by_owner[1] - last.released_pages_by_owner[1]),
+                  static_cast<ull>(ws.released_pages_by_owner[2] - last.released_pages_by_owner[2]), static_cast<ull>(ws.forgets - last.forgets));
+    last = ws;
+    std::uint64_t reg = 0, unreg = 0, gpu = 0, watched = 0;
+    for (const auto& [base, sf] : g_surfaces) {
+        if (!sf.image) continue;
+        (sf.gx_registered ? reg : unreg) += 1;
+        gpu += sf.gpu_written;
+        watched += sf.watched;
+    }
+    const std::uint64_t now_new[3] = {g_census_new_registered.load(), g_census_new_registered_nodata.load(), g_census_new_unregistered.load()};
+    const std::uint64_t watch = g_watch_uploads.load(), unexplained = g_census_unexplained.load(), unreg_up = g_census_unregistered.load();
+    const std::uint64_t check = g_census_check_hashed.load(), skipped = g_census_hash_skipped.load();
+    char l2[512];
+    std::snprintf(l2, sizeof(l2),
+                  "resources: textures: %zu surfaces (%llu on a GX resource, %llu on none; %llu shader-written, %llu watched); new on a resource %llu "
+                  "(%llu without data), on none %llu; re-uploads the watch asked for %llu (%llu on a resource no GX write explains), of surfaces on "
+                  "none %llu; hashes skipped %llu, check hashes %llu",
+                  g_surfaces.size(), static_cast<ull>(reg), static_cast<ull>(unreg), static_cast<ull>(gpu), static_cast<ull>(watched),
+                  static_cast<ull>(now_new[0] + now_new[1] - last_new[0] - last_new[1]), static_cast<ull>(now_new[1] - last_new[1]),
+                  static_cast<ull>(now_new[2] - last_new[2]), static_cast<ull>(watch - last_watch), static_cast<ull>(unexplained - last_unexplained),
+                  static_cast<ull>(unreg_up - last_unreg), static_cast<ull>(skipped - last_skipped), static_cast<ull>(check - last_check));
+    std::memcpy(last_new, now_new, sizeof(last_new));
+    last_watch = watch;
+    last_unexplained = unexplained;
+    last_unreg = unreg_up;
+    last_check = check;
+    last_skipped = skipped;
+    std::string out = std::string(l1) + "\n  " + l2;
+    {
+        static std::uint64_t last_n[7] = {}, last_us[7] = {};
+        static const char* const kName[7] = {"resource, the check", "resource, shader-written", "resource, command-processor written",
+                                             "resource, not watched", "none, shader-written", "none, watched", "none, not watched"};
+        std::string by;
+        for (int k = 0; k < 7; ++k) {
+            const std::uint64_t n = g_hash_class_n[k].load(), us = g_hash_class_us[k].load();
+            if (n != last_n[k]) {
+                char buf[96];
+                std::snprintf(buf, sizeof(buf), "%s%s %llu (%.1f ms)", by.empty() ? "" : ", ", kName[k], static_cast<ull>(n - last_n[k]),
+                              (us - last_us[k]) / 1000.0);
+                by += buf;
+            }
+            last_n[k] = n;
+            last_us[k] = us;
+        }
+        if (!by.empty()) out += "\n  resources: surface checks that hashed, by surface: " + by;
+    }
+    static const bool census = [] {
+        const char* e = std::getenv("BBHOST_RESOURCE_CENSUS");
+        return e && e[0] == '1';
+    }();
+    if (census) {
+        OrphanImages rt[2];
+        render_orphans_locked(rt);
+        OrphanImages tex[2];  // [0] shader-written, [1] the rest
+        for (const auto& [base, sf] : g_surfaces) {
+            if (!sf.image || sf.failed) continue;
+            const std::size_t span = std::max<std::size_t>(sf.total_src, 1);
+            if (gx_resource_at(sf.base, span, nullptr)) continue;
+            OrphanImages& o = tex[sf.gpu_written || sf.copied_mips ? 0 : 1];
+            if (gx_resource_overlapping(sf.base, span, nullptr)) {
+                ++o.partial;
+                o.partial_bytes += sf.memory.size;
+            } else {
+                ++o.n;
+                o.bytes += sf.memory.size;
+            }
+        }
+        char l3[600];
+        std::snprintf(l3, sizeof(l3),
+                      "resources: images on memory no live GX resource holds (+ partly holds): targets %llu (%llu MiB) + %llu (%llu MiB), "
+                      "snapshots %llu (%llu MiB) + %llu (%llu MiB), shader-written textures %llu (%llu MiB) + %llu (%llu MiB), other textures "
+                      "%llu (%llu MiB) + %llu (%llu MiB)",
+                      static_cast<ull>(rt[0].n), static_cast<ull>(rt[0].bytes >> 20), static_cast<ull>(rt[0].partial),
+                      static_cast<ull>(rt[0].partial_bytes >> 20), static_cast<ull>(rt[1].n), static_cast<ull>(rt[1].bytes >> 20),
+                      static_cast<ull>(rt[1].partial), static_cast<ull>(rt[1].partial_bytes >> 20), static_cast<ull>(tex[0].n),
+                      static_cast<ull>(tex[0].bytes >> 20), static_cast<ull>(tex[0].partial), static_cast<ull>(tex[0].partial_bytes >> 20),
+                      static_cast<ull>(tex[1].n), static_cast<ull>(tex[1].bytes >> 20), static_cast<ull>(tex[1].partial),
+                      static_cast<ull>(tex[1].partial_bytes >> 20));
+        out += std::string("\n  ") + l3;
+    }
+    return out;
+}
+
 void textures_report() {
+    if (!g_unreg_new.empty()) {
+        std::string by;
+        for (const auto& [key, c] : g_unreg_new) {
+            char buf[160];
+            std::snprintf(buf, sizeof(buf), " %s, first by %s: %llu (%llu MiB);", key.first.c_str(), key.second.c_str(),
+                          static_cast<unsigned long long>(c.n), static_cast<unsigned long long>(c.bytes >> 20));
+            by += buf;
+        }
+        host_log("texture: census: new surfaces on no GX resource, by why and what resolved them first:%s", by.c_str());
+    }
+    if (g_watch_verify) {
+        host_log("texture: watch verify: re-uploads the watch asked for whose memory had changed / had not: on a GX resource %llu / %llu, on none "
+                 "%llu / %llu",
+                 static_cast<unsigned long long>(g_watch_verify_n[1][1].load()), static_cast<unsigned long long>(g_watch_verify_n[1][0].load()),
+                 static_cast<unsigned long long>(g_watch_verify_n[0][1].load()), static_cast<unsigned long long>(g_watch_verify_n[0][0].load()));
+    }
     if (const std::uint64_t probe = tex_probe_base(); probe && hle_kernel_va_mapped(probe, 32)) {
         std::uint64_t head[4] = {};
         std::memcpy(head, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(probe)), sizeof(head));
@@ -4063,6 +4249,14 @@ void textures_report() {
         if (n) host_log("texture: write watch: the writers behind the last faults:%s", top.c_str());
     }
     const WriteWatchStats ws = write_watch_stats();
+    host_log("texture: write watch by owner: faults textures %llu, buffer mirrors %llu, both %llu, untagged %llu (handler %llu ms); arms textures %llu, "
+             "mirrors %llu (mprotect %llu ms); pages released textures %llu, mirrors %llu, untagged %llu",
+             static_cast<unsigned long long>(ws.faults_by_owner[1]), static_cast<unsigned long long>(ws.faults_by_owner[2]),
+             static_cast<unsigned long long>(ws.faults_by_owner[3]), static_cast<unsigned long long>(ws.faults_by_owner[0]),
+             static_cast<unsigned long long>(ws.fault_handler_ns / 1000000), static_cast<unsigned long long>(ws.arms_by_owner[1]),
+             static_cast<unsigned long long>(ws.arms_by_owner[2]), static_cast<unsigned long long>(ws.arm_ns / 1000000),
+             static_cast<unsigned long long>(ws.released_pages_by_owner[1]), static_cast<unsigned long long>(ws.released_pages_by_owner[2]),
+             static_cast<unsigned long long>(ws.released_pages_by_owner[0]));
     host_log("texture: write watch: %llu arms, %llu write faults (%llu pages more released ahead of them), %llu reads released, %llu remaps, %llu refused; "
              "%llu uploads on a watched write (%llu ms sooner in all than the hashes would have looked), %llu caught "
              "by the hashes instead, %llu paused",

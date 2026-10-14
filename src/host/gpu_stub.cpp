@@ -81,6 +81,7 @@ bool host_gpu_zpass_dump(std::uint64_t) { return false; }
 void host_gpu_set_predication(std::uint64_t, unsigned, bool, bool) {}
 std::string host_gpu_occlusion_report() { return {}; }
 std::string host_gpu_image_heap_report() { return {}; }
+void host_gpu_resources_report() {}
 std::string host_gpu_target_copy_report() { return {}; }
 std::string host_gpu_ps_wave_report() { return {}; }
 std::string host_gpu_memory_budget_report() { return {}; }

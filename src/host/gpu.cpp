@@ -6512,6 +6512,7 @@ bool host_gpu_dispatch(const GpuDispatch& d_in) {
     t_dispatch_user_reads = 0xffff;
     t_dispatch_class = kDcFailed;
     t_dispatch_name = nullptr;
+    const ResolveKind resolve_kind("dispatch");
     DispatchStamp stamp;
     GpuPhaseTimer timer(kPhaseLock);
     std::lock_guard<GpuMutex> lock(g.mu);
@@ -7693,6 +7694,22 @@ std::string host_gpu_device_identity() {
 }
 std::size_t host_gpu_shader_backlog() {
     return (gpu::translation_cache_cold() ? gpu::precompile_backlog() : 0) + gpu::shader_sweep_left();
+}
+
+void host_gpu_resources_report() {
+    std::string r;
+    {
+        std::lock_guard<GpuMutex> lock(g.mu);
+        if (!g.ok) return;
+        r = gpu::textures_census_window_locked();
+    }
+    for (std::size_t at = 0; at < r.size();) {
+        const std::size_t nl = r.find('\n', at);
+        const std::string line = r.substr(at, nl == std::string::npos ? std::string::npos : nl - at);
+        host_log("  %s", line.c_str() + (line.rfind("  ", 0) == 0 ? 2 : 0));
+        if (nl == std::string::npos) break;
+        at = nl + 1;
+    }
 }
 
 std::string host_gpu_image_heap_report() {

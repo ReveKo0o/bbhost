@@ -10843,6 +10843,24 @@ bool render_target_newer_overlapping_locked(std::uint64_t va, std::size_t bytes,
     return scan(g_rts) || scan(g_snapshots);
 }
 
+void render_orphans_locked(OrphanImages out[2]) {
+    out[0] = out[1] = OrphanImages{};
+    for (int k = 0; k < 2; ++k) {
+        for (const auto& [base, r] : k ? g_snapshots : g_rts) {
+            if (!r.image) continue;
+            const std::size_t span = std::max<std::size_t>(rt_size_bytes(r), 1);
+            if (gx_resource_at(base, span, nullptr)) continue;
+            if (gx_resource_overlapping(base, span, nullptr)) {
+                ++out[k].partial;
+                out[k].partial_bytes += r.memory.size;
+            } else {
+                ++out[k].n;
+                out[k].bytes += r.memory.size;
+            }
+        }
+    }
+}
+
 ReuseRetired render_retire_reused_locked(std::uint64_t now_ms, std::uint64_t idle_ms, std::chrono::steady_clock::time_point deadline) {
     ReuseRetired out;
     static std::uint64_t cursor_rts = 0, cursor_snapshots = 0;  // the next base each scan looks at
@@ -15164,6 +15182,7 @@ static bool tess_draw_one(const GpuDraw& d, TessDraw& t) {
 }
 
 bool host_gpu_draw(const GpuDraw& d) {
+    const ResolveKind resolve_kind(d.gx_token ? (d.gx_token_kind ? d.gx_token_kind : "token draw") : "packet draw");
     // The windows given since the last draw are this one's (host_gpu_draw_window).
     t_draw_windows.swap(t_given_windows);
     t_given_windows.clear();

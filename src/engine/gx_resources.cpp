@@ -159,6 +159,9 @@ std::atomic<std::uint64_t> g_maps[5][5] = {};  // [resource type][map type]
 std::atomic<std::uint64_t> g_map_unknown{0}, g_map_moved{0};
 std::atomic<std::uint64_t> g_lookups{0}, g_lookup_hits{0};
 std::atomic<std::uint64_t> g_peak_live{0};
+// New resources made over part of a live one's memory: [old type][new type].
+std::atomic<std::uint64_t> g_overlapped[5][5] = {};
+std::atomic<int> g_overlap_logged{0};
 
 // Object -> id for shader and input-layout objects. Written at
 // creation (rare: area loads) under g_obj_mu, read at every draw on the GX
@@ -276,6 +279,29 @@ void register_holder(std::uint64_t key, std::uint64_t holder, Kind kind, bool in
         g_replaced_holder.fetch_add(1, std::memory_order_relaxed);
         if (auto m = g_by_memory.find(old->second.info.memory); m != g_by_memory.end() && m->second == key) g_by_memory.erase(m);
         g_by_holder.erase(old);
+    }
+    if (e.info.memory && e.info.bytes) {
+        // The census: live resources the new one's memory overlaps other than
+        // at its own base (the same base is the reuse below), by the old one's
+        // type - memory the game gave to something new without a destructor
+        // or an unmap the registry saw.
+        auto o = g_by_memory.lower_bound(e.info.memory);
+        if (o != g_by_memory.begin()) --o;
+        for (; o != g_by_memory.end() && o->first < e.info.memory + e.info.bytes; ++o) {
+            if (o->first == e.info.memory || o->second == key) continue;
+            const auto h = g_by_holder.find(o->second);
+            if (h == g_by_holder.end()) continue;
+            const GxResourceInfo& old = h->second.info;
+            if (old.memory + old.bytes <= e.info.memory) continue;
+            g_overlapped[old.type < 5 ? old.type : 0][e.info.type < 5 ? e.info.type : 0].fetch_add(1, std::memory_order_relaxed);
+            if (g_overlap_logged.fetch_add(1, std::memory_order_relaxed) < 12) {
+                host_log("gx-resources: resource %u (type %u) [0x%llx, +0x%x) made at flip %llu over live resource %u (type %u) [0x%llx, +0x%x) "
+                         "made at flip %llu",
+                         e.info.id, e.info.type, static_cast<unsigned long long>(e.info.memory), e.info.bytes,
+                         static_cast<unsigned long long>(e.created_flip), old.id, old.type, static_cast<unsigned long long>(old.memory), old.bytes,
+                         static_cast<unsigned long long>(old.created_flip));
+            }
+        }
     }
     if (e.info.memory) {
         if (auto m = g_by_memory.find(e.info.memory); m != g_by_memory.end() && m->second != key) {
@@ -894,6 +920,27 @@ bool gx_resource_at(std::uint64_t va, std::size_t bytes, GxResourceInfo* out) {
     return true;
 }
 
+bool gx_resource_overlapping(std::uint64_t va, std::size_t bytes, GxResourceInfo* out) {
+    if (!bytes) return false;
+    std::lock_guard<std::mutex> lk(g_mu);
+    // Live resources do not overlap each other: the one before the range if
+    // it reaches in, else the first that starts inside it.
+    auto it = g_by_memory.lower_bound(va);
+    const auto take = [&](std::map<std::uint64_t, std::uint64_t>::const_iterator m) {
+        auto h = g_by_holder.find(m->second);
+        if (h == g_by_holder.end()) return false;
+        const GxResourceInfo& r = h->second.info;
+        if (r.memory >= va + bytes || r.memory + r.bytes <= va) return false;
+        if (out) *out = r;
+        return true;
+    };
+    if (it != g_by_memory.begin() && take(std::prev(it))) return true;
+    for (; it != g_by_memory.end() && it->first < va + bytes; ++it) {
+        if (take(it)) return true;
+    }
+    return false;
+}
+
 bool gx_resource_newer_overlapping(std::uint64_t va, std::size_t bytes, std::uint64_t after_flip) {
     if (!bytes) return false;
     std::lock_guard<std::mutex> lk(g_mu);
@@ -950,6 +997,19 @@ void gx_resources_report() {
     host_log("gx-resources: Map by resource and type%s unknown holders %llu, memory moved by a map %llu; lookups %llu (%llu hits)",
              maps.empty() ? " none;" : maps.c_str(), static_cast<ull>(g_map_unknown.load()), static_cast<ull>(g_map_moved.load()),
              static_cast<ull>(g_lookups.load()), static_cast<ull>(g_lookup_hits.load()));
+    {
+        std::string ov;
+        for (unsigned a = 0; a < 5; ++a) {
+            for (unsigned b = 0; b < 5; ++b) {
+                if (const ull n = g_overlapped[a][b].load()) {
+                    char buf[96];
+                    std::snprintf(buf, sizeof(buf), " %s over %s %llu;", kType[b], kType[a], n);
+                    ov += buf;
+                }
+            }
+        }
+        host_log("gx-resources: made over part of a live resource's memory:%s", ov.empty() ? " none" : ov.c_str());
+    }
     host_log("gx-resources: shader and input-layout objects created %llu (%llu at an address an earlier one had), not registered (table "
              "full) %llu",
              static_cast<ull>(g_obj_created.load()), static_cast<ull>(g_obj_recreated.load()), static_cast<ull>(g_obj_full.load()));

@@ -599,6 +599,10 @@ void host_gpu_set_predication(std::uint64_t block, unsigned op, bool draw_if_vis
 std::string host_gpu_occlusion_report();  // the 300-flip line; empty when off
 // The texture image heap's blocks and use (gpu.cpp).
 std::string host_gpu_image_heap_report();
+// The 5-second report's resource lines (host/textures.cpp
+// textures_census_window_locked): the write watch's faults, arms and releases
+// by owner, the texture surfaces by registration, the census of new ones.
+void host_gpu_resources_report();
 // Pixel shaders at wave32 (render.cpp): programs by subgroup size, when any
 // were added since the last call; empty otherwise or with the feature off.
 std::string host_gpu_ps_wave_report();

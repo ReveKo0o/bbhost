@@ -1274,6 +1274,29 @@ std::uint32_t tsharp_dim(std::uint32_t type, bool& arrayed);
 std::uint32_t tsharp_kind(const std::uint32_t* w);
 std::size_t format_bytes_per_pixel(VkFormat format);
 void textures_report();
+// What is resolving textures on this thread (a draw token's kind, "dispatch",
+// "upload token", ...), for the census of surfaces no GX resource covers;
+// set for a scope by ResolveKind (textures.cpp defines it).
+extern thread_local const char* t_resolve_kind;
+struct ResolveKind {
+    const char* prev;
+    explicit ResolveKind(const char* kind) : prev(t_resolve_kind) { t_resolve_kind = kind; }
+    ~ResolveKind() { t_resolve_kind = prev; }
+    ResolveKind(const ResolveKind&) = delete;
+    ResolveKind& operator=(const ResolveKind&) = delete;
+};
+// The 5-second report's resource line(s): the write watch's faults, arms and
+// releases by owner, the hashes, the surfaces by registration and the census
+// of new ones; with BBHOST_RESOURCE_CENSUS=1 also the images whose memory no
+// live GX resource holds (textures.cpp, render.cpp). Under g.mu.
+std::string textures_census_window_locked();
+struct OrphanImages {
+    std::uint64_t n = 0, bytes = 0;            // no live GX resource over any of its memory
+    std::uint64_t partial = 0, partial_bytes = 0;  // one over part of it, none over all
+};
+// Colour and depth targets [0], snapshots [1] whose memory no live GX
+// resource covers (render.cpp).
+void render_orphans_locked(OrphanImages out[2]);
 // Drops the descriptor-keyed view memo in textures.cpp: call it wherever an
 // image view, a surface or a render target is created or destroyed, so a
 // remembered descriptor cannot resolve to a view that is gone or stale.

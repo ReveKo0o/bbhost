@@ -53,6 +53,9 @@ void gx_resources_install(ElfImage* image);
 std::uint64_t gx_resources_create_failures();
 // The live resource whose memory covers [va, va + bytes), if any.
 bool gx_resource_at(std::uint64_t va, std::size_t bytes, GxResourceInfo* out);
+// The first live resource whose memory overlaps [va, va + bytes) at all, if
+// any (the census of surfaces no resource covers whole).
+bool gx_resource_overlapping(std::uint64_t va, std::size_t bytes, GxResourceInfo* out);
 // Whether a live resource made after flip `after_flip` holds memory in
 // [va, va + bytes): the game gave that memory to something newer.
 bool gx_resource_newer_overlapping(std::uint64_t va, std::size_t bytes, std::uint64_t after_flip);

@@ -557,6 +557,7 @@ void shadow_locate_locked(std::uint64_t va, std::uint64_t bytes, Located& loc) {
             const std::uint64_t lo = std::max(first_va, map_lo);
             const std::uint64_t hi = std::min(first_va + (static_cast<std::uint64_t>(b - a) << kPageShift), map_hi);
             WriteWatch w, aw;
+            w.owner = aw.owner = kWatchOwnerMirror;
             if (!hle_kernel_write_watch(lo, hi - lo, w)) return;
             const std::uint64_t alias = hle_kernel_write_watch_alias(lo, hi - lo, aw);
             for (std::uint32_t p = a; p < b; ++p) {
@@ -648,6 +649,7 @@ void shadow_locate_locked(std::uint64_t va, std::uint64_t bytes, Located& loc) {
         // Watched from before the copy reads it: a write after that marks it
         // again rather than going unseen. Only the part in this mapping.
         const std::uint64_t lo = std::max(page_va, map_lo), hi = std::min(page_va + kPageBytes, map_hi);
+        pg.watch.owner = pg.alias_watch.owner = kWatchOwnerMirror;
         if (!(prearmed[p - p0] & 1) && !hle_kernel_write_watch(lo, hi - lo, pg.watch)) {
             go_dynamic(*m, p, page_va, "cannot be write-watched");
             flush();

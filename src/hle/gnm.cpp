@@ -590,6 +590,7 @@ GUEST_ABI int hle_gnm_submit_flip(unsigned count, void** dcb, unsigned* dcb_byte
         if (const std::string r = host_gpu_recorder_report(); !r.empty()) host_log("  %s", r.c_str());
         if (const std::string r = host_gpu_occlusion_report(); !r.empty()) host_log("  %s", r.c_str());
         if (const std::string r = host_gpu_image_heap_report(); !r.empty()) host_log("  %s", r.c_str());
+        host_gpu_resources_report();
         if (const std::string r = host_gpu_ps_wave_report(); !r.empty()) host_log("  %s", r.c_str());
         if (const std::string r = host_gpu_memory_budget_report(); !r.empty()) host_log("  %s", r.c_str());
         // What the PC enhancements and Bloom cost in these flips: the file
