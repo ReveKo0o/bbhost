@@ -344,23 +344,19 @@ const bool g_acquire_fence = !present_env_off("BBHOST_PRESENT_ACQUIRE_FENCE");
 // 180 Hz display a present, ~94 frames shown a second of the ~187 the game
 // made (Kyo's log, 2026-10-14).
 const bool g_present_own_queue = !present_env_off("BBHOST_PRESENT_OWN_QUEUE");
-// ... except on NVIDIA unless BBHOST_PRESENT_OWN_QUEUE=1: with it, a friend's
-// RTX 5080 (Windows driver 617.14) hung at the title in five runs of five -
-// the command processor waiting for the presenter's copy (present_reads_wait)
-// while the presenter sat in the driver's present and every other thread,
-// the window's included, queued on the driver's own lock (2026-10-14). The
-// renderer's stream carries the copy there, as before 2026-10-14. Known once
-// the device is made; 0 (not yet) is not remembered.
-bool present_own_queue_on() {
-    static int on = -1;
-    if (on >= 0) return on != 0;
-    if (!g_present_own_queue) return false;
-    const std::uint32_t vendor = host_gpu_vendor_id();
-    if (!vendor) return true;
-    const char* e = std::getenv("BBHOST_PRESENT_OWN_QUEUE");
-    on = (e && e[0] == '1') || vendor != 0x10de ? 1 : 0;
-    return on != 0;
-}
+// On NVIDIA too, since the copy waits for its frame's submissions to be in the
+// driver's queue (host_gpu_wait_work_submitted) before it is submitted and
+// presented. A friend's RTX 5080 (Windows driver 617.14) had hung at the title
+// in five runs of five with it: the presenter in the driver's present - which
+// waits for the frame there - holding the driver's own lock, the submission
+// thread queued on that lock with the very submission the copy waited for on
+// the GPU, and every other thread, the window's included, behind them
+// (2026-10-14). Carried in the renderer's stream instead, the copy waited
+// behind the game's next frames: an RTX 2060 at ~58 fps in the world (V-Sync,
+// MAILBOX) slept ~25 ms for each acquired image and showed ~23 frames a second,
+// 558 dropped in a minute ("stuttering like crazy", 2026-10-14).
+// BBHOST_PRESENT_OWN_QUEUE=0: in the renderer's stream.
+bool present_own_queue_on() { return g_present_own_queue; }
 // BBHOST_PRESENT_SUBMIT=1: before its blit the presenter submits whatever the
 // renderer is recording, as it did on every frame. The frame it shows is
 // normally submitted already (the command processor submits each job before
@@ -699,9 +695,8 @@ bool vk_start() {
              g_acquire_fence && g_vk.acquire_fence ? "waited for on this thread (a fence)" : "waited for on the GPU queue (a semaphore)",
              g_present_submit_always ? "before every blit" : "only when the flip's frame is still in it",
              present_own_queue_on() && g_vk.present_queue && host_gpu_timeline() && host_gpu_present_timeline()
-                 ? "on the presenter's own queue after its frame alone (BBHOST_PRESENT_OWN_QUEUE=0: behind the game's queued work)"
-             : g_present_own_queue && host_gpu_vendor_id() == 0x10de
-                 ? "behind the game's queued work (NVIDIA: BBHOST_PRESENT_OWN_QUEUE=1 for its own queue)"
+                 ? "on the presenter's own queue after its frame alone, once the frame's submissions are in the driver "
+                   "(BBHOST_PRESENT_OWN_QUEUE=0: behind the game's queued work)"
                  : "behind the game's queued work",
              g_vk.gpu_wait ? "after the frame is done on the GPU (a sleeping wait)" : "at once (the driver waits for the frame)");
     return true;
@@ -1129,6 +1124,11 @@ bool vk_present() {
         host_gpu_present_reads_locked(value);
         host_gpu_unlock();
         locked = false;
+        // The frame's submissions in the driver's queue first: nothing the
+        // copy and the present below wait for on the GPU is then still to be
+        // handed over by a thread that may need the driver's lock to do it.
+        present_step("waiting for the frame's submissions to reach the driver");
+        host_gpu_wait_work_submitted(flip.submit_need);
         const VkSemaphore signals[2] = {rendered, present_tl};
         const std::uint64_t signal_values[2] = {0, value};  // the binary semaphore's is ignored
         const std::uint64_t frame_value = flip.submit_need;

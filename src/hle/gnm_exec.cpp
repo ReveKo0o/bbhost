@@ -725,6 +725,21 @@ bool overlaps_command_buffer(std::uint64_t va, std::size_t bytes, std::uint64_t*
 bool cp_write_after_waits(std::uint64_t va, const void* data, std::size_t n) {
     g_cp_writes.fetch_add(1, std::memory_order_relaxed);
     if (!cp_writes_need_gpu()) return false;
+    static const bool trace = [] {
+        const char* e = std::getenv("BBHOST_CP_WRITE_TRACE");
+        return e && e[0] == '1';
+    }();
+    if (trace) {
+        static std::atomic<int> logs{0};
+        if (logs.fetch_add(1) < 400) {
+            std::uint64_t v = 0;
+            if (data) std::memcpy(&v, data, n < 8 ? n : 8);
+            host_log("cp-write trace: op 0x%02x 0x%llx %zu bytes first 0x%llx%s; gpu writes pending there %d; need %llu done %llu; flip %llu",
+                     t_cur_op, static_cast<unsigned long long>(va), n, static_cast<unsigned long long>(v), data ? "" : " (no data)",
+                     host_gpu_writes_pending(va, n) ? 1 : 0, static_cast<unsigned long long>(t_cp_writes_need),
+                     static_cast<unsigned long long>(host_gpu_submissions_completed()), static_cast<unsigned long long>(hle_video_flip_count()));
+        }
+    }
     std::uint64_t serial = 0;
     if (data && !overlaps_command_buffer(va, n, nullptr) && host_gpu_mem_write_ordered(va, data, n, &serial)) {
         if (n == 4 || n == 8) {

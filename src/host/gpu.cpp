@@ -5569,6 +5569,29 @@ void host_gpu_wait_submitted(std::uint64_t ticket) {
     g_sub_idle.wait(lk, [ticket] { return g_sub_submitted.load(std::memory_order_acquire) >= ticket; });
 }
 
+void host_gpu_wait_work_submitted(std::uint64_t need) {
+    if (!need || need == ~0ull) return;
+    // Its serial is need - 1: in the driver once stream_submitted_serial() is
+    // past it. Bounded, and over at a lost device, whose recording is dropped
+    // and never submitted: the presenter must not sit here for good.
+    const std::uint64_t t0 = host_clock_monotonic_ns();
+    for (std::uint64_t spins = 0; stream_submitted_serial() < need; ++spins) {
+        if (g_device_lost.load(std::memory_order_acquire)) return;
+        if (spins < 4096) {
+            std::this_thread::yield();
+        } else {
+            if (host_clock_monotonic_ns() - t0 > 2'000'000'000ull) {
+                static std::atomic<int> said{0};
+                if (said.fetch_add(1) < 4)
+                    host_log("present: the frame's submissions (to %llu) not in the driver after 2 s (%llu are); the copy goes anyway",
+                             static_cast<unsigned long long>(need), static_cast<unsigned long long>(stream_submitted_serial()));
+                return;
+            }
+            host_sleep_us(20);
+        }
+    }
+}
+
 bool host_gpu_submit_for_flip(std::uint64_t need) {
     {
         // The command processor submits after every job (gnm_exec.cpp,

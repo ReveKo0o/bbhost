@@ -564,6 +564,10 @@ std::string host_gpu_busy_report();
 // Submitting whatever the command processor had recorded of the *next* frame
 // broke its render pass and cost a submission on every presented frame.
 bool host_gpu_submit_for_flip(std::uint64_t need);
+// Until the game's submissions a flip needs (host_gpu_work_needs() as it
+// arrived) have been handed to the driver's queue - not run: the presenter's
+// copy on its own queue then waits on the GPU for a value already on its way.
+void host_gpu_wait_work_submitted(std::uint64_t need);
 // The render target the game displays (its VA from sceVideoOutRegisterBuffers)
 // as an image to sample: VkImage, VkFormat, its size; false when the VA is not
 // a drawn render target. Caller holds the renderer's lock (host_gpu_lock) and
