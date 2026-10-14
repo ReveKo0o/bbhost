@@ -141,9 +141,69 @@ A draw whose setup the lifter hasn't seen still falls back to the translator. Th
 | Pixel and vertex shaders lifted | done |
 | Tessellation lifted, mesh hulls native | done |
 | Compute shaders lifted | done |
-| HLSL: the lifted SPIR-V printed as HLSL and compiled with DXC to SPIR-V for Vulkan; checked byte-exact against the direct path before players switch | next |
+| HLSL: the lifted SPIR-V printed as HLSL and compiled with DXC to SPIR-V for Vulkan; checked byte-exact against the direct path before players switch | behind a switch, off by default (below) |
 | Shaders as editable source, generated on the player's machine from their own game files (never shipped) | after HLSL |
 | D3D12 (Shader Model 6) from the same HLSL, if ever wanted; D3D11 is not planned, since it lacks the quad operations 703 programs use | later, optional |
+
+## HLSL
+
+With `BBHOST_HLSL=1` every lift is printed as HLSL (`src/gcn/hlsl.cpp`) and
+compiled by DXC to SPIR-V for Vulkan, and the stage takes DXC's module where
+it declares the lift's interface and keeps its operations; anything else
+keeps the lift's SPIR-V, counted by reason in the exit report. With
+`BBHOST_HLSL=2` a stage whose module is not in the translation cache yet
+keeps the lift for this start while two `bb-hlsl` threads compile it for the
+next, so switching costs the game no stall. The switch is off by default
+until the path is shown equal to the direct one in game.
+
+- **What the HLSL is.** The lifter's SPIR-V stays the shader's IR of record:
+  typed values in structured control flow. The printer reads it back and
+  writes one statement an operation, values named by their SPIR-V ids,
+  resources and stage variables by the engine's names, and constant-buffer
+  loads annotated with the member they read
+  (`// cbSceneParam.VC_MatrixViewProj[0].x`). Constant buffers are
+  `ByteAddressBuffer`s read a dword at a time, as the lift reads them.
+- **Exact by construction.** Every operation is spelled the way DXC lowers
+  back to the lift's instruction: floats are `precise` (NoContraction); where
+  HLSL's spelling is another instruction - `sign`, `ldexp`, `mad` (which DXC
+  makes a fused multiply-add a driver must not split), `fmin`/`fmax`, the
+  half packing, bitfield extracts - the operation is inline SPIR-V; the
+  helper-lane query is the built-in, which keeps `discard` an `OpKill`; quad
+  operations are `QuadReadLaneAt`/`QuadReadAcross*`; an invariant position
+  (`BBHOST_VS_INVARIANT=1`) keeps its decoration. Each compiled module is
+  checked against its lift: the same descriptor bindings, stage interface
+  and specialization constants, and no float, image, quad or discard
+  operation the lift does not have.
+- **Tessellation and compute.** The LS is a vertex shader with an array
+  output, the domain shader takes its control points as an `OutputPatch`,
+  and the game's hull - one body each control point runs, a barrier, then the
+  patch's factors - becomes HLSL's control-point and patch-constant
+  functions from that one body. Compute lifts print too (raw addresses as
+  `vk::RawBufferLoad`/`Store`, their counters as `InterlockedAdd` on a
+  `vk::BufferPointer`).
+- **Offline checks.** `gcn2hlsl` lifts every program in the bundles as the
+  renderer does, prints, compiles and validates it: 13,318 of 13,318 vertex
+  and pixel lifts, 450 of 450 tessellation stages, and the compute lifts;
+  with `--runtime-offsets`, as on a device with maintenance8, 89 pixel
+  shaders sample with a run-time offset, and those compile too.
+  `hlsl_equiv` runs each lift and its DXC module on the same random inputs on
+  lavapipe and compares the outputs bit for bit: 13,308 of the 13,318 vertex
+  and pixel lifts identical, 10 differing only in the bits of NaNs (which
+  Vulkan leaves to the implementation), none otherwise; the 89 with run-time
+  offsets identical; all 450 tessellation stages identical (a domain shader
+  behind a generated hull, a hull with its outputs stored from inside it,
+  since random constants give factors that cull every patch).
+  `tools/hlsl_verify.py` replays captured draws and dispatches with DXC's
+  stage against the lift's.
+- **DXC.** bbhost loads libdxcompiler (`dxcompiler.dll` on Windows) at run
+  time, from beside the executable or the library path, and needs nothing
+  else of it (not `dxil.dll`); without it the switch keeps every lift. A
+  module costs DXC ~65 ms median (-O3, eight at a time on this machine), once:
+  the result is kept in the translation cache. A sample's run-time offset,
+  which Vulkan allows with maintenance8, is one thing DXC's own validator
+  refuses with no option to allow it: such a module is compiled without that
+  validator and validated by bbhost, with the offset allowed (a build without
+  SPIRV-Tools keeps the lift).
 
 ## What comes next
 
@@ -158,6 +218,9 @@ A draw whose setup the lifter hasn't seen still falls back to the translator. Th
 | Tool | What it does |
 |---|---|
 | `gcn2spv` | translates and validates every shader in the game's bundles |
+| `gcn2hlsl` | lifts every shader in the bundles, prints it as HLSL, compiles it with DXC and checks the module against the lift (`--tess` for the tessellation stages; `--spv` for one module) |
+| `hlsl_equiv` | each lift and its DXC module on the same random inputs (on lavapipe), outputs compared bit for bit |
+| `tools/hlsl_verify.py` | captured draws replayed with DXC's stage against the lift's |
 | `gcndis` | disassembles GCN programs |
 | F12 in game | dumps the frame, every render target and the draw list into a folder of its own (`tools/f12_check.py` reads it; `BBHOST_F12_PNG=1` for PNG) |
 | `BBHOST_CAPTURE_DRAW` + `drawreplay` | captures one draw with its inputs and replays it outside the game; `BBHOST_CAPTURE_DISPATCH` does the same for a compute dispatch |
