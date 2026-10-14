@@ -7914,13 +7914,17 @@ bool host_gpu_copy_image_region(const GpuImageCopy& c) {
     return g.ok && textures_copy_image_region_locked(c);
 }
 
-bool host_gpu_texture_create_ahead(const std::uint32_t tsharp[8]) {
+bool host_gpu_texture_create_ahead(const std::uint32_t tsharp[8], std::uint64_t gen) {
     std::lock_guard<GpuMutex> lock(g.mu);
-    return g.ok && textures_create_ahead_locked(tsharp);
+    return g.ok && textures_create_ahead_locked(tsharp, gen);
 }
 
-void host_gpu_texture_retire(std::uint64_t base, std::size_t bytes, std::uint64_t after_submitted) {
-    textures_retire(base, bytes, after_submitted);  // its own lock: callable from the kernel's unmap
+void host_gpu_texture_retire(std::uint64_t base, std::size_t bytes, std::uint64_t after_submitted, std::uint64_t gen) {
+    textures_retire(base, bytes, after_submitted, gen);  // its own lock: callable from the kernel's unmap
+}
+
+void host_gpu_texture_written(std::uint64_t base, std::size_t bytes) {
+    textures_gx_written(base, bytes);  // its own lock, as the retirement's
 }
 
 bool host_gpu_mem_fill(std::uint64_t va, std::uint32_t value, std::size_t bytes) {

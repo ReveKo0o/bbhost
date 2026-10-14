@@ -409,7 +409,7 @@ bool host_gpu_clear_target(std::uint64_t va, std::uint32_t value, std::size_t by
 // built for it (base filled in): the image is created and its untile queued
 // now, on the creating thread, so the first bind finds it. False when the
 // cache already has it or could not resolve it.
-bool host_gpu_texture_create_ahead(const std::uint32_t tsharp[8]);
+bool host_gpu_texture_create_ahead(const std::uint32_t tsharp[8], std::uint64_t gen = 0);
 // A fill of [va, va+bytes) with a 16-byte value, from a fill
 // token at its place in the stream - what a recognised fill dispatch did.
 bool host_gpu_fill(std::uint64_t va, std::size_t bytes, const float rgba[4], std::uint32_t depth_clear, std::uint32_t stencil_clear);
@@ -433,7 +433,10 @@ bool host_gpu_copy_image_region(const GpuImageCopy& c);
 // The memory [base, base+bytes) of a resource GX destroyed or the kernel
 // unmapped: its surfaces are retired once the command processor has retired
 // everything submitted up to `after_submitted` (hle_gnm_submitted_total()).
-void host_gpu_texture_retire(std::uint64_t base, std::size_t bytes, std::uint64_t after_submitted);
+void host_gpu_texture_retire(std::uint64_t base, std::size_t bytes, std::uint64_t after_submitted, std::uint64_t gen = 0);
+// GX mapped the texture whose memory is [base, base + bytes) for the CPU to
+// write: its surfaces upload it again at their next use.
+void host_gpu_texture_written(std::uint64_t base, std::size_t bytes);
 // Copies `bytes` into the host-owned table ring the GPU page
 // table reaches and returns their guest address (0 when no ring could be
 // mapped); a draw token's user data points at tables placed here.

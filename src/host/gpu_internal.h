@@ -991,10 +991,14 @@ struct RtImage {
     std::uint32_t view_clear_first = 0, view_clear_count = 0;
     // The flip it was made at, and the flip and the time (steady clock, ms) a
     // draw, a fill or a copy last wrote it: its age and order for the reuse
-    // retire (image_reuse_sweep_locked). written_seq numbers the writes (one
+    // retire (image_reuse_sweep_locked). last_write numbers the writes (one
     // counter for every target): what the clear costs compare to tell whether
     // a draw came between two clears.
-    std::uint64_t created_flip = 0, written_flip = 0, written_ms = 0, written_seq = 0;
+    std::uint64_t created_flip = 0, written_flip = 0, written_ms = 0, last_write = 0;
+    // The submission (hle_gnm_cp_job_seq) that last wrote it, and the
+    // generation of the GX resource it is the image of (0: none known) - it
+    // goes when that resource does (render_retire_generation_locked).
+    std::uint64_t written_seq = 0, gx_gen = 0;
     // How its image was made, to make it again elsewhere (a target that went
     // to host memory for want of video memory comes back: render_return_targets_locked).
     VkImageCreateFlags create_flags = 0;
@@ -1278,6 +1282,16 @@ void textures_report();
 // "upload token", ...), for the census of surfaces no GX resource covers;
 // set for a scope by ResolveKind (textures.cpp defines it).
 extern thread_local const char* t_resolve_kind;
+// Images belong to their GX resource's generation (BBHOST_RES_IDENTITY, on
+// unless 0): retired with it, never handed to a later resource at the same
+// memory (textures.cpp).
+bool res_identity_on();
+// The colour and depth targets and the snapshots in [base, base + bytes)
+// that are generation `gen`'s images: retired with it (render.cpp).
+// A target something wrote in a submission made after `after_submitted` (the
+// count when the resource died) has a newer owner: it stays, and takes the
+// generation of the resource that now holds its memory.
+void render_retire_generation_locked(std::uint64_t base, std::size_t bytes, std::uint64_t gen, std::uint64_t after_submitted);
 struct ResolveKind {
     const char* prev;
     explicit ResolveKind(const char* kind) : prev(t_resolve_kind) { t_resolve_kind = kind; }
@@ -1293,6 +1307,7 @@ std::string textures_census_window_locked();
 struct OrphanImages {
     std::uint64_t n = 0, bytes = 0;            // no live GX resource over any of its memory
     std::uint64_t partial = 0, partial_bytes = 0;  // one over part of it, none over all
+    std::uint64_t gone = 0, gone_bytes = 0;    // the image of a GX resource (generation) that is no longer live
 };
 // Colour and depth targets [0], snapshots [1] whose memory no live GX
 // resource covers (render.cpp).
@@ -1460,7 +1475,7 @@ std::size_t texture_src_bytes_locked(std::uint64_t base);
 void textures_before_submit();                      // the uploads this submission copies are untiled (their prep pool jobs done)
 void textures_prewait_for_submit();                 // without g.mu: the same wait for the jobs queued so far, so the one under it is short
 // Creation-time upload and destruction (see gpu.h's entry points).
-bool textures_create_ahead_locked(const std::uint32_t* tsharp);
+bool textures_create_ahead_locked(const std::uint32_t* tsharp, std::uint64_t gen = 0);
 bool textures_upload_region_locked(std::uint64_t base, const std::uint32_t* tsharp, std::uint32_t mip, std::uint32_t layer, std::uint32_t x,
                                    std::uint32_t y, std::uint32_t w, std::uint32_t h, const void* data, std::size_t bytes, std::uint32_t row_bytes);
 bool textures_copy_image_region_locked(const GpuImageCopy& c);
@@ -1469,7 +1484,8 @@ bool textures_copy_image_region_locked(const GpuImageCopy& c);
 // (rt_image). False when there is no such texture.
 bool textures_carry_into_target_locked(std::uint64_t base, std::uint32_t width, std::uint32_t height, std::size_t bytes_per_pixel,
                                        VkImage target);
-void textures_retire(std::uint64_t base, std::size_t bytes, std::uint64_t after_submitted);
+void textures_retire(std::uint64_t base, std::size_t bytes, std::uint64_t after_submitted, std::uint64_t gen = 0);
+void textures_gx_written(std::uint64_t base, std::size_t bytes);  // a texture GX mapped (host_gpu_texture_written)
 void textures_submitted(int slot);                  // the recorded write-backs belong to this submission
 void textures_retired(int slot);                    // that submission completed: copy them to guest memory
 

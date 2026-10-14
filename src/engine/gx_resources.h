@@ -105,6 +105,14 @@ std::uint32_t gx_object_id(std::uint64_t object);
 // tiling. (width << 16) | height, 0 when not known (not a 2D texture view, or
 // a view the registry did not see made).
 std::uint32_t gx_view_extent(std::uint64_t view);
+// The generation of the resource a render-target, depth-stencil or
+// shader-resource view was made of (GxResourceInfo::gen), read lock-free at a
+// draw as gx_view_extent is; 0 when the registry did not see the view made or
+// did not know its resource.
+std::uint64_t gx_view_gen(std::uint64_t view);
+// The same by the view's id (gx_object_id: what a draw's records carry), for
+// the command processor; 0 when not known.
+std::uint64_t gx_view_gen_by_id(std::uint32_t id);
 // Shader-resource views (0x25669a0) and samplers (0x2565b40)
 // are registered too, with their T# (at +0x10) or S# (at +0x0) hashed at
 // creation (gx_words_hash of the 32 bytes). The id of `object` and that hash.

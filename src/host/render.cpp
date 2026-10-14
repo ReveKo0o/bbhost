@@ -1501,7 +1501,7 @@ std::uint64_t steady_ms() {
         std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
 #endif
 }
-std::uint64_t g_rt_write_seq = 0;  // under g.mu
+std::uint64_t g_rt_writes = 0;  // under g.mu: RtImage::last_write
 // A draw, a fill or a copy wrote the target (the reuse retire's age and order).
 // The time is read again once a flip and every 64 writes: every target of
 // every draw comes here, and the clock was 2.3% of the command processor in
@@ -1515,12 +1515,26 @@ void rt_written(RtImage& r) {
     }
     r.written_flip = f;
     r.written_ms = ms;
-    r.written_seq = ++g_rt_write_seq;
+    r.written_seq = hle_gnm_cp_job_seq();
+    r.last_write = ++g_rt_writes;
+}
+// The generation of the live GX texture whose memory a target or snapshot
+// made at `base` starts in (0: none): the target is that resource's image.
+// By its first byte: the target's size as the registers pad it can run past
+// the texture's.
+std::uint64_t rt_resource_gen(std::uint64_t base, std::size_t) {
+    GxResourceInfo r;
+    return gx_resource_at(base, 1, &r) && r.type >= 2 ? r.gen : 0;
 }
 // The reuse retire's bases and when it retired them, to count a target made
 // again at a base it had retired within the idle time - the sign of retiring
 // too early (each such remake costs an allocation and the old contents).
 std::unordered_map<std::uint64_t, std::uint64_t> g_reuse_retired_at;  // under g.mu
+// Bases whose target went with its GX resource, and when: a target made there
+// again within the reuse idle time is counted (g_gen_remade) - the memory's
+// next resource, drawn into soon after (render_retire_generation_locked).
+std::unordered_map<std::uint64_t, std::uint64_t> g_gen_retired_at;  // under g.mu
+std::uint64_t g_gen_remade = 0;                                     // under g.mu
 std::uint64_t g_reuse_remade = 0;                                     // under g.mu
 // BBHOST_IMG_REUSE_IDLE=<s>: how long nothing may have written an image before
 // the reuse retire looks at it (10 s).
@@ -1777,6 +1791,11 @@ RtImage* rt_image(std::uint64_t base, VkFormat format, std::uint32_t width, std:
     g_max_rt_bytes = std::max<std::uint64_t>(g_max_rt_bytes, rt_size_bytes(created));
     rt_written(created);
     created.created_flip = created.written_flip;
+    created.gx_gen = rt_resource_gen(base, rt_size_bytes(created));
+    if (auto ga = g_gen_retired_at.find(base); ga != g_gen_retired_at.end()) {
+        if (created.written_ms - ga->second < reuse_idle_ms()) ++g_gen_remade;
+        g_gen_retired_at.erase(ga);
+    }
     if (auto ra = g_reuse_retired_at.find(base); ra != g_reuse_retired_at.end()) {
         if (created.written_ms - ra->second < reuse_idle_ms()) {
             if (++g_reuse_remade <= 8) {
@@ -10212,6 +10231,7 @@ RtImage* make_copy_snapshot_locked(std::uint64_t src_base, std::uint64_t dst_bas
     g_max_rt_bytes = std::max<std::uint64_t>(g_max_rt_bytes, rt_size_bytes(made));
     rt_written(made);
     made.created_flip = made.written_flip;
+    made.gx_gen = rt_resource_gen(dst_base, rt_size_bytes(made));
     bump_view_epoch();
     return &made;
 }
@@ -10843,11 +10863,71 @@ bool render_target_newer_overlapping_locked(std::uint64_t va, std::size_t bytes,
     return scan(g_rts) || scan(g_snapshots);
 }
 
+std::uint64_t g_gen_retired_targets = 0, g_gen_retired_bytes = 0, g_gen_kept_written = 0;  // under g.mu
+
+void render_retire_generation_locked(std::uint64_t base, std::size_t bytes, std::uint64_t gen, std::uint64_t after_submitted) {
+    bool any = false;
+    for (int k = 0; k < 2; ++k) {
+        std::map<std::uint64_t, RtImage>& m = k ? g_snapshots : g_rts;
+        for (auto it = m.lower_bound(base); it != m.end() && it->first < base + bytes;) {
+            RtImage& r = it->second;
+            if (r.gx_gen != gen) {
+                ++it;
+                continue;
+            }
+            if (r.written_seq > after_submitted) {
+                // Drawn into by a submission made after its resource died: the
+                // memory's newer resource took it over (same base and shape).
+                r.gx_gen = rt_resource_gen(r.base, rt_size_bytes(r));
+                ++g_gen_kept_written;
+                ++it;
+                continue;
+            }
+            static std::atomic<int> logs{0};
+            if (logs.fetch_add(1) < 8) {
+                host_log("render: %s 0x%llx %ux%u format %d (%llu MiB) retired with its GX resource (generation %llu)",
+                         k ? "snapshot" : r.depth ? "depth target" : "colour target", static_cast<unsigned long long>(r.base), r.width, r.height,
+                         static_cast<int>(r.format), static_cast<unsigned long long>(r.memory.size >> 20), static_cast<unsigned long long>(gen));
+            }
+            ++g_gen_retired_targets;
+            g_gen_retired_bytes += r.memory.size;
+            if (!k) {
+                if (g_gen_retired_at.size() > 65536) g_gen_retired_at.clear();
+                g_gen_retired_at[r.base] = steady_ms();
+            }
+            tex_event(r.base, rt_size_bytes(r), "%s 0x%llx %ux%u format %d retired with its GX resource (generation %llu)",
+                      k ? "snapshot" : r.depth ? "depth target" : "colour target", static_cast<unsigned long long>(r.base), r.width, r.height,
+                      static_cast<int>(r.format), static_cast<unsigned long long>(gen));
+            // What was learned about the memory as this target - its unpadded
+            // extent, a clear waiting for it - was this resource's.
+            if (!k) {
+                g_rt_real_width.erase(r.base);
+                g_rt_real_height.erase(r.base);
+            }
+            textures_drop_rt_regions_locked(it->first);
+            destroy_rt_image(r);
+            it = m.erase(it);
+            any = true;
+        }
+    }
+    if (any) {
+        ++g_rt_gen;
+        bump_view_epoch();
+    }
+}
+
 void render_orphans_locked(OrphanImages out[2]) {
     out[0] = out[1] = OrphanImages{};
     for (int k = 0; k < 2; ++k) {
         for (const auto& [base, r] : k ? g_snapshots : g_rts) {
             if (!r.image) continue;
+            if (r.gx_gen) {
+                GxResourceInfo live;
+                if (!gx_resource_at(base, 1, &live) || live.gen != r.gx_gen) {
+                    ++out[k].gone;
+                    out[k].gone_bytes += r.memory.size;
+                }
+            }
             const std::size_t span = std::max<std::size_t>(rt_size_bytes(r), 1);
             if (gx_resource_at(base, span, nullptr)) continue;
             if (gx_resource_overlapping(base, span, nullptr)) {
@@ -10945,10 +11025,14 @@ void image_reuse_sweep_locked() {
 }
 
 std::string image_reuse_report_locked() {
-    char buf[320];
+    char buf[480];
     std::snprintf(buf, sizeof(buf),
+                  "targets and snapshots retired with their GX resource %llu (%llu MiB), kept as drawn after it died %llu, targets made again "
+                  "there within the idle time %llu; "
                   "images retired as their memory went to newer objects: targets and snapshots %llu (%llu MiB), shader-written textures %llu "
                   "(%llu MiB); targets made again within the idle time %llu; %llu sweeps, %llu us on average, the longest %llu us",
+                  static_cast<unsigned long long>(g_gen_retired_targets), static_cast<unsigned long long>(g_gen_retired_bytes >> 20),
+                  static_cast<unsigned long long>(g_gen_kept_written), static_cast<unsigned long long>(g_gen_remade),
                   static_cast<unsigned long long>(g_reuse_targets.n), static_cast<unsigned long long>(g_reuse_targets.bytes >> 20),
                   static_cast<unsigned long long>(g_reuse_textures.n), static_cast<unsigned long long>(g_reuse_textures.bytes >> 20),
                   static_cast<unsigned long long>(g_reuse_remade), static_cast<unsigned long long>(g_reuse_sweeps),
@@ -12871,7 +12955,7 @@ std::uint64_t g_cv_stencil_by_htile = 0, g_cv_depth_by_htile = 0, g_cv_stencil_k
 // the clears of an image no draw had bound since its last clear; by image.
 std::uint64_t g_cv_bytes[kCvKinds] = {}, g_cv_pass_ends[kCvKinds] = {}, g_cv_again[kCvKinds] = {};  // under g.mu
 struct ClearCost {
-    std::uint64_t clears = 0, bytes = 0, again = 0, written_seq = 0;
+    std::uint64_t clears = 0, bytes = 0, again = 0, last_write = 0;
     std::uint32_t width = 0, height = 0, layers = 0;
     int kind = 0;
 };
@@ -13030,7 +13114,7 @@ bool host_gpu_clear_view(const GpuClearView& c, bool apply, GpuClearViewResult* 
         ClearCost& cc = g_cv_by_image[r->base];
         // rt_written stamps an image at every draw that binds it (target_image)
         // and at this clear: unchanged since the last clear, no draw came between.
-        if (cc.clears && cc.written_seq == r->written_seq) {
+        if (cc.clears && cc.last_write == r->last_write) {
             ++cc.again;
             ++g_cv_again[kind];
         }
@@ -13102,14 +13186,14 @@ bool host_gpu_clear_view(const GpuClearView& c, bool apply, GpuClearViewResult* 
         }
         ++g_vc_set;
         rt_written(*r);
-        g_cv_by_image[r->base].written_seq = r->written_seq;
+        g_cv_by_image[r->base].last_write = r->last_write;
         return true;
     }
     if (!c.depth) {
         clear_image_locked(*r, c.rgba, first, count);
         note_fill_last(*r, r->base, rt_size_bytes(*r), c.rgba);
         rt_written(*r);
-        g_cv_by_image[r->base].written_seq = r->written_seq;
+        g_cv_by_image[r->base].last_write = r->last_write;
         return true;
     }
     // An HTILE clear an earlier fill left for this target's next draw is
@@ -13128,7 +13212,7 @@ bool host_gpu_clear_view(const GpuClearView& c, bool apply, GpuClearViewResult* 
     if (!planes.depth || (has_stencil && !planes.stencil)) ++g_cv_aspects[kind];
     clear_depth_layers_locked(*r, planes.depth, planes.stencil, planes.depth_value, planes.stencil_value, first, count);
     rt_written(*r);
-    g_cv_by_image[r->base].written_seq = r->written_seq;
+    g_cv_by_image[r->base].last_write = r->last_write;
     return true;
 }
 

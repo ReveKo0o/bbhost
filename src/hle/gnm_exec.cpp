@@ -2657,6 +2657,7 @@ struct Job {
     std::vector<std::pair<const void*, std::size_t>> guest;  // the originals, for the snapshot comparison
     std::function<void()> done;
     std::uint64_t free_event = 0;  // g_arena_free_event when submitted (BBHOST_ARENA_MONITOR)
+    std::uint64_t seq = 0;         // its place among every submission (hle_gnm_submitted_total once it was counted)
 };
 
 std::vector<std::pair<const void*, std::size_t>> snapshot_cbs(const std::vector<std::pair<const void*, std::size_t>>& in,
@@ -2684,6 +2685,10 @@ struct Queue {
 };
 std::mutex g_queues_mu;
 std::atomic<std::uint64_t> g_submitted_total{0}, g_retired_total{0};
+// The submission the calling command-processor thread is walking (Job::seq): a
+// resource whose images something wrote in a submission made after the
+// resource died has a newer owner (host textures' and targets' retirement).
+thread_local std::uint64_t t_cp_job_seq = 0;
 std::unordered_map<int, Queue*> g_queues;
 
 // BBHOST_CPUPROFILE=<file>:<first flip>:<last flip>: sample the graphics
@@ -2773,6 +2778,7 @@ void cp_thread(Queue* q, int id) {
         }
         cpu_profile_tick(profile);
         t_job_free_event = g_arena_monitor ? job.free_event : ~0ull;
+        t_cp_job_seq = job.seq;
         for (const auto& cb : job.cbs) note_command_buffer(reinterpret_cast<std::uintptr_t>(cb.first), cb.second);
         for (const auto& cb : job.ce_cbs) note_command_buffer(reinterpret_cast<std::uintptr_t>(cb.first), cb.second);
         for (std::size_t i = 0; i < job.cbs.size(); ++i) {
@@ -2991,7 +2997,7 @@ void hle_gnm_submit_async(int queue_id, const std::vector<std::pair<const void*,
     }
     q->jobs.back().free_event = g_arena_free_event.load(std::memory_order_relaxed);
     ++q->submitted;
-    g_submitted_total.fetch_add(1, std::memory_order_release);
+    q->jobs.back().seq = g_submitted_total.fetch_add(1, std::memory_order_release) + 1;
     q->cv.notify_all();
     // Do not let the game get far ahead of the command processor. On hardware
     // the GPU consumes a command buffer as it is submitted; here a software
@@ -3072,6 +3078,7 @@ std::string hle_gnm_flush_reasons() {
 // Lock-free totals for the texture cache's retirements, which run on the
 // command processor itself (the queue locks may be held there).
 std::uint64_t hle_gnm_submitted_total() { return g_submitted_total.load(std::memory_order_acquire); }
+std::uint64_t hle_gnm_cp_job_seq() { return t_cp_job_seq; }
 std::uint64_t hle_gnm_retired_total() { return g_retired_total.load(std::memory_order_acquire); }
 
 std::uint64_t hle_gnm_cp_backlog() {

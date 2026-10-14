@@ -96,6 +96,9 @@ std::uint64_t hle_gnm_cp_backlog();
 // `retired` reaches it.
 std::uint64_t hle_gnm_submitted_total();
 std::uint64_t hle_gnm_retired_total();
+// The submission the calling command-processor thread is walking, numbered as
+// hle_gnm_submitted_total counts them (1 the first); 0 on any other thread.
+std::uint64_t hle_gnm_cp_job_seq();
 std::string hle_gnm_flush_reasons();
 // BBHOST_ARENA_MONITOR=1: per-flip scan of the game's command-arena markers
 // (logs `arena: LOW`). The report carries the arena-wait counts whenever the
