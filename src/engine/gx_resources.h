@@ -42,6 +42,12 @@ struct GxResourceInfo {
     bool initial_data = false;
     bool alive = true;
     std::uint64_t created_flip = 0;
+    // The resource's generation: a host number given at registration, one
+    // counter for every resource, never reused (GX's 24-bit id is unique too,
+    // but wraps). A resource made later over the same memory has another, so
+    // (memory, generation) names one resource across destruction and reuse.
+    std::uint64_t gen = 0;
+    std::uint8_t bind = 0;  // GX's bind flags (+0x3b), as the creator stored them
 };
 // A guest address as Binary Ninja shows it (the preferred slide).
 std::uint64_t gx_guest_to_bn(std::uint64_t va);
@@ -56,6 +62,13 @@ bool gx_resource_at(std::uint64_t va, std::size_t bytes, GxResourceInfo* out);
 // The first live resource whose memory overlaps [va, va + bytes) at all, if
 // any (the census of surfaces no resource covers whole).
 bool gx_resource_overlapping(std::uint64_t va, std::size_t bytes, GxResourceInfo* out);
+// The live resource a GX holder (the object GX's methods take: CopyResource's,
+// a view's +0x08) stands for, if the registry has it - by identity, not by
+// address. A 1D texture's holder is found by its memory (+0x20).
+bool gx_resource_by_holder(std::uint64_t holder, GxResourceInfo* out);
+// The live resource behind a render-target, depth-stencil or shader-resource
+// view (its holder at +0x08).
+bool gx_view_resource(std::uint64_t view, GxResourceInfo* out);
 // Whether a live resource made after flip `after_flip` holds memory in
 // [va, va + bytes): the game gave that memory to something newer.
 bool gx_resource_newer_overlapping(std::uint64_t va, std::size_t bytes, std::uint64_t after_flip);

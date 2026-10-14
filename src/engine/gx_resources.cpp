@@ -150,6 +150,7 @@ std::mutex g_mu;
 std::unordered_map<std::uint64_t, Entry> g_by_holder;      // under g_mu
 std::map<std::uint64_t, std::uint64_t> g_by_memory;        // memory base -> holder, live entries only
 std::atomic<std::uint64_t> g_write_seq{1};
+std::atomic<std::uint64_t> g_gen_next{1};  // GxResourceInfo::gen
 
 // Counters.
 std::atomic<std::uint64_t> g_created[5] = {}, g_created_with_data[5] = {}, g_created_bytes[5] = {};
@@ -263,6 +264,8 @@ void register_holder(std::uint64_t key, std::uint64_t holder, Kind kind, bool in
         !rd(holder + 0x38, &e.info.type) || !rd(holder + 0x39, &e.info.usage)) {
         return;
     }
+    rd(holder + 0x3b, &e.info.bind);
+    e.info.gen = g_gen_next.fetch_add(1, std::memory_order_relaxed);
     e.info.id = id & 0xffffff;
     e.info.initial_data = initial_data;
     e.info.write_seq = initial_data ? g_write_seq.fetch_add(1, std::memory_order_relaxed) + 1 : 0;
@@ -918,6 +921,23 @@ bool gx_resource_at(std::uint64_t va, std::size_t bytes, GxResourceInfo* out) {
     g_lookup_hits.fetch_add(1, std::memory_order_relaxed);
     if (out) *out = r;
     return true;
+}
+
+bool gx_resource_by_holder(std::uint64_t holder, GxResourceInfo* out) {
+    if (!holder) return false;
+    std::uint64_t memory = 0;
+    const bool have_memory = rd(holder + 0x20, &memory);
+    std::lock_guard<std::mutex> lk(g_mu);
+    auto h = g_by_holder.find(holder);
+    if (h == g_by_holder.end() && have_memory && memory) h = g_by_holder.find(kMemoryKey | memory);
+    if (h == g_by_holder.end() || !h->second.info.alive) return false;
+    if (out) *out = h->second.info;
+    return true;
+}
+
+bool gx_view_resource(std::uint64_t view, GxResourceInfo* out) {
+    std::uint64_t holder = 0;
+    return view && rd(view + 0x08, &holder) && gx_resource_by_holder(holder, out);
 }
 
 bool gx_resource_overlapping(std::uint64_t va, std::size_t bytes, GxResourceInfo* out) {
