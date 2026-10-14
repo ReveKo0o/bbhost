@@ -2086,6 +2086,44 @@ public:
         return out;
     }
 
+    // --bench: the dispatch from the captured inputs, `repeat` times in one
+    // submission (each repeat from the pages as the last left them: the
+    // counters and append buffers keep moving, as a run of frames would),
+    // with GPU timestamps around the dispatches only; milliseconds a dispatch.
+    double time_dispatches(bool with_variant, std::uint32_t repeat) {
+        if (!dev_.timestamp_period_ns) fail("timing needs timestamp queries, which this queue lacks");
+        const auto& start = before();
+        if (!start.empty()) std::memcpy(pages_.map, start.data(), start.size());
+        for (Storage& st : storage_) upload(dev_, st.img, st.aspect, cap_.blob(st.before), st.subs, VK_IMAGE_LAYOUT_GENERAL);
+        VkQueryPoolCreateInfo qci{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+        qci.queryType = VK_QUERY_TYPE_TIMESTAMP;
+        qci.queryCount = 2;
+        VkQueryPool qpool = VK_NULL_HANDLE;
+        check(vkCreateQueryPool(dev_.device, &qci, nullptr, &qpool), "vkCreateQueryPool");
+        dev_.submit([&](VkCommandBuffer cmd) {
+            vkCmdResetQueryPool(cmd, qpool, 0, 2);
+            VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+            mb.srcAccessMask = VK_ACCESS_HOST_WRITE_BIT;
+            mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, with_variant ? variant_pipeline_ : pipeline_);
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, layout_, 0, 1, &set_, 0, nullptr);
+            vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, qpool, 0);
+            for (std::uint32_t k = 0; k < repeat; ++k) {
+                vkCmdDispatch(cmd, groups_[0], groups_[1], groups_[2]);
+                mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+                mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+                vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
+            }
+            vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, qpool, 1);
+        });
+        std::uint64_t ts[2] = {};
+        check(vkGetQueryPoolResults(dev_.device, qpool, 0, 2, sizeof(ts), ts, 8, VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT),
+              "vkGetQueryPoolResults");
+        vkDestroyQueryPool(dev_.device, qpool, nullptr);
+        return ts[1] > ts[0] ? static_cast<double>(ts[1] - ts[0]) * dev_.timestamp_period_ns / 1e6 / repeat : 0.0;
+    }
+
     Output live() const {
         Output out;
         out.pages = cap_.blob(json::str(json::member(cap_.m, "memory"), "after"));
@@ -2452,6 +2490,38 @@ int dispatch_replay_main(const Options& o, const Capture& cap, const fs::path& o
         comparisons.set("A_vs_variant", vj);
     }
     report.set("comparisons", comparisons);
+    if (o.bench) {
+        // The captured module and the variant in alternating batches of
+        // o.bench dispatches; warm-up batches discarded; medians.
+        constexpr int kWarmup = 3, kBatches = 16;
+        std::vector<double> captured_ms, variant_ms;
+        for (int k = 0; k < kWarmup + kBatches; ++k) {
+            double tc = 0.0, tv = 0.0;
+            if (!o.cs.empty() && k % 2) {
+                tv = r.time_dispatches(true, o.bench);
+                tc = r.time_dispatches(false, o.bench);
+            } else {
+                tc = r.time_dispatches(false, o.bench);
+                if (!o.cs.empty()) tv = r.time_dispatches(true, o.bench);
+            }
+            if (k < kWarmup) continue;
+            captured_ms.push_back(tc);
+            if (!o.cs.empty()) variant_ms.push_back(tv);
+        }
+        const auto median = [](std::vector<double> v) {
+            std::sort(v.begin(), v.end());
+            return v.empty() ? 0.0 : v[v.size() / 2];
+        };
+        json::Value bench = json::Value::make_object();
+        bench.set("dispatches_per_batch", o.bench);
+        bench.set("captured_median_ms", median(captured_ms));
+        std::printf("  bench: captured module %.4f ms a dispatch (median of %zu batches of %u)\n", median(captured_ms), captured_ms.size(), o.bench);
+        if (!variant_ms.empty()) {
+            bench.set("variant_median_ms", median(variant_ms));
+            std::printf("  bench: variant %.4f ms a dispatch\n", median(variant_ms));
+        }
+        report.set("bench", bench);
+    }
     const auto say = [](const char* what, const DispatchReplayer::Difference& d) {
         std::printf("  %s: %s%s%s\n", what, d.same ? "same" : "DIFFERENT", d.what.empty() ? "" : " - ", d.what.c_str());
     };
