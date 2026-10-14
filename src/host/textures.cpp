@@ -4285,7 +4285,9 @@ std::string textures_census_window_locked() {
                   "(textures %llu, mirrors %llu; mprotect %.1f ms), pages released %llu (textures %llu, mirrors %llu), remaps %llu",
                   static_cast<ull>(ws.faults - last.faults), static_cast<ull>(ws.faults_by_owner[1] - last.faults_by_owner[1]),
                   static_cast<ull>(ws.faults_by_owner[2] - last.faults_by_owner[2]), static_cast<ull>(ws.faults_by_owner[3] - last.faults_by_owner[3]),
-                  static_cast<ull>(ws.faults_by_owner[0] - last.faults_by_owner[0]), (ws.fault_handler_ns - last.fault_handler_ns) / 1e6,
+                  static_cast<ull>(ws.faults_by_owner[0] - last.faults_by_owner[0]),
+                  // converted from TSC ticks at the session's rate so far, which moves: clamped at 0
+                  ws.fault_handler_ns > last.fault_handler_ns ? (ws.fault_handler_ns - last.fault_handler_ns) / 1e6 : 0.0,
                   static_cast<ull>(ws.arms - last.arms), static_cast<ull>(ws.arms_by_owner[1] - last.arms_by_owner[1]),
                   static_cast<ull>(ws.arms_by_owner[2] - last.arms_by_owner[2]), (ws.arm_ns - last.arm_ns) / 1e6,
                   static_cast<ull>([&] {
