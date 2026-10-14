@@ -167,7 +167,9 @@ until the path is shown equal to the direct one in game.
   back to the lift's instruction: floats are `precise` (NoContraction); where
   HLSL's spelling is another instruction - `sign`, `ldexp`, `mad` (which DXC
   makes a fused multiply-add a driver must not split), `fmin`/`fmax`, the
-  half packing, bitfield extracts - the operation is inline SPIR-V; the
+  half packing, bitfield extracts, carries, borrows and wide multiplies - the
+  operation is inline SPIR-V (spelled out instead, the wide multiplies made
+  modules the NVIDIA driver's compiler refused); the
   helper-lane query is the built-in, which keeps `discard` an `OpKill`; quad
   operations are `QuadReadLaneAt`/`QuadReadAcross*`; an invariant position
   (`BBHOST_VS_INVARIANT=1`) keeps its decoration. Each compiled module is
@@ -194,7 +196,20 @@ until the path is shown equal to the direct one in game.
   behind a generated hull, a hull with its outputs stored from inside it,
   since random constants give factors that cull every patch).
   `tools/hlsl_verify.py` replays captured draws and dispatches with DXC's
-  stage against the lift's.
+  stage against the lift's: identical on lavapipe and on an RTX 4070, and
+  `hlsl_equiv --compile` asks a device's compiler to build every compute
+  module.
+- **In game.** At the title screen, every lift through DXC, the frames equal
+  the direct path's except the animated menu highlight, which differs between
+  any two runs. At three places in the world (Central Yharnam, Cathedral
+  Ward, the Forbidden Woods' tessellated meshes), two passes each way: every
+  frame, the frame rate and the GPU time within the runs' own noise; no lift
+  kept, no draw failure, no device loss. A cold start compiles ~2,500
+  modules at the title (~440 s of worker time; with 16 workers the
+  precompile ends 10-25 s later) and stalls up to ~0.7 s on arriving
+  somewhere new; warm, nothing is compiled and starts and arrivals are the
+  direct path's. With `BBHOST_HLSL=2` the first start is as fast as the
+  direct path's and the next takes what it compiled.
 - **DXC.** bbhost loads libdxcompiler (`dxcompiler.dll` on Windows) at run
   time, from beside the executable or the library path, and needs nothing
   else of it (not `dxil.dll`); without it the switch keeps every lift. A
@@ -219,8 +234,8 @@ until the path is shown equal to the direct one in game.
 |---|---|
 | `gcn2spv` | translates and validates every shader in the game's bundles |
 | `gcn2hlsl` | lifts every shader in the bundles, prints it as HLSL, compiles it with DXC and checks the module against the lift (`--tess` for the tessellation stages; `--spv` for one module) |
-| `hlsl_equiv` | each lift and its DXC module on the same random inputs (on lavapipe), outputs compared bit for bit |
-| `tools/hlsl_verify.py` | captured draws replayed with DXC's stage against the lift's |
+| `hlsl_equiv` | each lift and its DXC module on the same random inputs (on lavapipe), outputs compared bit for bit: pixel, vertex, LS, hull and domain shaders; `--compile` has a device's compiler build each compute module |
+| `tools/hlsl_verify.py` | captured draws and dispatches replayed with DXC's stage against the lift's |
 | `gcndis` | disassembles GCN programs |
 | F12 in game | dumps the frame, every render target and the draw list into a folder of its own (`tools/f12_check.py` reads it; `BBHOST_F12_PNG=1` for PNG) |
 | `BBHOST_CAPTURE_DRAW` + `drawreplay` | captures one draw with its inputs and replays it outside the game; `BBHOST_CAPTURE_DISPATCH` does the same for a compute dispatch |
