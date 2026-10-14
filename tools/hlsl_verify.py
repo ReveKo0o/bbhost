@@ -3,7 +3,9 @@
 
 For each draw capture under CAPTURES (a directory of capture directories, as
 `BBHOST_CAPTURE_DRAW='*ps'` or `'*'` writes them) whose bound pixel or vertex
-shader is a lift (the manifest's translate.ps_lifted / vs_lifted), runs
+shader is a lift (the manifest's translate.ps_lifted / vs_lifted), and each
+dispatch capture (BBHOST_CAPTURE_DISPATCH) whose compute shader is one
+(translate.lifted; stage cs), runs
 
     gcn2hlsl --spv <capture>/blobs/<stage>-spirv.bin --out <out>/<name>/<stage>
     drawreplay <capture> --<stage> <out>/<name>/<stage>.dxc.spv --no-live --out <out>/<name>/replay-<stage>
@@ -11,9 +13,12 @@ shader is a lift (the manifest's translate.ps_lifted / vs_lifted), runs
 gcn2hlsl prints the captured lift as HLSL and compiles it with DXC (the module
 the game would bind with BBHOST_HLSL=1); drawreplay renders the draw with the
 captured modules (A, the lift) and again with DXC's stage (the variant), and
-compares the outputs byte for byte. --lavapipe <manifest> replays on Mesa's
-CPU Vulkan driver, named by its ICD manifest (lvp_icd.*.json): repeatable,
-independent of the GPU's scheduling. Without it the replay runs on the
+compares the outputs byte for byte (a dispatch's counters exactly, the
+records it appends as a multiset: "identical, records reordered" when only
+their order differs). --lavapipe <manifest> replays on Mesa's CPU Vulkan
+driver, named by its ICD manifest (lvp_icd.*.json): repeatable, independent
+of the GPU's scheduling, and with one thread (LP_NUM_THREADS=1 unless set)
+so a dispatch's appends land in one order. Without it the replay runs on the
 system's device.
 
 Prints one line per capture and stage and the totals: identical (with the
@@ -78,7 +83,11 @@ def verify(capture, stage, out, args, env):
         row["status"] = "error"
         row["detail"] = ["no manifest"]
         return row
-    lifted = (m.get("translate") or {}).get("ps_lifted" if stage == "ps" else "vs_lifted")
+    translate = m.get("translate") or {}
+    if stage == "cs":
+        lifted = "dispatch" in m and translate.get("lifted")
+    else:
+        lifted = "dispatch" not in m and translate.get("ps_lifted" if stage == "ps" else "vs_lifted")
     blob = capture / "blobs" / f"{stage}-spirv.bin"
     if not lifted or not blob.is_file():
         row["status"] = "not a lift"
@@ -114,7 +123,10 @@ def verify(capture, stage, out, args, env):
         row["status"] = "not comparable"
         row["detail"] = ["the capture's own replay failed: " + (", ".join(failed) or "no verdict")]
         return row
-    if variant.get("bytes_identical"):
+    if stage == "cs" and variant.get("pass") and not variant.get("bytes_identical"):
+        row["status"] = "identical, records reordered"
+        row["detail"] = [f"{variant.get('reordered_ranges', 0)} written ranges in another order"]
+    elif variant.get("bytes_identical"):
         # The capture's self-checks can fail independently of the variant
         # (a draw that covers nothing); an identical variant is still identical.
         row["status"] = "identical"
@@ -134,7 +146,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("captures", type=Path, help="directory holding the capture directories")
     parser.add_argument("--out", type=Path, required=True, help="output directory (under tmp/ or build/: it holds HLSL made from the game's shaders)")
-    parser.add_argument("--stage", choices=("ps", "vs", "both"), default="both")
+    parser.add_argument("--stage", choices=("ps", "vs", "cs", "all"), default="all")
     parser.add_argument("--gcn2hlsl", type=Path, default=ROOT / "build/gcn2hlsl")
     parser.add_argument("--drawreplay", type=Path, default=ROOT / "build/drawreplay")
     parser.add_argument("--lavapipe", type=Path, metavar="MANIFEST", help="replay on lavapipe (CPU Vulkan), by its ICD manifest")
@@ -149,9 +161,10 @@ def main():
             sys.exit(f"no lavapipe manifest at {args.lavapipe}")
         env["VK_DRIVER_FILES"] = str(args.lavapipe)
         env["VK_ICD_FILENAMES"] = str(args.lavapipe)
+        env.setdefault("LP_NUM_THREADS", "1")
     args.out.mkdir(parents=True, exist_ok=True)
     captures = sorted(p for p in args.captures.iterdir() if (p / "manifest.json").is_file())
-    stages = ("ps", "vs") if args.stage == "both" else (args.stage,)
+    stages = ("ps", "vs", "cs") if args.stage == "all" else (args.stage,)
     rows = []
     for capture in captures:
         for stage in stages:
