@@ -21,7 +21,9 @@
 //     built-in (vk::ext_builtin_input), not IsHelperLane(), which would turn
 //     every discard into a demote;
 //   * quad operations are QuadReadLaneAt / QuadReadAcross*, which DXC lowers
-//     to the lift's OpGroupNonUniformQuadBroadcast / QuadSwap.
+//     to the lift's OpGroupNonUniformQuadBroadcast / QuadSwap;
+//   * an Invariant output (the position, with BBHOST_VS_INVARIANT) keeps the
+//     decoration as [[vk::ext_decorate(18)]] on its member.
 //
 // Tessellation: the LS is a vertex shader whose control point is an array
 // output; the domain shader takes its control points as an OutputPatch and

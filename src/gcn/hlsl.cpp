@@ -651,6 +651,7 @@ private:
         std::string name;        // the static variable
         std::string interp;      // nointerpolation / noperspective / centroid
         bool patch = false;
+        bool invariant = false;  // an output declared Invariant ([[vk::ext_decorate(18)]] on its member)
     };
     std::vector<StageVar> stage_vars;
     std::map<std::uint32_t, std::size_t> stage_index;  // variable -> stage_vars
@@ -881,7 +882,8 @@ private:
             if (decorated(v, spv::DecNoPerspective)) s.interp += "noperspective ";
             if (decorated(v, spv::DecCentroid)) s.interp += "centroid ";
             if (decorated(v, 17 /* Sample */)) s.interp += "sample ";
-            if (decorated(v, spv::DecInvariant)) fail("an invariant output");
+            s.invariant = decorated(v, spv::DecInvariant);
+            if (s.invariant && (s.input || exec_model == spv::EmTessellationControl)) fail("an invariant input or hull output");
             s.patch = decorated(v, spv::DecPatch);
             if (s.patch && !(exec_model == spv::EmTessellationEvaluation && s.input) && !(exec_model == spv::EmTessellationControl && !s.input))
                 fail("a patch variable outside a domain shader's inputs or a hull shader's outputs");
@@ -2362,6 +2364,11 @@ private:
             }
             std::string& st = v.input ? in_struct : out_struct;
             std::string& cp = v.input ? copy_in : copy_out;
+            // Invariant (BBHOST_VS_INVARIANT): DXC takes the decoration on the member.
+            if (v.invariant) {
+                if (v.builtin == 3) fail("invariant clip distances");
+                attr = "[[vk::ext_decorate(18 /* Invariant */)]] " + attr;
+            }
             if (v.builtin == 3) {
                 // ClipDistance: float[n] as SV_ClipDistance0 (and 1 past four).
                 const Type& at = type(v.pointee);
