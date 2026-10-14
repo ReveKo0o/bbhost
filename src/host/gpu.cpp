@@ -5701,7 +5701,7 @@ void submit_locked() {
     flush_deferred_writes_locked();  // (its transfer batch puts deferred copy-backs in place first)
     transfer_flush_locked();
     render_end_pass_locked();
-    view_clears_flush_locked();  // the presenter and the next submission's readers see every clear made so far
+    view_clears_flush_locked(kVcwSubmit);  // the presenter and the next submission's readers see every clear made so far
     stall_test_record_locked();  // BBHOST_TEST_GPU_STALL
     copy_versions_flush_locked();
     // A render target a shortage put in host memory goes back into video
@@ -6574,7 +6574,7 @@ bool host_gpu_dispatch(const GpuDispatch& d_in) {
     stamp.to(kDpPrepare);
     transfer_flush_locked();
     render_end_pass_locked();
-    view_clears_flush_locked();  // a compute shader may read or write any image: no clear stays owed past it
+    view_clears_flush_locked(kVcwDispatch);  // a compute shader may read or write any image: no clear stays owed past it
     copy_versions_flush_locked();  // a compute shader reads memory without looking at them
     stamp.to(kDpFlush);
     // BBHOST_CAPTURE_DISPATCH (draw_capture.h): run everything recorded so

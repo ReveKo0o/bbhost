@@ -980,9 +980,26 @@ struct RtImage {
 std::size_t rt_size_bytes(const RtImage& r);
 // Lazy clears (render.cpp): a clear token's clear owed to `r` made now, by
 // transfer, before something reads or writes the image; every owed clear
-// (a dispatch, the submission, a frame dump).
-void view_clear_apply_locked(RtImage& r);
-void view_clears_flush_locked();
+// (a dispatch, the submission, a frame dump). `why` is what made it, for the
+// exit report.
+enum ViewClearWhy : int {
+    kVcwAttachment,  // a draw binds the image, its pass does not cover it whole
+    kVcwSampled,     // a draw's vertex or pixel stage samples it
+    kVcwTess,        // a tessellated draw (its other stages sample too)
+    kVcwOlder,       // a newer clear of the image does not cover the owed one
+    kVcwClear,       // another clear of the image (the fill path's, DB_RENDER_CONTROL)
+    kVcwCopy,        // a copy reads or writes it
+    kVcwTexture,     // a texture view of it is made (render_target_view, rt_copied_view)
+    kVcwReadback,    // read back to memory
+    kVcwReplaced,    // its image is replaced by another
+    kVcwDispatch,    // a compute dispatch
+    kVcwSubmit,      // the submission
+    kVcwDump,        // a frame dump or capture
+    kVcwOther,
+    kVcwCount
+};
+void view_clear_apply_locked(RtImage& r, int why = kVcwOther);
+void view_clears_flush_locked(int why = kVcwOther);
 // Images over memory the game has given to something newer. On the console a
 // render target, a copy's snapshot or a shader-written texture is only memory:
 // when the game frees it and makes a newer object there, the old contents are
