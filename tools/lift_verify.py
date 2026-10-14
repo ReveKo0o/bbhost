@@ -13,7 +13,10 @@ renders the draw with the captured modules and again with the lifted pixel
 shader, and compares the outputs byte for byte. A draw captured with its lift
 bound (BBHOST_DECOMP, on by default) is replayed against the translation
 instead (--ps <out>/<name>/lift/reference.spv): either way one run has the
-lift and the other the translation.
+lift and the other the translation. With --stage cs the captures are
+BBHOST_CAPTURE_DISPATCH dispatches: drawreplay --cs runs the other compute
+module from the same inputs and compares the guest pages and storage images
+(counters exactly; an append buffer's records in any order: "same records").
 
 Writes <out>/summary.json and prints one line per capture plus the totals:
 lifted and byte-identical, lifted but different, rejected (with the reasons),
@@ -103,6 +106,11 @@ def verify(capture, out, gcnlift, drawreplay, timeout, keep_replay, stage="ps", 
             row["detail"] = ["the capture's own replay failed (drawreplay exit %d: %s)" % (replay.returncode, ", ".join(failed) or "no verdict")]
     elif variant.get("bytes_identical"):
         row["status"] = "identical"
+    elif stage == "cs" and variant.get("pass"):
+        # A dispatch whose append buffers hold the same records in another
+        # order (the order its counter steps landed), everything else equal.
+        row["status"] = "same records"
+        row["detail"] = [variant.get("detail", "")[:300]]
     else:
         row["status"] = "different"
         row["detail"] = [json.dumps({k: v for k, v in variant.items() if k not in ("note",)})[:400]]
@@ -118,7 +126,8 @@ def main():
     parser.add_argument("--timeout", type=float, default=300)
     parser.add_argument("--delete-verified", action="store_true", help="remove a capture once its lift is byte-identical")
     parser.add_argument("--keep-replay", action="store_true", help="keep drawreplay's target dumps and heatmaps (default: report.json only)")
-    parser.add_argument("--stage", choices=("ps", "vs"), default="ps", help="lift the pixel (default) or the vertex shader")
+    parser.add_argument("--stage", choices=("ps", "vs", "cs"), default="ps",
+                        help="lift the pixel (default) or the vertex shader, or (cs) a dispatch capture's compute shader")
     parser.add_argument("--specialize", action="store_true",
                         help="replay with the specialization constants bbhost's optimized relink gives (drawreplay --specialize)")
     args = parser.parse_args()
@@ -156,7 +165,7 @@ def main():
     print("totals: " + ", ".join(f"{k} {v}" for k, v in totals.most_common()))
     for why, n in reasons.most_common(12):
         print(f"  {n:3d} rejected: {why}")
-    return 1 if totals.get("different") or totals.get("invalid") else 0
+    return 1 if totals.get("different") or totals.get("invalid") else 0  # "same records" passes
 
 
 if __name__ == "__main__":
