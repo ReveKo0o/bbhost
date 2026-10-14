@@ -4086,7 +4086,8 @@ bool surfaces_may_cover_locked(std::uint64_t va, std::size_t bytes) {
     return false;
 }
 
-int mark_surfaces_dirty_locked(std::uint64_t va, std::size_t bytes) {
+std::atomic<std::uint64_t> g_fill_marks_skipped{0};  // surfaces under a fill, not marked dirty (the fill wrote no memory)
+int mark_surfaces_dirty_locked(std::uint64_t va, std::size_t bytes, bool memory_written) {
     if (!bytes) return 0;
     shadow_written_locked(va, bytes, true);  // GPU copies and fills land here too
     if (!surface_pages(va, va + bytes)) {
@@ -4116,6 +4117,10 @@ int mark_surfaces_dirty_locked(std::uint64_t va, std::size_t bytes) {
     for (Surface* sp : hit) {
         Surface& sf = *sp;
         ++touched;
+        if (!memory_written) {
+            g_fill_marks_skipped.fetch_add(1, std::memory_order_relaxed);
+            continue;
+        }
         // Only lift the throttle - the content hash still decides whether the
         // surface really changed. Forcing the upload instead made a single
         // 16 MiB copy re-upload every texture it covered, every frame.
@@ -4378,6 +4383,8 @@ void textures_report() {
              "resource is gone) %llu; uploads of a GX resource's image not write-watched %llu; checks of a shader-written one not hashed %llu",
              static_cast<unsigned long long>(g_view_other_gen.load()), static_cast<unsigned long long>(g_view_other_gen_kept.load()),
              static_cast<unsigned long long>(g_unwatched_uploads.load()), static_cast<unsigned long long>(g_census_hash_skipped_written.load()));
+    host_log("texture: surfaces under a fill not marked dirty (a fill writes no memory) %llu",
+             static_cast<unsigned long long>(g_fill_marks_skipped.load()));
     host_log("texture: identity (BBHOST_RES_IDENTITY%s): surfaces retired with their generation %llu (%llu of them over memory a newer resource "
              "holds), kept for another generation %llu, kept as written after their resource died %llu; made ahead over another generation's "
              "image %llu",

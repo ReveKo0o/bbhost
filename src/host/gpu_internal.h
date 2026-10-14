@@ -1338,7 +1338,10 @@ bool tsharp_sample_as_2d(std::uint32_t type, std::uint32_t base_array, std::uint
 // from guest memory at their next use (the periodic content hash is too slow
 // for a texture the game rewrites every frame). Caller holds the GPU lock.
 // Returns how many cached surfaces the range overlaps.
-int mark_surfaces_dirty_locked(std::uint64_t va, std::size_t bytes);
+// `memory_written`: false for a fill, which reaches images (a target, HTILE,
+// the textures it clears) and never the guest memory: the surfaces under it are
+// not marked, so nothing hashes their memory for a change that is not there.
+int mark_surfaces_dirty_locked(std::uint64_t va, std::size_t bytes, bool memory_written = true);
 // Whether a cached surface overlaps the range. Caller holds the GPU lock.
 bool surfaces_may_cover_locked(std::uint64_t va, std::size_t bytes);
 // GX's dynamic-buffer copy-backs as copy versions (gpu.cpp): the bytes

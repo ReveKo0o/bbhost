@@ -6656,7 +6656,7 @@ bool host_gpu_dispatch(const GpuDispatch& d_in) {
             // Only what lands on a texture or a render target: the rest are
             // buffers, and hundreds a frame would push the history out.
             const bool on_rt = find_render_target(base) != nullptr;
-            if (mark_surfaces_dirty_locked(base, bytes) || on_rt) {
+            if (mark_surfaces_dirty_locked(base, bytes, false) || on_rt) {
                 tex_event(base, bytes, "fill dispatch %s 0x%llx 0x%zx bytes with %g %g %g %g%s", pl.name.c_str(),
                           static_cast<unsigned long long>(base), bytes, rgba[0], rgba[1], rgba[2], rgba[3],
                           on_rt ? " (render target)" : "");
@@ -7891,7 +7891,7 @@ bool host_gpu_fill(std::uint64_t va, std::size_t bytes, const float rgba[4], std
     if (!g.ok || !bytes) return false;
     hle_gnm_warn_if_command_buffer("fill token", va, bytes);
     const bool on_rt = find_render_target(va) != nullptr;
-    if (mark_surfaces_dirty_locked(va, bytes) || on_rt) {
+    if (mark_surfaces_dirty_locked(va, bytes, false) || on_rt) {
         tex_event(va, bytes, "fill token 0x%llx 0x%zx bytes with %g %g %g %g%s", static_cast<unsigned long long>(va), bytes, rgba[0],
                   rgba[1], rgba[2], rgba[3], on_rt ? " (render target)" : "");
     }
