@@ -17,6 +17,8 @@ lift and the other the translation. With --stage cs the captures are
 BBHOST_CAPTURE_DISPATCH dispatches: drawreplay --cs runs the other compute
 module from the same inputs and compares the guest pages and storage images
 (counters exactly; an append buffer's records in any order: "same records").
+On lavapipe the dispatches run with LP_NUM_THREADS=1 (unless set), so the
+workgroups take their counter steps in the same order in every run.
 
 Writes <out>/summary.json and prints one line per capture plus the totals:
 lifted and byte-identical, lifted but different, rejected (with the reasons),
@@ -26,6 +28,7 @@ its lift has been shown identical, since captures are ~50 MiB each.
 """
 import argparse
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -79,8 +82,14 @@ def verify(capture, out, gcnlift, drawreplay, timeout, keep_replay, stage="ps", 
         row["status"] = "error"
         row["detail"] = ["gcnlift wrote no %s" % other.name]
         return row
+    env = dict(os.environ)
+    if stage == "cs":
+        # lavapipe runs a dispatch's workgroups on one thread, in order, so an
+        # append buffer fills the same way every run and the two compilers'
+        # outputs can be compared byte for byte (a GPU ignores this).
+        env.setdefault("LP_NUM_THREADS", "1")
     replay = subprocess.run([str(drawreplay), str(capture), f"--{stage}", str(other), "--no-live", "--out", str(replay_dir)] +
-                            (["--specialize"] if specialize else []), capture_output=True, text=True, timeout=timeout)
+                            (["--specialize"] if specialize else []), capture_output=True, text=True, timeout=timeout, env=env)
     rep = load(replay_dir / "report.json")
     row["drawreplay_exit"] = replay.returncode
     variant = ((rep or {}).get("comparisons") or {}).get("A_vs_variant")

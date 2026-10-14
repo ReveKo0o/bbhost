@@ -2466,10 +2466,31 @@ int dispatch_replay_main(const Options& o, const Capture& cap, const fs::path& o
         }
         for (std::uint64_t c : r.counters()) std::printf("  counter 0x%llx: %u in the variant\n", static_cast<unsigned long long>(c), r.word(v.pages, c));
     }
-    const bool pass = ab.same && live.same && sv.same;
+    // --no-live (tools/lift_verify.py): the game's own output is reported but
+    // not required - another device rounds its floating point its own way,
+    // and an append buffer's records follow the order its counter steps
+    // landed on the GPU, which a records-as-multiset compare cannot undo when
+    // a record depends on its slot.
+    const bool pass = ab.same && (live.same || !o.live) && sv.same;
+    json::Value overall = json::Value::make_object();
+    overall.set("replay_deterministic", ab.same);
+    overall.set("matches_live", o.live ? json::Value(live.same) : json::Value("not checked"));
+    overall.set("sentinel_sink_left_output_unchanged", sv.same);
+    overall.set("pass", pass);
+    report.set("verdict", overall);
     report.set("pass", pass);
     const std::string text = json::dump(report);
     write_file(out / "report.json", reinterpret_cast<const std::uint8_t*>(text.data()), text.size());
+    // The runs' outputs, for a closer look at a difference: the guest pages in
+    // the capture's page order (as its memory-after blob) and each storage image.
+    const auto dump = [&](const char* run, const DispatchReplayer::Output& x) {
+        write_file(out / (std::string(run) + "-memory.bin"), x.pages.data(), x.pages.size());
+        for (std::size_t k = 0; k < x.images.size(); ++k) {
+            write_file(out / (std::string(run) + "-image" + std::to_string(k) + ".bin"), x.images[k].data(), x.images[k].size());
+        }
+    };
+    dump("A", a);
+    if (!o.cs.empty()) dump("variant", v);
     std::printf("%s: %s\n", (out / "report.json").string().c_str(), pass ? "pass" : "FAIL");
     return pass ? 0 : 1;
 }
