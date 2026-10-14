@@ -6237,8 +6237,22 @@ std::uint32_t host_gpu_dispatch_user_reads() { return t_dispatch_user_reads; }
 // take (their user data stays the token's).
 std::atomic<std::uint64_t> g_cs_records_built{0}, g_cs_records_failed{0};
 
+namespace {
+// What the last host_gpu_dispatch on this thread turned out to be, and its
+// program's name (BBHOST_CP_CENSUS sorts the dispatches by it).
+thread_local GpuDispatchClass t_dispatch_class = kDcNone;
+thread_local const std::string* t_dispatch_name = nullptr;
+}  // namespace
+
+GpuDispatchClass host_gpu_last_dispatch_class(const char** program) {
+    if (program) *program = t_dispatch_name ? t_dispatch_name->c_str() : "-";
+    return t_dispatch_class;
+}
+
 bool host_gpu_dispatch(const GpuDispatch& d_in) {
     t_dispatch_user_reads = 0xffff;
+    t_dispatch_class = kDcFailed;
+    t_dispatch_name = nullptr;
     DispatchStamp stamp;
     GpuPhaseTimer timer(kPhaseLock);
     std::lock_guard<GpuMutex> lock(g.mu);
@@ -6276,6 +6290,7 @@ bool host_gpu_dispatch(const GpuDispatch& d_in) {
     const std::vector<std::uint32_t>& words = cc->words;
     const std::string& name = cc->name;
     const std::uint64_t code_hash = cc->hash;
+    t_dispatch_name = &cc->name;
     stamp.to(kDpProgram);
     if (host_tooling()) {
         g_dispatch_shaders.fetch_add(1, std::memory_order_relaxed);
@@ -6344,6 +6359,7 @@ bool host_gpu_dispatch(const GpuDispatch& d_in) {
     // nothing else.
     if (pl.image_blit) g_dispatch_image_blits.fetch_add(1, std::memory_order_relaxed);
     if (pl.buffer_to_image) g_dispatch_buf_to_image.fetch_add(1, std::memory_order_relaxed);
+    t_dispatch_class = pl.image_blit ? kDcImageBlit : pl.buffer_to_image ? kDcBufferToImage : pl.fill ? kDcFillShader : pl.copy ? kDcCopyShader : kDcShader;
     if (pl.fill) {
         const std::uint32_t* v = &d.user_data[pl.fill_dst_sgpr];
         // V# BASE_ADDRESS is a 40-bit byte address. T#/CB_COLOR are in 256-byte
@@ -6386,6 +6402,7 @@ bool host_gpu_dispatch(const GpuDispatch& d_in) {
                           on_rt ? " (render target)" : "");
             }
             if (render_handle_fill_locked(base, bytes, rgba, d.depth_clear, d.stencil_clear)) {
+                t_dispatch_class = kDcFill;
                 g.dispatches.fetch_add(1);
                 g_dispatch_fills.fetch_add(1, std::memory_order_relaxed);
                 return true;
@@ -6425,6 +6442,7 @@ bool host_gpu_dispatch(const GpuDispatch& d_in) {
         if (render_copy_target_locked(src, dst, bytes, "copy dispatch")) {
             tex_event(dst, bytes, "copy dispatch %s 0x%llx -> 0x%llx 0x%zx bytes: render target copied as an image", pl.name.c_str(),
                       static_cast<unsigned long long>(src), static_cast<unsigned long long>(dst), bytes);
+            t_dispatch_class = kDcCopyImage;
             g.dispatches.fetch_add(1);
             g_dispatch_copies.fetch_add(1, std::memory_order_relaxed);
             return true;

@@ -200,6 +200,9 @@ const GpuDrawInputs* hle_gx_trace_draw(std::uint32_t op, std::uint64_t packet_va
                                        std::uint32_t prim, const std::uint32_t* sh, const std::uint32_t* ctx,
                                        bool* render);
 void hle_gx_trace_dispatch(std::uint32_t op, std::uint64_t packet_va, std::uint32_t x, std::uint32_t cs_lo);
+// The caller (Binary Ninja address) of the Gnm emitter that wrote the packet
+// at `packet_va`, or 0 when no emitter hook saw it (BBHOST_CP_CENSUS).
+std::uint64_t hle_gx_emitter_caller(std::uint64_t packet_va);
 // BBHOST_GX_NATIVE: the CP walked a host-draw token, a NOP whose
 // payload is kGxNativeMagic and a 64-bit id; sh / ctx are its register file.
 // With BBHOST_GX_NATIVE=2 returns the draw's inputs (its GX objects through

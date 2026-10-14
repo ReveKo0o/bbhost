@@ -7003,6 +7003,15 @@ void hle_gx_native_release() {
         t_native_overflow.records.reset();
     }
 }
+std::uint64_t hle_gx_emitter_caller(std::uint64_t packet_va) {
+    std::lock_guard<std::mutex> lk(g_mu);
+    for (std::uint64_t d = 0; d <= 64; d += 4) {
+        const auto it = g_by_packet.find(packet_va - d);
+        if (it != g_by_packet.end()) return bn(it->second.ret);
+    }
+    return 0;
+}
+
 void hle_gx_trace_dispatch(std::uint32_t op, std::uint64_t packet_va, std::uint32_t x, std::uint32_t cs_lo) {
     if (!g_active.load(std::memory_order_relaxed)) return;
     const std::uint64_t flip = hle_video_flip_count();

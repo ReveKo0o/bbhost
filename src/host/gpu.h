@@ -301,6 +301,15 @@ struct CsUserCompare {
     std::uint32_t unit_reg[2] = {}, unit_built[2] = {};
 };
 void host_gpu_compare_cs_user_data(const GxStageRecords& st, const std::uint32_t* reg, std::uint32_t read_mask, CsUserCompare& out);
+// What the last host_gpu_dispatch on this thread was (BBHOST_CP_CENSUS): a
+// fill or a render-target copy done without a shader, a shader the copy and
+// fill detectors recognised but which still ran (an image or buffer-to-image
+// copy, a fill or copy whose range was not a target's), any other shader, or
+// a dispatch that failed. `program`, when given, gets the program's name.
+enum GpuDispatchClass : std::uint8_t {
+    kDcNone, kDcFill, kDcCopyImage, kDcImageBlit, kDcBufferToImage, kDcFillShader, kDcCopyShader, kDcShader, kDcFailed, kDcClasses
+};
+GpuDispatchClass host_gpu_last_dispatch_class(const char** program = nullptr);
 // Queues one draw.
 bool host_gpu_draw(const GpuDraw& d);
 // Runs queued work and waits for it; call before the command processor

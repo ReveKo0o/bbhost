@@ -18,6 +18,10 @@ void host_gpu_queue_lock_only() {}
 bool host_gpu_submit_for_flip(std::uint64_t) { return false; }
 bool host_gpu_display_image(std::uint64_t, void**, std::uint32_t*, std::uint32_t*, std::uint32_t*) { return false; }
 bool host_gpu_dispatch(const GpuDispatch&) { return false; }
+GpuDispatchClass host_gpu_last_dispatch_class(const char** program) {
+    if (program) *program = "-";
+    return kDcNone;
+}
 bool host_gpu_draw(const GpuDraw&) { return false; }
 void host_gpu_flush() {}
 void host_gpu_report() {}

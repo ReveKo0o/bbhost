@@ -24,6 +24,7 @@
 #include <unordered_map>
 #include <utility>
 #include <string>
+#include <tuple>
 #include <vector>
 #include <cstdlib>
 #include <cstring>
@@ -234,6 +235,13 @@ void indirect_log(const char* kind, std::uint64_t args, const std::uint32_t* a, 
 
 void bind_gds_counters(GpuDispatch& d);
 void note_gpu_args(std::uint64_t va, std::size_t bytes);
+// BBHOST_CP_CENSUS=1: the clears and copies still reaching the command
+// processor as packets - each dispatch by what it was and who emitted it, and
+// each DMA_DATA by kind (defined with the packet census below).
+extern const bool g_cp_census;
+void census_dispatch(std::uint64_t packet_va);
+enum CensusDma { kCdFillTarget, kCdFillMemory, kCdCopy, kCdGds, kCdCounter, kCdOther, kCdKinds };
+void census_dma(CensusDma kind, std::size_t bytes);
 
 void run_dispatch(const char* kind, std::uint32_t x, std::uint32_t y, std::uint32_t z, std::uint64_t indirect_va = 0) {
     GpuDispatch d;
@@ -287,6 +295,7 @@ void run_dispatch(const char* kind, std::uint32_t x, std::uint32_t y, std::uint3
     bind_gds_counters(d);
     const bool ran = host_gpu_dispatch(d);
     if (shadow.d) shadow.reads = host_gpu_dispatch_user_reads();
+    if (g_cp_census) census_dispatch(t_packet_va);
     if (!ran) {
         g_dispatch_failed.fetch_add(1);
         static std::atomic<int> logs{0};
@@ -1104,10 +1113,35 @@ bool ce_step() {
 // BBHOST_CP_CENSUS=1: what the command processor still walks,
 // by packet type and dwords, with the NOP payloads (our tokens and Gnmx's
 // markers) told apart by their magic.
-const bool g_cp_census = [] {
+extern const bool g_cp_census = [] {
     const char* e = std::getenv("BBHOST_CP_CENSUS");
     return e && e[0] == '1';
 }();
+std::mutex g_census_dispatch_mu;
+struct DispatchCensusKey {
+    std::uint8_t cls;
+    std::uint64_t caller;
+    std::string program;
+    bool operator<(const DispatchCensusKey& o) const { return std::tie(cls, caller, program) < std::tie(o.cls, o.caller, o.program); }
+};
+std::map<DispatchCensusKey, std::uint64_t> g_census_dispatches;
+std::atomic<std::uint64_t> g_census_dma[kCdKinds] = {}, g_census_dma_bytes[kCdKinds] = {};
+const char* const kDispatchClassName[kDcClasses] = {"none", "fill (no shader)", "render-target copy (no shader)", "image copy shader",
+                                                    "buffer-to-image shader", "fill shader (not a target)", "copy shader (as memory)",
+                                                    "shader", "failed"};
+const char* const kCensusDmaName[kCdKinds] = {"fill clearing a render target", "fill of memory", "copy", "through GDS",
+                                              "counter word", "other"};
+void census_dispatch(std::uint64_t packet_va) {
+    const char* program = nullptr;
+    const GpuDispatchClass cls = host_gpu_last_dispatch_class(&program);
+    const std::uint64_t caller = hle_gx_emitter_caller(packet_va);
+    std::lock_guard<std::mutex> lk(g_census_dispatch_mu);
+    if (g_census_dispatches.size() < 4096) ++g_census_dispatches[{static_cast<std::uint8_t>(cls), caller, program ? program : "-"}];
+}
+void census_dma(CensusDma kind, std::size_t bytes) {
+    g_census_dma[kind].fetch_add(1, std::memory_order_relaxed);
+    g_census_dma_bytes[kind].fetch_add(bytes, std::memory_order_relaxed);
+}
 std::atomic<std::uint64_t> g_census_packets[0x100] = {}, g_census_dwords[0x100] = {};
 std::mutex g_census_mu;
 std::map<std::uint32_t, std::pair<std::uint64_t, std::uint64_t>> g_census_nops;  // magic -> {packets, dwords}
@@ -1606,6 +1640,7 @@ void execute_packet(std::uint32_t op, const std::uint32_t* b, std::size_t n, int
                 const std::uint64_t dst = gpu_va(b[3], b[4]);
                 if (bytes == 0) break;
                 if (src_sel == 1 || dst_sel == 1) {
+                    if (g_cp_census) census_dma(kCdGds, bytes);
                     gds_dma(b, src_sel, dst_sel, bytes);
                     break;
                 }
@@ -1618,6 +1653,7 @@ void execute_packet(std::uint32_t op, const std::uint32_t* b, std::size_t n, int
                 // where the word's value is (CopyStructureCount, a reset).
                 if (host_gpu_gds_counters() && (covers_counter_word(dst, bytes) || (src_sel != 2 && covers_counter_word(gpu_va(b[1], b[2]), bytes)))) {
                     const bool ok = src_sel == 2 ? host_gpu_counter_fill(dst, b[1], bytes) : host_gpu_counter_copy(dst, gpu_va(b[1], b[2]), bytes);
+                    if (ok && g_cp_census) census_dma(kCdCounter, bytes);
                     if (ok) {
                         (src_sel == 2 ? g_counter_writes : g_counter_reads).fetch_add(1, std::memory_order_relaxed);
                         // A count copied out (CopyStructureCount into a draw's
@@ -1646,7 +1682,9 @@ void execute_packet(std::uint32_t op, const std::uint32_t* b, std::size_t n, int
                         if (bytes >= (1u << 20) && logs.fetch_add(1) < 40) {
                             host_log("gnm exec: DMA fill 0x%llx %zu bytes with 0x%08x", static_cast<unsigned long long>(dst), bytes, b[1]);
                         }
-                        if (!host_gpu_clear_target(dst, b[1], bytes)) {
+                        const bool target = host_gpu_clear_target(dst, b[1], bytes);
+                        if (g_cp_census) census_dma(target ? kCdFillTarget : kCdFillMemory, bytes);
+                        if (!target) {
                             // After a passed wait: the words on the GPU's timeline (cp_write_after_waits).
                             thread_local std::vector<std::uint32_t> words;
                             const std::uint32_t* data = nullptr;
@@ -1664,6 +1702,7 @@ void execute_packet(std::uint32_t op, const std::uint32_t* b, std::size_t n, int
                     }
                 } else if (src_sel == 0 || src_sel == 3) {
                     const std::uint64_t src = gpu_va(b[1], b[2]);
+                    if (g_cp_census) census_dma(kCdCopy, bytes);
                     warn_if_over_command_buffer("DMA copy", dst, bytes);
                     if (hle_kernel_va_mapped(src, bytes) && hle_kernel_va_mapped(dst, bytes)) {
                         // After a passed wait: the bytes on the GPU's timeline
@@ -3258,6 +3297,37 @@ void hle_gnm_cp_report() {
             by_reg += buf;
         }
         host_log("cp-census: context/user-config registers still written (dwords), %zu distinct:%s", regs.size(), by_reg.c_str());
+        std::string dma;
+        for (int k = 0; k < kCdKinds; ++k) {
+            if (const std::uint64_t n = g_census_dma[k].load()) {
+                char buf[128];
+                std::snprintf(buf, sizeof(buf), " %s %llu (%.1f MiB);", kCensusDmaName[k], static_cast<unsigned long long>(n),
+                              static_cast<double>(g_census_dma_bytes[k].load()) / (1 << 20));
+                dma += buf;
+            }
+        }
+        host_log("cp-census: DMA_DATA by kind:%s", dma.empty() ? " none" : dma.c_str());
+        std::lock_guard<std::mutex> dlk(g_census_dispatch_mu);
+        std::vector<std::pair<std::uint64_t, const DispatchCensusKey*>> ds;
+        std::uint64_t by_class[kDcClasses] = {};
+        for (const auto& [k, n] : g_census_dispatches) {
+            ds.push_back({n, &k});
+            by_class[k.cls < kDcClasses ? k.cls : 0] += n;
+        }
+        std::sort(ds.begin(), ds.end(), [](const auto& a, const auto& c) { return a.first > c.first; });
+        std::string classes;
+        for (int k = 0; k < kDcClasses; ++k) {
+            if (!by_class[k]) continue;
+            char buf[96];
+            std::snprintf(buf, sizeof(buf), " %s %llu;", kDispatchClassName[k], static_cast<unsigned long long>(by_class[k]));
+            classes += buf;
+        }
+        host_log("cp-census: dispatch packets run, by what they were:%s", classes.empty() ? " none" : classes.c_str());
+        for (std::size_t i = 0; i < ds.size() && i < 40; ++i) {
+            host_log("cp-census:   %8llu %s, program %s, emitted from 0x%llx", static_cast<unsigned long long>(ds[i].first),
+                     kDispatchClassName[ds[i].second->cls < kDcClasses ? ds[i].second->cls : 0], ds[i].second->program.c_str(),
+                     static_cast<unsigned long long>(ds[i].second->caller));
+        }
     }
     std::string dropped;
     for (int k = 0; k < kDroppedDraws; ++k) {
