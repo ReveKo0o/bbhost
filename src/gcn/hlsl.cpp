@@ -1680,50 +1680,32 @@ private:
         fail("opcode " + std::to_string(in.op));
     }
 
-    // IAddCarry, ISubBorrow, UMulExtended, SMulExtended: a struct of two
-    // values, each spelled with the integer arithmetic it is defined by.
+    // IAddCarry, ISubBorrow, UMulExtended, SMulExtended: the lift's own
+    // instruction, inline SPIR-V returning a struct of two members (DXC takes
+    // a struct result: spv_pair_uint { lo, hi }), then each member a value of
+    // its own. Spelled out instead (the high half of a multiply as a 64-bit
+    // multiply and a shift), the RTX's compiler refused some compute modules.
     void extended(const Ins& in) {
         const Type& st = type(in.type);
         if (st.k != TK::Struct || st.members.size() != 2) fail("an extended arithmetic result that is no pair");
         const std::uint32_t mt = st.members[0];
         const char k = kind_of(mt);
         if (k != 'u' && k != 'i') fail("extended arithmetic on 64-bit values");
+        if (st.members[1] != mt) fail("an extended arithmetic result of two types");
         const std::string lo = value_name(in.id) + "_lo", hi = value_name(in.id) + "_hi", tn = type_name(mt);
         parts[in.id] = {lo, hi};
         const bool hoist = hoisted.count(in.id) != 0;
         const auto def = [&](const std::string& n, const std::string& e) { line((hoist ? std::string() : tn + " ") + n + " = " + e + ";"); };
-        const std::string a = as(in.a.at(0), k), b = as(in.a.at(1), k);
-        const std::string au = as(in.a.at(0), 'u'), bu = as(in.a.at(1), 'u');
-        const std::string w = lanes_of(mt) > 1 ? std::to_string(lanes_of(mt)) : std::string();
-        switch (in.op) {
-        case spv::OpIAddCarry:
-            def(lo, a + " + " + b);
-            def(hi, "select(" + std::string(k == 'u' ? lo : "asuint(" + lo + ")") + " < " + au + ", " + zero_one(mt, true) + ", " + zero_one(mt, false) + ")");
-            break;
-        case spv::OpISubBorrow:
-            def(lo, a + " - " + b);
-            def(hi, "select(" + au + " < " + bu + ", " + zero_one(mt, true) + ", " + zero_one(mt, false) + ")");
-            break;
-        case spv::OpUMulExtended:
-            def(lo, a + " * " + b);
-            def(hi, (k == 'u' ? std::string() : "asint(") + "uint" + w + "((uint64_t" + w + "(" + au + ") * uint64_t" + w + "(" + bu + ")) >> 32)" +
-                        (k == 'u' ? "" : ")"));
-            break;
-        case spv::OpSMulExtended: {
-            const std::string ai = as(in.a.at(0), 'i'), bi = as(in.a.at(1), 'i');
-            def(lo, a + " * " + b);
-            def(hi, (k == 'i' ? std::string("asint(") : std::string("asuint(")) + "int" + w + "((int64_t" + w + "(" + ai + ") * int64_t" + w + "(" +
-                        bi + ")) >> 32))");
-            break;
-        }
-        default: break;
-        }
-    }
-    std::string zero_one(std::uint32_t t, bool one) {
-        const char k = kind_of(t);
-        const std::string s = scalar_literal(one ? 1 : 0, k);
-        if (lanes_of(t) == 1) return s;
-        return type_name(t) + "(" + s + ")";
+        const char* fname = in.op == spv::OpIAddCarry ? "spv_iadd_carry" : in.op == spv::OpISubBorrow ? "spv_isub_borrow"
+                          : in.op == spv::OpUMulExtended ? "spv_umul_extended" : "spv_smul_extended";
+        const std::string pair = "spv_pair_" + tn;
+        if (helper_keys.insert("struct " + pair).second) helper_decls.push_back("struct " + pair + " { " + tn + " lo; " + tn + " hi; };");
+        if (helper_keys.insert(std::string(fname) + "_" + tn).second)
+            helper_decls.push_back("[[vk::ext_instruction(" + std::to_string(in.op) + ")]] " + pair + " " + fname + "(" + tn + " a0, " + tn + " a1);");
+        const std::string r = value_name(in.id) + "_r";
+        line(pair + " " + r + " = " + fname + "(" + as(in.a.at(0), k) + ", " + as(in.a.at(1), k) + ");");
+        def(lo, r + ".lo");
+        def(hi, r + ".hi");
     }
 
     void ext_inst(const Ins& in) {
