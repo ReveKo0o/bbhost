@@ -67,7 +67,11 @@ gcn::LiftResult lift_tess_cached(TranslationUse use, const gcn::Program& prog, c
 // again. BBHOST_HLSL_O=0..3 sets DXC's optimization level (default 3),
 // BBHOST_HLSL_DXC the library to load, BBHOST_HLSL_DUMP=<dir> writes each
 // compiled module's HLSL there (made from the game's shaders: it stays on this
-// machine).
+// machine). BBHOST_HLSL=2 compiles behind the game instead: a stage whose
+// module the cache does not have keeps the lifter's SPIR-V for this start,
+// and two bb-hlsl threads (BBHOST_HLSL_THREADS) compile it for the next - the
+// first start after switching costs nothing, the next takes every module it
+// met from the cache.
 bool hlsl_on();
 
 // At device start, after the device's features are given to the translator

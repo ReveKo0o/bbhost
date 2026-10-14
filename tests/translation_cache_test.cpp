@@ -23,6 +23,7 @@
 #include <vector>
 
 std::uint32_t host_thread_id() { return 1; }
+void host_thread_set_name(const char*) {}
 
 using namespace gpu;
 

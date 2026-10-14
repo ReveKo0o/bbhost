@@ -16,6 +16,8 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
+#include <deque>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -690,15 +692,72 @@ void hlsl_keep(const std::string& why) {
 void hlsl_stage(gcn::LiftResult& l, const gcn::TranslateOptions* o = nullptr);
 }  // namespace
 
-bool hlsl_on() {
-    static const bool on = [] {
+int hlsl_mode() {
+    static const int mode = [] {
         const char* e = std::getenv("BBHOST_HLSL");
-        return e && e[0] == '1';
+        return e && (e[0] == '1' || e[0] == '2') && !e[1] ? e[0] - '0' : 0;
     }();
-    return on;
+    return mode;
 }
+bool hlsl_on() { return hlsl_mode() != 0; }
 
 namespace {
+// BBHOST_HLSL=2: bb-hlsl, the compiles behind the game. A stage whose module
+// is not in the cache keeps the lift's SPIR-V for this start; its module is
+// compiled here and kept in the cache for the next.
+struct HlslBehind {
+    struct Job {
+        Key key;
+        std::vector<std::uint32_t> lifted;
+        gcn::HlslOptions hopt;
+    };
+    std::mutex mu;
+    std::condition_variable cv;
+    std::deque<Job> jobs;                                            // under mu
+    std::unordered_map<Key, bool, KeyHash> seen;                     // under mu: queued in this run
+    bool started = false;                                            // under mu
+    std::atomic<std::uint64_t> deferred{0}, done{0}, done_us{0}, failed{0};
+} g_hlsl_behind;
+void hlsl_behind_thread() {
+    host_thread_set_name("bb-hlsl");
+    const Dxc& dxc = hlsl_dxc();
+    for (;;) {
+        HlslBehind::Job job;
+        {
+            std::unique_lock<std::mutex> lk(g_hlsl_behind.mu);
+            g_hlsl_behind.cv.wait(lk, [] { return !g_hlsl_behind.jobs.empty(); });
+            job = std::move(g_hlsl_behind.jobs.front());
+            g_hlsl_behind.jobs.pop_front();
+        }
+        const auto t0 = std::chrono::steady_clock::now();
+        std::string why;
+        const std::vector<std::uint32_t> spirv = hlsl_compile(job.lifted, job.hopt, dxc, why);
+        Writer w;
+        w.u8(spirv.empty() ? 0 : 1);
+        w.words(spirv);
+        w.str(why);
+        store(job.key, w);
+        g_hlsl_behind.done.fetch_add(1, std::memory_order_relaxed);
+        g_hlsl_behind.done_us.fetch_add(us_since(t0), std::memory_order_relaxed);
+        if (spirv.empty()) g_hlsl_behind.failed.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+void hlsl_defer(const Key& key, const std::vector<std::uint32_t>& lifted, const gcn::HlslOptions& hopt) {
+    std::lock_guard<std::mutex> lk(g_hlsl_behind.mu);
+    if (!g_hlsl_behind.seen.try_emplace(key, true).second) return;
+    g_hlsl_behind.jobs.push_back({key, lifted, hopt});
+    g_hlsl_behind.deferred.fetch_add(1, std::memory_order_relaxed);
+    if (!g_hlsl_behind.started) {
+        g_hlsl_behind.started = true;
+        // Two threads (BBHOST_HLSL_THREADS): the module set fills in a few
+        // minutes of play without taking the game's cores.
+        const char* e = std::getenv("BBHOST_HLSL_THREADS");
+        const int n = e && *e ? std::clamp(std::atoi(e), 1, 16) : 2;
+        for (int k = 0; k < n; ++k) std::thread(hlsl_behind_thread).detach();
+    }
+    g_hlsl_behind.cv.notify_one();
+}
+
 void hlsl_stage(gcn::LiftResult& l, const gcn::TranslateOptions* to) {
     if (!hlsl_on() || !l.ok()) return;
     gcn::HlslOptions hopt;
@@ -740,6 +799,9 @@ void hlsl_stage(gcn::LiftResult& l, const gcn::TranslateOptions* to) {
     }
     if (found) {
         g_hlsl.cached.fetch_add(1, std::memory_order_relaxed);
+    } else if (hlsl_mode() == 2 && cache) {
+        hlsl_defer(key, l.spirv, hopt);
+        return;  // the lift's SPIR-V this start
     } else {
         const auto t0 = std::chrono::steady_clock::now();
         spirv = hlsl_compile(l.spirv, hopt, dxc, why);
@@ -982,10 +1044,24 @@ void translation_cache_report() {
             std::lock_guard<std::mutex> lk(g_hlsl.mu);
             for (const auto& [why, n] : g_hlsl.reasons) reasons += "; " + why + " x" + std::to_string(n);
         }
+        std::string behind;
+        if (hlsl_mode() == 2) {
+            std::size_t waiting = 0;
+            {
+                std::lock_guard<std::mutex> lk(g_hlsl_behind.mu);
+                waiting = g_hlsl_behind.jobs.size();
+            }
+            char b[200];
+            std::snprintf(b, sizeof(b), "; %llu kept the lift for this start, their modules compiled on bb-hlsl for the next (%llu done in %.1f s, %llu of "
+                                        "them failed, %zu waiting)",
+                          static_cast<unsigned long long>(g_hlsl_behind.deferred.load()), static_cast<unsigned long long>(g_hlsl_behind.done.load()),
+                          g_hlsl_behind.done_us.load() / 1e6, static_cast<unsigned long long>(g_hlsl_behind.failed.load()), waiting);
+            behind = b;
+        }
         host_log("render: HLSL: %llu lifted stages took DXC's module (%llu compiled at this start in %.1f s of worker time, %llu from the "
-                 "translation cache); %llu kept the lifter's SPIR-V%s",
+                 "translation cache)%s; %llu kept the lifter's SPIR-V%s",
                  static_cast<unsigned long long>(g_hlsl.taken.load()), static_cast<unsigned long long>(g_hlsl.compiled.load()),
-                 g_hlsl.compile_us.load() / 1e6, static_cast<unsigned long long>(g_hlsl.cached.load()),
+                 g_hlsl.compile_us.load() / 1e6, static_cast<unsigned long long>(g_hlsl.cached.load()), behind.c_str(),
                  static_cast<unsigned long long>(g_hlsl.kept.load()), reasons.c_str());
     }
     if (!g_tc_enabled) return;
