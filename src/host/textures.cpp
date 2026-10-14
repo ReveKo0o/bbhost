@@ -3488,6 +3488,17 @@ bool textures_copy_image_region_locked(const GpuImageCopy& c) {
 // processor has retired everything submitted when the resource died, unless
 // a live resource has taken the memory since (its surface is then the new
 // one's, refreshed by the usual path).
+// The copies made of the levels of the surface at `base` (level_alias_view).
+void drop_level_aliases_locked(std::uint64_t base) {
+    for (auto la = g_level_aliases.lower_bound(std::make_tuple(base, 0u, 0u, 0u, std::numeric_limits<int>::min()));
+         la != g_level_aliases.end() && std::get<0>(la->first) == base;) {
+        invalidate_rt_views(la->second.img.base);
+        defer_destroy_view(la->second.img.view);
+        defer_destroy_image(la->second.img.image, la->second.img.memory);
+        la = g_level_aliases.erase(la);
+    }
+}
+
 struct RetireEntry {
     std::uint64_t base;
     std::size_t bytes;
@@ -3585,6 +3596,7 @@ void retire_surfaces_locked() {
             }
             g_retired_surfaces.fetch_add(1, std::memory_order_relaxed);
             g_retired_bytes.fetch_add(sf.total_dst, std::memory_order_relaxed);
+            drop_level_aliases_locked(sf.base);  // copies of its levels, keyed by its base
             for (auto& v : sf.views) defer_destroy_view(v.second);
             if (sf.image) defer_destroy_image(sf.image, sf.memory);
             if (g_last_view_surface == &sf) g_last_view_surface = nullptr;
@@ -3745,13 +3757,7 @@ ReuseRetired textures_retire_reused_locked(std::uint64_t now, std::uint64_t idle
         out.bytes += sf.memory.size;
         // The copies made of its levels go with it: keyed by its base, they
         // would hold their memory until a surface at that base was read again.
-        for (auto la = g_level_aliases.lower_bound(std::make_tuple(sf.base, 0u, 0u, 0u, std::numeric_limits<int>::min()));
-             la != g_level_aliases.end() && std::get<0>(la->first) == sf.base;) {
-            invalidate_rt_views(la->second.img.base);
-            defer_destroy_view(la->second.img.view);
-            defer_destroy_image(la->second.img.image, la->second.img.memory);
-            la = g_level_aliases.erase(la);
-        }
+        drop_level_aliases_locked(sf.base);
         for (auto& v : sf.views) defer_destroy_view(v.second);
         defer_destroy_image(sf.image, sf.memory);
         if (g_last_view_surface == &sf) g_last_view_surface = nullptr;
