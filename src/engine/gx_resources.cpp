@@ -284,6 +284,7 @@ void register_holder(std::uint64_t key, std::uint64_t holder, Kind kind, bool in
     }
     rd(holder + 0x3b, &e.info.bind);
     e.info.gen = g_gen_next.fetch_add(1, std::memory_order_relaxed);
+    e.info.created_submit = hle_gnm_submitted_total();
     e.info.id = id & 0xffffff;
     e.info.initial_data = initial_data;
     e.info.write_seq = initial_data ? g_write_seq.fetch_add(1, std::memory_order_relaxed) + 1 : 0;

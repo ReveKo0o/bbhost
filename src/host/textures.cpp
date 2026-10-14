@@ -2369,7 +2369,7 @@ VkImageView level_alias_view(std::uint64_t base, const std::uint32_t* w, VkForma
 // base that is another generation's image, while the registry says the
 // memory is a newer resource's, is replaced like one of another shape - the
 // memory's previous owner's image is never handed to the resource after it.
-std::atomic<std::uint64_t> g_view_other_gen{0}, g_view_other_gen_kept{0};
+std::atomic<std::uint64_t> g_view_other_gen{0}, g_view_other_gen_kept{0}, g_view_other_gen_adopted{0};
 VkImageView texture_view_uncached(const std::uint32_t* w, bool storage, bool& dims_ok, std::uint32_t& dim, bool& arrayed,
                          bool shader_arrayed, bool r128, std::uint64_t expect_gen = 0) {
     dims_ok = true;
@@ -2597,7 +2597,15 @@ VkImageView texture_view_uncached(const std::uint32_t* w, bool storage, bool& di
             // image (no ping-pong between an old view and the new resource's).
             GxResourceInfo live;
             other_gen = gx_resource_at(sf.base, std::max<std::size_t>(sf.total_src, 1), &live) && live.gen != sf.gx_gen;
-            (other_gen ? g_view_other_gen : g_view_other_gen_kept).fetch_add(1, std::memory_order_relaxed);
+            if (other_gen && sf.written_seq > live.created_submit) {
+                // Written (an upload or copy token, a shader) by a submission
+                // made after the memory's resource was created: its image now.
+                sf.gx_gen = live.gen;
+                other_gen = false;
+                g_view_other_gen_adopted.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                (other_gen ? g_view_other_gen : g_view_other_gen_kept).fetch_add(1, std::memory_order_relaxed);
+            }
             if (other_gen) {
                 tex_event(base, sf.total_src, "replace 0x%llx: the image is generation %llu's, the memory generation %llu's (a view of %llu bound)",
                           static_cast<unsigned long long>(base), static_cast<unsigned long long>(sf.gx_gen), static_cast<unsigned long long>(live.gen),
@@ -3067,7 +3075,7 @@ bool ahead_held_back() {
     return on && vram_within_reserve(256ull << 20);
 }
 
-std::atomic<std::uint64_t> g_ahead_replaced_gen{0};
+std::atomic<std::uint64_t> g_ahead_replaced_gen{0}, g_ahead_adopted{0};
 
 bool textures_create_ahead_locked(const std::uint32_t* w, std::uint64_t gen) {
     const std::uint64_t base = tsharp_base(w);
@@ -3081,6 +3089,15 @@ bool textures_create_ahead_locked(const std::uint32_t* w, std::uint64_t gen) {
             return false;
         }
         Surface& sf = old->second;
+        // Written by a submission made after this resource was created - its
+        // upload tokens, which carry the data it was created with, reached
+        // the image before this job did: the image is this resource's.
+        GxResourceInfo live;
+        if (sf.written_seq && gx_resource_at(base, 1, &live) && live.gen == gen && sf.written_seq > live.created_submit) {
+            sf.gx_gen = gen;
+            g_ahead_adopted.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
         tex_event(base, sf.total_src, "replace 0x%llx: generation %llu's image, made ahead for generation %llu", static_cast<unsigned long long>(base),
                   static_cast<unsigned long long>(sf.gx_gen), static_cast<unsigned long long>(gen));
         for (auto& v : sf.views) defer_destroy_view(v.second);
@@ -4412,8 +4429,10 @@ void textures_report() {
              static_cast<unsigned long long>(g_retired_surfaces.load()), static_cast<unsigned long long>(g_retired_bytes.load() >> 20),
              static_cast<unsigned long long>(g_retire_kept_live.load()));
     host_log("texture: identity: binds through a view of another generation than the surface's: surface replaced %llu, kept (the view's "
-             "resource is gone) %llu; uploads of a GX resource's image not write-watched %llu; checks of a shader-written one not hashed %llu",
+             "resource is gone) %llu, taken by the new resource it was written for %llu; made ahead over such an image instead taken %llu; uploads "
+             "of a GX resource's image not write-watched %llu; checks of a shader-written one not hashed %llu",
              static_cast<unsigned long long>(g_view_other_gen.load()), static_cast<unsigned long long>(g_view_other_gen_kept.load()),
+             static_cast<unsigned long long>(g_view_other_gen_adopted.load()), static_cast<unsigned long long>(g_ahead_adopted.load()),
              static_cast<unsigned long long>(g_unwatched_uploads.load()), static_cast<unsigned long long>(g_census_hash_skipped_written.load()));
     host_log("texture: surfaces under a fill not marked dirty (a fill writes no memory) %llu",
              static_cast<unsigned long long>(g_fill_marks_skipped.load()));

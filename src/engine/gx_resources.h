@@ -48,6 +48,9 @@ struct GxResourceInfo {
     // (memory, generation) names one resource across destruction and reuse.
     std::uint64_t gen = 0;
     std::uint8_t bind = 0;  // GX's bind flags (+0x3b), as the creator stored them
+    // The submissions made when it was created (hle_gnm_submitted_total): a
+    // host image something wrote in a later one is this resource's.
+    std::uint64_t created_submit = 0;
 };
 // A guest address as Binary Ninja shows it (the preferred slide).
 std::uint64_t gx_guest_to_bn(std::uint64_t va);
