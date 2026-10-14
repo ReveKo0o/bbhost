@@ -1,4 +1,5 @@
-// gcnlift: lift a captured draw's pixel or vertex shader.
+// gcnlift: lift a captured draw's pixel or vertex shader, or a captured
+// dispatch's compute shader (a BBHOST_CAPTURE_DISPATCH capture: no option).
 //
 //   gcnlift <capture-dir> <out-dir> [--vs | --ls | --ds | --native]
 //
@@ -540,11 +541,86 @@ int run_native(const fs::path& capture, const fs::path& out) {
     return all ? 0 : 1;
 }
 
+// A dispatch capture's compute shader: the options gpu.cpp compute_options
+// builds, from the capture's "translate" and "dispatch" records; the
+// translation rebuilt and checked against the captured module (or the lift,
+// for a capture taken with the lift bound), and the lift made against it.
+// Replay with `drawreplay <capture-dir> --cs <out-dir>/lifted.spv` (or
+// reference.spv for a captured lift).
+int run_dispatch(const fs::path& capture, const fs::path& out, const json::Value& m) {
+    const json::Value& blobs = json::member(m, "blobs");
+    const auto blob = [&](const std::string& name) { return read_file(capture / json::str(json::member(blobs, name.c_str()), "file")); };
+    const json::Value& stage = json::member(m, "stage");
+    const json::Value& tr = json::member(m, "translate");
+    const json::Value& d = json::member(m, "dispatch");
+    const std::vector<std::uint32_t> gcn_words = words_of(blob(json::str(stage, "gcn")), "cs-gcn");
+    const std::vector<std::uint32_t> captured = words_of(blob(json::str(stage, "spirv")), "cs-spirv");
+    gcn::TranslateOptions o;
+    o.stage = gcn::Stage::Compute;
+    o.rsrc1 = static_cast<std::uint32_t>(json::as_u64(json::member(tr, "rsrc1"), "rsrc1"));
+    o.rsrc2 = static_cast<std::uint32_t>(json::as_u64(json::member(tr, "rsrc2"), "rsrc2"));
+    o.gds_counters = json::flag(tr, "gds_counters");
+    o.exec_known = json::flag(tr, "exec_known");
+    o.max_lds_bytes = json::u32(tr, "max_lds_bytes");
+    const auto& threads = json::arr(d, "threads");
+    for (std::size_t k = 0; k < 3 && k < threads.size(); ++k) o.cs_threads[k] = static_cast<std::uint32_t>(json::as_u64(threads[k], "threads"));
+    if (const json::Value* dims = tr.find("image_dims"); dims && dims->type == json::Value::Type::Array) {
+        for (const json::Value& e : dims->array) {
+            if (e.type != json::Value::Type::Array || e.array.size() != 2) fail("image_dims entries are [dim, arrayed]");
+            o.image_dims.push_back({static_cast<std::uint32_t>(json::as_u64(e.array[0], "image dim")),
+                                    e.array[1].type == json::Value::Type::Bool && e.array[1].boolean});
+        }
+    } else {
+        for (const json::Value& b : json::arr(stage, "images")) o.image_dims.push_back({json::u32(b, "dim"), json::flag(b, "arrayed")});
+    }
+    const gcn::Program program = gcn::decode(gcn_words.data(), gcn_words.size());
+    const gcn::TranslateResult reference = gcn::translate(program, o);
+    const gcn::LiftResult lifted = gcn::lift_compute_shader(program, o, reference);
+    const json::Value* lj = tr.find("lifted");
+    const bool captured_lifted = lj && lj->type == json::Value::Type::Bool && lj->boolean;
+    const bool same_reference = captured_lifted ? lifted.ok() && lifted.spirv == captured : reference.ok() && reference.spirv == captured;
+    const std::string invalid = lifted.ok() ? validate(lifted.spirv) : std::string();
+    fs::create_directories(out);
+    json::Value report = json::Value::make_object();
+    report.set("schema", "bbhost-gcn-lift");
+    report.set("version", 1);
+    report.set("capture", capture.string());
+    report.set("pipeline", json::str(json::member(m, "identity"), "pipeline"));
+    report.set("stage", "compute");
+    report.set("reference_matches_capture", same_reference);
+    report.set("captured_module", captured_lifted ? "lifted" : "translated");
+    report.set("lifted", lifted.ok());
+    report.set("spirv_valid", lifted.ok() && invalid.empty());
+    if (!invalid.empty()) report.set("spirv_error", invalid);
+    json::Value proof = json::Value::make_array();
+    for (const std::string& p : lifted.proof) proof.push(p);
+    report.set("proof", proof);
+    json::Value rejections = json::Value::make_array();
+    for (const std::string& r : lifted.rejections) rejections.push(r);
+    report.set("rejections", rejections);
+    report.set("reference_words", static_cast<unsigned long>(reference.spirv.size()));
+    report.set("lifted_words", static_cast<unsigned long>(lifted.spirv.size()));
+    write_file(out / "report.json", json::dump(report));
+    write_file(out / "listing.txt", lifted.listing);
+    const auto spv_text = [](const std::vector<std::uint32_t>& w) { return std::string(reinterpret_cast<const char*>(w.data()), w.size() * 4); };
+    if (lifted.ok()) write_file(out / "lifted.spv", spv_text(lifted.spirv));
+    if (reference.ok()) write_file(out / "reference.spv", spv_text(reference.spirv));
+    std::printf("rebuilt %s compute module %s the captured SPIR-V; lift %s%s\n", captured_lifted ? "lifted" : "translated",
+                same_reference ? "matches" : "DOES NOT MATCH", lifted.ok() ? "ok" : "rejected", invalid.empty() ? "" : (" but INVALID: " + invalid).c_str());
+    for (const std::string& r : lifted.rejections) std::printf("  rejected: %s\n", r.c_str());
+    if (!same_reference) {
+        std::printf("  the rebuilt options do not reproduce the dispatch's shader; the lift is not comparable\n");
+        return 1;
+    }
+    return lifted.ok() && invalid.empty() ? 0 : 1;
+}
+
 int run(const fs::path& capture, const fs::path& out, bool vs) {
     const std::vector<std::uint8_t> text = read_file(capture / "manifest.json");
     json::Value m;
     std::string error;
     if (!json::parse(std::string(text.begin(), text.end()), m, error)) fail("manifest.json: " + error);
+    if (json::str(m, "schema") == "bbhost-dispatch-capture") return run_dispatch(capture, out, m);
     if (json::str(m, "schema") != "bbhost-draw-capture") fail("not a draw capture");
     const json::Value& blobs = json::member(m, "blobs");
     const auto blob = [&](const std::string& name) { return read_file(capture / json::str(json::member(blobs, name.c_str()), "file")); };

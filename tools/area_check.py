@@ -348,6 +348,7 @@ GPU_BUSY = re.compile(r"gpu busy ([\d.]+) ms/s")
 DETAIL = re.compile(r"\] frame detail: draws (\d+): pixel shader lifted (\d+), translated (\d+), fallback (\d+), none (\d+); "
                     r"draw failures (\d+)(?: \((.*)\))?")
 INTERVALS = re.compile(r"\] frame intervals ms:((?: [\d.]+)+)\s*$")
+DISPATCH_DETAIL = re.compile(r"\] frame detail: dispatches (\d+): lifted (\d+), translated (\d+)")
 # The probe's lines, as bbhost logs a plugin's ("plugin: <line>", host/plugins.cpp).
 PROBE = r"\] (?:plugin: )?mapval "
 TRAVEL = re.compile(PROBE + r"step \d+ travel (\S+) ([\d.]+) return point (\d+) block ([0-9a-f]+) -> (\w+)")
@@ -446,7 +447,7 @@ class Log:
                     "max_ms": float(m.group(7)), "over_16_7": int(m.group(8)), "over_33_3": int(m.group(9)),
                     "cpu_pct": int(m.group(10)),
                     "work": [float(w.group(k)) for k in (1, 2, 3)] if w else None,
-                    "gpu_busy": float(g.group(1)) if g else None, "detail": None, "intervals": []}))
+                    "gpu_busy": float(g.group(1)) if g else None, "detail": None, "dispatch_detail": None, "intervals": []}))
                 return
             m = DETAIL.search(line)
             if m and self.seconds:
@@ -454,6 +455,10 @@ class Log:
                     "draws": int(m.group(1)), "lifted": int(m.group(2)), "translated": int(m.group(3)),
                     "fallback": int(m.group(4)), "none": int(m.group(5)), "failures": int(m.group(6)),
                     "reasons": parse_reasons(m.group(7))}
+                return
+            m = DISPATCH_DETAIL.search(line)
+            if m and self.seconds:
+                self.seconds[-1][1]["dispatch_detail"] = {"dispatches": int(m.group(1)), "lifted": int(m.group(2)), "translated": int(m.group(3))}
                 return
             m = INTERVALS.search(line)
             if m and self.seconds:
@@ -654,6 +659,14 @@ def window_stats(seconds):
                 reasons[k] = reasons.get(k, 0) + v
         d["failure_reasons"] = reasons
         out["draws"] = d
+    # The window's compute dispatches by whether their shader ran its lift
+    # (bbhost's `frame detail: dispatches` line; seconds without one had none).
+    dd = [r.get("dispatch_detail") for r in seconds if r.get("dispatch_detail")]
+    if dd:
+        d = {k: sum(x[k] for x in dd) for k in ("dispatches", "lifted", "translated")}
+        d["lifted_share"] = round(d["lifted"] / d["dispatches"], 4) if d["dispatches"] else None
+        d["per_second"] = round(d["dispatches"] / secs, 1) if secs else None
+        out["dispatches"] = d
     return out
 
 
@@ -1442,6 +1455,10 @@ def summary_text(report):
                     fmt(d.get("per_second"), "%.0f"), d["lifted"], fmt((d.get("lifted_share") or 0) * 100, "%.1f%%"), d["translated"],
                     d["fallback"], d["none"], d["failures"],
                     (" (" + ", ".join("%s %d" % kv for kv in d["failure_reasons"].items()) + ")") if d.get("failure_reasons") else ""))
+            dd = w.get("dispatches")
+            if dd:
+                out.append("  dispatches %s/s: compute shader lifted %d (%s), translated %d" % (
+                    fmt(dd.get("per_second"), "%.0f"), dd["lifted"], fmt((dd.get("lifted_share") or 0) * 100, "%.1f%%"), dd["translated"]))
             out.append("  in the window: %d slow pipelines, %d stalls (worst %d ms), %d main-loop frames over 33 ms" % (
                 w["slow_pipelines"]["count"], w["stalls"]["count"], w["stalls"]["max_ms"], w["long_frames"]["count"]))
         ar = a.get("arrival")

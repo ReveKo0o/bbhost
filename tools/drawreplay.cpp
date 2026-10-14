@@ -37,7 +37,9 @@
 // (the GDS counters the dispatch counted in) must match exactly; a buffer it
 // stores through may hold its records in another order - an append buffer's
 // order is the order its subgroups' atomics landed - and is compared as the
-// multiset of its records; every other byte of every page exactly.
+// multiset of its records; every other byte of every page exactly. --cs
+// FILE.spv: the dispatch again with another compute module (the lift against
+// a captured translation, or the reverse), against A by the same rules.
 //
 // Exit 0: every check passed; 1: a check failed; 2: bad capture or Vulkan error.
 #include "core/sha256.h"
@@ -1900,6 +1902,7 @@ struct Options {
     fs::path ls;   // a tessellated draw's vertex stage
     fs::path hs;   // a tessellated draw's control stage
     fs::path native;  // gcnlift --native's folder: a game-hull draw's three stages on stage I/O
+    fs::path cs;      // a dispatch capture's variant compute module
     fs::path ls_set4;  // gcnlift --ls's ls-set4.json: the --ls variant binds its constant buffers in set 4
     bool live = true;
     bool validate = false;
@@ -1910,7 +1913,8 @@ struct Options {
 
 [[noreturn]] void usage() {
     std::fprintf(stderr, "usage: drawreplay <capture-dir> [--out DIR] [--atol X] [--rtol Y] [--ps FILE.spv] [--vs FILE.spv] [--ds FILE.spv] [--ls FILE.spv] "
-                         "[--hs FILE.spv] [--ls-set4 FILE.json] [--native DIR] [--library] [--specialize] [--no-live] [--validate] [--bench N]\n");
+                         "[--hs FILE.spv] [--ls-set4 FILE.json] [--native DIR] [--cs FILE.spv] [--library] [--specialize] [--no-live] [--validate] "
+                         "[--bench N]\n");
     std::exit(2);
 }
 
@@ -1926,6 +1930,7 @@ Options parse_args(int argc, char** argv) {
         else if (a == "--atol") o.tol.atol = std::strtod(value().c_str(), nullptr);
         else if (a == "--rtol") o.tol.rtol = std::strtod(value().c_str(), nullptr);
         else if (a == "--ps") o.ps = value();
+        else if (a == "--cs") o.cs = value();
         else if (a == "--vs" || a == "--ds") o.vs = value();
         else if (a == "--ls") o.ls = value();
         else if (a == "--native") o.native = value();
@@ -1979,6 +1984,8 @@ public:
         build_pipeline();
     }
     ~DispatchReplayer() {
+        if (variant_pipeline_) vkDestroyPipeline(dev_.device, variant_pipeline_, nullptr);
+        if (variant_module_) vkDestroyShaderModule(dev_.device, variant_module_, nullptr);
         if (pipeline_) vkDestroyPipeline(dev_.device, pipeline_, nullptr);
         if (module_) vkDestroyShaderModule(dev_.device, module_, nullptr);
         for (auto& [id, v] : views_) vkDestroyImageView(dev_.device, v, nullptr);
@@ -1994,8 +2001,22 @@ public:
         for (auto& [i, t] : l2_) dev_.destroy(t);
     }
 
+    // A second pipeline from another compute module (--cs), on the same layout.
+    void variant(const std::vector<std::uint32_t>& words) {
+        VkShaderModuleCreateInfo mci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+        mci.codeSize = words.size() * 4;
+        mci.pCode = words.data();
+        check(vkCreateShaderModule(dev_.device, &mci, nullptr, &variant_module_), "vkCreateShaderModule (variant)");
+        VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+        ci.layout = layout_;
+        ci.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        ci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+        ci.stage.module = variant_module_;
+        ci.stage.pName = "main";
+        check(vkCreateComputePipelines(dev_.device, VK_NULL_HANDLE, 1, &ci, nullptr, &variant_pipeline_), "vkCreateComputePipelines (variant)");
+    }
     // The guest pages after one run from the captured inputs.
-    std::vector<std::uint8_t> run(bool sentinel) {
+    std::vector<std::uint8_t> run(bool sentinel, bool with_variant = false) {
         const auto& start = before();
         if (!start.empty()) std::memcpy(pages_.map, start.data(), start.size());
         auto* sink = static_cast<std::uint32_t*>(sink_.map);
@@ -2005,7 +2026,7 @@ public:
             mb.srcAccessMask = VK_ACCESS_HOST_WRITE_BIT;
             mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
             vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
-            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline_);
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, with_variant ? variant_pipeline_ : pipeline_);
             vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, layout_, 0, 1, &set_, 0, nullptr);
             vkCmdDispatch(cmd, groups_[0], groups_[1], groups_[2]);
             mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
@@ -2264,8 +2285,8 @@ private:
     VkPipelineLayout layout_ = VK_NULL_HANDLE;
     VkDescriptorPool pool_ = VK_NULL_HANDLE;
     VkDescriptorSet set_ = VK_NULL_HANDLE;
-    VkShaderModule module_ = VK_NULL_HANDLE;
-    VkPipeline pipeline_ = VK_NULL_HANDLE;
+    VkShaderModule module_ = VK_NULL_HANDLE, variant_module_ = VK_NULL_HANDLE;
+    VkPipeline pipeline_ = VK_NULL_HANDLE, variant_pipeline_ = VK_NULL_HANDLE;
     std::uint32_t groups_[3] = {1, 1, 1};
     std::vector<std::uint64_t> counters_;
     std::vector<Written> written_;
@@ -2278,12 +2299,19 @@ int dispatch_replay_main(const Options& o, const Capture& cap, const fs::path& o
     std::printf("drawreplay: dispatch %s (%s, flip %llu) on %s\n", o.capture.string().c_str(), json::str(identity, "pipeline").c_str(),
                 static_cast<unsigned long long>(json::u64(identity, "flip")), dev.name.c_str());
     DispatchReplayer r(cap, dev);
+    if (!o.cs.empty()) r.variant(words_of(read_file(o.cs), "the variant compute module"));
     const auto a = r.run(false);
     const auto b = r.run(false);
     const auto sentinel = r.run(true);
     const auto ab = r.compare(a, b);
     const auto live = r.compare(a, r.live());
     const auto sv = r.compare(a, sentinel);
+    DispatchReplayer::Difference av;
+    std::vector<std::uint8_t> v;
+    if (!o.cs.empty()) {
+        v = r.run(false, true);
+        av = r.compare(a, v);
+    }
     json::Value report = json::Value::make_object();
     report.set("schema", "bbhost-dispatch-replay");
     report.set("version", 1);
@@ -2321,6 +2349,13 @@ int dispatch_replay_main(const Options& o, const Capture& cap, const fs::path& o
     comparisons.set("A_vs_live", verdict(live, "the replay against the pages the game's own dispatch left"));
     comparisons.set("A_vs_sentinel",
                     verdict(sv, "the sink page full of sentinel words must change nothing: the program reads no page the capture lacks"));
+    if (!o.cs.empty()) {
+        json::Value vj = verdict(av, "the variant module from the captured inputs against A: counters exactly, written ranges as record multisets, "
+                                     "every other byte exactly");
+        vj.set("bytes_identical", a == v);
+        vj.set("module", o.cs.string());
+        comparisons.set("A_vs_variant", vj);
+    }
     report.set("comparisons", comparisons);
     const auto say = [](const char* what, const DispatchReplayer::Difference& d) {
         std::printf("  %s: %s%s%s\n", what, d.same ? "same" : "DIFFERENT", d.what.empty() ? "" : " - ", d.what.c_str());
@@ -2329,6 +2364,11 @@ int dispatch_replay_main(const Options& o, const Capture& cap, const fs::path& o
     say("A vs B", ab);
     say("A vs live", live);
     say("A vs sentinel sink", sv);
+    if (!o.cs.empty()) {
+        say("A vs variant", av);
+        if (av.same) std::printf("  A vs variant: %s\n", a == v ? "byte-identical" : "the same records, some in another order");
+        for (std::uint64_t c : r.counters()) std::printf("  counter 0x%llx: %u in the variant\n", static_cast<unsigned long long>(c), r.word(v, c));
+    }
     const bool pass = ab.same && live.same && sv.same;
     report.set("pass", pass);
     const std::string text = json::dump(report);
