@@ -1201,6 +1201,7 @@ CapturePtr capture_dispatch_begin_locked(CaptureDispatch&& d) {
         if (!args[0] || !args[1] || !args[2]) {
             s.quiet = true;  // no work: not a candidate, not a rejection
             --g_dispatch_matches;
+            if (int& taken = g_dispatch_taken[d.pipeline]; taken > 0) --taken;  // nor one of BBHOST_CAPTURE_DISPATCH_EACH's
             return CapturePtr();
         }
         if (args[0] > 65535 || args[1] > 65535 || args[2] > 65535) return reject("its indirect arguments ask past 65535 workgroups a dimension");
