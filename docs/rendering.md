@@ -73,8 +73,9 @@ exactly what that binds - the parameter block with the page table, the images
 and samplers, the particles' counter words - so a dispatch is set up the same
 way whichever runs. Its memory reads and writes go through the same
 page-table walk. GCN's loops that run until every lane's execution bit
-clears become structured per-invocation loops, and the GPU particles'
-wave-wide counter idiom (`ds_append`/`ds_consume` in GDS, each lane's rank
+clears become structured per-invocation loops, a block GCN branches over
+where no lane needs it becomes a selection an invocation skips where its own
+bit is clear, and the GPU particles' wave-wide counter idiom (`ds_append`/`ds_consume` in GDS, each lane's rank
 from `v_mbcnt`) becomes one atomic add per invocation, so no compute lift
 needs subgroup operations. A barrier is accepted only where every invocation
 of the workgroup provably reaches it, and LDS, which no game compute shader
