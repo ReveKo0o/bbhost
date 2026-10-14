@@ -570,6 +570,7 @@ struct Surface {
     // write (mark_surfaces_dirty_locked) has landed on it since.
     std::uint64_t gx_seq = 0;
     bool cp_dirty = false;
+    std::uint64_t cp_dirty_serial = 0;  // the submission carrying the last such write (Gpu::flushes when marked)
     bool gx_registered = false;  // its memory is a live GX resource's
     // That resource's generation (GxResourceInfo::gen) at the last upload: the
     // surface is that resource's image, and goes with it (retire_surfaces_locked).
@@ -1806,7 +1807,8 @@ const bool g_hash_registered = [] {
     const char* e = std::getenv("BBHOST_TEX_HASH_REGISTERED");
     return e && e[0] == '1';
 }();
-std::atomic<std::uint64_t> g_census_hash_skipped{0}, g_census_check_hashed{0}, g_census_check_missed{0}, g_census_hash_skipped_written{0};
+std::atomic<std::uint64_t> g_census_hash_skipped{0}, g_census_check_hashed{0}, g_census_check_missed{0}, g_census_hash_skipped_written{0},
+    g_cp_dirty_settled{0};
 std::atomic<std::uint64_t> g_ahead_used{0}, g_ahead_replaced{0}, g_ahead_bind_before_prep{0};
 
 // Keeps a surface in step with the guest memory behind it. Split out of
@@ -1986,6 +1988,7 @@ void refresh_surface_locked(Surface& sf) {
         }
     }
     const std::uint64_t exact_every = hot ? kExactHotMs : kExactColdMs;
+    bool whole_matched = !changed && sf.total_src <= kSampledAbove;  // the sampled hash read it whole
     if (!changed && g_exact_enabled && sf.total_src > kSampledAbove && sf.total_src <= kExactMaxBytes &&
         now_ms() - sf.exact_at_ms >= exact_every && exact_budget_take(sf.total_src)) {
         sf.exact_at_ms = now_ms();
@@ -1993,7 +1996,18 @@ void refresh_surface_locked(Surface& sf) {
         if (h != sf.exact_hash) {
             changed = exact_caught = true;
             g_exact_catches.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            whole_matched = true;
         }
+    }
+    // A GX texture's memory the command processor wrote, found whole as it
+    // was uploaded once the GPU has run the submission that wrote it (its
+    // copies land when that runs, not when they are recorded): in step again,
+    // so it is not hashed at every check until the next write over it (the
+    // 1-in-64 check takes it from here).
+    if (whole_matched && sf.cp_dirty && by_identity(sf) && g.completed_submits > sf.cp_dirty_serial) {
+        sf.cp_dirty = false;
+        g_cp_dirty_settled.fetch_add(1, std::memory_order_relaxed);
     }
     g_hash_class_n[hash_class].fetch_add(1, std::memory_order_relaxed);
     g_hash_class_us[hash_class].fetch_add(us_since(t_hash), std::memory_order_relaxed);
@@ -4172,6 +4186,7 @@ int mark_surfaces_dirty_locked(std::uint64_t va, std::size_t bytes, bool memory_
         sf.refreshed_serial = 0;
         sf.unchanged = 0;
         sf.cp_dirty = true;
+        sf.cp_dirty_serial = g.flushes;
         if (sf.hot < 2) sf.hot = 2;
         if (probe && sf.base == probe) {
             static std::atomic<int> logs{0};
@@ -4461,8 +4476,9 @@ void textures_report() {
              static_cast<unsigned long long>(g_view_other_gen.load()), static_cast<unsigned long long>(g_view_other_gen_kept.load()),
              static_cast<unsigned long long>(g_view_other_gen_adopted.load()), static_cast<unsigned long long>(g_ahead_adopted.load()),
              static_cast<unsigned long long>(g_unwatched_uploads.load()), static_cast<unsigned long long>(g_census_hash_skipped_written.load()));
-    host_log("texture: surfaces under a fill not marked dirty (a fill writes no memory) %llu",
-             static_cast<unsigned long long>(g_fill_marks_skipped.load()));
+    host_log("texture: surfaces under a fill or an image copy not marked dirty (no memory written) %llu; GX textures the command processor "
+             "wrote found whole as uploaded, in step again %llu",
+             static_cast<unsigned long long>(g_fill_marks_skipped.load()), static_cast<unsigned long long>(g_cp_dirty_settled.load()));
     host_log("texture: identity (BBHOST_RES_IDENTITY%s): surfaces retired with their generation %llu (%llu of them over memory a newer resource "
              "holds), kept for another generation %llu, kept as written after their resource died %llu; made ahead over another generation's "
              "image %llu",

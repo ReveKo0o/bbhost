@@ -6698,8 +6698,9 @@ bool host_gpu_dispatch(const GpuDispatch& d_in) {
                      static_cast<unsigned long long>(dst), bytes, stride, find_render_target(src) ? " (render target)" : "");
         }
         hle_gnm_warn_if_command_buffer("copy dispatch", dst, bytes);
-        const int on_surfaces = mark_surfaces_dirty_locked(dst, bytes);
-        if (render_copy_target_locked(src, dst, bytes, "copy dispatch")) {
+        const bool as_image = render_copy_target_locked(src, dst, bytes, "copy dispatch");
+        const int on_surfaces = mark_surfaces_dirty_locked(dst, bytes, !as_image);  // an image copy writes no memory
+        if (as_image) {
             tex_event(dst, bytes, "copy dispatch %s 0x%llx -> 0x%llx 0x%zx bytes: render target copied as an image", pl.name.c_str(),
                       static_cast<unsigned long long>(src), static_cast<unsigned long long>(dst), bytes);
             t_dispatch_class = kDcCopyImage;
@@ -8028,8 +8029,11 @@ bool host_gpu_copy_guest(std::uint64_t dst, std::uint64_t src, std::size_t bytes
     if (!bytes) return true;
     if (dst < src + bytes && src < dst + bytes) return false;
     note_gpu_write_over_marker("guest copy", dst, src, bytes);
-    const int on_surfaces = mark_surfaces_dirty_locked(dst, bytes);
-    if (render_copy_target_locked(src, dst, bytes, "copy token")) {
+    // Copied image to image, the guest memory is not written: the surfaces
+    // over it are not marked (mark_surfaces_dirty_locked's memory_written).
+    const bool as_image = render_copy_target_locked(src, dst, bytes, "copy token");
+    const int on_surfaces = mark_surfaces_dirty_locked(dst, bytes, !as_image);
+    if (as_image) {
         tex_event(dst, bytes, "copy token 0x%llx -> 0x%llx 0x%zx bytes: render target copied as an image",
                   static_cast<unsigned long long>(src), static_cast<unsigned long long>(dst), bytes);
         g_guest_copy_targets.fetch_add(1, std::memory_order_relaxed);
