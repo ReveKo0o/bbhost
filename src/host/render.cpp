@@ -1082,6 +1082,15 @@ std::uint64_t g_vc_why[kVcwCount] = {}, g_vc_why_bytes[kVcwCount] = {};  // owed
 const char* const kVcwName[kVcwCount] = {"a draw's attachment its pass does not cover whole", "sampled by a draw", "a tessellated draw",
                                          "an older clear a newer one does not cover", "another clear", "a copy", "a texture view",
                                          "a readback", "the image replaced", "a dispatch", "the submission", "a dump", "other"};
+// The same by image: owed clears taken as a load op, and made by transfer by
+// what made them (the report's largest by transfer bytes).
+struct ViewClearImage {
+    std::uint64_t load = 0, transfer = 0, transfer_bytes = 0;
+    std::uint64_t why[kVcwCount] = {};
+    std::uint32_t width = 0, height = 0, layers = 0;
+    bool depth = false;
+};
+std::unordered_map<std::uint64_t, ViewClearImage> g_vc_by_image;  // by base, under g.mu
 
 void view_clears_flush_locked(int why);
 void view_clear_apply_locked(RtImage& r, int why);
@@ -6868,6 +6877,7 @@ void begin_pass(const DrawState& s, std::uint64_t key, bool hazard = false) {
             }
             r.view_clear = r.view_clear_load = false;
             ++g_vc_load;
+            ++g_vc_by_image[r.base].load;
             ++g_clears;
         }
         colors.push_back(a);
@@ -6895,6 +6905,7 @@ void begin_pass(const DrawState& s, std::uint64_t key, bool hazard = false) {
             }
             r.view_clear = r.view_clear_load = false;
             ++g_vc_load;
+            ++g_vc_by_image[r.base].load;
             ++g_clears;
         }
         if (!extent.width || s.depth->width < extent.width) extent.width = s.depth->width;
@@ -10921,7 +10932,16 @@ void view_clear_apply_barrier_locked(RtImage& r, bool barrier, int why) {
     ++g_vc_why[why];
     {
         const std::size_t bpp = r.depth ? (r.format == VK_FORMAT_D16_UNORM ? 2 : 4) : rt_bytes_per_pixel(r);
-        g_vc_why_bytes[why] += static_cast<std::uint64_t>(r.width) * r.height * bpp * std::max(1u, r.view_clear_count);
+        const std::uint64_t bytes = static_cast<std::uint64_t>(r.width) * r.height * bpp * std::max(1u, r.view_clear_count);
+        g_vc_why_bytes[why] += bytes;
+        ViewClearImage& vi = g_vc_by_image[r.base];
+        ++vi.transfer;
+        vi.transfer_bytes += bytes;
+        ++vi.why[why];
+        vi.width = r.width;
+        vi.height = r.height;
+        vi.layers = r.layers;
+        vi.depth = r.depth;
     }
     const bool saved = g_in_view_flush;
     g_in_view_flush = true;
@@ -11324,6 +11344,23 @@ std::string host_gpu_clear_view_report() {
             why += buf;
         }
         host_log("render: lazy clears made by transfer, by what made them:%s", why.c_str());
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> order;
+        for (const auto& [base, vi] : g_vc_by_image) order.push_back({vi.transfer_bytes, base});
+        std::sort(order.rbegin(), order.rend());
+        std::string images;
+        for (std::size_t i = 0; i < order.size() && i < 12; ++i) {
+            const ViewClearImage& vi = g_vc_by_image[order[i].second];
+            std::string whys;
+            for (int w = 0; w < kVcwCount; ++w) {
+                if (vi.why[w]) whys += (whys.empty() ? "" : ", ") + std::string(kVcwName[w]) + " " + std::to_string(vi.why[w]);
+            }
+            char buf[200];
+            std::snprintf(buf, sizeof(buf), " 0x%llx %ux%u x%u%s: load op %llu, transfer %llu (%.1f GiB: ", static_cast<unsigned long long>(order[i].second),
+                          vi.width, vi.height, vi.layers, vi.depth ? " depth" : "", static_cast<unsigned long long>(vi.load),
+                          static_cast<unsigned long long>(vi.transfer), static_cast<double>(vi.transfer_bytes) / (1ull << 30));
+            images += buf + whys + ");";
+        }
+        host_log("render: lazy clears by image, the most made by transfer:%s", images.c_str());
     }
     if (g_cv_by_image.size()) {
         std::string cost;
