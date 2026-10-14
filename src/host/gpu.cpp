@@ -3808,8 +3808,21 @@ void report_checkpoints() {
 }
 
 // What the driver knows about the fault, when VK_EXT_device_fault is there.
+// Not asked of NVIDIA's Windows driver, which wrote to 0 inside it after a
+// loss (617.42; its Linux driver answers, with no addresses).
+// BBHOST_DEVICE_FAULT_QUERY=1 asks it anyway.
 void report_device_fault() {
     if (!g.has_device_fault) return;
+#if defined(_WIN32)
+    static const bool ask_nvidia = [] {
+        const char* e = std::getenv("BBHOST_DEVICE_FAULT_QUERY");
+        return e && e[0] == '1';
+    }();
+    if (g.vendor_id == 0x10de && !ask_nvidia) {
+        host_log("gpu: the driver's fault report not asked for (NVIDIA's Windows driver crashed in it; BBHOST_DEVICE_FAULT_QUERY=1 asks)");
+        return;
+    }
+#endif
     auto get_info = reinterpret_cast<PFN_vkGetDeviceFaultInfoEXT>(vkGetDeviceProcAddr(g.device, "vkGetDeviceFaultInfoEXT"));
     if (!get_info) return;
     VkDeviceFaultCountsEXT counts{VK_STRUCTURE_TYPE_DEVICE_FAULT_COUNTS_EXT};
@@ -3943,19 +3956,25 @@ void device_lost_locked(const char* where, bool declared) {
     } else {
         host_log("gpu: the device is lost (%s, flip %llu): the GPU stopped responding and the system reset it", where, flip);
     }
-    report_device_fault();
-    report_checkpoints();
-    if (!g.has_checkpoints) host_log("gpu: no progress markers this run; the next %d starts run with them", kMarkedRuns);
-    // Everything stops after this, so say what was in flight: the last draws
-    // name the pipeline that faulted or hung.
-    host_gpu_hang_report();  // with the command stream's last op (recorder.cpp)
+    // The note for the next starts first, then what is ours to say, and the
+    // driver's own diagnostics last: NVIDIA's Windows driver (617.42) crashed
+    // inside vkGetDeviceFaultInfoEXT after a loss - a GTX 1660 SUPER's and an
+    // RTX 2060's logs ended at this line with a write to 0 in nvoglv64.dll -
+    // so the note was never written and their next starts ran without the
+    // markers that would have said where the GPU stopped.
     const std::string hooks = host_foreign_hooks();
-    if (!hooks.empty()) host_log("gpu: hooked into this process: %s - such hooks are a common cause of lost devices", hooks.c_str());
     const std::string path = device_lost_note_path();
     if (!path.empty()) {
         std::ofstream out(path, std::ios::trunc);
         out << "starts-left " << kMarkedRuns << '\n' << "flip " << flip << ", " << where << (hooks.empty() ? "" : ", with ") << hooks << '\n';
     }
+    if (!g.has_checkpoints) host_log("gpu: no progress markers this run; the next %d starts run with them", kMarkedRuns);
+    // Everything stops after this, so say what was in flight: the last draws
+    // name the pipeline that faulted or hung.
+    host_gpu_hang_report();  // with the command stream's last op (recorder.cpp)
+    if (!hooks.empty()) host_log("gpu: hooked into this process: %s - such hooks are a common cause of lost devices", hooks.c_str());
+    report_checkpoints();
+    report_device_fault();
 }
 
 // Records a CP write that lands on the GPU later (see Gpu::pending_writes),
