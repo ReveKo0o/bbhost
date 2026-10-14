@@ -10967,7 +10967,22 @@ bool host_gpu_clear_view(const GpuClearView& c, bool apply, GpuClearViewResult* 
     }
     if (!apply) return r != nullptr;
     if (!r) {
+        // No image could be had for the view (not expected: the hook checked
+        // the format): the clear goes the fill path's way, by address, and
+        // waits for an image there.
         ++g_cv_none[kind];
+        if (!c.depth) {
+            const std::uint32_t pitch = ((c.color[1] & 0x7ff) + 1) * 8;
+            const std::uint32_t slice_px = ((c.color[2] & 0x3fffff) + 1) * 64;
+            const VkFormat fmt = cb_format(CbInfo::from(c.color[4]));
+            const std::uint64_t slice_bytes = static_cast<std::uint64_t>(slice_px) * format_bytes_per_pixel(fmt);
+            const std::uint64_t base = static_cast<std::uint64_t>(c.color[0]) << 8;
+            (void)pitch;
+            render_handle_fill_locked(base + slice_bytes * first, slice_bytes * std::max(1u, count), c.rgba, 0, 0);
+        } else {
+            const auto scaled = static_cast<std::uint32_t>(std::floor(c.depth_value * 16383.0f));
+            g_pending_htile[static_cast<std::uint64_t>(c.z_read_base) << 8] = PendingHtile{scaled << 18, c.stencil};
+        }
         return false;
     }
     ++g_cv_run[kind];
@@ -11013,7 +11028,7 @@ std::string host_gpu_clear_view_report() {
     for (int k = 0; k < kCvKinds; ++k) {
         if (!g_cv_run[k] && !g_cv_none[k]) continue;
         char buf[200];
-        std::snprintf(buf, sizeof(buf), " %s %llu (images made %llu, without an image %llu, one aspect only %llu);", kClearViewKindName[k],
+        std::snprintf(buf, sizeof(buf), " %s %llu (images made %llu, no image so the fill path's way %llu, one aspect only %llu);", kClearViewKindName[k],
                       static_cast<unsigned long long>(g_cv_run[k]), static_cast<unsigned long long>(g_cv_made[k]),
                       static_cast<unsigned long long>(g_cv_none[k]), static_cast<unsigned long long>(g_cv_aspects[k]));
         out += buf;

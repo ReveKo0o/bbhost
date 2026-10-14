@@ -237,6 +237,13 @@ void hle_gx_image_copy_token(std::uint64_t id);
 // view's image.
 constexpr std::uint32_t kGxClearMagic = 0x4c434242u;  // "BBCL"
 void hle_gx_clear_token(std::uint64_t id);
+// GX's CopyStructureCount (0x2568be0) writes a count copy token,
+// {kGxCountCopyMagic, id low, id high} (BBHOST_GX_COUNT_COPIES): the
+// destination and the UAV's count word; `check` when the packet still
+// follows (the switch's check mode). The command processor copies the word
+// (hle_gnm_count_copy).
+constexpr std::uint32_t kGxCountCopyMagic = 0x43534242u;  // "BBSC"
+bool hle_gx_count_copy_token(std::uint64_t id, std::uint64_t* dst, std::uint64_t* src, bool* check);
 // A Scaleform HAL draw (0x73e670, 0x73e6b0, 0x73e640)
 // writes a draw token built from the HAL's objects. BBHOST_GX_NATIVE_SCALEFORM=2
 // returns the draw's inputs (its objects through hle_gx_trace_objects) for the

@@ -156,6 +156,9 @@ enum Kind : std::uint8_t {
     // src/data, bytes, blocking), hooked only for BBHOST_CP_CENSUS, which
     // names who emits the DMA packets the command processor still runs.
     kEmitDma,
+    // GX's CopyStructureCount (0x2568be0: ctx, -, destination holder, offset,
+    // UAV view): a count copy token (BBHOST_GX_COUNT_COPIES).
+    kCopyStructureCount,
     kKinds
 };
 const char* const kKindName[kKinds] = {
@@ -171,7 +174,8 @@ const char* const kKindName[kKinds] = {
     "set clip control", "set primitive setup", "set shader stages", "set colour control", "set render control", "set stencil clear",
     "set viewport scissor", "set index offset", "set CS", "set base", "set CS user data (n)", "set CS user data (8)", "set CS user data (4)",
     "set CS user data (1)", "set CS user data pointer", "set CS user data (8, compute ring)", "set CS (compute ring)", "depth decompress pass", "depth-stencil clear pass",
-    "create shader (types 1, 5, 6)", "create shader (types 1, 5)", "create pixel shader", "create compute shader", "emit DMA_DATA"};
+    "create shader (types 1, 5, 6)", "create shader (types 1, 5)", "create pixel shader", "create compute shader", "emit DMA_DATA",
+    "CopyStructureCount"};
 const char* const kStageName[6] = {"VS", "HS", "DS", "GS", "PS", "CS"};
 bool is_dispatch(int k) { return k == kDispatch || k == kDispatchIndirect; }
 
@@ -271,6 +275,7 @@ const Hook kHooks[kKinds] = {
     {0x25672d0, 16, {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x53, 0x48, 0x81, 0xec, 0x28, 0x01, 0x00, 0x00}},
     {0x25673e0, 16, {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x53, 0x48, 0x81, 0xec, 0x28, 0x01, 0x00, 0x00}},
     {0x1473e60, 14, {BB_PUSH6, 0x50}},  // the DMA_DATA writer
+    {0x2568be0, 17, {BB_PUSH6, 0x48, 0x83, 0xec, 0x18}},  // CopyStructureCount (sub rsp, 0x18)
 };
 #undef BB_PUSH6
 #undef BB_PUSH4_ECX
@@ -2676,6 +2681,61 @@ bool clear_dsv_view(const std::uint64_t* f) {
     if (c.htile && c.om_depth != c.depth_value) g_cv_depth_differs.fetch_add(1, std::memory_order_relaxed);
     g_cv_aspects[c.flags].fetch_add(1, std::memory_order_relaxed);
     return clear_view_token(ctx, c);
+}
+
+// BBHOST_GX_COUNT_COPIES: GX's CopyStructureCount (0x2568be0) as a count
+// copy token - D3D11's CopyStructureCount, which copies a UAV's hidden count
+// into a buffer. GX keeps the count in the word past the UAV's records
+// (buffer memory + size - 8) and copied it with a DMA_DATA packet (4 bytes,
+// into the destination at the offset), which the command processor found to
+// be a counter word's and copied on the GPU's timeline. The token names the
+// two buffers; the command processor makes the same copy at the token
+// (hle_gnm_count_copy). 0: the packet as before; 1 (checks): both, and the
+// packet that follows is compared with the token; 2: the token alone.
+const int g_count_copies = [] {
+    const char* e = std::getenv("BBHOST_GX_COUNT_COPIES");
+    return e ? std::atoi(e) : 0;
+}();
+struct CountCopy {
+    std::uint64_t dst = 0, src = 0;
+};
+std::mutex g_count_copies_mu;
+std::unordered_map<std::uint64_t, CountCopy> g_count_copy_records;  // by token id, until the CP walks the token
+std::atomic<std::uint64_t> g_cc_calls{0}, g_cc_tokens{0}, g_cc_refused{0}, g_cc_unwritten{0}, g_cc_unmatched{0};
+
+// f: rdi ctx, rsi -, rdx the destination buffer's holder, rcx the byte offset,
+// r8 the UAV view (+0x08 its buffer's holder: memory +0x20, size +0x30).
+std::uint64_t native_count_copy(const std::uint64_t* f) {
+    if (!g_count_copies || g_native != 2 || g_backend != 1) return 0;
+    const std::uint64_t ctx = f[5], dst_holder = f[3], uav = f[1];
+    const std::uint32_t offset = static_cast<std::uint32_t>(f[2]);
+    g_cc_calls.fetch_add(1, std::memory_order_relaxed);
+    std::uint64_t src_holder = 0, src_mem = 0, dst_mem = 0;
+    std::uint32_t src_size = 0;
+    if (!ctx || !dst_holder || !uav || !safe_read(uav + 8, &src_holder, 8) || !src_holder || !safe_read(src_holder + 0x20, &src_mem, 8) ||
+        !safe_read(src_holder + 0x30, &src_size, 4) || !safe_read(dst_holder + 0x20, &dst_mem, 8) || !src_mem || !dst_mem || src_size < 8) {
+        g_cc_refused.fetch_add(1, std::memory_order_relaxed);
+        return 0;
+    }
+    CountCopy c{dst_mem + offset, src_mem + src_size - 8};
+    const std::uint64_t id = next_native_id();
+    {
+        std::lock_guard<std::mutex> lk(g_count_copies_mu);
+        if (g_count_copy_records.size() > 65536) g_count_copy_records.clear();
+        g_count_copy_records[id] = c;
+    }
+    if (!write_native_token(ctx, kGxCountCopyMagic, id)) {
+        std::lock_guard<std::mutex> lk(g_count_copies_mu);
+        g_count_copy_records.erase(id);
+        g_cc_unwritten.fetch_add(1, std::memory_order_relaxed);
+        return 0;
+    }
+    g_cc_tokens.fetch_add(1, std::memory_order_relaxed);
+    if (g_count_copies != 2) return 0;
+    // The method's own bookkeeping after its packet: the command buffer's
+    // flush (its resource-usage marks write nothing a token draw reads).
+    hle_call_guest(guest_fn(0x2aaf700), ctx + 0x10);
+    return 1;
 }
 
 // f: rdi ctx, rsi view, rdx resource, rcx value*. A view over the whole
@@ -5170,6 +5230,7 @@ GUEST_ABI std::uint64_t gx_hook(std::uint64_t id, const std::uint64_t* f) {
         note_update(f);
         return 0;
     }
+    if (id == kCopyStructureCount) return native_count_copy(f);
     if (id == kEmitDma) {
         // Where the packet goes and who asked for it (hle_gx_emitter_caller).
         const std::uint64_t cmd = rd64(f[5] + 0x10);
@@ -5865,6 +5926,7 @@ void hle_gx_trace_arm(GuestMemory* mem) {
     for (std::uint64_t id = 0; id < kKinds; ++id) {
         if (id == kUpdateSubresource && !g_trace && !g_gx_cost_enabled && !g_watch_update && !g_upload_census) continue;
         if (id == kEmitDma && !g_cp_census_hooks) continue;
+        if (id == kCopyStructureCount && !g_count_copies) continue;
         const Hook& h = kHooks[id];
         const std::uint64_t va = g_slide + (h.va - kPreferredGuestSlide);
         if (va < mem->slide || va + h.n > mem->slide + mem->size) continue;
@@ -6106,6 +6168,20 @@ void hle_gx_image_copy_token(std::uint64_t id) {
         g_image_copies.erase(it);
     }
     host_gpu_copy_image_region(c);
+}
+
+bool hle_gx_count_copy_token(std::uint64_t id, std::uint64_t* dst, std::uint64_t* src, bool* check) {
+    std::lock_guard<std::mutex> lk(g_count_copies_mu);
+    const auto it = g_count_copy_records.find(id);
+    if (it == g_count_copy_records.end()) {
+        g_cc_unmatched.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    *dst = it->second.dst;
+    *src = it->second.src;
+    *check = g_count_copies == 1;
+    g_count_copy_records.erase(it);
+    return true;
 }
 
 void hle_gx_clear_token(std::uint64_t id) {
@@ -6586,6 +6662,11 @@ void report_clears_and_copies() {
                     static_cast<ull>(rows[i].first));
         }
         host_log("gx-clears-copies: buffer-copy passes by caller:%s", by.empty() ? " none" : by.c_str());
+    }
+    if (g_count_copies) {
+        host_log("gx-count-copy: BBHOST_GX_COUNT_COPIES=%d: CopyStructureCount calls %llu, tokens %llu, refused %llu, not written %llu, "
+                 "unmatched %llu", g_count_copies, static_cast<ull>(g_cc_calls.load()), static_cast<ull>(g_cc_tokens.load()),
+                 static_cast<ull>(g_cc_refused.load()), static_cast<ull>(g_cc_unwritten.load()), static_cast<ull>(g_cc_unmatched.load()));
     }
     if (!g_clear_views) return;
     std::string refused;

@@ -241,6 +241,17 @@ void note_gpu_args(std::uint64_t va, std::size_t bytes);
 // each DMA_DATA by kind (defined with the packet census below).
 extern const bool g_cp_census;
 void census_dispatch(std::uint64_t packet_va);
+// BBHOST_GX_COUNT_COPIES: GX's CopyStructureCount as a token (gx_trace.cpp
+// native_count_copy): the copy of a UAV's count word, made at the token as
+// the DMA_DATA packet's was; in its check mode the packet that follows is
+// compared with the token.
+struct CountCheck {
+    bool active = false;
+    std::uint64_t dst = 0, src = 0;
+};
+thread_local CountCheck t_count_check;
+std::atomic<std::uint64_t> g_cc_gpu{0}, g_cc_cpu{0}, g_cc_lost{0}, g_cc_same{0}, g_cc_differ{0}, g_cc_no_packet{0};
+void cp_count_copy(std::uint64_t dst, std::uint64_t src);
 enum CensusDma { kCdFillTarget, kCdFillResource, kCdFillMemory, kCdCopyResource, kCdCopy, kCdRegister, kCdGds, kCdCounter, kCdKinds };
 void census_dma(CensusDma kind, std::size_t bytes);
 // The top-level command buffer being walked is a snapshot of the guest's
@@ -1268,6 +1279,24 @@ bool covers_counter_word(std::uint64_t va, std::size_t bytes) {
     return it != g_counter_words.end() && *it < va + bytes;
 }
 
+// A count copy token's copy, as the DMA_DATA packet's was made: a counter
+// word's on the GPU's timeline, where the count is; otherwise on the CP.
+void cp_count_copy(std::uint64_t dst, std::uint64_t src) {
+    if (host_gpu_gds_counters() && covers_counter_word(src, 4) && host_gpu_counter_copy(dst, src, 4)) {
+        g_cc_gpu.fetch_add(1, std::memory_order_relaxed);
+        g_counter_reads.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    if (!hle_kernel_va_mapped(src, 4) || !hle_kernel_va_mapped(dst, 4)) {
+        g_cc_lost.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    record(dst, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(src)), 4);
+    g_exec_writes.fetch_add(1);
+    std::memmove(reinterpret_cast<void*>(static_cast<std::uintptr_t>(dst)), reinterpret_cast<const void*>(static_cast<std::uintptr_t>(src)), 4);
+    g_cc_cpu.fetch_add(1, std::memory_order_relaxed);
+}
+
 void gds_log_once(std::atomic<int>& n, const char* fmt, unsigned long long a, unsigned long long b = 0) {
     if (n.fetch_add(1, std::memory_order_relaxed) < 4) host_log(fmt, a, b);
 }
@@ -1651,6 +1680,16 @@ void execute_packet(std::uint32_t op, const std::uint32_t* b, std::size_t n, int
                 const std::size_t bytes = b[5] & 0x1fffffu;
                 const std::uint64_t dst = gpu_va(b[3], b[4]);
                 if (bytes == 0) break;
+                if (t_count_check.active && src_sel != 2 && src_sel != 1) {
+                    t_count_check.active = false;
+                    const bool same = t_count_check.dst == dst && t_count_check.src == gpu_va(b[1], b[2]) && bytes == 4;
+                    (same ? g_cc_same : g_cc_differ).fetch_add(1, std::memory_order_relaxed);
+                    if (!same && g_cc_differ.load() <= 8) {
+                        host_log("gnm exec: CopyStructureCount token 0x%llx <- 0x%llx; the packet after it copies 0x%llx <- 0x%llx, %zu bytes",
+                                 static_cast<unsigned long long>(t_count_check.dst), static_cast<unsigned long long>(t_count_check.src),
+                                 static_cast<unsigned long long>(dst), static_cast<unsigned long long>(gpu_va(b[1], b[2])), bytes);
+                    }
+                }
                 if (src_sel == 1 || dst_sel == 1) {
                     if (g_cp_census) census_dma(kCdGds, bytes);
                     gds_dma(b, src_sel, dst_sel, bytes);
@@ -2115,6 +2154,18 @@ void execute_packet(std::uint32_t op, const std::uint32_t* b, std::size_t n, int
             if (n >= 3 && b[0] == kGxUploadMagic) hle_gx_upload_token(b[1] | (static_cast<std::uint64_t>(b[2]) << 32));
             if (n >= 3 && b[0] == kGxImageCopyMagic) hle_gx_image_copy_token(b[1] | (static_cast<std::uint64_t>(b[2]) << 32));
             if (n >= 3 && b[0] == kGxClearMagic) hle_gx_clear_token(b[1] | (static_cast<std::uint64_t>(b[2]) << 32));
+            if (n >= 3 && b[0] == kGxCountCopyMagic) {
+                std::uint64_t dst = 0, src = 0;
+                bool check = false;
+                if (hle_gx_count_copy_token(b[1] | (static_cast<std::uint64_t>(b[2]) << 32), &dst, &src, &check)) {
+                    if (!check) {
+                        cp_count_copy(dst, src);
+                    } else {
+                        if (t_count_check.active) g_cc_no_packet.fetch_add(1, std::memory_order_relaxed);
+                        t_count_check = CountCheck{true, dst, src};
+                    }
+                }
+            }
             // A dispatch token.
             if (n >= 3 && b[0] == kGxDispatchMagic) {
                 CpDispatchTimer timer(1);
@@ -3278,6 +3329,13 @@ void hle_gnm_wait_report() {
 }
 
 void hle_gnm_cp_report() {
+    if (g_cc_gpu.load() || g_cc_cpu.load() || g_cc_lost.load() || g_cc_same.load() || g_cc_differ.load() || g_cc_no_packet.load()) {
+        host_log("cp: CopyStructureCount tokens: copied on the GPU's timeline %llu, on the CP %llu, unmapped %llu; checked against the packet "
+                 "after the token: the same %llu, differing %llu, no packet %llu",
+                 static_cast<unsigned long long>(g_cc_gpu.load()), static_cast<unsigned long long>(g_cc_cpu.load()),
+                 static_cast<unsigned long long>(g_cc_lost.load()), static_cast<unsigned long long>(g_cc_same.load()),
+                 static_cast<unsigned long long>(g_cc_differ.load()), static_cast<unsigned long long>(g_cc_no_packet.load()));
+    }
     if (g_cp_census) {
         struct Row {
             std::uint32_t op;
