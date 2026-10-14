@@ -609,21 +609,38 @@ std::string hlsl_validate(const std::vector<std::uint32_t>& spirv) {
     return {};
 #endif
 }
+// BBHOST_HLSL_DUMP: the HLSL (and the lift it was printed from, to compile it
+// again with gcn2hlsl --spv) under the lift's hash; empty without the variable.
+std::string hlsl_dump(const std::vector<std::uint32_t>& lifted, const gcn::HlslResult& h) {
+    const char* dir = std::getenv("BBHOST_HLSL_DUMP");
+    if (!dir || !*dir) return {};
+    KeyHasher n;
+    for (const std::uint32_t w : lifted) n.u32(w);
+    char name[40];
+    std::snprintf(name, sizeof(name), "%016llx.%s", static_cast<unsigned long long>(n.a), h.profile.empty() ? "xx" : h.profile.substr(0, 2).c_str());
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    const std::filesystem::path base = std::filesystem::path(dir) / name;
+    if (!h.source.empty()) std::ofstream(base.string() + ".hlsl", std::ios::binary) << h.source;
+    std::ofstream(base.string() + ".lift.spv", std::ios::binary)
+        .write(reinterpret_cast<const char*>(lifted.data()), static_cast<std::streamsize>(lifted.size() * 4));
+    return base.string();
+}
 // Prints, compiles and checks one lifted module: DXC's SPIR-V, or empty with `why`.
 std::vector<std::uint32_t> hlsl_compile(const std::vector<std::uint32_t>& lifted, const gcn::HlslOptions& hopt, const Dxc& dxc, std::string& why) {
     const gcn::HlslResult h = gcn::emit_hlsl(lifted, hopt);
+    const std::string dumped = hlsl_dump(lifted, h);
+    // The first few failures in full, with where they were dumped.
+    const auto log_failure = [&](const std::string& what) {
+        static std::atomic<int> logged{0};
+        if (logged.fetch_add(1) < 8)
+            host_log("render: HLSL: a lift kept its SPIR-V%s%s: %s", dumped.empty() ? "" : " (", dumped.empty() ? "" : (dumped + ")").c_str(),
+                     what.substr(0, 600).c_str());
+    };
     if (!h.ok()) {
         why = "the printer does not take it: " + (h.errors.empty() ? std::string("no source") : h.errors[0]);
+        log_failure(why);
         return {};
-    }
-    if (const char* dir = std::getenv("BBHOST_HLSL_DUMP"); dir && *dir) {
-        KeyHasher n;
-        for (const std::uint32_t w : lifted) n.u32(w);
-        char name[40];
-        std::snprintf(name, sizeof(name), "%016llx.%s.hlsl", static_cast<unsigned long long>(n.a), h.profile.substr(0, 2).c_str());
-        std::error_code ec;
-        std::filesystem::create_directories(dir, ec);
-        std::ofstream(std::filesystem::path(dir) / name, std::ios::binary) << h.source;
     }
     DxcOptions o;
     o.optimize = hlsl_level();
@@ -631,18 +648,22 @@ std::vector<std::uint32_t> hlsl_compile(const std::vector<std::uint32_t>& lifted
     std::string error;
     if (!dxc.compile(h, o, spirv, error)) {
         why = "DXC: " + error.substr(0, error.find('\n'));
+        log_failure("DXC: " + error);
         return {};
     }
     if (std::string d = gcn::hlsl_interface_diff(lifted, spirv); !d.empty()) {
         why = "another interface: " + d;
+        log_failure(why);
         return {};
     }
     if (std::string d = gcn::hlsl_operation_diff(lifted, spirv); !d.empty()) {
         why = "other operations: " + d;
+        log_failure(why);
         return {};
     }
     if (std::string v = hlsl_validate(spirv); !v.empty()) {
         why = "invalid SPIR-V: " + v;
+        log_failure(why);
         return {};
     }
     return spirv;
