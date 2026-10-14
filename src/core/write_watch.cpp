@@ -252,8 +252,8 @@ bool write_watch_arm_locked(std::uint64_t va, std::size_t len, WriteWatch& w) {
     }
     g_arms_by_owner[owner].fetch_add(1, std::memory_order_relaxed);
     if (g_arms.fetch_add(1, std::memory_order_relaxed) == 0) {
-        host_log("write-watch: on - texture memory is write-protected, and a write to it re-uploads the texture "
-                 "on its next use");
+        host_log("write-watch: on - memory the host keeps a copy of (vertex and index data, textures no GX resource "
+                 "holds) is write-protected, and a write to it is copied again at its next use");
     }
     check_mapping_headroom();
     w.armed = armed;

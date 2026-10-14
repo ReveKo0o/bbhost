@@ -476,26 +476,26 @@ void note_map(std::uint64_t holder, std::uint64_t type) {
     std::uint64_t texture_memory = 0;
     std::uint32_t texture_bytes = 0;
     {
-    std::lock_guard<std::mutex> lk(g_mu);
-    auto it = g_by_holder.find(holder);
-    if (it == g_by_holder.end()) {
-        g_map_unknown.fetch_add(1, std::memory_order_relaxed);
-        return;
-    }
-    Entry& e = it->second;
-    const unsigned rt = e.info.type < 5 ? e.info.type : 0, mt = type < 5 ? static_cast<unsigned>(type) : 0;
-    g_maps[rt][mt].fetch_add(1, std::memory_order_relaxed);
-    e.info.write_seq = g_write_seq.fetch_add(1, std::memory_order_relaxed) + 1;
-    if (memory && memory != e.info.memory) {
-        g_map_moved.fetch_add(1, std::memory_order_relaxed);
-        if (auto m = g_by_memory.find(e.info.memory); m != g_by_memory.end() && m->second == holder) g_by_memory.erase(m);
-        e.info.memory = memory;
-        g_by_memory[memory] = holder;
-    }
-    if (e.info.type >= 2 && e.info.type <= 4) {
-        texture_memory = e.info.memory;
-        texture_bytes = e.info.bytes;
-    }
+        std::lock_guard<std::mutex> lk(g_mu);
+        auto it = g_by_holder.find(holder);
+        if (it == g_by_holder.end()) {
+            g_map_unknown.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+        Entry& e = it->second;
+        const unsigned rt = e.info.type < 5 ? e.info.type : 0, mt = type < 5 ? static_cast<unsigned>(type) : 0;
+        g_maps[rt][mt].fetch_add(1, std::memory_order_relaxed);
+        e.info.write_seq = g_write_seq.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (memory && memory != e.info.memory) {
+            g_map_moved.fetch_add(1, std::memory_order_relaxed);
+            if (auto m = g_by_memory.find(e.info.memory); m != g_by_memory.end() && m->second == holder) g_by_memory.erase(m);
+            e.info.memory = memory;
+            g_by_memory[memory] = holder;
+        }
+        if (e.info.type >= 2 && e.info.type <= 4) {
+            texture_memory = e.info.memory;
+            texture_bytes = e.info.bytes;
+        }
     }
     // A texture mapped (none is, in any run so far): the CPU writes it next,
     // and its image is no longer what its memory holds - the texture cache,

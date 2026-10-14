@@ -10898,8 +10898,8 @@ void render_retire_generation_locked(std::uint64_t base, std::size_t bytes, std:
             tex_event(r.base, rt_size_bytes(r), "%s 0x%llx %ux%u format %d retired with its GX resource (generation %llu)",
                       k ? "snapshot" : r.depth ? "depth target" : "colour target", static_cast<unsigned long long>(r.base), r.width, r.height,
                       static_cast<int>(r.format), static_cast<unsigned long long>(gen));
-            // What was learned about the memory as this target - its unpadded
-            // extent, a clear waiting for it - was this resource's.
+            // The unpadded extent learned for the memory as this target was
+            // this resource's, not the next one's there.
             if (!k) {
                 g_rt_real_width.erase(r.base);
                 g_rt_real_height.erase(r.base);

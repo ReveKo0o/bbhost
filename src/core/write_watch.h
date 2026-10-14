@@ -1,7 +1,9 @@
 #pragma once
 
 // Write tracking for guest memory the host keeps a copy of: the texture
-// cache's surfaces. A surface's pages are made read-only when it is uploaded,
+// cache's surfaces that no GX texture holds (a GX texture's changes come
+// through GX itself: host/textures.cpp, by_identity) and the buffer shadow's
+// vertex and index pages. A surface's pages are made read-only when it is uploaded,
 // the first write to one of them faults, and the fault makes that page
 // writable again and records that it was written. The next bind of the
 // surface sees the written page and uploads it again - on the next frame,

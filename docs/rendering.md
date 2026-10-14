@@ -119,8 +119,15 @@ translated.
 
 **Textures and memory.** The game's memory is shared with the GPU, as on the
 PS4: its GPU-visible parts (about 5 GB) are imported into Vulkan, because
-shaders that cannot be fully resolved read memory through a page table. Textures are detiled on the GPU, and bbhost notices when the game
-rewrites one by write-protecting its pages. Render targets are Vulkan images
+shaders that cannot be fully resolved read memory through a page table.
+Textures are detiled on the GPU. A texture's image, a render target's and a
+copy's belong to the GX resource they were made for, by that resource's
+generation: GX's own calls change them - the resource's creation, upload and
+copy tokens, the shaders that write it - and they are retired when the
+resource is destroyed, so memory the game gives to a new resource never hands
+it the old image. Only what GX does not create - YEBIS's and Scaleform's own
+textures, and the device-local copies of vertex and index data - is still
+noticed by write-protecting its pages. Render targets are Vulkan images
 sized from the engine's own views, and can be re-created at any resolution
 while the game runs, the way the PC engine's GX device resizes.
 
@@ -149,7 +156,7 @@ path at all:
 | Pipeline drains | native: barrier tokens from GX's calls |
 | Labels and fences the game waits on | emulated: written by the command processor on the GPU's timeline |
 | Shaders | decompiled (lifted) to SPIR-V; a few refused programs translated (see below) |
-| Resource identity | the game's memory addresses, plus write tracking |
+| Resource identity | GX's resources by their objects and generations; what GX does not create (YEBIS's and Scaleform's textures, vertex and index copies) by address, with write tracking |
 
 ## Shader lifting
 
@@ -331,8 +338,9 @@ the default, and nothing waits on DXC:
 
 ## What comes next
 
-- Resources identified by the engine's own objects and generations rather than
-  by guest address and write tracking.
+- The rest of resource identity: the device-local copies of vertex and index
+  data told what changed by GX's Map calls, and the textures YEBIS and
+  Scaleform make known by their own creation calls, so write tracking can go.
 - The completions the game waits on (GX's block pools and command arena, Map,
   query results) from the host's own submission timeline rather than labels,
   after which the PM4 command processor only orders work.
