@@ -6825,6 +6825,23 @@ std::string host_gpu_profile_report() {
         if (!stats.empty()) host_log("gpu profile stats (k per pair: verts/vs/prims/clip-in/clip-out/fs):%s", stats.c_str());
         g.profile_stats_sum.clear();
     }
+    {
+        // The game's compute programs (a name of eight hex digits) on lines of
+        // their own, every one of them: the line above lists the top entries
+        // and a log line ends at 1 KiB, so the cheap programs fell off it.
+        std::string line;
+        int listed = 0;
+        for (const auto& e : v) {
+            if (e.first.size() != 8 || e.first.find_first_not_of("0123456789abcdef") != std::string::npos) continue;
+            std::snprintf(buf, sizeof(buf), " %s=%.2fms(%llu)", e.first.c_str(), e.second.first / 1e6, static_cast<unsigned long long>(e.second.second));
+            line += buf;
+            if (++listed % 16 == 0) {
+                host_log("gpu profile compute (since the last):%s", line.c_str());
+                line.clear();
+            }
+        }
+        if (!line.empty()) host_log("gpu profile compute (since the last):%s", line.c_str());
+    }
     g.profile_ns.clear();
     if (g.profile_gaps) {
         // The gaps by what was recorded in them, the top twelve, as site
