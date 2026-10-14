@@ -180,6 +180,10 @@ public:
             r.source = assemble();
             r.profile = profile;
             r.arguments = arguments;
+            if (runtime_offset) {
+                r.arguments.push_back("-Vd");
+                r.validate_offsets = true;
+            }
             if (hv202x) r.language = "202x";
         } catch (const Unsupported& e) {
             r.errors.push_back(e.what());
@@ -212,6 +216,7 @@ private:
     std::set<std::uint32_t> capabilities;
     std::string profile;
     std::vector<std::string> arguments;
+    bool runtime_offset = false;  // a sample takes its offset at run time (HlslResult::validate_offsets)
 
     struct Block {
         std::uint32_t label = 0;
@@ -1825,6 +1830,7 @@ private:
     }
     std::string offset_arg(const ImageOperands& o, std::uint32_t image_type) {
         if (!(o.mask & (spv::IoConstOffset | spv::IoOffset))) return "";
+        if (o.mask & spv::IoOffset) runtime_offset = true;
         const std::uint32_t n = coord_count(image_type, false);
         return ", " + coords(o.offset, n, 'i');
     }

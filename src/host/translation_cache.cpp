@@ -594,6 +594,12 @@ std::string hlsl_reason_key(const std::string& r) {
     }
     return k;
 }
+constexpr bool kHlslValidator =
+#ifdef BBHOST_HAVE_SPIRV_OPT
+    true;
+#else
+    false;
+#endif
 std::string hlsl_validate(const std::vector<std::uint32_t>& spirv) {
 #ifdef BBHOST_HAVE_SPIRV_OPT
     spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_2);
@@ -639,6 +645,11 @@ std::vector<std::uint32_t> hlsl_compile(const std::vector<std::uint32_t>& lifted
     };
     if (!h.ok()) {
         why = "the printer does not take it: " + (h.errors.empty() ? std::string("no source") : h.errors[0]);
+        log_failure(why);
+        return {};
+    }
+    if (h.validate_offsets && !kHlslValidator) {
+        why = "a run-time sample offset, which DXC's validator refuses, and no SPIR-V validator in this build";
         log_failure(why);
         return {};
     }

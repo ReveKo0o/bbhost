@@ -194,7 +194,7 @@ struct Device {
     VkFence fence = VK_NULL_HANDLE;
     VkPhysicalDeviceMemoryProperties mem{};
     std::string name;
-    bool quad_ops = false;
+    bool quad_ops = false, runtime_offsets = false;
     std::string robust = "robustness2 unavailable";
 
     void init() {
@@ -239,19 +239,32 @@ struct Device {
         // Random words index buffers and texels out of range: every access
         // bounds-checked, an out-of-range one reading 0 (robustness2), the same
         // for both modules.
-        VkPhysicalDeviceVulkan13Features q13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
-        VkPhysicalDeviceRobustness2FeaturesEXT qr2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT};
-        q13.pNext = &qr2;
-        VkPhysicalDeviceFeatures2 q2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
-        q2.pNext = &q13;
-        vkGetPhysicalDeviceFeatures2(phys, &q2);
         std::uint32_t next = 0;
         vkEnumerateDeviceExtensionProperties(phys, nullptr, &next, nullptr);
         std::vector<VkExtensionProperties> props(next);
         vkEnumerateDeviceExtensionProperties(phys, nullptr, &next, props.data());
-        bool r2 = false;
-        for (const VkExtensionProperties& e : props) r2 |= std::strcmp(e.extensionName, VK_EXT_ROBUSTNESS_2_EXTENSION_NAME) == 0;
+        bool r2 = false, m8 = false;
+        for (const VkExtensionProperties& e : props) {
+            r2 |= std::strcmp(e.extensionName, VK_EXT_ROBUSTNESS_2_EXTENSION_NAME) == 0;
+            m8 |= std::strcmp(e.extensionName, VK_KHR_MAINTENANCE_8_EXTENSION_NAME) == 0;
+        }
+        VkPhysicalDeviceVulkan13Features q13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
+        VkPhysicalDeviceRobustness2FeaturesEXT qr2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT};
+        VkPhysicalDeviceMaintenance8FeaturesKHR q8{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_8_FEATURES_KHR};
+        q13.pNext = &qr2;
+        if (m8) qr2.pNext = &q8;
+        VkPhysicalDeviceFeatures2 q2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+        q2.pNext = &q13;
+        vkGetPhysicalDeviceFeatures2(phys, &q2);
         std::vector<const char*> dext;
+        // A sample's run-time offset (a lift made with gcn2hlsl
+        // --runtime-offsets, as on a device with the feature) needs maintenance8.
+        VkPhysicalDeviceMaintenance8FeaturesKHR fm8{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_8_FEATURES_KHR};
+        runtime_offsets = m8 && q8.maintenance8;
+        if (runtime_offsets) {
+            dext.push_back(VK_KHR_MAINTENANCE_8_EXTENSION_NAME);
+            fm8.maintenance8 = VK_TRUE;
+        }
         VkPhysicalDeviceRobustness2FeaturesEXT fr2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT};
         if (r2) {
             dext.push_back(VK_EXT_ROBUSTNESS_2_EXTENSION_NAME);
@@ -264,6 +277,10 @@ struct Device {
         f13.synchronization2 = VK_TRUE;
         f13.robustImageAccess = q13.robustImageAccess;
         if (r2) f13.pNext = &fr2;
+        if (runtime_offsets) {
+            fm8.pNext = f13.pNext;
+            f13.pNext = &fm8;
+        }
         VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
         f2.pNext = &f13;
         f2.features.shaderInt64 = supported.shaderInt64;
@@ -273,6 +290,7 @@ struct Device {
         f2.features.robustBufferAccess = supported.robustBufferAccess;
         f2.features.independentBlend = supported.independentBlend;
         f2.features.sampleRateShading = supported.sampleRateShading;
+        f2.features.shaderImageGatherExtended = supported.shaderImageGatherExtended;
         const float priority = 1.0f;
         VkDeviceQueueCreateInfo qci{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
         qci.queueFamilyIndex = family;
@@ -1140,7 +1158,8 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "%s\n", f.what());
         return 2;
     }
-    std::printf("device: %s; quad operations in pixel shaders: %s; %s\n", dev.name.c_str(), dev.quad_ops ? "yes" : "no", dev.robust.c_str());
+    std::printf("device: %s; quad operations in pixel shaders: %s; %s; run-time sample offsets (maintenance8): %s\n", dev.name.c_str(), dev.quad_ops ? "yes" : "no", dev.robust.c_str(),
+                dev.runtime_offsets ? "yes" : "no");
     // --progress: a shard that crashed (a shader faulting inside the driver)
     // resumes past the program its progress file names, which is listed as crashed.
     std::string resume_after;

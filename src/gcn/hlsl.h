@@ -78,6 +78,15 @@ struct HlslResult {
     std::string language = "2021";        // -HV: 202x where vk::BufferPointer is used (a compute lift's atomics)
     std::vector<std::string> arguments;   // DXC arguments this module needs (-enable-16bit-types)
     std::vector<std::string> errors;      // what the printer does not take: empty on success
+    // A sample takes its offset at run time: the Offset image operand, which
+    // VK_KHR_maintenance8 allows on samples (the lift writes it only where the
+    // device has the feature, gcn::runtime_sample_offsets) and DXC's own
+    // validator refuses (VUID-RuntimeSpirv-Offset-10213), with no option to
+    // allow it. `arguments` then turn DXC's validation off (-Vd), and the
+    // caller validates the module itself with the offset allowed
+    // (spvtools::ValidatorOptions::SetAllowOffsetTextureOperand) - or, with no
+    // validator at hand, keeps the lift.
+    bool validate_offsets = false;
     bool ok() const { return errors.empty() && !source.empty(); }
 };
 

@@ -1,6 +1,7 @@
 // The HLSL printer (gcn/hlsl.h) on hand-encoded programs the lifter takes:
 // quad swizzles in every quad pattern, v_cndmask_b32 with source modifiers, a
-// sample and a LOD query in a divergent region, loops with per-lane exits
+// sample and a LOD query in a divergent region, a sample's run-time offset
+// (both ways the lift takes it), loops with per-lane exits
 // (one inside a kill region, with the helper-lane query), a depth export and
 // image loads and sizes. Each lift is printed, the source checked for the
 // spellings that keep its instructions, and - where DXC is installed (host/
@@ -46,7 +47,9 @@ bool spirv_valid(const std::vector<std::uint32_t>& words, std::string& msg) {
 }
 
 // Prints `lift`, checks the source holds each of `spellings`, and compiles it.
-void through_hlsl(const gcn::LiftResult& lift, const std::string& what, const std::vector<std::string>& spellings = {}) {
+// `runtime_offset`: whether the module samples with a run-time offset, which
+// DXC compiles without its own validator (HlslResult::validate_offsets).
+void through_hlsl(const gcn::LiftResult& lift, const std::string& what, const std::vector<std::string>& spellings = {}, bool runtime_offset = false) {
     CHECK(lift.ok());
     if (!lift.ok()) {
         std::fprintf(stderr, "%s: not lifted: %s\n", what.c_str(), lift.rejections.empty() ? "?" : lift.rejections[0].c_str());
@@ -61,6 +64,7 @@ void through_hlsl(const gcn::LiftResult& lift, const std::string& what, const st
         return;
     }
     ++g_printed;
+    CHECK(h.validate_offsets == runtime_offset);
     for (const std::string& s : spellings) {
         const bool found = h.source.find(s) != std::string::npos;
         CHECK(found);
@@ -90,7 +94,7 @@ void through_hlsl(const gcn::LiftResult& lift, const std::string& what, const st
 
 // ---- Sea Islands encodings ---------------------------------------------------------
 constexpr std::uint32_t kVcc = 106, kExec = 126, kZero = 128, kHalf = 240, kOne = 242, kV = 256, kEndpgm = 0xbf810000u;
-constexpr std::uint32_t kGetLod = 96, kSampleLz = 39;
+constexpr std::uint32_t kGetLod = 96, kSampleLz = 39, kSampleLzO = 55;
 
 struct Asm {
     std::vector<std::uint32_t> w;
@@ -224,6 +228,27 @@ void samples_and_loops() {
         a.exp_mrt0(4);
         a.w.push_back(kEndpgm);
         through_hlsl(lift_ps(a.w), "image_sample_lz", {"SampleLevel("});
+    }
+    // A sample whose offset is a run-time value: the Offset operand where the
+    // device has maintenance8 (DXC's validator refuses it: -Vd, and the caller
+    // validates), the coordinates moved by it elsewhere.
+    for (const bool runtime : {false, true}) {
+        Asm a;
+        a.sop1(4, 20, kExec);
+        a.wqm();
+        a.interp(2, 0, 0);
+        a.interp(3, 0, 1);
+        a.vop1(8, 8, kV + 3);  // v8 = int(attr0.y): the packed offsets
+        a.vop1(1, 9, kV + 2);
+        a.vop1(1, 10, kV + 3);
+        a.mimg(kSampleLzO, 4, 8, 0xf);
+        a.sop1(4, kExec, 20);
+        a.exp_mrt0(4);
+        a.w.push_back(kEndpgm);
+        gcn::set_runtime_sample_offsets(runtime);
+        through_hlsl(lift_ps(a.w), std::string("image_sample_lz_o, ") + (runtime ? "run-time offset" : "moved coordinates"),
+                     runtime ? std::vector<std::string>{"SampleLevel("} : std::vector<std::string>{"SampleLevel(", "GetDimensions("}, runtime);
+        gcn::set_runtime_sample_offsets(false);
     }
     // A uniform loop with a kill region before it: the loop's header phis
     // (declared at the top), its exit, and the values used past it.
