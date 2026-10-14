@@ -1680,7 +1680,7 @@ void execute_packet(std::uint32_t op, const std::uint32_t* b, std::size_t n, int
                 const std::size_t bytes = b[5] & 0x1fffffu;
                 const std::uint64_t dst = gpu_va(b[3], b[4]);
                 if (bytes == 0) break;
-                if (t_count_check.active && src_sel != 2 && src_sel != 1) {
+                if (t_count_check.active && src_sel != 2 && src_sel != 1 && !((b[5] >> 27) & 1)) {
                     t_count_check.active = false;
                     const bool same = t_count_check.dst == dst && t_count_check.src == gpu_va(b[1], b[2]) && bytes == 4;
                     (same ? g_cc_same : g_cc_differ).fetch_add(1, std::memory_order_relaxed);

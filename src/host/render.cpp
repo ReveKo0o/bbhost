@@ -1067,7 +1067,21 @@ thread_local const char* t_draw_pipeline = nullptr;  // the draw being resolved,
 thread_local bool t_snapshot_cbs = false;
 std::atomic<std::uint64_t> g_sf_cb_snapshots{0};
 thread_local char t_draw_origin[160] = "";             // and where it came from
-void clear_image_locked(RtImage& r, const float rgba[4], std::uint32_t first_layer, std::uint32_t layer_count);  // below, outside the unnamed namespace
+void clear_image_locked(RtImage& r, const float rgba[4], std::uint32_t first_layer, std::uint32_t layer_count, bool barrier = true);  // below, outside the unnamed namespace
+// Lazy clears (BBHOST_GX_CLEAR_LAZY, with clear tokens): the images whose
+// clear token's clear is not made yet. The next pass that binds such an image
+// whole takes the clear as its load op (begin_pass); everything else that
+// ends a pass first - a copy, an upload, a dispatch, a readback, a draw that
+// samples it, the submission - makes it before going on (render_end_pass_locked
+// -> view_clears_flush_locked), as a transfer clear.
+std::vector<std::uint64_t> g_view_clear_list;  // bases with a pending view clear (some may be stale), under g.mu
+bool g_in_view_flush = false;
+std::uint64_t g_vc_set = 0, g_vc_load = 0, g_vc_transfer = 0, g_vc_merged = 0, g_vc_dropped = 0, g_vc_flushes = 0, g_vc_sampled = 0;  // under g.mu
+// A pass ended because the next draw begins another (begin_pass): the owed
+// clears stay owed - the draw has already made the ones it reads.
+bool g_pass_end_for_draw = false;
+void view_clears_flush_locked();
+void view_clear_apply_locked(RtImage& r);
 
 // RADV (GFX8 to GFX10.3, the Deck's VanGogh among them) compresses a colour
 // target with DCC only when every format it may be viewed in has the
@@ -1314,6 +1328,10 @@ std::uint64_t g_max_rt_bytes = 0;
 std::unordered_set<std::uint64_t> g_htile_bases;
 
 void destroy_rt_image(RtImage& r) {
+    if (r.view_clear) {
+        r.view_clear = r.view_clear_load = false;
+        ++g_vc_dropped;
+    }
     invalidate_rt_views(r.base);
     defer_destroy_view(r.view);
     for (auto& [layer, view] : r.layer_views) defer_destroy_view(view);
@@ -1561,6 +1579,9 @@ RtImage* rt_image(std::uint64_t base, VkFormat format, std::uint32_t width, std:
             rt_written(r);
             return &r;
         }
+        // A clear token's clear still owed to the old image goes first: its
+        // pixels may be carried into the new one.
+        if (r.view_clear) view_clear_apply_locked(r);
         g.rt_replacements.fetch_add(1);
         if (r.format == format && r.width == width && r.height == height) {
             // More slices than before: the faces drawn so far survive. On a
@@ -6801,7 +6822,9 @@ void begin_pass(const DrawState& s, std::uint64_t key, bool hazard = false) {
     if (g_pass.active && g_pass.key == key && !hazard) return;
     transfer_flush_locked();
     if (hazard && g_pass.active && g_pass.key == key) g_barriers_mid_pass.fetch_add(1, std::memory_order_relaxed);
+    g_pass_end_for_draw = true;
     end_pass_for_draw_locked();
+    g_pass_end_for_draw = false;
     if (g_hazards.owed) {
         bool need = hazard;
         for (int t = 0; t < 8 && !need; ++t) {
@@ -6834,6 +6857,18 @@ void begin_pass(const DrawState& s, std::uint64_t key, bool hazard = false) {
         a.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
         a.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
         a.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+        if (s.color[t]->view_clear && s.color[t]->view_clear_load) {
+            // A clear token's clear as the load op (the draw checked it covers the pass).
+            RtImage& r = *s.color[t];
+            a.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+            a.clearValue = r.view_clear_value;
+            if (r.format == VK_FORMAT_B8G8R8A8_UNORM || r.format == VK_FORMAT_B8G8R8A8_SRGB) {
+                std::swap(a.clearValue.color.float32[0], a.clearValue.color.float32[2]);  // as clear_image_locked does
+            }
+            r.view_clear = r.view_clear_load = false;
+            ++g_vc_load;
+            ++g_clears;
+        }
         colors.push_back(a);
         if (!extent.width || s.color[t]->width < extent.width) extent.width = s.color[t]->width;
         if (!extent.height || s.color[t]->height < extent.height) extent.height = s.color[t]->height;
@@ -6847,6 +6882,20 @@ void begin_pass(const DrawState& s, std::uint64_t key, bool hazard = false) {
         depth.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
         depth.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
         stencil = depth;
+        if (s.depth->view_clear && s.depth->view_clear_load) {
+            RtImage& r = *s.depth;
+            if (r.view_clear_aspects & VK_IMAGE_ASPECT_DEPTH_BIT) {
+                depth.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+                depth.clearValue = r.view_clear_value;
+            }
+            if (r.view_clear_aspects & VK_IMAGE_ASPECT_STENCIL_BIT) {
+                stencil.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+                stencil.clearValue = r.view_clear_value;
+            }
+            r.view_clear = r.view_clear_load = false;
+            ++g_vc_load;
+            ++g_clears;
+        }
         if (!extent.width || s.depth->width < extent.width) extent.width = s.depth->width;
         if (!extent.height || s.depth->height < extent.height) extent.height = s.depth->height;
     }
@@ -7389,6 +7438,11 @@ DrawCmds* draw_packet_early_locked() {
 }
 
 void render_end_pass_locked() {
+    struct FlushAfter {
+        ~FlushAfter() {
+            if (!g_view_clear_list.empty() && !g_in_view_flush && !g_pass_end_for_draw) view_clears_flush_locked();
+        }
+    } flush_after;
     if (g_pass.active) {
         g_pass.active = false;
         // Into the open draw's packet when it can take it (recorder.cpp).
@@ -7562,7 +7616,7 @@ std::size_t rt_bytes_per_pixel(const RtImage& r) { return format_bytes_per_pixel
 // Recognised fill shader: the whole image is this constant. The V# byte count
 // is the tiled allocation, often a few rows larger (or a 1024² slice) than
 // width*height*bpp of the unpadded image, so there is no size check here.
-void clear_image_locked(RtImage& r, const float rgba[4], std::uint32_t first_layer = 0, std::uint32_t layer_count = ~0u) {
+void clear_image_locked(RtImage& r, const float rgba[4], std::uint32_t first_layer = 0, std::uint32_t layer_count = ~0u, bool barrier) {
     if (r.base == g_order_target && hle_video_flip_count() >= 2000 && g_order_logs.load() < 120) {
         g_order_logs.fetch_add(1);
         host_log("order: CLEAR 0x%llx rgba=%.3f %.3f %.3f %.3f", static_cast<unsigned long long>(r.base), rgba[0], rgba[1], rgba[2],
@@ -7595,10 +7649,12 @@ void clear_image_locked(RtImage& r, const float rgba[4], std::uint32_t first_lay
         v.float32[3] = rgba[3];
         rec().clear_color_image(r.image, VK_IMAGE_LAYOUT_GENERAL, v, 1, &range);
     }
-    VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
-    mb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-    mb.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
-    rec().pipeline_barrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
+    if (barrier) {
+        VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        mb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        mb.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+        rec().pipeline_barrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
+    }
     g_clears.fetch_add(1);
 }
 
@@ -10829,7 +10885,8 @@ RtImage* clear_view_target_locked(const GpuClearView& c, bool create, std::uint3
 }
 
 // Depth and stencil cleared over layers [first, first + count).
-void clear_depth_layers_locked(RtImage& r, bool depth, bool stencil, float dval, std::uint32_t sval, std::uint32_t first, std::uint32_t count) {
+void clear_depth_layers_locked(RtImage& r, bool depth, bool stencil, float dval, std::uint32_t sval, std::uint32_t first, std::uint32_t count,
+                               bool barrier = true) {
     begin_recording_locked();
     render_end_pass_locked();
     ensure_initialised(r);
@@ -10840,19 +10897,84 @@ void clear_depth_layers_locked(RtImage& r, bool depth, bool stencil, float dval,
     if (!range.aspectMask) return;
     const VkClearDepthStencilValue v{dval, sval & 0xff};
     rec().clear_depth_stencil_image(r.image, VK_IMAGE_LAYOUT_GENERAL, v, 1, &range);
-    VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
-    mb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-    mb.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
-    rec().pipeline_barrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
+    if (barrier) {
+        VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        mb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        mb.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+        rec().pipeline_barrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
+    }
     g_clears.fetch_add(1);
 }
 
+}  // namespace
+
+namespace gpu {
+// A pending view clear made now, by transfer (lazy clears); `barrier` false
+// leaves the barrier after it to the caller (a flush makes one for all).
+void view_clear_apply_barrier_locked(RtImage& r, bool barrier) {
+    if (!r.view_clear) return;
+    r.view_clear = r.view_clear_load = false;
+    ++g_vc_transfer;
+    const bool saved = g_in_view_flush;
+    g_in_view_flush = true;
+    if (!r.depth) {
+        float rgba[4];
+        std::memcpy(rgba, r.view_clear_value.color.float32, sizeof(rgba));
+        clear_image_locked(r, rgba, r.view_clear_first, r.view_clear_count, barrier);
+    } else {
+        clear_depth_layers_locked(r, (r.view_clear_aspects & VK_IMAGE_ASPECT_DEPTH_BIT) != 0,
+                                  (r.view_clear_aspects & VK_IMAGE_ASPECT_STENCIL_BIT) != 0, r.view_clear_value.depthStencil.depth,
+                                  r.view_clear_value.depthStencil.stencil, r.view_clear_first, r.view_clear_count, barrier);
+    }
+    g_in_view_flush = saved;
+}
+void view_clear_apply_locked(RtImage& r) { view_clear_apply_barrier_locked(r, true); }
+
+// Every pending view clear not taken by the pass being begun, by transfer,
+// with one barrier after them all.
+void view_clears_flush_locked() {
+    if (g_in_view_flush) return;
+    std::vector<std::uint64_t> list;
+    list.swap(g_view_clear_list);
+    std::vector<std::uint64_t> kept;
+    bool made = false;
+    for (const std::uint64_t base : list) {
+        auto it = g_rts.find(base);
+        if (it == g_rts.end() || !it->second.view_clear) continue;
+        if (it->second.view_clear_load) {
+            kept.push_back(base);
+            continue;
+        }
+        view_clear_apply_barrier_locked(it->second, false);
+        made = true;
+    }
+    if (made) {
+        ++g_vc_flushes;
+        VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        mb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        mb.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+        rec().pipeline_barrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
+    }
+    for (const std::uint64_t base : kept) g_view_clear_list.push_back(base);
+}
+}  // namespace gpu
+
+namespace {
 // Clear tokens: run, and images they made; by kind: colour, colour that
 // GX would fast clear through CMASK, depth with HTILE, depth without.
 enum ClearViewKind { kCvRtv, kCvRtvFast, kCvDsvHtile, kCvDsv, kCvKinds };
 const char* const kClearViewKindName[kCvKinds] = {"colour", "colour (CMASK fast clear)", "depth with HTILE", "depth without HTILE"};
 int clear_view_kind(const GpuClearView& c) { return c.depth ? (c.htile ? kCvDsvHtile : kCvDsv) : (c.fast_clear ? kCvRtvFast : kCvRtv); }
 std::uint64_t g_cv_run[kCvKinds] = {}, g_cv_made[kCvKinds] = {}, g_cv_none[kCvKinds] = {}, g_cv_aspects[kCvKinds] = {};  // under g.mu
+// What the clears cost: the bytes they write, the passes they had to end, and
+// the clears of an image no draw had bound since its last clear; by image.
+std::uint64_t g_cv_bytes[kCvKinds] = {}, g_cv_pass_ends[kCvKinds] = {}, g_cv_again[kCvKinds] = {};  // under g.mu
+struct ClearCost {
+    std::uint64_t clears = 0, bytes = 0, again = 0, written_ms = 0;
+    std::uint32_t width = 0, height = 0, layers = 0;
+    int kind = 0;
+};
+std::unordered_map<std::uint64_t, ClearCost> g_cv_by_image;  // by base, under g.mu
 
 // BBHOST_GX_CLEAR_VIEWS=1: the fill path's clear checked against the token.
 // The token resolves (without making an image) and the fill token the
@@ -10958,7 +11080,15 @@ bool host_gpu_clear_view(const GpuClearView& c, bool apply, GpuClearViewResult* 
     const int kind = clear_view_kind(c);
     std::uint32_t first = 0, count = 0;
     const std::size_t before = g_rts.size();
-    RtImage* r = clear_view_target_locked(c, apply, &first, &count);
+    // Only an image that is already there is cleared: a view no draw has
+    // bound yet keeps its clear the fill path's way (below) - the textures
+    // over its memory take it and it waits there for the first draw that
+    // makes the image - instead of an image made now, which samplers would
+    // then read in place of those textures. (Views the game clears and
+    // never draws into stay that way: two 64x64 depth views ~200 times a
+    // second in the world.)
+    RtImage* r = clear_view_target_locked(c, false, &first, &count);
+    if (r && apply) r = clear_view_target_locked(c, true, &first, &count);
     if (out) {
         out->image = r;
         out->first_layer = first;
@@ -10967,9 +11097,10 @@ bool host_gpu_clear_view(const GpuClearView& c, bool apply, GpuClearViewResult* 
     }
     if (!apply) return r != nullptr;
     if (!r) {
-        // No image could be had for the view (not expected: the hook checked
-        // the format): the clear goes the fill path's way, by address, and
-        // waits for an image there.
+        // No image for the view yet: the fill path's way, by address - a fill
+        // of the view's slices (the textures there take it; a target made
+        // there later starts with it), or for a depth view the depth clear
+        // its first draw makes.
         ++g_cv_none[kind];
         if (!c.depth) {
             const std::uint32_t pitch = ((c.color[1] & 0x7ff) + 1) * 8;
@@ -10983,14 +11114,82 @@ bool host_gpu_clear_view(const GpuClearView& c, bool apply, GpuClearViewResult* 
             const auto scaled = static_cast<std::uint32_t>(std::floor(c.depth_value * 16383.0f));
             g_pending_htile[static_cast<std::uint64_t>(c.z_read_base) << 8] = PendingHtile{scaled << 18, c.stencil};
         }
-        return false;
+        return true;
     }
     ++g_cv_run[kind];
     if (g_rts.size() > before) ++g_cv_made[kind];
+    {
+        const std::size_t bpp = r->depth ? (r->format == VK_FORMAT_D16_UNORM ? 2 : 4) : rt_bytes_per_pixel(*r);
+        const std::uint64_t bytes = static_cast<std::uint64_t>(r->width) * r->height * bpp * std::max(1u, std::min(count, r->layers));
+        g_cv_bytes[kind] += bytes;
+        if (g_pass.active) ++g_cv_pass_ends[kind];
+        ClearCost& cc = g_cv_by_image[r->base];
+        // rt_written stamps an image at every draw that binds it (target_image)
+        // and at this clear: unchanged since the last clear, no draw came between.
+        if (cc.clears && cc.written_ms == r->written_ms) {
+            ++cc.again;
+            ++g_cv_again[kind];
+        }
+        ++cc.clears;
+        cc.bytes += bytes;
+        cc.width = r->width;
+        cc.height = r->height;
+        cc.layers = r->layers;
+        cc.kind = kind;
+    }
+    static const bool lazy = [] {
+        const char* e = std::getenv("BBHOST_GX_CLEAR_LAZY");
+        return !(e && e[0] == '0');
+    }();
+    if (lazy) {
+        // Owed until the image is next used (render.cpp, lazy clears): an
+        // older clear of it that this one does not cover is made first.
+        VkImageAspectFlags aspects = VK_IMAGE_ASPECT_COLOR_BIT;
+        if (c.depth) {
+            aspects = 0;
+            if (c.flags & 1) aspects |= VK_IMAGE_ASPECT_DEPTH_BIT;
+            if ((c.flags & 2) && r->format != VK_FORMAT_D32_SFLOAT && r->format != VK_FORMAT_D16_UNORM) aspects |= VK_IMAGE_ASPECT_STENCIL_BIT;
+            if (!aspects) return true;
+            if (r->htile_clear_pending) {  // an older HTILE clear from the fill path goes first
+                r->htile_clear_pending = false;
+                float dval;
+                std::memcpy(&dval, &r->htile_clear_depth, 4);
+                clear_depth_layers_locked(*r, true, true, dval, r->htile_clear_stencil, 0, r->layers);
+            }
+        }
+        first = std::min(first, r->layers - 1);
+        count = std::min(std::max(count, 1u), r->layers - first);
+        if (r->view_clear) {
+            const bool covers = (aspects & r->view_clear_aspects) == r->view_clear_aspects && first <= r->view_clear_first &&
+                                first + count >= r->view_clear_first + r->view_clear_count;
+            if (covers) {
+                ++g_vc_merged;
+            } else {
+                view_clear_apply_locked(*r);
+            }
+        }
+        if (!r->view_clear) g_view_clear_list.push_back(r->base);
+        r->view_clear = true;
+        r->view_clear_load = false;
+        r->view_clear_aspects = aspects;
+        r->view_clear_first = first;
+        r->view_clear_count = count;
+        if (c.depth) {
+            r->view_clear_value.depthStencil = {c.depth_value, c.stencil & 0xff};
+        } else {
+            std::memcpy(r->view_clear_value.color.float32, c.rgba, sizeof(c.rgba));
+            note_fill_last(*r, r->base, rt_size_bytes(*r), c.rgba);
+        }
+        ++g_vc_set;
+        rt_written(*r);
+        g_cv_by_image[r->base].written_ms = r->written_ms;
+        return true;
+    }
     if (!c.depth) {
         clear_image_locked(*r, c.rgba, first, count);
         note_fill_last(*r, r->base, rt_size_bytes(*r), c.rgba);
         rt_written(*r);
+        g_cv_by_image[r->base].written_ms = r->written_ms;
         return true;
     }
     // An HTILE clear an earlier fill left for this target's next draw is
@@ -11005,6 +11204,7 @@ bool host_gpu_clear_view(const GpuClearView& c, bool apply, GpuClearViewResult* 
     if (!depth || !stencil) ++g_cv_aspects[kind];
     clear_depth_layers_locked(*r, depth, stencil, c.depth_value, c.stencil, first, count);
     rt_written(*r);
+    g_cv_by_image[r->base].written_ms = r->written_ms;
     return true;
 }
 
@@ -11028,7 +11228,7 @@ std::string host_gpu_clear_view_report() {
     for (int k = 0; k < kCvKinds; ++k) {
         if (!g_cv_run[k] && !g_cv_none[k]) continue;
         char buf[200];
-        std::snprintf(buf, sizeof(buf), " %s %llu (images made %llu, no image so the fill path's way %llu, one aspect only %llu);", kClearViewKindName[k],
+        std::snprintf(buf, sizeof(buf), " %s %llu (images made %llu, no image yet so by address %llu, one aspect only %llu);", kClearViewKindName[k],
                       static_cast<unsigned long long>(g_cv_run[k]), static_cast<unsigned long long>(g_cv_made[k]),
                       static_cast<unsigned long long>(g_cv_none[k]), static_cast<unsigned long long>(g_cv_aspects[k]));
         out += buf;
@@ -11041,6 +11241,38 @@ std::string host_gpu_clear_view_report() {
             row += " " + std::string(kClearCheckName[o]) + " " + std::to_string(g_ccheck_counts[k][o]) + ",";
         }
         if (!row.empty()) checks += " [" + std::string(kClearViewKindName[k]) + ":" + row + "]";
+    }
+    if (g_vc_set) {
+        host_log("render: lazy clears: %llu owed, taken as a pass's load op %llu, made by transfer %llu (%llu of them for a draw that "
+                 "samples the image; %llu batches), covered by a later clear %llu, dropped with their image %llu",
+                 static_cast<unsigned long long>(g_vc_set), static_cast<unsigned long long>(g_vc_load),
+                 static_cast<unsigned long long>(g_vc_transfer), static_cast<unsigned long long>(g_vc_sampled),
+                 static_cast<unsigned long long>(g_vc_flushes), static_cast<unsigned long long>(g_vc_merged),
+                 static_cast<unsigned long long>(g_vc_dropped));
+    }
+    if (g_cv_by_image.size()) {
+        std::string cost;
+        for (int k = 0; k < kCvKinds; ++k) {
+            if (!g_cv_run[k]) continue;
+            char buf[200];
+            std::snprintf(buf, sizeof(buf), " %s %.1f GiB written, %llu passes ended, %llu cleared again with no draw between;", kClearViewKindName[k],
+                          static_cast<double>(g_cv_bytes[k]) / (1ull << 30), static_cast<unsigned long long>(g_cv_pass_ends[k]),
+                          static_cast<unsigned long long>(g_cv_again[k]));
+            cost += buf;
+        }
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> top;
+        for (const auto& [base, cc] : g_cv_by_image) top.push_back({cc.bytes, base});
+        std::sort(top.rbegin(), top.rend());
+        std::string images;
+        for (std::size_t i = 0; i < top.size() && i < 12; ++i) {
+            const ClearCost& cc = g_cv_by_image[top[i].second];
+            char buf[200];
+            std::snprintf(buf, sizeof(buf), " 0x%llx %ux%u x%u (%s) %llu clears, %.1f GiB, %llu again;", static_cast<unsigned long long>(top[i].second),
+                          cc.width, cc.height, cc.layers, kClearViewKindName[cc.kind], static_cast<unsigned long long>(cc.clears),
+                          static_cast<double>(cc.bytes) / (1ull << 30), static_cast<unsigned long long>(cc.again));
+            images += buf;
+        }
+        host_log("render: clear tokens' cost:%s largest by bytes:%s", cost.c_str(), images.c_str());
     }
     std::string imageless;
     for (const auto& [base, e] : g_ccheck_imageless) {
@@ -15388,6 +15620,75 @@ static bool draw_impl(const GpuDraw& d) {
                 if (g_hazards.owed && g_hazards.written.count(base)) sample_hazard = true;
                 g_hazards.sampled.insert(base);
             }
+        }
+    }
+    if (!g_view_clear_list.empty()) {
+        // Lazy clears: an attachment of this draw's pass that owes a clear
+        // token's clear takes it as the pass's load op when the pass covers
+        // it whole (that one layer, the render area its size); every other
+        // owed clear is made now, before the draw reads anything.
+        std::uint32_t ew = 0, eh = 0;  // the render area, as begin_pass works it out
+        const auto extent_of = [&](const RtImage* r) {
+            if (!r) return;
+            ew = ew ? std::min(ew, r->width) : r->width;
+            eh = eh ? std::min(eh, r->height) : r->height;
+        };
+        for (int t = 0; t < 8; ++t) extent_of(s.color[t]);
+        extent_of(s.depth);
+        bool load = false;
+        const auto take = [&](RtImage* r, std::uint32_t layer) {
+            if (!r || !r->view_clear) return;
+            if (r->width == ew && r->height == eh && r->view_clear_first == layer && r->view_clear_count == 1) {
+                r->view_clear_load = true;
+                load = true;
+            }
+        };
+        for (int t = 0; t < 8; ++t) take(s.color[t], s.color_layer[t]);
+        take(s.depth, s.depth_layer);
+        // The owed clears this draw reads go now: an attachment that cannot
+        // take its clear as the load op, and an image its vertex or pixel
+        // stage samples (a T# whose memory lies in the image's); a
+        // tessellated draw, whose other stages sample too, makes them all.
+        // The rest stay owed past this pass.
+        const bool all = s.tess_hw || s.domain_level;
+        bool made = false;
+        for (const std::uint64_t base : g_view_clear_list) {
+            auto it = g_rts.find(base);
+            if (it == g_rts.end() || !it->second.view_clear || it->second.view_clear_load) continue;
+            RtImage& r = it->second;
+            bool read = all;
+            for (int t = 0; t < 8 && !read; ++t) read = s.color[t] == &r;
+            read = read || s.depth == &r;
+            if (!read) {
+                const std::uint64_t end = r.base + std::max<std::size_t>(rt_size_bytes(r), 1);
+                for (int st = 0; st < 2 && !read; ++st) {
+                    for (const StageImages::Image& im : stage_images[st].images) {
+                        if (!im.resolved) continue;
+                        const std::uint64_t b = tsharp_base(im.w);
+                        if (b >= r.base && b < end) {
+                            read = true;
+                            ++g_vc_sampled;
+                            break;
+                        }
+                    }
+                }
+            }
+            if (!read) continue;
+            view_clear_apply_barrier_locked(r, false);
+            made = true;
+        }
+        if (made) {
+            ++g_vc_flushes;
+            VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+            mb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            mb.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+            rec().pipeline_barrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
+        }
+        // A pass with these targets already open began before the clear.
+        if (load && g_pass.active) {
+            g_pass_end_for_draw = true;
+            render_end_pass_locked();
+            g_pass_end_for_draw = false;
         }
     }
     g_pass_profile_name = &bind_pl->profile_name;

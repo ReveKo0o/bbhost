@@ -958,6 +958,15 @@ struct RtImage {
     std::uint64_t fill_va = 0;
     std::uint64_t pending_seen = 0;  // g_pending_gen when apply_pending_clear last scanned for it (render.cpp)
     std::size_t fill_bytes = 0;
+    // A clear token's clear not made yet (render.cpp, BBHOST_GX_CLEAR_LAZY):
+    // the next pass that binds the image whole takes it as its load op;
+    // anything else that ends a pass (a copy, a dispatch, a readback, a draw
+    // that samples it, the submission) makes it first.
+    bool view_clear = false;
+    bool view_clear_load = false;  // taken by the pass the current draw begins
+    VkImageAspectFlags view_clear_aspects = 0;
+    VkClearValue view_clear_value{};
+    std::uint32_t view_clear_first = 0, view_clear_count = 0;
     // The flip it was made at, and the flip and the time (steady clock, ms) a
     // draw, a fill or a copy last wrote it: its age and order for the reuse
     // retire (image_reuse_sweep_locked).
