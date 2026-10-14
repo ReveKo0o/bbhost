@@ -4289,10 +4289,145 @@ int wrapper_draw(Kind kind, const std::uint64_t* f, std::uint64_t caller) {
 // 0), the workgroup counts from the call, an indirect dispatch's arguments at
 // SET_BASE plus the offset. 0 not taken, 1 token and packet (shadow), 2 the
 // token replaces the packet.
+// The dispatch emitter's callers that dispatch through GX's compute commit
+// (gx_dispatch_commit 0x2acbe50, then the emitter on ctx + 0x10): GX's
+// Dispatch and DispatchIndirect methods, the engine render context's inlined
+// copies (0x25a2270 / 0x25a2320: GPU particles, the tone-map LUTs) and the
+// flip's three (LUT copies, the depth-of-field LUT). Return addresses.
+constexpr std::uint64_t kGxCsCommitCallers[] = {0x256960d, 0x256968f, 0x25a22ed, 0x25a23a0, 0x25d654b, 0x25d90df, 0x25d9bf0};
+bool gx_cs_commit_caller(std::uint64_t caller) {
+    for (const std::uint64_t c : kGxCsCommitCallers) {
+        if (c == caller) return true;
+    }
+    return false;
+}
+// BBHOST_GX_DISPATCH_RECORDS: a dispatch through GX's compute commit takes
+// its compute stage's records at the call, from the context's pending state,
+// and the user data is built from them when it runs, as draws build theirs
+// (1, the default); 0 takes the user data the commit's writers wrote.
+const int g_ds_records_mode = [] {
+    const char* e = std::getenv("BBHOST_GX_DISPATCH_RECORDS");
+    return e && e[0] ? std::atoi(e) : 1;
+}();
+// Why a GX compute-commit dispatch got no records (the user data the
+// writers wrote stands in): textures past slot 63, a descriptor list that
+// could not be read, the shader not the commit's.
+enum CsRecordsMiss { kCsMissShader, kCsMissList, kCsMissHighTextures, kCsMisses };
+const char* const kCsMissName[kCsMisses] = {"the pending shader is not the one the commit bound", "the descriptor list could not be read",
+                                             "textures past slot 63"};
+std::atomic<std::uint64_t> g_cs_records_taken{0}, g_cs_records_missed[kCsMisses] = {};
+
+// The compute stage's records for a dispatch through GX's compute commit,
+// taken at the dispatch emitter right after the commit, from the context's
+// pending state (ctx + 0xb730: samplers +0x1e70, shader-resource views
+// +0x1ef0, constant buffers +0x22f0, the shader +0x2360, UAVs +0x2368) the way
+// gx_commit_compute_stage (0x2acbe90) builds its records: a view's 32 bytes
+// at +0x10, a UAV's at +0x10, a sampler's 16 (an empty slot: the default at
+// 0x586c8b0), a constant buffer's V# over its renamed address (the
+// context's map at ctx + 0xb3c0) with memory type 0x6e, the shader's own
+// buffer (+0xd2, the V# at +0xf0) at slot 15; the context block (ctx +
+// 0xb2f0) for a descriptor of type 7 or 0x14; the shader's masks (+0, +8,
+// +0x10) and descriptor list (+0xe0, count +0xe8).
+bool snapshot_cs_records(std::uint64_t ctx, GxStageRecords& s, CsRecordsMiss* why) {
+    const std::uint64_t st = ctx + 0xb730;
+    const std::uint64_t shader = rd64(st + 0x2360);
+    if (!shader || rd64(ctx + 0x1fc8) != shader) {
+        *why = kCsMissShader;
+        return false;
+    }
+    s.compute = true;
+    s.ndesc = 0;
+    s.cb_hashed = 0;
+    s.obj_tex_set = 0;
+    s.obj_smp_set = 0;
+    s.obj_cb_set = 0;
+    s.obj_smp_default = 0;
+    s.cs_smp_set = 0;
+    s.has_ctx_block = false;
+    // The count is a dword (the commit zero-extends it; what follows it in
+    // the object is something else), and the commit takes at most 64.
+    std::uint64_t table = 0;
+    std::uint32_t count = 0;
+    if (!safe_read(shader, s.mask, sizeof(s.mask)) || !safe_read(shader + 0xe0, &table, 8) || !safe_read(shader + 0xe8, &count, 4)) {
+        *why = kCsMissList;
+        return false;
+    }
+    count = std::min<std::uint32_t>(count, 64);
+    if (count && !safe_read(table, s.desc, static_cast<std::size_t>(count) * 4)) {
+        *why = kCsMissList;
+        return false;
+    }
+    if (s.mask[1]) {
+        *why = kCsMissHighTextures;
+        return false;
+    }
+    s.ndesc = count;
+    std::uint64_t fp = 1469598103934665603ull ^ s.ndesc;
+    for (std::uint32_t i = 0; i < s.ndesc; ++i) fp = (fp ^ s.desc[i]) * 1099511628211ull;
+    s.desc_fp = s.ndesc ? fp | 1 : 0;
+    // The slots the commit fills: the shader's masks, and every slot a
+    // descriptor names (a record of a slot outside the masks is whatever the
+    // context's arrays held, which a native build leaves zero).
+    std::uint64_t tex = s.mask[0];
+    std::uint32_t smp = static_cast<std::uint32_t>(s.mask[2] & 0xffff), cbs = static_cast<std::uint32_t>((s.mask[2] >> 16) & 0xffff),
+                  uavs = static_cast<std::uint32_t>((s.mask[2] >> 36) & 0xff);
+    for (std::uint32_t i = 0; i < s.ndesc; ++i) {
+        const std::uint32_t type = s.desc[i] & 0xff, slot = (s.desc[i] >> 16) & 0xff;
+        switch (type) {
+            case 0x0: case 0x1: case 0xd: case 0xe: if (slot < 64) tex |= 1ull << slot; break;
+            case 0x2: case 0x3: case 0xf: case 0x10: if (slot < 8) uavs |= 1u << slot; break;
+            case 0x4: case 0x11: if (slot < 16) smp |= 1u << slot; break;
+            case 0x5: case 0x12: if (slot < 16) cbs |= 1u << slot; break;
+            case 0x7: case 0x14: s.has_ctx_block = true; break;
+            default: break;
+        }
+    }
+    if (s.has_ctx_block) s.has_ctx_block = safe_read(ctx + 0xb2f0, s.ctx_block, sizeof(s.ctx_block));
+    for (std::uint64_t m = tex; m; m &= m - 1) {
+        const int j = __builtin_ctzll(m);
+        const std::uint64_t view = rd64(st + 0x1ef0 + 8 * static_cast<std::uint64_t>(j));
+        if (view && safe_read(view + 0x10, s.obj_tex + j * 32, 32)) {
+            s.obj_tex_set |= 1ull << j;
+            s.obj_tex_id[j] = gx_object_id(view);
+        }
+    }
+    for (std::uint32_t m = uavs; m; m &= m - 1) {
+        const int j = __builtin_ctz(m);
+        const std::uint64_t uav = rd64(st + 0x2368 + 8 * static_cast<std::uint64_t>(j));
+        if (uav && safe_read(uav + 0x10, s.obj_smp + j * 32, 32)) s.obj_smp_set |= 1u << j;
+    }
+    for (std::uint32_t m = smp; m; m &= m - 1) {
+        const int j = __builtin_ctz(m);
+        const std::uint64_t obj = rd64(st + 0x1e70 + 8 * static_cast<std::uint64_t>(j));
+        if (safe_read(obj ? obj : guest(kDefaultSamplerCache), s.smp_cache + j * 16, 16)) s.cs_smp_set = static_cast<std::uint16_t>(s.cs_smp_set | (1u << j));
+    }
+    const std::uint64_t map = ctx + 0xb3c0;
+    for (std::uint32_t m = cbs & 0x3fff; m; m &= m - 1) {
+        const int j = __builtin_ctz(m);
+        const std::uint64_t cb = rd64(st + 0x22f0 + 8 * static_cast<std::uint64_t>(j));
+        if (!cb) continue;
+        const std::uint64_t addr = dynamic_buffer_address(map, cb + 0x18);
+        const std::uint32_t size = rd32(cb + 0x2c);
+        const std::uint32_t rec[4] = {static_cast<std::uint32_t>(addr), ((static_cast<std::uint32_t>(addr >> 32) & 0xfff) | 0x100000 | 0x8000),
+                                      (size + 15) >> 4, 0x20077fac & 0xc7ffffff};
+        std::memcpy(s.cb + j * 16, rec, sizeof(rec));
+        s.obj_cb_set |= 1u << j;
+    }
+    // The shader's own constant buffer, slot 15 (gx_commit_compute_stage).
+    std::uint8_t embedded = 0;
+    if (((cbs >> 15) & 1) && safe_read(shader + 0xd2, &embedded, 1) && embedded && safe_read(shader + 0xf0, s.cb + 15 * 16, 16)) {
+        s.obj_cb_set |= 1u << 15;
+    }
+    return true;
+}
+
 struct DispatchRecord {
     GpuDispatch d;
     std::uint64_t caller = 0;
     bool shadow = false;
+    // A dispatch through GX's compute commit: its compute stage's records
+    // (snapshot_cs_records), which its user data is built from.
+    std::shared_ptr<GxStageRecords> cs;
     // Shadow diagnostics: the buffer the dispatch is emitted on, its write
     // pointer at the token, the recording thread's image's set slots and their
     // writers (ComputeUserData), and the per-buffer image's.
@@ -4423,6 +4558,18 @@ int wrapper_dispatch(Kind kind, const std::uint64_t* f, std::uint64_t caller) {
         std::memcpy(r.buf_user, w->user, sizeof(r.buf_user));
         r.tid = tid();
     }
+    // Through GX's compute commit: the compute stage's records, which the
+    // user data is built from when the dispatch runs (as a draw's is).
+    if (g_ds_records_mode && gx_cs_commit_caller(caller)) {
+        auto rec = std::make_shared<GxStageRecords>();
+        CsRecordsMiss why = kCsMissShader;
+        if (snapshot_cs_records(cb - 0x10, *rec, &why)) {
+            r.cs = std::move(rec);
+            g_cs_records_taken.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            g_cs_records_missed[why].fetch_add(1, std::memory_order_relaxed);
+        }
+    }
     // The record first, then the token, the lock not held over the write
     // (as for Scaleform's: the refill can wait for the command processor).
     const std::uint64_t id = next_native_id();
@@ -4471,8 +4618,13 @@ const GpuDispatch* dispatch_token_impl(std::uint64_t id) {
         t_ds_pending = true;
         return nullptr;
     }
+    // The records stay alive until the next token on this thread: the
+    // command processor runs the dispatch before it walks another.
     static thread_local GpuDispatch t_ds;
+    static thread_local std::shared_ptr<GxStageRecords> t_ds_cs;
     t_ds = r.d;
+    t_ds_cs = std::move(r.cs);
+    t_ds.cs_records = t_ds_cs.get();
     g_ds_run.fetch_add(1, std::memory_order_relaxed);
     return &t_ds;
 }
@@ -4489,6 +4641,41 @@ DsWhy classify_slot(const DispatchRecord& rec, int k, const GpuDispatchWriters& 
     if (wp && w.packet[k] >= wp && w.packet[k] < wp + 32) return kDsWhySamePacket;
     if (w.buffer[k] == w.dispatch_buffer && w.packet[k] < w.dispatch_packet) return kDsWhyLaterSameBuf;
     return kDsWhyOtherBuf;
+}
+// Shadow: the user data a token's compute records build, against the
+// register file at its packet (host_gpu_compare_cs_user_data).
+std::atomic<std::uint64_t> g_csc_dispatches{0}, g_csc_built{0}, g_csc_not_built{0}, g_csc_dwords{0}, g_csc_dwords_differ{0}, g_csc_units{0},
+    g_csc_units_differ{0}, g_csc_unreadable{0}, g_csc_bad{0};
+void compare_cs_records(const DispatchRecord& rec, const GpuDispatch& regs, std::uint32_t read_mask) {
+    CsUserCompare c;
+    host_gpu_compare_cs_user_data(*rec.cs, regs.user_data, read_mask, c);
+    g_csc_dispatches.fetch_add(1, std::memory_order_relaxed);
+    if (!c.built) {
+        g_csc_not_built.fetch_add(1, std::memory_order_relaxed);
+        static std::atomic<int> logs{0};
+        if (logs.fetch_add(1, std::memory_order_relaxed) < 6) {
+            host_log("gx-dispatch: records of a dispatch from 0x%llx (program %llx) were not built: result %d", static_cast<ull>(rec.caller),
+                     static_cast<ull>(regs.code_va), c.result);
+        }
+        return;
+    }
+    g_csc_built.fetch_add(1, std::memory_order_relaxed);
+    g_csc_dwords.fetch_add(c.dwords, std::memory_order_relaxed);
+    g_csc_dwords_differ.fetch_add(c.dwords_differ, std::memory_order_relaxed);
+    g_csc_units.fetch_add(c.units, std::memory_order_relaxed);
+    g_csc_units_differ.fetch_add(c.units_differ, std::memory_order_relaxed);
+    g_csc_unreadable.fetch_add(c.unreadable, std::memory_order_relaxed);
+    if (!c.dwords_differ && !c.units_differ) return;
+    g_csc_bad.fetch_add(1, std::memory_order_relaxed);
+    static std::atomic<int> logs{0};
+    if (logs.fetch_add(1, std::memory_order_relaxed) < 24) {
+        host_log("gx-dispatch: records of a dispatch from 0x%llx (program %llx, reads %04x) differ from the register file: %llu of %llu plain "
+                 "dwords (first s[%d] registers %08x built %08x), %llu of %llu table slots / block dwords (first through s[%d], entry %u: "
+                 "registers' %08x %08x built %08x %08x)",
+                 static_cast<ull>(rec.caller), static_cast<ull>(regs.code_va), read_mask, static_cast<ull>(c.dwords_differ), static_cast<ull>(c.dwords),
+                 c.first_bad, c.bad_reg, c.bad_built, static_cast<ull>(c.units_differ), static_cast<ull>(c.units), c.first_unit_ud,
+                 c.first_unit_index, c.unit_reg[0], c.unit_reg[1], c.unit_built[0], c.unit_built[1]);
+    }
 }
 // Shadow, per program: dispatches compared, those whose token differs in user
 // data the program reads, in user data it loads but never reads, and the
@@ -4544,6 +4731,7 @@ void dispatch_check_impl(const GpuDispatch& regs, const GpuDispatchWriters* writ
             p.caller = rec.caller;
         }
     }
+    if (rec.cs) compare_cs_records(rec, regs, read_mask);
     // An indirect dispatch's counts come from memory at the token, so the
     // placeholder the call carries is not a difference.
     bad[4] = !d.indirect_va && std::memcmp(d.dim, regs.dim, sizeof(d.dim)) != 0;
@@ -4644,6 +4832,14 @@ void report_dispatch_tokens() {
         if (const std::uint64_t n = g_ds_bad[k].load()) appendf(fields, " %s %llu;", kDsFieldName[k], static_cast<ull>(n));
     }
     {
+        std::string missed;
+        for (int k = 0; k < kCsMisses; ++k) {
+            if (const std::uint64_t m = g_cs_records_missed[k].load()) appendf(missed, " %s %llu;", kCsMissName[k], static_cast<ull>(m));
+        }
+        host_log("gx-dispatch: compute records taken at %llu dispatches through GX's compute commit; not taken:%s",
+                 static_cast<ull>(g_cs_records_taken.load()), missed.empty() ? " none" : missed.c_str());
+    }
+    {
         std::string why;
         for (int k = 0; k < kDsRefusals; ++k) {
             if (const std::uint64_t m = g_ds_refused_why[k].load()) appendf(why, " %s %llu;", kDsRefusalName[k], static_cast<ull>(m));
@@ -4681,6 +4877,14 @@ void report_dispatch_tokens() {
             if (const std::uint64_t m = g_ds_why[k].load()) appendf(why, " %s %llu;", kDsWhyName[k], static_cast<ull>(m));
         }
         host_log("gx-dispatch: shadow by caller:%s", by_caller.empty() ? " none" : by_caller.c_str());
+        if (const std::uint64_t m = g_csc_dispatches.load()) {
+            host_log("gx-dispatch: shadow, user data built from the compute records: %llu dispatches, built %llu (not %llu); loaded plain "
+                     "dwords %llu, differing %llu; table slots and block dwords %llu, differing %llu, unreadable %llu; dispatches with a "
+                     "difference %llu",
+                     static_cast<ull>(m), static_cast<ull>(g_csc_built.load()), static_cast<ull>(g_csc_not_built.load()),
+                     static_cast<ull>(g_csc_dwords.load()), static_cast<ull>(g_csc_dwords_differ.load()), static_cast<ull>(g_csc_units.load()),
+                     static_cast<ull>(g_csc_units_differ.load()), static_cast<ull>(g_csc_unreadable.load()), static_cast<ull>(g_csc_bad.load()));
+        }
         host_log("gx-dispatch: shadow, loaded registers that differ, by the register's writer:%s (of another buffer's: the image's writer on the "
                  "dispatch's own command buffer %llu, on another %llu)",
                  why.empty() ? " none" : why.c_str(), static_cast<ull>(g_ds_other_own.load()), static_cast<ull>(g_ds_other_foreign.load()));

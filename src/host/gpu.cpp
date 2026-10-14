@@ -6227,7 +6227,12 @@ bool host_gpu_gds_counters() {
 thread_local std::uint32_t t_dispatch_user_reads = 0xffff;
 std::uint32_t host_gpu_dispatch_user_reads() { return t_dispatch_user_reads; }
 
-bool host_gpu_dispatch(const GpuDispatch& d) {
+// Dispatch tokens from GX's compute commit (GpuDispatch::cs_records): user
+// data built from their records, and those whose records the builder did not
+// take (their user data stays the token's).
+std::atomic<std::uint64_t> g_cs_records_built{0}, g_cs_records_failed{0};
+
+bool host_gpu_dispatch(const GpuDispatch& d_in) {
     t_dispatch_user_reads = 0xffff;
     DispatchStamp stamp;
     GpuPhaseTimer timer(kPhaseLock);
@@ -6238,6 +6243,22 @@ bool host_gpu_dispatch(const GpuDispatch& d) {
     if (!init_locked()) {
         return false;
     }
+    // A token's compute records: the user data its descriptors write, built
+    // as GX's compute commit writes it, the tables in the host ring. The rest
+    // of the user data (dwords no descriptor writes) stays the token's.
+    GpuDispatch built;
+    const GpuDispatch* dp = &d_in;
+    if (d_in.cs_records) {
+        built = d_in;
+        std::uint16_t set = 0;
+        if (render_cs_user_data_locked(*d_in.cs_records, built.user_data, &set)) {
+            g_cs_records_built.fetch_add(1, std::memory_order_relaxed);
+            dp = &built;
+        } else if (g_cs_records_failed.fetch_add(1, std::memory_order_relaxed) < 4) {
+            host_log("gpu: a dispatch token's compute records name a descriptor the builder does not take: its user data is the token's");
+        }
+    }
+    const GpuDispatch& d = *dp;
     const CachedCompute* cc = compute_program_at(d.code_va);
     if (!cc) {
         static std::atomic<int> logs{0};
@@ -7942,6 +7963,11 @@ void host_gpu_report() {
         for (std::size_t k = 0; k < by_count.size() && k < 16; ++k) {
             host_log("gpu:   %8llu %s", static_cast<unsigned long long>(by_count[k].first), by_count[k].second.c_str());
         }
+    }
+    if (const std::uint64_t n = g_cs_records_built.load() + g_cs_records_failed.load()) {
+        host_log("gpu: dispatch tokens with compute records: %llu, user data built from them %llu, not built (the token's kept) %llu",
+                 static_cast<unsigned long long>(n), static_cast<unsigned long long>(g_cs_records_built.load()),
+                 static_cast<unsigned long long>(g_cs_records_failed.load()));
     }
     if (host_gpu_gds_counters()) {
         host_log("gpu: GDS counters: %llu dispatches counted in bound words, %llu counted in GDS with none bound; %llu counts set and %llu copied "

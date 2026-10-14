@@ -10335,6 +10335,18 @@ const std::uint8_t* gx_object_record(const GxStageRecords& st, std::uint32_t typ
     if (t_tess_constants && slot == 0x13 && (type == 0x5 || type == 0x12 || type == 0xb)) {
         return reinterpret_cast<const std::uint8_t*>(t_tess_constants);
     }
+    if (st.compute) {
+        // A compute stage (GxStageRecords::compute): UAVs in obj_smp, the
+        // sampler caches in smp_cache, sixteen constant buffers in cb.
+        switch (type) {
+            case 0x4: case 0x11: case 0xa:
+                return slot < 16 && ((st.cs_smp_set >> slot) & 1) ? st.smp_cache + static_cast<std::size_t>(slot) * 16 : nullptr;
+            case 0x5: case 0x12: case 0xb:
+                return slot < 16 && ((st.obj_cb_set >> slot) & 1) ? st.cb + static_cast<std::size_t>(slot) * 16 : nullptr;
+            default:
+                break;
+        }
+    }
     switch (type) {
         case 0x0: case 0xd: case 0x1: case 0xe: case 0x8:
             return slot < 64 && ((st.obj_tex_set >> slot) & 1) ? st.obj_tex + static_cast<std::size_t>(slot) * 32 : nullptr;
@@ -10503,7 +10515,10 @@ GxUserResult build_gx_user_data(const GxStageRecords& st, GxUserData& out, std::
                     break;
                 }
                 case 0x6: case 0x13: {
-                    const std::uint32_t w = 0x20;
+                    // GX's draw commit writes 0x20; its compute commit the
+                    // GDS counter range, base 0x20 and eight counters, which
+                    // the particle programs move into M0 for ds_append/consume.
+                    const std::uint32_t w = st.compute ? 0x00200020u : 0x20u;
                     if (!(in_ext ? put_ext(off, &w, 1, true) : put_user(off, &w, 1))) return kUserSlot;
                     break;
                 }
@@ -10748,6 +10763,92 @@ std::uint64_t host_gpu_ring_place(const void* data, std::size_t bytes, std::size
     if (!data || !bytes || !align || (align & (align - 1))) return 0;
     std::lock_guard<GpuMutex> lk(g.mu);
     return ring_place(static_cast<const std::uint8_t*>(data), bytes, align < 8 ? 8 : align);
+}
+
+// A dispatch's compute-stage user data from its records (GxStageRecords::
+// compute), as GX's compute commit writes it: records and constants in the
+// user SGPRs, tables, the context block and the extended block placed in the
+// host ring. Under g.mu.
+bool gpu::render_cs_user_data_locked(const GxStageRecords& st, std::uint32_t user[16], std::uint16_t* set) {
+    GxUserData u;
+    if (build_gx_user_data(st, u) != kUserBuilt) return false;
+    for (int k = 0; k < 16; ++k) {
+        if ((u.set >> k) & 1) user[k] = u.user[k];
+    }
+    *set = u.set;
+    return true;
+}
+
+// Shadow: the user data a dispatch's records build against what the register
+// file holds at its packet, over the registers the program reads - records
+// and constants dword by dword, a table, the context block or the extended
+// block by what its pointer reaches.
+void host_gpu_compare_cs_user_data(const GxStageRecords& st, const std::uint32_t* reg, std::uint32_t read_mask, CsUserCompare& out) {
+    std::lock_guard<GpuMutex> lk(g.mu);
+    GxUserData u;
+    out = CsUserCompare{};
+    out.result = static_cast<int>(build_gx_user_data(st, u));
+    if (out.result != kUserBuilt) return;
+    out.built = true;
+    std::uint32_t pointers = 0;
+    for (int i = 0; i < u.nranges; ++i) pointers |= 3u << u.ranges[i].ud;
+    // The context block's pointer is not a range: its two dwords are found by
+    // the descriptor (type 7) and compared by content below.
+    std::uint32_t ctx_block_ud = 0xff;
+    for (std::uint32_t i = 0; i < st.ndesc && i < 64; ++i) {
+        if ((st.desc[i] & 0xff) == 0x7) ctx_block_ud = (st.desc[i] >> 8) & 0xff;
+    }
+    if (ctx_block_ud < 15) pointers |= 3u << ctx_block_ud;
+    for (unsigned k = 0; k < 16; ++k) {
+        if (!((read_mask >> k) & 1) || !((u.set >> k) & 1) || ((pointers >> k) & 1)) continue;
+        ++out.dwords;
+        if (reg[k] != u.user[k]) {
+            ++out.dwords_differ;
+            if (out.first_bad < 0) {
+                out.first_bad = static_cast<int>(k);
+                out.bad_reg = reg[k];
+                out.bad_built = u.user[k];
+            }
+        }
+    }
+    const auto unit = [&](std::uint64_t guest, std::uint64_t host, std::uint32_t bytes, int ud, std::uint32_t index) {
+        ++out.units;
+        std::uint8_t a[0xc0] = {};
+        if (!guest || !hle_kernel_va_mapped(guest, bytes)) {
+            ++out.unreadable;
+            return;
+        }
+        read_guest_locked(guest, bytes, a);
+        if (std::memcmp(a, reinterpret_cast<const std::uint8_t*>(static_cast<std::uintptr_t>(host)), bytes) != 0) {
+            ++out.units_differ;
+            if (out.first_unit_ud < 0) {
+                out.first_unit_ud = ud;
+                out.first_unit_index = index;
+                std::memcpy(out.unit_reg, a, 8);
+                std::memcpy(out.unit_built, reinterpret_cast<const std::uint8_t*>(static_cast<std::uintptr_t>(host)), 8);
+            }
+        }
+    };
+    for (int i = 0; i < u.nranges; ++i) {
+        const GxUserData::Range& r = u.ranges[i];
+        if (!((read_mask >> r.ud) & 3)) continue;  // a pointer the program does not read
+        const std::uint64_t guest = static_cast<std::uint64_t>(reg[r.ud]) | (static_cast<std::uint64_t>(reg[r.ud + 1]) << 32);
+        if (r.slots) {
+            for (std::uint32_t s = 0; s < 64; ++s) {
+                if ((r.slots >> s) & 1) unit(guest + static_cast<std::uint64_t>(s) * r.stride, r.va + static_cast<std::uint64_t>(s) * r.stride, r.stride, r.ud, s);
+            }
+        } else {
+            for (std::uint32_t k = 0; k < r.count; ++k) {
+                const std::uint32_t e = r.first + k;
+                if ((u.ext_set[e >> 6] >> (e & 63)) & 1) unit(guest + 4ull * k, r.va + 4ull * k, 4, r.ud, e);
+            }
+        }
+    }
+    if (ctx_block_ud < 15 && ((read_mask >> ctx_block_ud) & 3)) {
+        const std::uint64_t guest = static_cast<std::uint64_t>(reg[ctx_block_ud]) | (static_cast<std::uint64_t>(reg[ctx_block_ud + 1]) << 32);
+        const std::uint64_t host = static_cast<std::uint64_t>(u.user[ctx_block_ud]) | (static_cast<std::uint64_t>(u.user[ctx_block_ud + 1]) << 32);
+        if (host) unit(guest, host, 0xc0, static_cast<int>(ctx_block_ud), 0);
+    }
 }
 
 

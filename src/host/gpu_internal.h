@@ -638,6 +638,10 @@ std::uint64_t render_tess_draws();  // the tessellated draws so far (render.cpp)
 // Copies guest memory as the work being recorded now will see it: the CP writes
 // still queued in unfinished submissions applied on top (Gpu::pending_writes).
 void read_guest_locked(std::uint64_t va, std::size_t bytes, void* out);
+// A dispatch token's compute-stage user data from its records (render.cpp):
+// the dwords its descriptors write, tables in the host ring; `set` says
+// which. False when a descriptor is one the builder does not take.
+bool render_cs_user_data_locked(const GxStageRecords& st, std::uint32_t user[16], std::uint16_t* set);
 void defer_destroy(const DevBuffer& b);  // freed once the current command buffer retired
 // Upload staging: `size` bytes placed in a mapped host-visible chunk the current command buffer shares with the ones
 // before and after it; the chunk is free for reuse once all of them retired. `b` is the chunk with `map` advanced to

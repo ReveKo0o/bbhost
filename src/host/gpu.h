@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <string>
 
+struct GxStageRecords;
 struct GpuDispatch {
     std::uint64_t code_va = 0;      // guest VA of the shader program (COMPUTE_PGM_LO/HI)
     std::uint32_t rsrc1 = 0;        // COMPUTE_PGM_RSRC1
@@ -41,6 +42,12 @@ struct GpuDispatch {
     static constexpr std::uint32_t kGdsCounters = 8;  // gcn::kGdsCounters
     std::uint32_t gds_base = 0;
     GdsCounter gds[kGdsCounters] = {};
+    // A dispatch token from GX's compute commit: the compute stage's records,
+    // taken at the call from the context's pending state (gx_trace.cpp
+    // snapshot_cs_records). The user data the descriptors name is built from
+    // them when the dispatch runs (the rest stays user_data's); null for a
+    // dispatch from its packet or from another caller.
+    const GxStageRecords* cs_records = nullptr;
     // The dispatch-token shadow: work out which user-data dwords the program
     // reads (host_gpu_dispatch_user_reads), to compare only those.
     bool want_user_reads = false;
@@ -195,6 +202,15 @@ struct alignas(64) GxStageRecords {
     // type 7 (a user-data pointer) or 0x14 (a pointer in the extended block)
     // hands the shader, copied at the call when the stage has one.
     bool has_ctx_block = false;
+    // A compute stage's records (a dispatch token's, gx_trace.cpp
+    // snapshot_cs_records): the 32-byte "sampler" records (types 2/3, the
+    // tables of type 9) are its UAVs' (obj_smp, slots 0-7), the sampler
+    // caches (type 4, tables of type 0xa) its samplers' 16-byte records in
+    // smp_cache, the constant buffers its 16 slots - the shader's embedded
+    // buffer at slot 15 - in cb (obj_cb_set's bits), and a type 6 descriptor
+    // is the GDS counter range 0x00200020.
+    bool compute = false;
+    std::uint16_t cs_smp_set = 0;  // compute: the sampler-cache slots smp_cache holds
     // desc[0..ndesc) hashed at the copy, which keys the
     // renderer's binding plans (how each binding reads these records, worked
     // out once per shader rather than at every draw); 0 for no descriptors.
@@ -269,6 +285,22 @@ bool host_gpu_dispatch(const GpuDispatch& d);
 // host_gpu_dispatch touches, when it asked (GpuDispatch::want_user_reads) and
 // its pipeline was found; 0xffff otherwise.
 std::uint32_t host_gpu_dispatch_user_reads();
+// Shadow (BBHOST_GX_NATIVE_DISPATCH=1): a dispatch token's compute records
+// (GpuDispatch::cs_records) built into user data, against the register
+// file's at the dispatch packet, over the registers its program reads
+// (read_mask, render.cpp). Plain dwords compare directly; a table, the context
+// block or the extended block by the contents its pointer reaches.
+struct CsUserCompare {
+    int result = 0;     // the builder's result (0: built)
+    bool built = false;
+    std::uint64_t dwords = 0, dwords_differ = 0, units = 0, units_differ = 0, unreadable = 0;
+    int first_bad = -1;  // the first differing plain dword
+    std::uint32_t bad_reg = 0, bad_built = 0;
+    int first_unit_ud = -1;  // the first differing table slot or block dword: its pointer's slot
+    std::uint32_t first_unit_index = 0;
+    std::uint32_t unit_reg[2] = {}, unit_built[2] = {};
+};
+void host_gpu_compare_cs_user_data(const GxStageRecords& st, const std::uint32_t* reg, std::uint32_t read_mask, CsUserCompare& out);
 // Queues one draw.
 bool host_gpu_draw(const GpuDraw& d);
 // Runs queued work and waits for it; call before the command processor
