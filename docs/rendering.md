@@ -51,8 +51,8 @@ before they are needed. There are two compilers:
   data - and handles every shader the game uses;
 - the *lifter* (`src/gcn/lift.cpp`) decompiles a shader into typed,
   structured SPIR-V, the form a person could read and edit. It is used for
-  every pixel shader, and every vertex shader on vertex input, it accepts -
-  with the vertex formats read from the shader's parameters, or as
+  every pixel and compute shader, and every vertex shader on vertex input, it
+  accepts - with the vertex formats read from the shader's parameters, or as
   specialisation constants, the way the translator reads them; the rest keep
   the translation. `tools/lift_verify.py` compares the two compilers' output
   byte for byte.
@@ -67,6 +67,19 @@ local, hull and domain shaders become one native pipeline - the LDS they pass
 patches through turned into stage inputs and outputs, the game's patch list
 drawn as it is, with no compute pass in front. `BBHOST_LIFT_TESS=0` keeps every
 tessellation stage translated.
+
+A compute shader is lifted against its dispatch's translation and binds
+exactly what that binds - the parameter block with the page table, the images
+and samplers, the particles' counter words - so a dispatch is set up the same
+way whichever runs. Its memory reads and writes go through the same
+page-table walk. GCN's loops that run until every lane's execution bit
+clears become structured per-invocation loops, and the GPU particles'
+wave-wide counter idiom (`ds_append`/`ds_consume` in GDS, each lane's rank
+from `v_mbcnt`) becomes one atomic add per invocation, so no compute lift
+needs subgroup operations. A barrier is accepted only where every invocation
+of the workgroup provably reaches it, and LDS, which no game compute shader
+uses, is refused. `BBHOST_LIFT_COMPUTE=0` keeps every compute shader
+translated.
 
 **Textures and memory.** The game's memory is shared with the GPU, as on the
 PS4: its GPU-visible parts (about 5 GB) are imported into Vulkan, because
@@ -97,7 +110,7 @@ path at all:
 | Other compute dispatches | emulated register state, the game's shaders |
 | Clears and target copies | partly recognised from packets |
 | Labels and fences | emulated, on the command processor |
-| Shaders | decompiled (lifted) to SPIR-V; compute and a few refused programs translated (see below) |
+| Shaders | decompiled (lifted) to SPIR-V; a few refused programs translated (see below) |
 | Resource identity | the game's memory addresses, plus write tracking |
 
 ## Shader lifting
@@ -109,7 +122,7 @@ Every shader the game creates goes through the lifter. One it refuses is transla
 | Pixel | 3,206 of 3,209 | 100% | FXAA3HQ, which needs a whole-wave proof; two debug shaders whose result depends on how the PS4 packs pixels into waves (no exact PC form). None is drawn at the 12 places. |
 | Vertex | all 10,116 | 100% | - |
 | Tessellation: local, hull, domain | all; the 141 mesh hull sets as native pipelines | 100% | - |
-| Compute | 0 | - (dispatches) | not started: every compute shader is translated |
+| Compute | all 38 in the bundles, and the 6 of the executable's own (GX's and YEBIS's) that the 12 places dispatch | 100% of dispatches | The executable carries 24 more, lifted when first dispatched; none is dispatched at the 12 places. |
 
 A draw whose setup the lifter hasn't seen still falls back to the translator. The exit report counts those by reason, and `BBHOST_LIFT_TESS` and the other switches turn the lifted paths off for comparison.
 
@@ -117,8 +130,8 @@ A draw whose setup the lifter hasn't seen still falls back to the translator. Th
 |---|---|
 | Pixel and vertex shaders lifted | done |
 | Tessellation lifted, mesh hulls native | done |
-| Compute shaders lifted | next |
-| HLSL: the lifted SPIR-V printed as HLSL and compiled with DXC to SPIR-V for Vulkan; checked byte-exact against the direct path before players switch | planned, after compute |
+| Compute shaders lifted | done |
+| HLSL: the lifted SPIR-V printed as HLSL and compiled with DXC to SPIR-V for Vulkan; checked byte-exact against the direct path before players switch | next |
 | Shaders as editable source, generated on the player's machine from their own game files (never shipped) | after HLSL |
 | D3D12 (Shader Model 6) from the same HLSL, if ever wanted; D3D11 is not planned, since it lacks the quad operations 703 programs use | later, optional |
 
@@ -130,7 +143,7 @@ A draw whose setup the lifter hasn't seen still falls back to the translator. Th
   by guest address and write tracking.
 - Clears and copies from their GX calls rather than from packets, after which
   the PM4 command processor only orders work.
-- Compute shaders lifted, then HLSL (the table above).
+- HLSL from the lifted shaders (the table above).
 
 ## Tools
 
@@ -139,7 +152,7 @@ A draw whose setup the lifter hasn't seen still falls back to the translator. Th
 | `gcn2spv` | translates and validates every shader in the game's bundles |
 | `gcndis` | disassembles GCN programs |
 | F12 in game | dumps the frame, every render target and the draw list into a folder of its own (`tools/f12_check.py` reads it; `BBHOST_F12_PNG=1` for PNG) |
-| `BBHOST_CAPTURE_DRAW` + `drawreplay` | captures one draw with its inputs and replays it outside the game |
+| `BBHOST_CAPTURE_DRAW` + `drawreplay` | captures one draw with its inputs and replays it outside the game; `BBHOST_CAPTURE_DISPATCH` does the same for a compute dispatch |
 | `tools/area_check.py` | ten places in the game measured the same way every time - frame times, GPU time, draws by how their pixel shader ran, compiles, frames and lift checks - and two builds compared against their own noise ([area-check.md](area-check.md)) |
 | `BBHOST_VK_VALIDATE=1` | runs with the Vulkan validation layer |
 | `BBHOST_GPU_PROFILE=1` | per-pass GPU timings |
