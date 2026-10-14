@@ -999,6 +999,11 @@ struct RtImage {
     // generation of the GX resource it is the image of (0: none known) - it
     // goes when that resource does (render_retire_generation_locked).
     std::uint64_t written_seq = 0, gx_gen = 0;
+    // Its resource died (steady ms; 0: alive) with this many submissions
+    // made, and that resource's memory: retired once idle for the reuse idle
+    // time, or taken by the memory's next resource if one draws into it first
+    // or is made over it without data (render_retire_reused_locked).
+    std::uint64_t dead_ms = 0, dead_after = 0, dead_memory = 0;
     // How its image was made, to make it again elsewhere (a target that went
     // to host memory for want of video memory comes back: render_return_targets_locked).
     VkImageCreateFlags create_flags = 0;
@@ -1044,13 +1049,18 @@ void view_clears_flush_locked(int why = kVcwOther);
 void image_reuse_sweep_locked();
 struct ReuseRetired {
     std::uint64_t n = 0, bytes = 0;
+    std::uint64_t dead_n = 0;  // targets and snapshots of a dead GX resource retired once idle (counted apart from n)
 };
 // Each scan goes on from where the last one stopped and stops at `deadline`,
 // so a sweep holds g.mu for a bounded time however many images there are.
+// `address_rule`: whether the rule by a newer object over an idle image's
+// memory applies (BBHOST_IMG_RETIRE_REUSED); the images of dead GX resources
+// (marked by render_retire_generation_locked / retire_surfaces_locked) go once
+// idle either way, unless the memory's next resource wrote them first.
 ReuseRetired render_retire_reused_locked(std::uint64_t now_ms, std::uint64_t idle_ms,
-                                         std::chrono::steady_clock::time_point deadline);  // render.cpp: targets and snapshots
+                                         std::chrono::steady_clock::time_point deadline, bool address_rule);  // render.cpp: targets and snapshots
 ReuseRetired textures_retire_reused_locked(std::uint64_t now_ms, std::uint64_t idle_ms,
-                                           std::chrono::steady_clock::time_point deadline);  // textures.cpp: shader-written surfaces
+                                           std::chrono::steady_clock::time_point deadline, bool address_rule);  // textures.cpp: shader-written surfaces
 // Whether a target or snapshot made after `after_flip` (other than `self`)
 // covers part of [va, va + bytes).
 bool render_target_newer_overlapping_locked(std::uint64_t va, std::size_t bytes, std::uint64_t after_flip, const RtImage* self);
@@ -1300,7 +1310,8 @@ bool host_image_by_resource_locked(std::uint64_t memory, std::uint64_t gen, Host
 // memory (textures.cpp).
 bool res_identity_on();
 // The colour and depth targets and the snapshots in [base, base + bytes)
-// that are generation `gen`'s images: retired with it (render.cpp).
+// that are generation `gen`'s images: marked dead, and retired by the reuse
+// sweep once idle (render.cpp).
 // A target something wrote in a submission made after `after_submitted` (the
 // count when the resource died) has a newer owner: it stays, and takes the
 // generation of the resource that now holds its memory.
@@ -1503,6 +1514,12 @@ bool textures_copy_image_region_locked(const GpuImageCopy& c);
 bool textures_carry_into_target_locked(std::uint64_t base, std::uint32_t width, std::uint32_t height, std::size_t bytes_per_pixel,
                                        VkImage target);
 void textures_retire(std::uint64_t base, std::size_t bytes, std::uint64_t after_submitted, std::uint64_t gen = 0);
+// The generation of the live GX texture that takes a dead resource's image
+// (0: none, and the image goes): one made without data at the dead
+// resource's memory, or one covering the image [image_base, +image_bytes)
+// whole - the image the address rule kept. A texture made with data has
+// texels of its own (made ahead, or at its first bind).
+std::uint64_t gx_successor_gen(std::uint64_t dead_memory, std::uint64_t image_base, std::size_t image_bytes);
 void textures_gx_written(std::uint64_t base, std::size_t bytes);  // a texture GX mapped (host_gpu_texture_written)
 void textures_submitted(int slot);                  // the recorded write-backs belong to this submission
 void textures_retired(int slot);                    // that submission completed: copy them to guest memory

@@ -10863,57 +10863,75 @@ bool render_target_newer_overlapping_locked(std::uint64_t va, std::size_t bytes,
     return scan(g_rts) || scan(g_snapshots);
 }
 
-std::uint64_t g_gen_retired_targets = 0, g_gen_retired_bytes = 0, g_gen_kept_written = 0;  // under g.mu
+std::uint64_t g_gen_retired_targets = 0, g_gen_retired_bytes = 0, g_gen_kept_written = 0, g_gen_adopted = 0;  // under g.mu
+std::uint64_t g_gen_dead_marked = 0;  // under g.mu: targets and snapshots whose resource died, waiting out the idle time
+std::uint64_t g_gen_taken_next = 0;   // under g.mu: taken by the texture made over their memory without data (gx_successor_gen)
+
+// A target or snapshot whose GX resource died goes once it has been idle for
+// the reuse idle time, unless the memory's next resource takes it first: at
+// an area load the game destroys its targets and makes textures at the same
+// memory again, which draw into these images within seconds - or only fill
+// them and copy from them, as the Hunter's Nightmare does with two a frame -
+// and so keep them (taken by the new resource, as on the console the memory
+// is), rather than each being retired and made again cleared. Retired under
+// a texture that only fills and copies, the fills fell to the textures and
+// the copies to the memory underneath, which the fills never reach.
+void retire_target_locked(std::map<std::uint64_t, RtImage>::iterator it, bool snapshot) {
+    RtImage& r = it->second;
+    static std::atomic<int> logs{0};
+    if (logs.fetch_add(1) < 8) {
+        host_log("render: %s 0x%llx %ux%u format %d (%llu MiB) retired with its GX resource (generation %llu)",
+                 snapshot ? "snapshot" : r.depth ? "depth target" : "colour target", static_cast<unsigned long long>(r.base), r.width, r.height,
+                 static_cast<int>(r.format), static_cast<unsigned long long>(r.memory.size >> 20), static_cast<unsigned long long>(r.gx_gen));
+    }
+    ++g_gen_retired_targets;
+    g_gen_retired_bytes += r.memory.size;
+    if (!snapshot) {
+        if (g_gen_retired_at.size() > 65536) g_gen_retired_at.clear();
+        g_gen_retired_at[r.base] = steady_ms();
+    }
+    tex_event(r.base, rt_size_bytes(r), "%s 0x%llx %ux%u format %d retired with its GX resource (generation %llu)",
+              snapshot ? "snapshot" : r.depth ? "depth target" : "colour target", static_cast<unsigned long long>(r.base), r.width, r.height,
+              static_cast<int>(r.format), static_cast<unsigned long long>(r.gx_gen));
+    // The unpadded extent learned at the address stays: a view-less pass
+    // (YEBIS's, the wrapper's) that makes a target there again sizes it by it.
+    textures_drop_rt_regions_locked(it->first);
+    destroy_rt_image(r);
+}
 
 void render_retire_generation_locked(std::uint64_t base, std::size_t bytes, std::uint64_t gen, std::uint64_t after_submitted) {
-    bool any = false;
+    (void)bytes;
     for (int k = 0; k < 2; ++k) {
         std::map<std::uint64_t, RtImage>& m = k ? g_snapshots : g_rts;
-        for (auto it = m.lower_bound(base); it != m.end() && it->first < base + bytes;) {
+        for (auto it = m.lower_bound(base); it != m.end() && it->first < base + bytes; ++it) {
             RtImage& r = it->second;
-            if (r.gx_gen != gen) {
-                ++it;
-                continue;
-            }
+            if (r.gx_gen != gen) continue;
             if (r.written_seq > after_submitted) {
                 // Drawn into by a submission made after its resource died: the
                 // memory's newer resource took it over (same base and shape).
                 r.gx_gen = rt_resource_gen(r.base, rt_size_bytes(r));
                 ++g_gen_kept_written;
-                ++it;
                 continue;
             }
-            static std::atomic<int> logs{0};
-            if (logs.fetch_add(1) < 8) {
-                host_log("render: %s 0x%llx %ux%u format %d (%llu MiB) retired with its GX resource (generation %llu)",
-                         k ? "snapshot" : r.depth ? "depth target" : "colour target", static_cast<unsigned long long>(r.base), r.width, r.height,
-                         static_cast<int>(r.format), static_cast<unsigned long long>(r.memory.size >> 20), static_cast<unsigned long long>(gen));
+            if (const std::uint64_t next = gx_successor_gen(base, r.base, rt_size_bytes(r))) {
+                r.gx_gen = next;
+                ++g_gen_taken_next;
+                continue;
             }
-            ++g_gen_retired_targets;
-            g_gen_retired_bytes += r.memory.size;
-            if (!k) {
-                if (g_gen_retired_at.size() > 65536) g_gen_retired_at.clear();
-                g_gen_retired_at[r.base] = steady_ms();
-            }
-            tex_event(r.base, rt_size_bytes(r), "%s 0x%llx %ux%u format %d retired with its GX resource (generation %llu)",
-                      k ? "snapshot" : r.depth ? "depth target" : "colour target", static_cast<unsigned long long>(r.base), r.width, r.height,
-                      static_cast<int>(r.format), static_cast<unsigned long long>(gen));
-            // The unpadded extent learned for the memory as this target was
-            // this resource's, not the next one's there.
-            if (!k) {
-                g_rt_real_width.erase(r.base);
-                g_rt_real_height.erase(r.base);
-            }
-            textures_drop_rt_regions_locked(it->first);
-            destroy_rt_image(r);
-            it = m.erase(it);
-            any = true;
+            r.dead_ms = steady_ms();
+            r.dead_after = after_submitted;
+            r.dead_memory = base;
+            ++g_gen_dead_marked;
         }
     }
-    if (any) {
-        ++g_rt_gen;
-        bump_view_epoch();
+}
+
+std::uint64_t dead_targets_waiting_locked() {
+    std::uint64_t n = 0;
+    for (const auto* m : {&g_rts, &g_snapshots}) {
+        for (const auto& [base, r] : *m) n += r.dead_ms != 0;
     }
+    return n;
 }
 
 void render_orphans_locked(OrphanImages out[2]) {
@@ -10941,7 +10959,8 @@ void render_orphans_locked(OrphanImages out[2]) {
     }
 }
 
-ReuseRetired render_retire_reused_locked(std::uint64_t now_ms, std::uint64_t idle_ms, std::chrono::steady_clock::time_point deadline) {
+ReuseRetired render_retire_reused_locked(std::uint64_t now_ms, std::uint64_t idle_ms, std::chrono::steady_clock::time_point deadline,
+                                         bool address_rule) {
     ReuseRetired out;
     static std::uint64_t cursor_rts = 0, cursor_snapshots = 0;  // the next base each scan looks at
     bool stopped = false;
@@ -10955,8 +10974,35 @@ ReuseRetired render_retire_reused_locked(std::uint64_t now_ms, std::uint64_t idl
                 return;
             }
             RtImage& r = it->second;
+            if (r.dead_ms && res_identity_on()) {
+                // Its GX resource died (render_retire_generation_locked).
+                if (r.written_seq > r.dead_after) {
+                    // Drawn into since by the memory's next resource: its now.
+                    r.gx_gen = rt_resource_gen(r.base, rt_size_bytes(r));
+                    r.dead_ms = 0;
+                    ++g_gen_adopted;
+                    ++it;
+                    continue;
+                }
+                if (const std::uint64_t next = gx_successor_gen(r.dead_memory, r.base, rt_size_bytes(r))) {
+                    // Made over its memory without data since: that texture's.
+                    r.gx_gen = next;
+                    r.dead_ms = 0;
+                    ++g_gen_taken_next;
+                    ++it;
+                    continue;
+                }
+                if (r.dead_ms + idle_ms <= now_ms) {
+                    retire_target_locked(it, snapshots);
+                    it = m.erase(it);
+                    out.dead_n += 1;
+                    continue;
+                }
+                ++it;
+                continue;
+            }
             const std::size_t span = std::max<std::size_t>(rt_size_bytes(r), 1);
-            if (r.written_ms + idle_ms > now_ms || gx_resource_at(r.base, span, nullptr) ||
+            if (!address_rule || r.written_ms + idle_ms > now_ms || gx_resource_at(r.base, span, nullptr) ||
                 (!gx_resource_newer_overlapping(r.base, span, r.written_flip) &&
                  !render_target_newer_overlapping_locked(r.base, span, r.written_flip, &r))) {
                 ++it;
@@ -10981,7 +11027,7 @@ ReuseRetired render_retire_reused_locked(std::uint64_t now_ms, std::uint64_t idl
     };
     sweep(g_rts, false, cursor_rts);
     sweep(g_snapshots, true, cursor_snapshots);
-    if (out.n) {
+    if (out.n || out.dead_n) {
         ++g_rt_gen;
         bump_view_epoch();
     }
@@ -10998,7 +11044,10 @@ void image_reuse_sweep_locked() {
         const char* e = std::getenv("BBHOST_IMG_RETIRE_REUSED");
         return !(e && e[0] == '0');
     }();
-    if (!on) return;
+    // BBHOST_IMG_RETIRE_REUSED=0 leaves out the address rule (a newer object
+    // over an idle image's memory); the targets of dead GX resources
+    // (BBHOST_RES_IDENTITY) still go once idle.
+    if (!on && !res_identity_on()) return;
     static std::uint64_t last = 0;
     const std::uint64_t now = steady_ms();
     if (now - last < 1000) return;
@@ -11010,9 +11059,11 @@ void image_reuse_sweep_locked() {
     static bool textures_first = false;
     textures_first = !textures_first;
     ReuseRetired t, x;
-    if (textures_first) x = textures_retire_reused_locked(now, reuse_idle_ms(), deadline);
-    t = render_retire_reused_locked(now, reuse_idle_ms(), deadline);
-    if (!textures_first) x = textures_retire_reused_locked(now, reuse_idle_ms(), deadline);
+    // Textures go by the address rule alone (a dead resource's image goes when
+    // its retirement runs, or to the memory's next texture).
+    if (textures_first && on) x = textures_retire_reused_locked(now, reuse_idle_ms(), deadline, on);
+    t = render_retire_reused_locked(now, reuse_idle_ms(), deadline, on);
+    if (!textures_first && on) x = textures_retire_reused_locked(now, reuse_idle_ms(), deadline, on);
     const std::uint64_t us = static_cast<std::uint64_t>(
         std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count());
     ++g_reuse_sweeps;
@@ -11025,14 +11076,18 @@ void image_reuse_sweep_locked() {
 }
 
 std::string image_reuse_report_locked() {
-    char buf[480];
+    char buf[640];
     std::snprintf(buf, sizeof(buf),
-                  "targets and snapshots retired with their GX resource %llu (%llu MiB), kept as drawn after it died %llu, targets made again "
-                  "there within the idle time %llu; "
+                  "targets and snapshots retired with their GX resource once idle %llu (%llu MiB), kept as drawn after it died %llu (by the "
+                  "time it died %llu, later %llu), taken by a texture made over their memory without data %llu, waiting %llu, targets made "
+                  "again there within the idle time %llu; "
                   "images retired as their memory went to newer objects: targets and snapshots %llu (%llu MiB), shader-written textures %llu "
                   "(%llu MiB); targets made again within the idle time %llu; %llu sweeps, %llu us on average, the longest %llu us",
                   static_cast<unsigned long long>(g_gen_retired_targets), static_cast<unsigned long long>(g_gen_retired_bytes >> 20),
-                  static_cast<unsigned long long>(g_gen_kept_written), static_cast<unsigned long long>(g_gen_remade),
+                  static_cast<unsigned long long>(g_gen_kept_written + g_gen_adopted), static_cast<unsigned long long>(g_gen_kept_written),
+                  static_cast<unsigned long long>(g_gen_adopted), static_cast<unsigned long long>(g_gen_taken_next),
+                  static_cast<unsigned long long>(dead_targets_waiting_locked()),
+                  static_cast<unsigned long long>(g_gen_remade),
                   static_cast<unsigned long long>(g_reuse_targets.n), static_cast<unsigned long long>(g_reuse_targets.bytes >> 20),
                   static_cast<unsigned long long>(g_reuse_textures.n), static_cast<unsigned long long>(g_reuse_textures.bytes >> 20),
                   static_cast<unsigned long long>(g_reuse_remade), static_cast<unsigned long long>(g_reuse_sweeps),

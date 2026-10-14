@@ -3546,7 +3546,14 @@ struct RetireEntry {
 std::mutex g_retire_mu;
 std::vector<RetireEntry> g_retire_pending;  // under g_retire_mu
 std::atomic<std::uint64_t> g_retired_surfaces{0}, g_retired_bytes{0}, g_retire_kept_live{0}, g_retire_kept_other_gen{0},
-    g_retired_by_gen{0}, g_retired_by_gen_live{0}, g_retire_kept_written{0};
+    g_retired_by_gen{0}, g_retired_by_gen_live{0}, g_retire_kept_written{0}, g_retire_taken_next{0};
+
+std::uint64_t gx_successor_gen(std::uint64_t dead_memory, std::uint64_t image_base, std::size_t image_bytes) {
+    GxResourceInfo live;
+    if (gx_resource_at(dead_memory, 1, &live) && live.memory == dead_memory && live.type >= 2 && !live.initial_data) return live.gen;
+    if (gx_resource_at(image_base, std::max<std::size_t>(image_bytes, 1), &live) && live.type >= 2 && !live.initial_data) return live.gen;
+    return 0;
+}
 
 void textures_retire(std::uint64_t base, std::size_t bytes, std::uint64_t after_submitted, std::uint64_t gen) {
     std::lock_guard<std::mutex> lk(g_retire_mu);
@@ -3606,9 +3613,11 @@ void retire_surfaces_locked() {
             Surface& sf = it->second;
             // By identity: the dead resource's image goes, whatever has taken
             // its memory since - a resource made there later has its own (made
-            // ahead, or at its first bind); the image of another generation
-            // stays. A surface with no generation (on no resource at its last
-            // upload) goes when no live resource covers it, as before.
+            // ahead, or at its first bind) - unless only the image holds its
+            // texels and a texture made over the memory without data takes it
+            // (below); the image of another generation stays. A surface with
+            // no generation (on no resource at its last upload) goes when no
+            // live resource covers it, as before.
             if (res_identity_on() && e.gen && sf.gx_gen) {
                 if (sf.gx_gen != e.gen) {
                     g_retire_kept_other_gen.fetch_add(1, std::memory_order_relaxed);
@@ -3624,6 +3633,20 @@ void retire_surfaces_locked() {
                     g_retire_kept_written.fetch_add(1, std::memory_order_relaxed);
                     ++it;
                     continue;
+                }
+                // A shader-written image (its texels are not in memory) goes to
+                // a texture the game made over the memory without data (an
+                // area's UAV textures, made again at a load), as the address
+                // rule kept it for whatever resource covered it: retired, it
+                // would be made again from memory that never had those texels.
+                // One made with data gets its own surface (made ahead).
+                if (sf.gpu_written) {
+                    if (const std::uint64_t next = gx_successor_gen(e.base, sf.base, std::max<std::size_t>(sf.total_src, 1))) {
+                        sf.gx_gen = next;
+                        g_retire_taken_next.fetch_add(1, std::memory_order_relaxed);
+                        ++it;
+                        continue;
+                    }
                 }
                 g_retired_by_gen.fetch_add(1, std::memory_order_relaxed);
                 if (gx_resource_at(sf.base, std::max<std::size_t>(sf.total_src, 1), nullptr)) g_retired_by_gen_live.fetch_add(1, std::memory_order_relaxed);
@@ -3770,7 +3793,8 @@ std::string textures_return_report() {
     return buf;
 }
 
-ReuseRetired textures_retire_reused_locked(std::uint64_t now, std::uint64_t idle_ms, std::chrono::steady_clock::time_point deadline) {
+ReuseRetired textures_retire_reused_locked(std::uint64_t now, std::uint64_t idle_ms, std::chrono::steady_clock::time_point deadline,
+                                           bool address_rule) {
     ReuseRetired out;
     static std::uint64_t cursor = 0;  // the next base the scan looks at
     int k = 0;
@@ -3779,7 +3803,7 @@ ReuseRetired textures_retire_reused_locked(std::uint64_t now, std::uint64_t idle
         if ((++k & 15) == 0 && std::chrono::steady_clock::now() >= deadline) break;
         Surface& sf = it->second;
         const std::size_t span = std::max<std::size_t>(sf.total_src, 1);
-        if (!sf.image || !sf.gpu_written || sf.written_ms + idle_ms > now || gx_resource_at(sf.base, span, nullptr) ||
+        if (!address_rule || !sf.image || !sf.gpu_written || sf.written_ms + idle_ms > now || gx_resource_at(sf.base, span, nullptr) ||
             (!gx_resource_newer_overlapping(sf.base, span, sf.written_flip) &&
              !render_target_newer_overlapping_locked(sf.base, span, sf.written_flip, nullptr))) {
             ++it;
@@ -4514,11 +4538,12 @@ void textures_report() {
              static_cast<unsigned long long>(g_fill_marks_skipped.load()), static_cast<unsigned long long>(g_marks_outside_resource.load()),
              static_cast<unsigned long long>(g_cp_dirty_settled.load()));
     host_log("texture: identity (BBHOST_RES_IDENTITY%s): surfaces retired with their generation %llu (%llu of them over memory a newer resource "
-             "holds), kept for another generation %llu, kept as written after their resource died %llu; made ahead over another generation's "
-             "image %llu",
+             "holds), kept for another generation %llu, kept as written after their resource died %llu, shader-written ones taken by a "
+             "texture made over their memory without data %llu; made ahead over another generation's image %llu",
              res_identity_on() ? "" : "=0, off", static_cast<unsigned long long>(g_retired_by_gen.load()),
              static_cast<unsigned long long>(g_retired_by_gen_live.load()), static_cast<unsigned long long>(g_retire_kept_other_gen.load()),
-             static_cast<unsigned long long>(g_retire_kept_written.load()), static_cast<unsigned long long>(g_ahead_replaced_gen.load()));
+             static_cast<unsigned long long>(g_retire_kept_written.load()), static_cast<unsigned long long>(g_retire_taken_next.load()),
+             static_cast<unsigned long long>(g_ahead_replaced_gen.load()));
     host_log("texture: census: hashes skipped on registered watched surfaces %llu; of the 1-in-64 check hashes %llu, %llu found a change the watch had "
              "not reported",
              static_cast<unsigned long long>(g_census_hash_skipped.load()), static_cast<unsigned long long>(g_census_check_hashed.load()),

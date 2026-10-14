@@ -124,12 +124,16 @@ Textures are detiled on the GPU. A texture's image, a render target's and a
 copy's belong to the GX resource they were made for, by that resource's
 generation: GX's own calls change them - the resource's creation, upload and
 copy tokens, the shaders that write it - and they are retired when the
-resource is destroyed, so memory the game gives to a new resource never hands
-it the old image. Only what GX does not create - YEBIS's and Scaleform's own
-textures, and the device-local copies of vertex and index data - is still
-noticed by write-protecting its pages. Render targets are Vulkan images
-sized from the engine's own views, and can be re-created at any resolution
-while the game runs, the way the PC engine's GX device resizes.
+resource is destroyed, so memory the game gives to a new resource with texels
+of its own never hands it the old image. A target, or an image only shaders
+wrote, goes instead to a texture the game makes over the same memory without
+data, as the console's memory carries it over: the game re-creates its targets
+at an area load and may only clear and copy from them. Only what GX does not
+create - YEBIS's and Scaleform's own textures, and the device-local copies of
+vertex and index data - is still noticed by write-protecting its pages.
+Render targets are Vulkan images sized from the engine's own views, and can be
+re-created at any resolution while the game runs, the way the PC engine's GX
+device resizes.
 
 **Native passes.** Several parts of the frame no longer run the game's GPU
 path at all:
