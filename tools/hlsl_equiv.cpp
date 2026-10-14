@@ -1,7 +1,8 @@
 // hlsl_equiv: a lifted shader and its HLSL path's module, run on the same
 // random inputs, their outputs compared bit for bit.
 //
-//   hlsl_equiv [--size N] [--vertices N] [--seed S] [--shard I/N] [--list FILE] [--only SUBSTR] <dir>...
+//   hlsl_equiv [--size N] [--vertices N] [--seed S] [--shard I/N] [--list FILE] [--only SUBSTR]
+//              [--small-ints] [--float-words] [--timeout S] [--progress FILE] <dir>...
 //
 // <dir> holds what `gcn2hlsl --out` writes: <bundle>/<program>.<stage>.lift.spv
 // and .dxc.spv. For each pixel or vertex shader pair the tool builds one
@@ -14,9 +15,18 @@
 //     outputs are random per vertex, interpolated as the inputs ask (flat,
 //     noperspective, centroid); every colour output and the depth output read
 //     back;
-//   vertex shader: points through a generated geometry shader that turns each
+//   vertex shader (and a tessellation LS, whose control point is an array
+//     output): points through a generated geometry shader that turns each
 //     vertex's outputs (position, every location, clip distances, point size)
-//     into a row of texels, written raw.
+//     into a row of texels, written raw;
+//   domain shader: a generated hull gives four patches random control points
+//     and patch constants and the factors 3, in point mode; each tessellator
+//     point's outputs go through the same geometry shader;
+//   hull shader: a generated vertex shader gives four patches random control
+//     points; a generated domain shader (point mode; the domain, spacing and
+//     winding DXC's module declares, as the lift's hull declares none) writes
+//     every control point's outputs, the patch constants and the factors the
+//     hull made into a buffer, which is compared.
 // The generated stages are HLSL compiled by DXC (host/dxc.h). Run it on
 // lavapipe (VK_DRIVER_FILES=<lvp_icd.json>): the CPU driver evaluates both
 // modules the same way every time, so a difference is the modules', not the
@@ -90,6 +100,7 @@ struct Module {
     std::set<std::uint32_t> dref_samplers;  // sampler variables used in a depth-compare sample
     std::set<std::uint32_t> plain_samplers;
     std::set<std::uint32_t> caps;
+    std::map<std::uint32_t, std::vector<std::uint32_t>> modes;  // OpExecutionMode: mode -> its literals
 };
 
 Module parse(const std::vector<std::uint32_t>& w) {
@@ -103,6 +114,7 @@ Module parse(const std::vector<std::uint32_t>& w) {
         const std::uint32_t* a = &w[i + 1];
         switch (op) {
         case 17: m.caps.insert(a[0]); break;
+        case 16: m.modes[a[1]] = std::vector<std::uint32_t>(a + 2, a + n - 1); break;  // OpExecutionMode
         case 15: {  // OpEntryPoint
             m.model = a[0];
             std::size_t k = 2;
@@ -167,6 +179,246 @@ bool scalar_shape(const Module& m, std::uint32_t t, char& kind, std::uint32_t& c
     else if (st.op == 20) kind = 'b';
     else return false;
     return true;
+}
+
+// ---- a hull's outputs, stored by the hull ------------------------------------------
+// A hull's factors decide whether its patch reaches the domain shader at all,
+// and random inputs give the game's hulls factors that cull every patch. So
+// the hull stores what it made itself: before each return of the entry
+// point, every invocation writes its control point's outputs, then the patch
+// constants and the factors, to a storage buffer (set `set`, binding 0), at
+// record (primitive ID x output points + invocation ID). Both modules are
+// changed the same way, finding their outputs by location and built-in, not
+// by id: per-control-point outputs by location, patch outputs by location,
+// TessLevelOuter[4], TessLevelInner[2]; every component as a uint.
+struct HullRecord {
+    std::uint32_t cp_words = 0, patch_words = 0;
+    std::uint32_t words() const { return cp_words + patch_words; }
+};
+std::vector<std::uint32_t> instrument_hull(const std::vector<std::uint32_t>& in, std::uint32_t set, std::uint32_t out_points, HullRecord& rec) {
+    struct In {
+        std::size_t at;
+        std::uint32_t op, n;
+    };
+    std::vector<In> list;
+    for (std::size_t i = 5; i < in.size();) {
+        const std::uint32_t n = in[i] >> 16, op = in[i] & 0xffff;
+        if (!n || i + n > in.size()) fail("malformed module");
+        list.push_back({i, op, n});
+        i += n;
+    }
+    std::uint32_t bound = in[3];
+    std::map<std::uint32_t, std::vector<std::uint32_t>> types;  // id -> opcode, operands
+    std::map<std::uint32_t, std::map<std::uint32_t, std::uint32_t>> deco;
+    struct Out {
+        std::uint32_t var, pointee;
+    };
+    std::vector<Out> outputs;
+    std::map<std::uint32_t, std::uint32_t> var_pointee, var_class;
+    std::uint32_t entry_fn = 0, uint_t = 0;
+    std::size_t entry_at = 0, last_annotation = 0, first_function = 0;
+    std::map<std::uint32_t, std::uint32_t> int_consts;  // value -> id, of type uint_t (found after uint_t)
+    for (const In& x : list) {
+        const std::uint32_t* a = &in[x.at + 1];
+        if (x.op == 15 && !entry_at) {  // OpEntryPoint
+            entry_at = x.at;
+            entry_fn = a[1];
+        } else if (x.op == 71 || x.op == 72 || x.op == 332 || x.op == 5632 || x.op == 5633) {
+            last_annotation = x.at + x.n;
+            if (x.op == 71) deco[a[0]][a[1]] = x.n > 3 ? a[2] : 0;
+        } else if (x.op >= 19 && x.op <= 39) {
+            types[a[0]] = std::vector<std::uint32_t>(&in[x.at], &in[x.at] + x.n);
+            types[a[0]][0] = x.op;
+            if (x.op == 21 && a[1] == 32 && a[2] == 0 && !uint_t) uint_t = a[0];
+        } else if (x.op == 59) {  // OpVariable
+            const std::uint32_t pointee = types.count(a[0]) ? types[a[0]].at(3) : 0;
+            var_pointee[a[1]] = pointee;
+            var_class[a[1]] = a[2];
+            if (a[2] == 3) outputs.push_back({a[1], pointee});
+        } else if (x.op == 54 && !first_function) {
+            first_function = x.at;
+        }
+    }
+    if (!entry_at || !first_function || !last_annotation) fail("a hull module without its entry point, functions or decorations");
+    {
+        int returns = 0;
+        bool inside = false;
+        for (const In& x : list) {
+            if (x.op == 54) inside = in[x.at + 2] == entry_fn;
+            if (x.op == 253 && inside) ++returns;
+        }
+        if (returns != 1) fail("a hull entry point with " + std::to_string(returns) + " returns");
+    }
+    std::vector<std::uint32_t> head, globals, decorations, iface;  // what goes in
+    const auto emit = [](std::vector<std::uint32_t>& v, std::uint32_t op, std::initializer_list<std::uint32_t> ops) {
+        v.push_back(static_cast<std::uint32_t>(ops.size() + 1) << 16 | op);
+        v.insert(v.end(), ops);
+    };
+    if (!uint_t) {
+        uint_t = bound++;
+        emit(globals, 21, {uint_t, 32, 0});
+    }
+    const auto constant = [&](std::uint32_t v) {
+        const auto it = int_consts.find(v);
+        if (it != int_consts.end()) return it->second;
+        const std::uint32_t id = bound++;
+        emit(globals, 43, {uint_t, id, v});
+        int_consts[v] = id;
+        return id;
+    };
+    const auto pointer = [&](std::uint32_t sc, std::uint32_t t) {
+        const std::uint32_t id = bound++;
+        emit(globals, 32, {id, sc, t});
+        return id;
+    };
+    // The buffer.
+    const std::uint32_t rta = bound++, st = bound++, ssbo = bound++;
+    emit(globals, 29, {rta, uint_t});
+    emit(globals, 30, {st, rta});
+    const std::uint32_t ptr_st = pointer(12, st), ptr_u = pointer(12, uint_t);
+    emit(globals, 59, {ptr_st, ssbo, 12});
+    emit(decorations, 71, {rta, 6, 4});        // ArrayStride 4
+    emit(decorations, 71, {st, 2});            // Block
+    emit(decorations, 72, {st, 0, 35, 0});     // Offset 0
+    emit(decorations, 71, {ssbo, 34, set});    // DescriptorSet
+    emit(decorations, 71, {ssbo, 33, 0});      // Binding
+    if (in[1] >= 0x00010400u) iface.push_back(ssbo);
+    // The invocation's and the patch's IDs: the module's built-ins, or new ones.
+    const auto builtin_input = [&](std::uint32_t b) {
+        for (const auto& [var, c] : var_class) {
+            if (c == 1 && deco.count(var) && deco[var].count(11) && deco[var][11] == b) return var;
+        }
+        const std::uint32_t var = bound++;
+        emit(globals, 59, {pointer(1, uint_t), var, 1});
+        emit(decorations, 71, {var, 11, b});
+        iface.push_back(var);
+        var_pointee[var] = uint_t;
+        return var;
+    };
+    const std::uint32_t inv_var = builtin_input(8), prim_var = builtin_input(7);
+    // The values, in order: (variable, pointee, per control point).
+    struct Val {
+        std::uint32_t var, pointee, location;
+        bool per_cp;
+        int builtin;
+    };
+    std::vector<Val> vals;
+    for (const Out& o : outputs) {
+        const auto& d = deco[o.var];
+        if (d.count(11)) {
+            if (d.at(11) == 11 || d.at(11) == 12) vals.push_back({o.var, o.pointee, d.at(11) == 11 ? 1000u : 1001u, false, static_cast<int>(d.at(11))});
+            else fail("a hull output built-in other than the factors");
+            continue;
+        }
+        if (!d.count(30)) continue;
+        vals.push_back({o.var, o.pointee, d.at(30), !d.count(15), -1});
+    }
+    std::stable_sort(vals.begin(), vals.end(), [](const Val& x, const Val& y) {
+        if (x.per_cp != y.per_cp) return x.per_cp;
+        return x.location < y.location;
+    });
+    // Element types: (type, count) after the per-control-point level.
+    const auto shape = [&](std::uint32_t t, std::uint32_t& count) {
+        count = 0;
+        if (types.at(t)[0] == 28) {
+            const std::uint32_t len_id = types.at(t)[3];
+            std::uint32_t len = 0;
+            for (const In& x : list) {
+                if (x.op == 43 && in[x.at + 2] == len_id) len = in[x.at + 3];
+            }
+            if (!len) fail("an output array of unknown length");
+            count = len;
+            t = types.at(t)[2];
+        }
+        return t;
+    };
+    std::vector<std::uint32_t> code;  // before each OpReturn of the entry point
+    const auto load_u = [&](std::uint32_t var) {
+        const std::uint32_t t = var_pointee.at(var), v = bound++;
+        emit(code, 61, {t, v, var});
+        if (t == uint_t) return v;
+        const std::uint32_t u = bound++;
+        emit(code, 124, {uint_t, u, v});  // OpBitcast
+        return u;
+    };
+    const std::uint32_t inv = load_u(inv_var), prim = load_u(prim_var);
+    const std::uint32_t t1 = bound++, slot = bound++;
+    emit(code, 132, {uint_t, t1, prim, constant(out_points)});  // OpIMul
+    emit(code, 128, {uint_t, slot, t1, inv});                    // OpIAdd
+    std::vector<std::uint32_t> store_code;  // the stores; the record's size is known after
+    std::uint32_t word = 0;
+    const std::uint32_t base = bound++;
+    const auto store = [&](std::uint32_t value) {
+        const std::uint32_t addr = bound++, ptr = bound++;
+        emit(store_code, 128, {uint_t, addr, base, constant(word++)});
+        emit(store_code, 65, {ptr_u, ptr, ssbo, constant(0), addr});
+        emit(store_code, 62, {ptr, value});
+    };
+    std::map<std::uint32_t, std::uint32_t> out_ptr;  // element type -> Output pointer
+    for (const Val& v : vals) {
+        std::uint32_t t = v.pointee, count = 0;
+        if (v.per_cp) {
+            if (types.at(t)[0] != 28) fail("a per-control-point output that is not an array");
+            t = types.at(t)[2];
+        }
+        const std::uint32_t elem = shape(t, count);
+        const auto& et = types.at(elem);
+        std::uint32_t comps = 1, comp_t = elem;
+        if (et[0] == 23) {
+            comps = et[3];
+            comp_t = et[2];
+        }
+        if (types.at(comp_t)[0] != 21 && types.at(comp_t)[0] != 22) fail("an output of another component type");
+        if (!out_ptr.count(elem)) out_ptr[elem] = pointer(3, elem);
+        for (std::uint32_t k = 0; k < (count ? count : 1); ++k) {
+            std::vector<std::uint32_t> idx;
+            if (v.per_cp) idx.push_back(inv);
+            if (count) idx.push_back(constant(k));
+            const std::uint32_t p = bound++, x = bound++;
+            store_code.push_back(static_cast<std::uint32_t>(4 + idx.size()) << 16 | 65);  // OpAccessChain
+            store_code.push_back(out_ptr[elem]);
+            store_code.push_back(p);
+            store_code.push_back(v.var);
+            store_code.insert(store_code.end(), idx.begin(), idx.end());
+            emit(store_code, 61, {elem, x, p});
+            for (std::uint32_t c = 0; c < comps; ++c) {
+                std::uint32_t s = x;
+                if (comps > 1) {
+                    s = bound++;
+                    emit(store_code, 81, {comp_t, s, x, c});  // OpCompositeExtract
+                }
+                if (comp_t != uint_t) {
+                    const std::uint32_t u = bound++;
+                    emit(store_code, 124, {uint_t, u, s});
+                    s = u;
+                }
+                store(s);
+            }
+        }
+        if (v.per_cp) rec.cp_words = word;
+    }
+    rec.patch_words = word - rec.cp_words;
+    emit(code, 132, {uint_t, base, slot, constant(rec.words())});
+    code.insert(code.end(), store_code.begin(), store_code.end());
+    // The module again, with the additions.
+    std::vector<std::uint32_t> out(in.begin(), in.begin() + 5);
+    bool in_entry = false;
+    for (const In& x : list) {
+        if (x.at == last_annotation) out.insert(out.end(), decorations.begin(), decorations.end());
+        if (x.at == first_function) out.insert(out.end(), globals.begin(), globals.end());
+        if (x.op == 54) in_entry = in[x.at + 2] == entry_fn;
+        if (x.op == 253 && in_entry) out.insert(out.end(), code.begin(), code.end());  // before OpReturn
+        if (x.at == entry_at) {
+            std::vector<std::uint32_t> ep(&in[x.at], &in[x.at] + x.n);
+            ep.insert(ep.end(), iface.begin(), iface.end());
+            ep[0] = static_cast<std::uint32_t>(ep.size()) << 16 | 15;
+            out.insert(out.end(), ep.begin(), ep.end());
+            continue;
+        }
+        out.insert(out.end(), &in[x.at], &in[x.at] + x.n);
+    }
+    out[3] = bound;
+    return out;
 }
 
 // ---- Vulkan ----------------------------------------------------------------------
@@ -291,6 +543,8 @@ struct Device {
         f2.features.independentBlend = supported.independentBlend;
         f2.features.sampleRateShading = supported.sampleRateShading;
         f2.features.shaderImageGatherExtended = supported.shaderImageGatherExtended;
+        f2.features.tessellationShader = supported.tessellationShader;
+        f2.features.vertexPipelineStoresAndAtomics = supported.vertexPipelineStoresAndAtomics;
         const float priority = 1.0f;
         VkDeviceQueueCreateInfo qci{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
         qci.queueFamilyIndex = family;
@@ -430,6 +684,10 @@ struct Inputs {
     // Buffer and params words small integers (0-63) rather than floats: a
     // loop whose count a random float's bits give runs for ever.
     bool small_ints = false;
+    // Buffer and params words all floats in [-2, 2] (no raw words): a raw
+    // word in a matrix's translation swamps every point a domain shader
+    // makes, so its outputs barely depend on the tessellation coordinate.
+    bool float_words = false;
     std::uint32_t size = 32;      // the pixel shader's target: size x size
     std::uint32_t vertices = 48;  // the vertex shader's points
 };
@@ -446,7 +704,8 @@ public:
     std::string compare(const fs::path& lift_path, const fs::path& dxc_path, const Inputs& in) {
         const std::vector<std::uint32_t> lift = read_words(lift_path), other = read_words(dxc_path);
         const Module m = parse(lift);
-        if (m.model != 4 && m.model != 0) throw Skip("execution model " + std::to_string(m.model));
+        if (m.model != 4 && m.model != 0 && m.model != 1 && m.model != 2) throw Skip("execution model " + std::to_string(m.model));
+        const Module declared = m.model == 1 ? parse(other) : Module();  // a hull's domain and spacing, which only DXC's module declares
         if (m.caps.count(68) && !dev.quad_ops) throw Skip("quad operations unsupported by the device");
         for (const std::uint32_t s : m.dref_samplers) {
             if (m.plain_samplers.count(s)) throw Skip("a sampler used with and without a depth compare");
@@ -454,8 +713,12 @@ public:
         Resources r = make_resources(m, in);
         std::string result;
         try {
-            Run a = m.model == 4 ? run_pixel(m, lift, r, in) : run_vertex(m, lift, r, in);
-            Run b = m.model == 4 ? run_pixel(m, other, r, in) : run_vertex(m, other, r, in);
+            const auto run = [&](const std::vector<std::uint32_t>& w) {
+                return m.model == 4 ? run_pixel(m, w, r, in) : m.model == 0 ? run_vertex(m, w, r, in) : m.model == 2 ? run_domain(m, w, r, in)
+                                                                                                         : run_hull(m, w, r, in, declared);
+            };
+            Run a = run(lift);
+            Run b = run(other);
             if (const char* dump = std::getenv("HLSL_EQUIV_DUMP"); dump && *dump) {
                 // Both runs' targets, raw, for a closer look at a difference.
                 for (std::size_t t = 0; t < a.outputs.size(); ++t) {
@@ -494,6 +757,8 @@ private:
         VkDescriptorPool pool = VK_NULL_HANDLE;
         std::map<std::uint32_t, VkDescriptorSet> sets;
         Buffer vertex;  // the vertex shader's attributes: one uint4 a location, per vertex
+        Buffer capture;  // a hull's run: what the hull stores; a domain shader's: the point counter (set capture_set, binding 0)
+        std::uint32_t capture_set = 0;
         std::vector<std::uint32_t> vertex_locations;
         std::vector<std::uint32_t> attr_words;  // the pixel shader's inputs' per-vertex values (3 vertices x location x 4)
     };
@@ -530,7 +795,7 @@ private:
             std::memcpy(&bits, &f, 4);
             return bits;
         };
-        const VkShaderStageFlags stages = m.model == 4 ? VK_SHADER_STAGE_FRAGMENT_BIT : VK_SHADER_STAGE_VERTEX_BIT;
+        const VkShaderStageFlags stages = VK_SHADER_STAGE_ALL_GRAPHICS;
         std::map<std::uint32_t, std::vector<VkDescriptorSetLayoutBinding>> per_set;
         std::set<std::pair<std::uint32_t, std::uint32_t>> seen;
         for (const Var& v : m.vars) {
@@ -556,7 +821,7 @@ private:
                 b.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
                 b.buffer = dev.buffer(16384, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
                 auto* p = static_cast<std::uint32_t*>(b.buffer.map);
-                for (std::uint32_t k = 0; k < 4096; ++k) p[k] = (k & 3) == 3 ? word() : float_word();
+                for (std::uint32_t k = 0; k < 4096; ++k) p[k] = (k & 3) == 3 && !in.float_words ? word() : float_word();
             } else if (t.op == 26) {  // sampler
                 b.type = VK_DESCRIPTOR_TYPE_SAMPLER;
                 VkSamplerCreateInfo si{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
@@ -636,6 +901,26 @@ private:
             per_set[b.set].push_back(lb);
             r.bindings.push_back(std::move(b));
         }
+        // A hull's run: the buffer the hull stores its outputs to; a domain
+        // shader's: the geometry shader's point counter. In a set past the module's.
+        if (m.model == 1 || m.model == 2) {
+            std::uint32_t top = 0;
+            for (const auto& [s, v] : per_set) top = std::max(top, s + 1);
+            r.capture_set = top;
+            Binding b;
+            b.set = top;
+            b.binding = 0;
+            b.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            b.buffer = dev.buffer(1u << 20, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+            r.capture = b.buffer;
+            VkDescriptorSetLayoutBinding lb{};
+            lb.binding = 0;
+            lb.descriptorType = b.type;
+            lb.descriptorCount = 1;
+            lb.stageFlags = stages;
+            per_set[top].push_back(lb);
+            r.bindings.push_back(std::move(b));
+        }
         // Every set index up to the highest one (empty layouts in between).
         std::uint32_t max_set = 0;
         for (const auto& [s, v] : per_set) max_set = std::max(max_set, s);
@@ -659,7 +944,7 @@ private:
         const VkDescriptorPoolSize sizes[] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 8}, {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 64},
                                               {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 64}, {VK_DESCRIPTOR_TYPE_SAMPLER, 64}};
         VkDescriptorPoolCreateInfo dpi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
-        dpi.maxSets = 8;
+        dpi.maxSets = 16;
         dpi.poolSizeCount = 4;
         dpi.pPoolSizes = sizes;
         check(vkCreateDescriptorPool(dev.device, &dpi, nullptr, &r.pool), "vkCreateDescriptorPool");
@@ -863,8 +1148,17 @@ private:
     }
 
     // ---- vertex shaders: each vertex's outputs as a row of texels ------------------
-    Run run_vertex(const Module& m, const std::vector<std::uint32_t>& words, Resources& r, const Inputs& in) {
-        // The vertex shader's outputs, mirrored as the geometry shader's inputs.
+    // The geometry shader that turns each point of a vertex or domain shader
+    // `m` into a column of texels, one row an output (position, every location,
+    // clip distances, point size): the column is the point's primitive ID.
+    struct Rows {
+        std::string gs;
+        std::uint32_t rows = 0;
+    };
+    // counter_set: the column from a counter in that set's buffer (binding 0)
+    // instead - after tessellation the primitive ID is the patch's, the same
+    // for each of its points.
+    Rows gs_rows(const Module& m, std::uint32_t columns, int counter_set = -1) {
         struct Out {
             std::string decl, read;  // the input's declaration; its value as uint4
         };
@@ -872,14 +1166,27 @@ private:
         for (const Var& v : m.vars) {
             if (v.sc != 3 || !m.interface_ids.count(v.id)) continue;
             if (v.has(30)) {
+                // A scalar or vector; or an array of them (an LS's control
+                // point, one location an element), a row an element.
+                std::uint32_t elem = v.pointee, count = 0;
+                if (m.types.at(elem).op == 28) {
+                    count = m.consts.at(m.types.at(elem).w.at(1));
+                    elem = m.types.at(elem).w.at(0);
+                }
                 char kind;
                 std::uint32_t comps;
-                if (!scalar_shape(m, v.pointee, kind, comps) || kind == 'b') throw Skip("a vertex output of an aggregate type");
+                if (!scalar_shape(m, elem, kind, comps) || kind == 'b') throw Skip("a vertex output of an aggregate type");
                 const std::string loc = std::to_string(v.get(30));
                 const std::string tn = std::string(kind == 'f' ? "float" : kind == 'u' ? "uint" : "int") + (comps > 1 ? std::to_string(comps) : "");
                 std::string pad = comps == 4 ? "" : comps == 3 ? ", 0u" : comps == 2 ? ", 0u, 0u" : ", 0u, 0u, 0u";
-                outs.push_back({"    [[vk::location(" + loc + ")]] nointerpolation " + tn + " o" + loc + " : O" + loc + ";\n",
-                                "uint4(asuint(v[0].o" + loc + ")" + pad + ")"});
+                if (!count) {
+                    outs.push_back({"    [[vk::location(" + loc + ")]] nointerpolation " + tn + " o" + loc + " : O" + loc + ";\n",
+                                    "uint4(asuint(v[0].o" + loc + ")" + pad + ")"});
+                    continue;
+                }
+                for (std::uint32_t k = 0; k < count; ++k)
+                    outs.push_back({k ? std::string() : "    [[vk::location(" + loc + ")]] nointerpolation " + tn + " o" + loc + "[" + std::to_string(count) + "] : O" + loc + ";\n",
+                                    "uint4(asuint(v[0].o" + loc + "[" + std::to_string(k) + "])" + pad + ")"});
                 continue;
             }
             if (!v.has(11)) continue;
@@ -902,23 +1209,68 @@ private:
                 throw Skip("vertex output built-in " + std::to_string(bi));
             }
         }
-        const std::uint32_t rows = static_cast<std::uint32_t>(outs.size());
-        if (!rows) throw Skip("no outputs");
-        std::string gs = "struct VOut {\n";
+        Rows r;
+        r.rows = static_cast<std::uint32_t>(outs.size());
+        if (!r.rows) throw Skip("no outputs");
+        std::string& gs = r.gs;
+        gs = "struct VOut {\n";
         for (const Out& o : outs) gs += o.decl;
         gs += "};\nstruct GOut {\n    float4 pos : SV_Position;\n    [[vk::builtin(\"PointSize\")]] float psize : PSIZE;\n"
               "    [[vk::location(0)]] nointerpolation uint4 bits : BITS;\n};\n";
-        gs += "[maxvertexcount(" + std::to_string(rows) + ")]\nvoid main(point VOut v[1], uint prim : SV_PrimitiveID, inout PointStream<GOut> s) {\n";
+        if (counter_set >= 0) gs += "[[vk::binding(0, " + std::to_string(counter_set) + ")]] RWByteAddressBuffer counter;\n";
+        gs += "[maxvertexcount(" + std::to_string(r.rows) + ")]\nvoid main(point VOut v[1], uint prim_id : SV_PrimitiveID, inout PointStream<GOut> s) {\n";
+        gs += counter_set >= 0 ? "    uint prim;\n    counter.InterlockedAdd(0u, 1u, prim);\n" : "    uint prim = prim_id;\n";
         gs += "    GOut g;\n    g.psize = 1.0f;\n";
-        for (std::uint32_t k = 0; k < rows; ++k) {
-            gs += "    g.pos = float4((float(prim) + 0.5f) / " + std::to_string(in.vertices) + ".0f * 2.0f - 1.0f, (" + std::to_string(k) +
-                  ".5f) / " + std::to_string(rows) + ".0f * 2.0f - 1.0f, 0.5f, 1.0f);\n";
+        for (std::uint32_t k = 0; k < r.rows; ++k) {
+            gs += "    g.pos = float4((float(prim) + 0.5f) / " + std::to_string(columns) + ".0f * 2.0f - 1.0f, (" + std::to_string(k) + ".5f) / " +
+                  std::to_string(r.rows) + ".0f * 2.0f - 1.0f, 0.5f, 1.0f);\n";
             gs += "    g.bits = " + outs[k].read + ";\n    s.Append(g);\n";
         }
         gs += "}\n";
+        return r;
+    }
+    // Draws `vertices` with `pipeline` into a columns x rows R32G32B32A32_UINT
+    // target cleared to 0xdeadbeef, and reads it back.
+    Run draw_rows(VkPipeline pipeline, Resources& r, std::uint32_t columns, std::uint32_t rows, std::uint32_t vertices, bool vertex_buffer) {
+        Image target = dev.image(VK_FORMAT_R32G32B32A32_UINT, columns, rows, 1, 1, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT, VK_IMAGE_ASPECT_COLOR_BIT, false);
+        Run run;
+        Buffer rb = dev.buffer(static_cast<VkDeviceSize>(columns) * rows * 16, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        dev.submit([&](VkCommandBuffer cmd) {
+            barrier(cmd, target.image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+            VkRenderingAttachmentInfo a{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+            a.imageView = target.view;
+            a.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+            a.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+            a.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+            for (std::uint32_t& c : a.clearValue.color.uint32) c = 0xdeadbeefu;
+            VkRenderingInfo ri{VK_STRUCTURE_TYPE_RENDERING_INFO};
+            ri.renderArea = {{0, 0}, {columns, rows}};
+            ri.layerCount = 1;
+            ri.colorAttachmentCount = 1;
+            ri.pColorAttachments = &a;
+            vkCmdBeginRendering(cmd, &ri);
+            if (vertex_buffer) {
+                const VkDeviceSize zero = 0;
+                vkCmdBindVertexBuffers(cmd, 0, 1, &r.vertex.buffer, &zero);
+            }
+            draw(cmd, pipeline, r, columns, rows, vertices, 0);
+            vkCmdEndRendering(cmd);
+            barrier(cmd, target.image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+            VkBufferImageCopy c{};
+            c.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+            c.imageExtent = {columns, rows, 1};
+            vkCmdCopyImageToBuffer(cmd, target.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, rb.buffer, 1, &c);
+        });
+        const auto* p = static_cast<const std::uint8_t*>(rb.map);
+        run.outputs.emplace_back(p, p + rb.size);
+        dev.destroy(rb);
+        dev.destroy(target);
+        return run;
+    }
+    Run run_vertex(const Module& m, const std::vector<std::uint32_t>& words, Resources& r, const Inputs& in) {
+        const Rows rows = gs_rows(m, in.vertices);
         const std::string ps = "[[vk::location(0)]] uint4 main([[vk::location(0)]] nointerpolation uint4 bits : BITS) : SV_Target0 { return bits; }\n";
-        const VkShaderModule gsm = helper(gs, "gs_6_6"), psm = helper(ps, "ps_6_6"), vsm = module(words);
-        Image target = dev.image(VK_FORMAT_R32G32B32A32_UINT, in.vertices, rows, 1, 1, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT, VK_IMAGE_ASPECT_COLOR_BIT, false);
+        const VkShaderModule gsm = helper(rows.gs, "gs_6_6"), psm = helper(ps, "ps_6_6"), vsm = module(words);
         // One vertex buffer binding a location, uint4 each.
         std::vector<VkVertexInputBindingDescription> vb;
         std::vector<VkVertexInputAttributeDescription> va;
@@ -928,40 +1280,263 @@ private:
             va.push_back({r.vertex_locations[k], 0, VK_FORMAT_R32G32B32A32_UINT, static_cast<std::uint32_t>(k * 16)});
         const std::vector<VkFormat> formats = {VK_FORMAT_R32G32B32A32_UINT};
         VkPipeline pipeline = graphics_pipeline(r.layout, vsm, gsm, psm, formats, false, true, {vb, va});
-        Run run;
-        Buffer rb = dev.buffer(static_cast<VkDeviceSize>(in.vertices) * rows * 16, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
-        dev.submit([&](VkCommandBuffer cmd) {
-            barrier(cmd, target.image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
-            VkRenderingAttachmentInfo a{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
-            a.imageView = target.view;
-            a.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-            a.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
-            a.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-            a.clearValue.color.uint32[0] = 0xdeadbeefu;
-            VkRenderingInfo ri{VK_STRUCTURE_TYPE_RENDERING_INFO};
-            ri.renderArea = {{0, 0}, {in.vertices, rows}};
-            ri.layerCount = 1;
-            ri.colorAttachmentCount = 1;
-            ri.pColorAttachments = &a;
-            vkCmdBeginRendering(cmd, &ri);
-            if (!r.vertex_locations.empty()) {
-                const VkDeviceSize zero = 0;
-                vkCmdBindVertexBuffers(cmd, 0, 1, &r.vertex.buffer, &zero);
-            }
-            draw(cmd, pipeline, r, in.vertices, rows, in.vertices, 0);
-            vkCmdEndRendering(cmd);
-            barrier(cmd, target.image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
-            VkBufferImageCopy c{};
-            c.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-            c.imageExtent = {in.vertices, rows, 1};
-            vkCmdCopyImageToBuffer(cmd, target.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, rb.buffer, 1, &c);
-        });
-        const auto* p = static_cast<const std::uint8_t*>(rb.map);
-        run.outputs.emplace_back(p, p + rb.size);
-        dev.destroy(rb);
+        Run run = draw_rows(pipeline, r, in.vertices, rows.rows, in.vertices, !r.vertex_locations.empty());
         vkDestroyPipeline(dev.device, pipeline, nullptr);
         vkDestroyShaderModule(dev.device, vsm, nullptr);
-        dev.destroy(target);
+        return run;
+    }
+
+    // ---- tessellation: the stage around the tested one generated --------------------
+    // Random control points and patch constants come from tables in the
+    // generated stages: words of floats mostly in [-2, 2] (every seventh raw
+    // unless --float-words), as the lifts' uint4 control points carry floats' bits.
+    static constexpr std::uint32_t kPatches = 4, kTessColumns = 256;
+    static std::string u4(std::uint32_t a, std::uint32_t b, std::uint32_t c, std::uint32_t d) {
+        return "uint4(" + hex(a) + ", " + hex(b) + ", " + hex(c) + ", " + hex(d) + ")";
+    }
+    static std::uint32_t table_word(std::mt19937_64& rng, std::size_t k, bool raw) {
+        if (raw && k % 7 == 3) return static_cast<std::uint32_t>(rng());
+        const std::uint32_t pick = static_cast<std::uint32_t>(rng() % 64);
+        float f = pick == 0 ? 0.0f : pick == 1 ? -0.0f : pick == 2 ? 1.0f : static_cast<float>(static_cast<int>(rng() % 4001) - 2000) / 1000.0f;
+        std::uint32_t bits;
+        std::memcpy(&bits, &f, 4);
+        return bits;
+    }
+    // A stage variable as a struct member: its element type (a scalar or
+    // vector) and array count (0: none) after `outer` levels of per-control-point
+    // arrays are taken off.
+    struct Member {
+        std::uint32_t location = 0, count = 0, comps = 0;
+        char kind = 'u';
+        std::string name, tn;
+        std::uint32_t elements() const { return count ? count : 1; }
+        std::string decl(const std::string& semantic) const {
+            return "    [[vk::location(" + std::to_string(location) + ")]] " + tn + " " + name + (count ? "[" + std::to_string(count) + "]" : "") + " : " +
+                   semantic + std::to_string(location) + ";\n";
+        }
+        // Element k from a uint4 expression.
+        std::string from_u4(const std::string& e) const {
+            static const char* sw[] = {"", ".x", ".xy", ".xyz", ""};
+            const std::string v = comps == 4 ? e : "(" + e + ")" + sw[comps];
+            return kind == 'f' ? "asfloat(" + v + ")" : kind == 'i' ? "asint(" + v + ")" : v;
+        }
+        std::string to_u4(const std::string& e) const {
+            static const char* pad[] = {"", ", 0u, 0u, 0u", ", 0u, 0u", ", 0u", ""};
+            return comps == 4 ? "asuint(" + e + ")" : "uint4(asuint(" + e + ")" + pad[comps] + ")";
+        }
+        std::string at(std::uint32_t k) const { return name + (count ? "[" + std::to_string(k) + "]" : ""); }
+    };
+    static Member member_of(const Module& m, const Var& v, std::uint32_t outer, std::uint32_t& outer_count) {
+        std::uint32_t t = v.pointee;
+        outer_count = 0;
+        for (std::uint32_t k = 0; k < outer; ++k) {
+            const TypeInfo& ty = m.types.at(t);
+            if (ty.op != 28) throw Skip("a control-point variable that is not an array");
+            outer_count = m.consts.at(ty.w.at(1));
+            t = ty.w.at(0);
+        }
+        Member mb;
+        mb.location = v.get(30);
+        mb.name = "m" + std::to_string(mb.location);
+        if (m.types.at(t).op == 28) {
+            mb.count = m.consts.at(m.types.at(t).w.at(1));
+            t = m.types.at(t).w.at(0);
+        }
+        if (!scalar_shape(m, t, mb.kind, mb.comps) || mb.kind == 'b') throw Skip("a tessellation variable of an aggregate type");
+        mb.tn = std::string(mb.kind == 'f' ? "float" : mb.kind == 'u' ? "uint" : "int") + (mb.comps > 1 ? std::to_string(mb.comps) : "");
+        return mb;
+    }
+    static const char* partitioning(const Module& m) {
+        return m.modes.count(1) ? "integer" : m.modes.count(2) ? "fractional_even" : m.modes.count(3) ? "fractional_odd" : nullptr;
+    }
+
+    // Domain shaders: a generated hull gives each of kPatches patches random
+    // control points and patch constants and the factors 3, in point mode; the
+    // tessellator's points go through the geometry shader's rows, a column a point.
+    Run run_domain(const Module& m, const std::vector<std::uint32_t>& words, Resources& r, const Inputs& in) {
+        const bool tri = m.modes.count(22) != 0, quad = m.modes.count(24) != 0;
+        const char* part = partitioning(m);
+        if ((!tri && !quad) || !part) throw Skip("a domain shader without a triangle or quad domain and its spacing");
+        std::vector<Member> cps, pcs;
+        std::uint32_t patch = 0;
+        for (const Var& v : m.vars) {
+            if (v.sc != 1 || !m.interface_ids.count(v.id)) continue;
+            if (v.has(11)) {
+                const std::uint32_t bi = v.get(11);
+                if (bi != 13 && bi != 11 && bi != 12 && bi != 7 && bi != 14) throw Skip("domain input built-in " + std::to_string(bi));
+                continue;
+            }
+            if (!v.has(30)) continue;
+            std::uint32_t n = 0;
+            if (v.has(15)) {
+                pcs.push_back(member_of(m, v, 0, n));
+            } else {
+                cps.push_back(member_of(m, v, 1, n));
+                if (patch && n != patch) throw Skip("control-point inputs of different patch sizes");
+                patch = n;
+            }
+        }
+        if (!patch) patch = 1;
+        std::mt19937_64 rng(in.seed ^ 0x7e55a11dull);
+        std::size_t wk = 0;
+        std::string hs = "struct VOut { [[vk::location(0)]] uint id : VID; };\nstruct CP {\n";
+        std::uint32_t cpe = 0, pce = 0;
+        for (const Member& c : cps) {
+            hs += c.decl("CP");
+            cpe += c.elements();
+        }
+        if (cps.empty()) hs += "    [[vk::location(31)]] uint4 unused : CPU;\n";
+        hs += std::string("};\nstruct PC {\n    float outer[") + (tri ? "3" : "4") + "] : SV_TessFactor;\n    float inner" + (tri ? "" : "[2]") +
+              " : SV_InsideTessFactor;\n";
+        for (const Member& c : pcs) {
+            hs += c.decl("PC");
+            pce += c.elements();
+        }
+        hs += "};\n";
+        const auto table = [&](const char* name, std::uint32_t n) {
+            std::string t = "static const uint4 " + std::string(name) + "[" + std::to_string(std::max(1u, n)) + "] = {";
+            for (std::uint32_t k = 0; k < std::max(1u, n); ++k) {
+                std::uint32_t w4[4];
+                for (std::uint32_t& x : w4) x = table_word(rng, wk++, !in.float_words);
+                t += (k ? ", " : "") + u4(w4[0], w4[1], w4[2], w4[3]);
+            }
+            return t + "};\n";
+        };
+        hs += table("cpv", kPatches * patch * cpe) + table("pcv", kPatches * pce);
+        hs += "PC pcf(InputPatch<VOut, " + std::to_string(patch) + "> ip, uint pid : SV_PrimitiveID) {\n    PC o;\n";
+        for (int k = 0; k < (tri ? 3 : 4); ++k) hs += "    o.outer[" + std::to_string(k) + "] = 3.0f;\n";
+        hs += tri ? "    o.inner = 3.0f;\n" : "    o.inner[0] = 3.0f;\n    o.inner[1] = 3.0f;\n";
+        hs += "    uint b = (pid % " + std::to_string(kPatches) + "u) * " + std::to_string(pce) + "u;\n";
+        std::uint32_t at = 0;
+        for (const Member& c : pcs) {
+            for (std::uint32_t k = 0; k < c.elements(); ++k, ++at) hs += "    o." + c.at(k) + " = " + c.from_u4("pcv[b + " + std::to_string(at) + "u]") + ";\n";
+        }
+        hs += "    return o;\n}\n";
+        hs += std::string("[domain(\"") + (tri ? "tri" : "quad") + "\")]\n[partitioning(\"" + part + "\")]\n[outputtopology(\"point\")]\n[outputcontrolpoints(" +
+              std::to_string(patch) + ")]\n[patchconstantfunc(\"pcf\")]\n";
+        hs += "CP main(InputPatch<VOut, " + std::to_string(patch) + "> ip, uint i : SV_OutputControlPointID, uint pid : SV_PrimitiveID) {\n    CP o;\n";
+        hs += "    uint b = ((pid % " + std::to_string(kPatches) + "u) * " + std::to_string(patch) + "u + i) * " + std::to_string(cpe) + "u;\n";
+        at = 0;
+        for (const Member& c : cps) {
+            for (std::uint32_t k = 0; k < c.elements(); ++k, ++at) hs += "    o." + c.at(k) + " = " + c.from_u4("cpv[b + " + std::to_string(at) + "u]") + ";\n";
+        }
+        if (cps.empty()) hs += "    o.unused = uint4(0u, 0u, 0u, 0u);\n";
+        hs += "    return o;\n}\n";
+        const std::string vs = "struct VOut { [[vk::location(0)]] uint id : VID; };\nVOut main(uint vid : SV_VertexID) { VOut o; o.id = vid; return o; }\n";
+        const Rows rows = gs_rows(m, kTessColumns, static_cast<int>(r.capture_set));
+        std::memset(r.capture.map, 0, 16);
+        const std::string ps = "[[vk::location(0)]] uint4 main([[vk::location(0)]] nointerpolation uint4 bits : BITS) : SV_Target0 { return bits; }\n";
+        const VkShaderModule vsm = helper(vs, "vs_6_6"), hsm = helper(hs, "hs_6_6"), gsm = helper(rows.gs, "gs_6_6"), psm = helper(ps, "ps_6_6"),
+                             dsm = module(words);
+        VkPipeline pipeline = graphics_pipeline(r.layout, vsm, gsm, psm, {VK_FORMAT_R32G32B32A32_UINT}, false, true, {}, hsm, dsm, patch);
+        Run run = draw_rows(pipeline, r, kTessColumns, rows.rows, patch * kPatches, false);
+        vkDestroyPipeline(dev.device, pipeline, nullptr);
+        vkDestroyShaderModule(dev.device, dsm, nullptr);
+        return run;
+    }
+
+    // Hull shaders: a generated vertex shader gives each of kPatches patches
+    // random control points; both hull modules store what they made
+    // themselves (instrument_hull), whatever the factors; a generated domain
+    // shader (point mode; the domain, spacing and winding `declared` says -
+    // DXC's module, as the lift's hull declares none) completes the pipeline.
+    Run run_hull(const Module& m, const std::vector<std::uint32_t>& words, Resources& r, const Inputs& in, const Module& declared) {
+        const bool tri = declared.modes.count(22) != 0, quad = declared.modes.count(24) != 0;
+        const char* part = partitioning(declared);
+        if ((!tri && !quad) || !part) throw Skip("a hull shader whose HLSL module declares no triangle or quad domain and spacing");
+        const std::uint32_t order = declared.modes.count(5) ? 5 : 4;
+        if (!m.modes.count(26)) throw Skip("a hull shader without OutputVertices");
+        const std::uint32_t out_points = m.modes.at(26).at(0);
+        std::vector<Member> ins;
+        std::uint32_t in_points = 0;
+        for (const Var& v : m.vars) {
+            if (!m.interface_ids.count(v.id) || v.sc != 1) continue;
+            if (v.has(11)) {
+                const std::uint32_t bi = v.get(11);
+                if (bi != 8 && bi != 7 && bi != 14) throw Skip("hull input built-in " + std::to_string(bi));
+                continue;
+            }
+            if (!v.has(30)) continue;
+            std::uint32_t n = 0;
+            ins.push_back(member_of(m, v, 1, n));
+            if (in_points && n != in_points) throw Skip("control-point inputs of different patch sizes");
+            in_points = n;
+        }
+        if (!in_points) throw Skip("a hull shader without control-point inputs");
+        std::mt19937_64 rng(in.seed ^ 0x4a11c0deull);
+        std::size_t wk = 0;
+        // The vertex shader: control point `vid` of the draw.
+        std::uint32_t ine = 0;
+        std::string vs = "struct VOut {\n";
+        for (const Member& c : ins) {
+            vs += c.decl("V");
+            ine += c.elements();
+        }
+        vs += "};\nstatic const uint4 vv[" + std::to_string(kPatches * in_points * ine) + "] = {";
+        for (std::uint32_t k = 0; k < kPatches * in_points * ine; ++k) {
+            std::uint32_t w4[4];
+            for (std::uint32_t& x : w4) x = table_word(rng, wk++, !in.float_words);
+            vs += (k ? ", " : "") + u4(w4[0], w4[1], w4[2], w4[3]);
+        }
+        vs += "};\nVOut main(uint vid : SV_VertexID) {\n    VOut o;\n    uint b = vid * " + std::to_string(ine) + "u;\n";
+        std::uint32_t at = 0;
+        for (const Member& c : ins) {
+            for (std::uint32_t k = 0; k < c.elements(); ++k, ++at) vs += "    o." + c.at(k) + " = " + c.from_u4("vv[b + " + std::to_string(at) + "u]") + ";\n";
+        }
+        vs += "    return o;\n}\n";
+        std::string ds = std::string("struct PC {\n    float outer[") + (tri ? "3" : "4") + "] : SV_TessFactor;\n    float inner" + (tri ? "" : "[2]") +
+                         " : SV_InsideTessFactor;\n};\n";
+        ds += std::string("[domain(\"") + (tri ? "tri" : "quad") + "\")]\nfloat4 main(PC pc) : SV_Position {\n";
+        ds += std::string("    vk::ext_execution_mode(") + (std::strcmp(part, "integer") == 0 ? "1" : std::strcmp(part, "fractional_even") == 0 ? "2" : "3") +
+              ");\n    vk::ext_execution_mode(" + std::to_string(order) + ");\n    vk::ext_execution_mode(10);  // PointMode\n";
+        ds += "    return float4(0.0f, 0.0f, 0.0f, 1.0f);\n}\n";
+        HullRecord rec;
+        std::vector<std::uint32_t> instrumented;
+        try {
+            instrumented = instrument_hull(words, r.capture_set, out_points, rec);
+        } catch (const Failure& f) {
+            throw Skip(std::string("not instrumented: ") + f.what());
+        }
+        if (const char* dump = std::getenv("HLSL_EQUIV_DUMP"); dump && *dump) {
+            static int dumped = 0;
+            std::ofstream(std::string(dump) + "/hull-" + std::to_string(dumped++) + ".spv", std::ios::binary)
+                .write(reinterpret_cast<const char*>(instrumented.data()), static_cast<std::streamsize>(instrumented.size() * 4));
+        }
+        const std::size_t bytes = static_cast<std::size_t>(rec.words()) * 4 * out_points * kPatches;
+        if (bytes > r.capture.size) throw Skip("a hull's outputs past the capture buffer");
+        const VkShaderModule vsm = helper(vs, "vs_6_6"), dsm = helper(ds, "ds_6_6"), hsm = module(instrumented);
+        VkPipeline pipeline = graphics_pipeline(r.layout, vsm, VK_NULL_HANDLE, VK_NULL_HANDLE, {}, false, false, {}, hsm, dsm, in_points);
+        std::memset(r.capture.map, 0xef, static_cast<std::size_t>(r.capture.size));  // 0xefefefef: not written
+        dev.submit([&](VkCommandBuffer cmd) {
+            VkRenderingInfo ri{VK_STRUCTURE_TYPE_RENDERING_INFO};
+            ri.renderArea = {{0, 0}, {1, 1}};
+            ri.layerCount = 1;
+            vkCmdBeginRendering(cmd, &ri);
+            draw(cmd, pipeline, r, 1, 1, in_points * kPatches, 0);
+            vkCmdEndRendering(cmd);
+            VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+            mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+            mb.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
+        });
+        Run run;
+        const auto* p = static_cast<const std::uint8_t*>(r.capture.map);
+        run.outputs.emplace_back(p, p + bytes);
+        // The patch's words are its own only in invocation 0's record: in the
+        // others they may be read before invocation 0 wrote them.
+        auto& o = run.outputs.back();
+        for (std::uint32_t patch = 0; patch < kPatches; ++patch) {
+            for (std::uint32_t inv = 1; inv < out_points; ++inv) {
+                const std::size_t rec_at = (static_cast<std::size_t>(patch) * out_points + inv) * rec.words() * 4;
+                std::memset(o.data() + rec_at + static_cast<std::size_t>(rec.cp_words) * 4, 0xef, static_cast<std::size_t>(rec.patch_words) * 4);
+            }
+        }
+        // The record's shape, so two modules that store other things differ.
+        run.outputs.push_back(std::vector<std::uint8_t>(8));
+        std::memcpy(run.outputs.back().data(), &rec.cp_words, 4);
+        std::memcpy(run.outputs.back().data() + 4, &rec.patch_words, 4);
+        vkDestroyPipeline(dev.device, pipeline, nullptr);
+        vkDestroyShaderModule(dev.device, hsm, nullptr);
         return run;
     }
 
@@ -969,8 +1544,11 @@ private:
         std::vector<VkVertexInputBindingDescription> bindings;
         std::vector<VkVertexInputAttributeDescription> attributes;
     };
+    // tcs and tes: tessellation stages, patch_points control points a patch;
+    // no fs: the rasterizer discards (a hull's run writes a buffer only).
     VkPipeline graphics_pipeline(VkPipelineLayout layout, VkShaderModule vs, VkShaderModule gs, VkShaderModule fs, const std::vector<VkFormat>& colors,
-                                 bool depth, bool points, const VertexInput& vi) {
+                                 bool depth, bool points, const VertexInput& vi, VkShaderModule tcs = VK_NULL_HANDLE, VkShaderModule tes = VK_NULL_HANDLE,
+                                 std::uint32_t patch_points = 0) {
         std::vector<VkPipelineShaderStageCreateInfo> st;
         const auto stage = [&](VkShaderStageFlagBits s, VkShaderModule m) {
             VkPipelineShaderStageCreateInfo i{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
@@ -980,21 +1558,26 @@ private:
             st.push_back(i);
         };
         stage(VK_SHADER_STAGE_VERTEX_BIT, vs);
+        if (tcs) stage(VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT, tcs);
+        if (tes) stage(VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT, tes);
         if (gs) stage(VK_SHADER_STAGE_GEOMETRY_BIT, gs);
-        stage(VK_SHADER_STAGE_FRAGMENT_BIT, fs);
+        if (fs) stage(VK_SHADER_STAGE_FRAGMENT_BIT, fs);
+        VkPipelineTessellationStateCreateInfo ts{VK_STRUCTURE_TYPE_PIPELINE_TESSELLATION_STATE_CREATE_INFO};
+        ts.patchControlPoints = patch_points;
         VkPipelineVertexInputStateCreateInfo vis{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
         vis.vertexBindingDescriptionCount = static_cast<std::uint32_t>(vi.bindings.size());
         vis.pVertexBindingDescriptions = vi.bindings.data();
         vis.vertexAttributeDescriptionCount = static_cast<std::uint32_t>(vi.attributes.size());
         vis.pVertexAttributeDescriptions = vi.attributes.data();
         VkPipelineInputAssemblyStateCreateInfo ia{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
-        ia.topology = points ? VK_PRIMITIVE_TOPOLOGY_POINT_LIST : VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+        ia.topology = tcs ? VK_PRIMITIVE_TOPOLOGY_PATCH_LIST : points ? VK_PRIMITIVE_TOPOLOGY_POINT_LIST : VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
         VkPipelineViewportStateCreateInfo vp{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
         vp.viewportCount = vp.scissorCount = 1;
         VkPipelineRasterizationStateCreateInfo rs{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
         rs.polygonMode = VK_POLYGON_MODE_FILL;
         rs.cullMode = VK_CULL_MODE_NONE;
         rs.lineWidth = 1.0f;
+        rs.rasterizerDiscardEnable = fs ? VK_FALSE : VK_TRUE;
         VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
         ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
         VkPipelineDepthStencilStateCreateInfo ds{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
@@ -1020,6 +1603,7 @@ private:
         gp.pStages = st.data();
         gp.pVertexInputState = &vis;
         gp.pInputAssemblyState = &ia;
+        if (tcs) gp.pTessellationState = &ts;
         gp.pViewportState = &vp;
         gp.pRasterizationState = &rs;
         gp.pMultisampleState = &ms;
@@ -1085,7 +1669,7 @@ private:
                     std::uint32_t v;
                     std::memcpy(&v, &x[k], 4);
                     ++words;
-                    if (v != 0xdeadbeefu && v != 0x7fc0deadu && v != 0x12345678u && v != 0xfedcba98u && v != 0x3e800000u) ++written;
+                    if (v != 0xdeadbeefu && v != 0x7fc0deadu && v != 0x12345678u && v != 0xfedcba98u && v != 0x3e800000u && v != 0xefefefefu) ++written;
                     if (distinct.size() < 100000) distinct.insert(v);
                 }
             }
@@ -1130,18 +1714,22 @@ int main(int argc, char** argv) {
         else if (arg == "--verbose") verbose = true;
         else if (arg == "--progress" && a + 1 < argc) progress_path = argv[++a];
         else if (arg == "--small-ints") in.small_ints = true;
+        else if (arg == "--float-words") in.float_words = true;
         else if (arg == "--timeout" && a + 1 < argc) timeout_s = std::atoi(argv[++a]);
         else dirs.push_back(arg);
     }
     if (dirs.empty() || !shards) {
-        std::fprintf(stderr, "usage: hlsl_equiv [--size N] [--vertices N] [--seed S] [--shard I/N] [--only SUBSTR] [--list FILE] <dir>...\n");
+        std::fprintf(stderr, "usage: hlsl_equiv [--size N] [--vertices N] [--seed S] [--shard I/N] [--only SUBSTR] [--list FILE] [--small-ints] [--float-words] "
+                             "[--timeout S] [--progress FILE] <dir>...\n");
         return 2;
     }
     std::vector<fs::path> lifts;
     for (const fs::path& d : dirs) {
         for (const auto& e : fs::recursive_directory_iterator(d)) {
             const std::string n = e.path().filename().string();
-            if (n.size() > 12 && n.compare(n.size() - 9, 9, ".lift.spv") == 0 && (n.find(".ps.lift") != std::string::npos || n.find(".vs.lift") != std::string::npos))
+            if (n.size() > 12 && n.compare(n.size() - 9, 9, ".lift.spv") == 0 &&
+                (n.find(".ps.lift") != std::string::npos || n.find(".vs.lift") != std::string::npos || n.find(".ls.lift") != std::string::npos ||
+                 n.find(".hs.lift") != std::string::npos || n.find(".ds.lift") != std::string::npos))
                 lifts.push_back(e.path());
         }
     }
