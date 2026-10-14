@@ -3142,18 +3142,35 @@ bool compute_lift_selects(const std::string& name) {
 }
 // The program's lift in place of its translation's SPIR-V, when selected and
 // accepted; `lifted` and `why` (the first rejection, or empty) say which.
+// Every compute program a pipeline was made for, at GX's creation or at a
+// dispatch, by how it runs: empty for its lift, or why it runs translated
+// (compute_lift_report). A program counts as lifted while every pipeline of
+// it is.
+std::mutex g_lift_decided_mu;
+std::map<std::string, std::string> g_lift_decided;
+void note_compute_lift(const std::string& name, bool lifted, const std::string& why) {
+    std::lock_guard<std::mutex> lk(g_lift_decided_mu);
+    std::string& at = g_lift_decided[name];
+    if (!lifted && at.empty()) at = why.empty() ? std::string("not asked for (BBHOST_LIFT_COMPUTE=0 or BBHOST_DECOMP)") : why;
+}
 void apply_compute_lift(const gcn::Program& prog, const gcn::TranslateOptions& o, gcn::TranslateResult& meta, const std::string& name, bool& lifted,
                         std::string& why) {
     lifted = false;
     why.clear();
-    if (!meta.ok() || !compute_lift_selects(name)) return;
+    if (!meta.ok()) return;
+    if (!compute_lift_selects(name)) {
+        note_compute_lift(name, false, why);
+        return;
+    }
     gcn::LiftResult l = lift_compute_cached(prog, o, meta);
     if (l.ok()) {
         meta.spirv = std::move(l.spirv);
         lifted = true;
+        note_compute_lift(name, true, why);
         return;
     }
     why = l.rejections.empty() ? std::string("no module") : l.rejections[0];
+    note_compute_lift(name, false, why);
 }
 
 struct PrecompiledCompute {
@@ -3786,6 +3803,7 @@ ComputePipeline& pipeline_for(const GpuDispatch& d, std::uint64_t key, const std
         pl.meta = translate_cached(prog, o);
         pl.lifted = false;
         pl.lift_why = std::string("the driver refused the lift's ") + failed;
+        note_compute_lift(name, false, pl.lift_why);
     }
     // A lifted program runs its lift (render/next); ComputeLean, the translation
     // with its buffers pushed, is the form a translated one runs in.
@@ -3940,6 +3958,7 @@ void precompile_compute(const std::string& name, const std::vector<std::uint8_t>
             e.meta = translate_cached(prog, co);
             e.lifted = false;
             e.lift_why = "the driver refused the lift's " + why;
+            note_compute_lift(name, false, e.lift_why);
             why.clear();
         }
     }
@@ -6104,29 +6123,52 @@ struct DispatchStamp {
 // dispatches lifted, and the rest by why their lift was refused, or not asked
 // for. Takes g.mu (the pipelines' counts).
 std::string compute_lift_report() {
+    // A rejection without the instruction offset it names (as tools/area_check.py strips it).
+    const auto reason_of = [](std::string r) {
+        if (r.size() > 8 && r[6] == ':' && r[7] == ' ') r = r.substr(8);
+        return r;
+    };
+    std::map<std::string, std::string> decided;
+    {
+        std::lock_guard<std::mutex> lk(g_lift_decided_mu);
+        decided = g_lift_decided;
+    }
     std::lock_guard<GpuMutex> lock(g.mu);
     std::map<std::string, std::pair<std::set<std::string>, std::uint64_t>> why;  // reason -> programs, dispatches
-    std::set<std::string> programs, lifted;
+    std::map<std::string, std::uint64_t> by_program;                             // dispatched programs' dispatches
+    std::set<std::string> lifted_dispatched;
     std::uint64_t dispatches = 0, lifted_dispatches = 0;
     for (const auto& [key, pl] : g.pipelines) {
         if (pl.failed || pl.name.empty()) continue;
-        programs.insert(pl.name);
+        by_program[pl.name] += pl.dispatches;
         dispatches += pl.dispatches;
         if (pl.lifted) {
-            lifted.insert(pl.name);
             lifted_dispatches += pl.dispatches;
             continue;
         }
-        // A rejection without the instruction offset it names (as tools/area_check.py strips it).
-        std::string reason = pl.lift_why.empty() ? std::string("not asked for (BBHOST_LIFT_COMPUTE=0 or BBHOST_DECOMP)") : pl.lift_why;
-        if (reason.size() > 8 && reason[6] == ':' && reason[7] == ' ') reason = reason.substr(8);
-        auto& w = why[reason];
+        auto& w = why[reason_of(pl.lift_why.empty() ? std::string("not asked for (BBHOST_LIFT_COMPUTE=0 or BBHOST_DECOMP)") : pl.lift_why)];
         w.first.insert(pl.name);
         w.second += pl.dispatches;
     }
-    char buf[256];
-    std::snprintf(buf, sizeof(buf), "compute shader lifts: %zu of %zu programs lifted, %llu of %llu dispatches ran a lift", lifted.size(), programs.size(),
-                  static_cast<unsigned long long>(lifted_dispatches), static_cast<unsigned long long>(dispatches));
+    std::size_t made_lifted = 0;
+    for (const auto& [name, reason] : decided) {
+        if (reason.empty()) {
+            ++made_lifted;
+        } else if (!by_program.count(name)) {
+            why[reason_of(reason)].first.insert(name);  // made at GX's creation, never dispatched
+        }
+    }
+    for (const auto& [name, n] : by_program) {
+        bool all = true;
+        for (const auto& [reason, w] : why) all = all && !w.first.count(name);
+        if (all) lifted_dispatched.insert(name);
+    }
+    char buf[320];
+    std::snprintf(buf, sizeof(buf),
+                  "compute shader lifts: %zu of %zu programs lifted (their pipelines made at GX's creation or a dispatch); %zu of %zu "
+                  "dispatched programs, %llu of %llu dispatches ran a lift",
+                  made_lifted, decided.size(), lifted_dispatched.size(), by_program.size(), static_cast<unsigned long long>(lifted_dispatches),
+                  static_cast<unsigned long long>(dispatches));
     std::string out = buf;
     for (const auto& [reason, w] : why) {
         std::string names;
