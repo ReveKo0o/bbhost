@@ -18,6 +18,7 @@
 #include <fstream>
 #include <iterator>
 #include <map>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -28,6 +29,10 @@ struct Site {
     std::uint64_t address = 0;  // guest VA at the preferred base
     std::vector<std::uint8_t> expect, bytes;
     bool code = true;
+    // Patches this site steps aside for: while any of them is on, this site
+    // is neither checked nor written - two patches that write the same bytes
+    // differently, the one named here having the last word.
+    std::vector<std::string> yields;
 };
 
 struct Manifest {
@@ -39,6 +44,30 @@ struct Manifest {
 std::string unquote(const std::string& v) {
     if (v.size() >= 2 && (v.front() == '"' || v.front() == '\'') && v.back() == v.front()) return v.substr(1, v.size() - 2);
     return v;
+}
+
+// A TOML array of strings, ["a", "b"] (or a lone string).
+std::vector<std::string> parse_string_list(const std::string& text) {
+    std::vector<std::string> out;
+    std::string cur;
+    bool quoted = false;
+    char q = 0;
+    for (char c : text) {
+        if (quoted) {
+            if (c == q) {
+                quoted = false;
+                out.push_back(cur);
+                cur.clear();
+            } else {
+                cur.push_back(c);
+            }
+        } else if (c == '"' || c == '\'') {
+            quoted = true;
+            q = c;
+        }
+    }
+    if (out.empty() && !text.empty() && text.front() != '[') out.push_back(unquote(text));
+    return out;
 }
 
 bool parse_hex_bytes(const std::string& text, std::vector<std::uint8_t>* out) {
@@ -72,7 +101,9 @@ bool parse_manifest(const std::string& path, Manifest* m, std::string* err) {
     m->eboot = get("patch.eboot");
     m->description = get("patch.description");
     m->option = get("patch.option");
-    const std::string en = get("patch.enabled");
+    // `default`: the name an earlier port of Kyo's list gave the same switch.
+    std::string en = get("patch.enabled");
+    if (en.empty()) en = get("patch.default");
     m->enabled = en.empty() || en == "true" || en == "1";
     if (m->name.empty() || m->eboot.empty()) {
         *err = "[patch] needs name and eboot";
@@ -100,6 +131,8 @@ bool parse_manifest(const std::string& path, Manifest* m, std::string* err) {
             }
         } else if (field == "kind") {
             s.code = val != "data";
+        } else if (field == "yields") {
+            s.yields = parse_string_list(v);
         }
     }
     for (auto& [id, s] : sites) {
@@ -127,10 +160,19 @@ bool option_on(const std::string& option, bool* known) {
     return false;
 }
 
-void apply(ElfImage* image, const Manifest& m) {
+// Whether a site steps aside for a patch that is on (Site::yields).
+bool yielded(const Site& s, const std::set<std::string>& on) {
+    for (const std::string& y : s.yields) {
+        if (on.count(y)) return true;
+    }
+    return false;
+}
+
+void apply(ElfImage* image, const Manifest& m, const std::set<std::string>& on) {
     GuestMemory& mem = image->mem;
     // Every site checked before any is written.
     for (const Site& s : m.sites) {
+        if (yielded(s, on)) continue;
         if (s.address < kPreferredGuestSlide) {
             host_log("patch: %s refused: site %s address 0x%llx is below the image", m.name.c_str(), s.id.c_str(),
                      static_cast<unsigned long long>(s.address));
@@ -152,8 +194,16 @@ void apply(ElfImage* image, const Manifest& m) {
             return;
         }
     }
-    int written = 0;
+    int written = 0, stepped_aside = 0;
+    std::string aside;
     for (const Site& s : m.sites) {
+        if (yielded(s, on)) {
+            ++stepped_aside;
+            for (const std::string& y : s.yields) {
+                if (on.count(y) && aside.find(y) == std::string::npos) aside += (aside.empty() ? "" : ", ") + y;
+            }
+            continue;
+        }
         const std::uint64_t at = mem.slide + (s.address - kPreferredGuestSlide);
         auto* p = static_cast<std::uint8_t*>(guest_ptr(mem, at));
         if (std::memcmp(p, s.bytes.data(), s.bytes.size()) == 0) continue;
@@ -172,7 +222,9 @@ void apply(ElfImage* image, const Manifest& m) {
         }
         ++written;
     }
-    host_log("patch: %s: %d of %zu sites written%s%s", m.name.c_str(), written, m.sites.size(),
+    char yields[256] = "";
+    if (stepped_aside) std::snprintf(yields, sizeof(yields), " (%d left to %s)", stepped_aside, aside.c_str());
+    host_log("patch: %s: %d of %zu sites written%s%s%s", m.name.c_str(), written, m.sites.size(), yields,
              m.description.empty() ? "" : " - ", m.description.c_str());
 }
 
@@ -239,6 +291,12 @@ bool patch_manifest_option_known(const std::string& option) {
     return known;
 }
 
+bool patch_manifest_on(const std::string& name, bool enabled) {
+    const std::string v = config_value("patches." + name);
+    if (!v.empty()) return !(v == "false" || v == "0");
+    return enabled && !patch_manifest_off(name);
+}
+
 bool patch_manifest_off(const std::string& name) {
     const std::string v = config_value("patches." + name);
     if (!v.empty()) return v == "false" || v == "0";
@@ -285,6 +343,8 @@ void patch_manifests_apply(ElfImage* image) {
                  dirs.size() > 2 ? ", the mods directory" : "");
         return;
     }
+    // Which are on, first: a site may step aside for another patch (yields).
+    std::vector<Manifest> chosen;
     for (const auto& [name, path] : files) {
         Manifest m;
         std::string err;
@@ -297,9 +357,9 @@ void patch_manifests_apply(ElfImage* image) {
                      image->sha256.c_str());
             continue;
         }
-        if (!m.enabled) continue;
-        if (patch_manifest_off(m.name)) {
-            host_log("patch: %s off ([patches] in bbhost.toml: the setup window's Patches tab)", m.name.c_str());
+        if (!patch_manifest_on(m.name, m.enabled)) {
+            // Off by the player, or off until the player turns it on (enabled = false).
+            if (m.enabled) host_log("patch: %s off ([patches] in bbhost.toml: the setup window's Patches tab)", m.name.c_str());
             continue;
         }
         if (!m.option.empty()) {
@@ -321,6 +381,9 @@ void patch_manifests_apply(ElfImage* image) {
                 continue;
             }
         }
-        apply(image, m);
+        chosen.push_back(std::move(m));
     }
+    std::set<std::string> on;
+    for (const Manifest& m : chosen) on.insert(m.name);
+    for (const Manifest& m : chosen) apply(image, m, on);
 }

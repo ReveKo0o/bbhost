@@ -191,7 +191,9 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
     static const char* const kResolutions[] = {"1280x720",         "1600x900",         "1920x1080",        "2560x1440",
                                                "3200x1800",        "3840x2160",        "2560x1080 (21:9)", "3440x1440 (21:9)",
                                                "5120x2160 (21:9)", "3840x1080 (32:9)", "5120x1440 (32:9)", "1280x800 (16:10)",
-                                               "960x600 (16:10, upscaled)", "1024x640 (16:10, upscaled)"};
+                                               "960x600 (16:10, upscaled)", "1024x640 (16:10, upscaled)",
+                                               "640x360",          "960x540",          "1440x810",         "2880x1620",
+                                               "1920x1200 (16:10)", "2560x1600 (16:10)", "1280x960 (4:3)", "1440x1080 (4:3)"};
     // The game's frame rate (engine/frame_rate.h): 0 is uncapped.
     static const int kCaps[] = {30, 60, 90, 120, 0};
     constexpr int kCapCount = static_cast<int>(sizeof(kCaps) / sizeof(kCaps[0]));
@@ -236,7 +238,7 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
     std::vector<PatchRow> patch_rows;
     for (PatchListing& p : patch_manifests_list(cfg.mods.empty() ? cfg.data + "/mods" : cfg.mods)) {
         PatchRow r;
-        r.on = r.was = !patch_manifest_off(p.name);
+        r.on = r.was = patch_manifest_on(p.name, p.enabled);
         r.p = std::move(p);
         patch_rows.push_back(std::move(r));
     }

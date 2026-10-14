@@ -20,7 +20,10 @@
 // replaces an earlier one.
 //
 // A player leaves one out with `<name> = false` under [patches] in
-// bbhost.toml, which the setup window's Patches tab writes.
+// bbhost.toml, which the setup window's Patches tab writes; one whose [patch]
+// says `enabled = false` is off until `<name> = true` there. A site may name
+// patches it steps aside for (`yields = ["other"]`): while one of them is on,
+// that site is neither checked nor written.
 #pragma once
 
 #include <string>
@@ -44,5 +47,8 @@ struct PatchListing {
 std::vector<PatchListing> patch_manifests_list(const std::string& mods);
 // Whether the player left this manifest out: [patches] <name> = false.
 bool patch_manifest_off(const std::string& name);
+// Whether this manifest applies by its switch: [patches] <name> when set,
+// else its own [patch] enabled (false: off until the player turns it on).
+bool patch_manifest_on(const std::string& name, bool enabled);
 // Whether `option` is one a manifest may name (startup.skip_intro, ...).
 bool patch_manifest_option_known(const std::string& option);

@@ -1,0 +1,73 @@
+# The low-resolution renders of Kyo's shadPS4 resolution patches, at every
+# resolution: every "Resolution Patch WxH" in his list (and "Optimal 1080p")
+# makes the same four targets a fixed size whatever the render size is, for
+# their cost - they are drawn every frame and scale with the pixel count.
+#
+#   0x125b1a3..de  the depth renders at a half and a quarter of the render
+#                  size (a colour and depth pair each, formats 0x1c / 0x14:
+#                  what motion blur reads - the HD Motion Blur patches set the
+#                  same four words) -> 640x360 and 320x180
+#   0x26c3de4/f0   the scene context's half-size target -> 640x360
+#   0x26c45ba      a full-size RGBA8 target of the scene context -> 80x45
+#
+# bbhost's resolution changes the two words every pass reads (0x55289f8,
+# engine/graphics_patch.cpp), so without this these four followed it: at 4K
+# the half-size pair alone was 1920x1080 against the patches' 640x360. They
+# are the patches' own bytes. A site steps aside while a patch that sets the
+# same words differently is on (yields), as that patch's lines come after the
+# resolution patches' in the list: Enable Screen Space Reflections keeps the
+# depth renders at half and quarter size, the HD Motion Blur ones set their
+# own sizes.
+[patch]
+name = "low-res-aux-targets"
+eboot = "941f887a562aae054fac35af8cc8f27cf075f3d4cc2e029fb5ae2a663aaa5ae7"
+description = "the depth renders at 640x360 and 320x180 and two scene targets at 640x360 and 80x45 at every resolution, as the shadPS4 resolution patches"
+
+# sub_125b0xx: mov eax, [rbx]; shr eax, 1; mov [rsp], eax -> mov dword [rsp], 640
+[site.depth-half-width]
+address = "0x0125b1a3"
+expect = "8b 03 d1 e8 89 04 24"
+bytes = "c7 04 24 80 02 00 00"
+yields = ["screen-space-reflections", "hd-motion-blur-360p", "hd-motion-blur-4k"]
+
+# mov eax, [rbx+4]; shr eax, 1; mov [rsp+4], eax -> mov dword [rsp+4], 360
+[site.depth-half-height]
+address = "0x0125b1aa"
+expect = "8b 43 04 d1 e8 89 44 24 04"
+bytes = "c7 44 24 04 68 01 00 00 90"
+yields = ["screen-space-reflections", "hd-motion-blur-360p", "hd-motion-blur-4k"]
+
+# mov eax, [rbx]; shr eax, 2; mov [rsp], eax -> mov dword [rsp], 320
+[site.depth-quarter-width]
+address = "0x0125b1d6"
+expect = "8b 03 c1 e8 02 89 04 24"
+bytes = "c7 04 24 40 01 00 00 90"
+yields = ["screen-space-reflections", "hd-motion-blur-360p", "hd-motion-blur-4k"]
+
+# mov eax, [rbx+4]; shr eax, 2; mov [rsp+4], eax -> mov dword [rsp+4], 180
+[site.depth-quarter-height]
+address = "0x0125b1de"
+expect = "8b 43 04 c1 e8 02 89 44 24 04"
+bytes = "c7 44 24 04 b4 00 00 00 90 90"
+yields = ["screen-space-reflections", "hd-motion-blur-360p", "hd-motion-blur-4k"]
+
+# the scene context: mov eax, [r15]; shr eax, 1 -> mov eax, 640
+[site.scene-half-width]
+address = "0x026c3de4"
+expect = "41 8b 07 d1 e8"
+bytes = "b8 80 02 00 00"
+yields = ["hd-motion-blur-360p", "hd-motion-blur-4k"]
+
+# mov eax, [r15+4]; shr eax, 1 -> mov eax, 360
+[site.scene-half-height]
+address = "0x026c3df0"
+expect = "41 8b 47 04 d1 e8"
+bytes = "b8 68 01 00 00 90"
+yields = ["hd-motion-blur-360p", "hd-motion-blur-4k"]
+
+# mov eax, [r15]; mov [rsp+0x200], eax; mov eax, [r15+4]; mov [rsp+0x204], eax
+# -> mov rax, 45 << 32 | 80; mov [rsp+0x200], rax (80x45)
+[site.scene-full-size]
+address = "0x026c45ba"
+expect = "41 8b 07 89 84 24 00 02 00 00 41 8b 47 04 89 84 24 04 02 00 00"
+bytes = "48 b8 50 00 00 00 2d 00 00 00 48 89 84 24 00 02 00 00 90 90 90"

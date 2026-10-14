@@ -86,13 +86,14 @@ name = "skip-intro"
 eboot = "941f887a562aae054fac35af8cc8f27cf075f3d4cc2e029fb5ae2a663aaa5ae7"
 description = "the three company logos at startup are skipped"
 option = "startup.skip_intro"      # optional: a setting that switches it
-enabled = true                      # optional, default true
+enabled = true                      # optional, default true; false: off until turned on
 
 [site.logo-fromsoft]
 address = "0x04d99138"              # Binary Ninja address (image at 0x400000)
 expect = "4c 00 6f 00"              # the bytes that must be there
 bytes = "00 00 00 00"               # the bytes written, same length
 kind = "code"                       # optional: "code" (default) or "data"
+yields = ["other-patch"]            # optional: left alone while one of these is on
 ```
 
 - `eboot` is the SHA-256 of the decrypted eboot the addresses belong to. A
@@ -106,7 +107,13 @@ kind = "code"                       # optional: "code" (default) or "data"
 
 The setup window's Patches tab lists every manifest with a switch. A patch
 that follows an `option` is switched by that setting; any other is turned off
-with `<name> = false` under `[patches]` in `bbhost.toml`.
+with `<name> = false` under `[patches]` in `bbhost.toml`, and one whose
+`[patch]` says `enabled = false` is off until `<name> = true` there.
+
+Two patches may write the same bytes differently (the resolution patches'
+fixed sizes and the HD Motion Blur ones, say). A site that names the other
+patch in `yields` steps aside while that one is on: it is neither checked nor
+written, and the log line says how many sites were left to which patch.
 
 Shipped patches:
 
@@ -119,6 +126,12 @@ Shipped patches:
 | `deflate-level.toml` | the game's run-time compression at level 1 instead of 9, removing a periodic ~25 ms hitch |
 | `old-hunters.toml` | makes the game treat itself as The Old Hunters edition, so the DLC is available (Kyo's 1.09 patch) |
 | `debug-camera.toml` | restores the debug free camera (Lance McDonald's 1.09 patch): hold Action and press L3 to cycle its modes. Off by default; it replaces a debug-menu test step, which then must not be used |
+| `low-res-aux-targets.toml` | the low-resolution renders of Kyo's shadPS4 resolution patches at every resolution: the half- and quarter-size depth renders at 640x360 and 320x180, the scene context's half-size target at 640x360 and a full-size one at 80x45 (on by default; native 4K on a Radeon 8060S: 38 -> 48 fps) |
+| `screen-space-reflections.toml` | Enable Screen Space Reflections (enable only, keeps res), Kyo's patch (off by default) |
+| `disable-misc-renders.toml` | Disable Misc. Renders, Kyo's patch: four of the scene's extra targets are not made (off by default) |
+| `disable-dynamic-light-shadow.toml` | Disable Dynamic Light Shadow, Kyo's patch (off by default) |
+| `hd-motion-blur-360p.toml`, `hd-motion-blur-4k.toml` | HD Motion Blur at 640x360 or 3840x2160, Kyo's patches (off by default; 4K wins when both are on) |
+| `fxaa2-gs-dlaa-gs.toml` | FXAA2_GS + DLAA_GS, Kyo's patch: both YEBIS anti-aliasing filters (off by default) |
 
 Patches whose bytes depend on settings, and anything that needs a hook rather
 than fixed bytes, are written in code or as plugins.
