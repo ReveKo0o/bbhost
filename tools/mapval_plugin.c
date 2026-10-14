@@ -45,6 +45,8 @@
  *                                             them again), so the place holds still
  *     dump <name>                             this frame to
  *                                             $BBHOST_MAPVAL_DUMPS/<name>.ppm
+ *     f12 <name>                              an F12 capture of the next frame
+ *                                             (the host logs its folder)
  *     capture <n> [<name>]                    let BBHOST_CAPTURE_DRAW take up to n
  *                                             draws, into
  *                                             $BBHOST_MAPVAL_CAPTURES/<name>; 0 stops
@@ -100,7 +102,7 @@ static double loading_t0;  /* when the screen came up */
 
 /* --- the tour ------------------------------------------------------------ */
 
-enum { S_WARP, S_KILL, S_FALL, S_WAIT, S_TRAVEL, S_WALK, S_HOLD, S_MARK, S_CAMERA, S_QUIET, S_DUMP, S_CAPTURE };
+enum { S_WARP, S_KILL, S_FALL, S_WAIT, S_TRAVEL, S_WALK, S_HOLD, S_MARK, S_CAMERA, S_QUIET, S_DUMP, S_CAPTURE, S_F12 };
 typedef struct {
     int kind;
     char name[64];
@@ -181,6 +183,8 @@ static void load_tour(const char* path) {
             s.kind = S_QUIET, strcpy(s.name, "quiet"); /* hold: the radius */
         else if (!strcmp(kind, "dump") && sscanf(line, "%*s %63s", s.name) == 1)
             s.kind = S_DUMP;
+        else if (!strcmp(kind, "f12") && sscanf(line, "%*s %63s", s.name) == 1)
+            s.kind = S_F12;
         else if (!strcmp(kind, "capture") && sscanf(line, "%*s %d", &s.team) == 1) {
             s.kind = S_CAPTURE; /* team: the draws */
             if (sscanf(line, "%*s %*d %63s", s.name) != 1) s.name[0] = 0;
@@ -472,6 +476,11 @@ static void begin(int i, double t) {
         snprintf(line, sizeof line, "dump %s/%s.ppm", dir && *dir ? dir : ".", s->name);
         request(line);
         api->log("mapval dump %s %.3f", s->name, t);
+    } else if (s->kind == S_F12) {
+        char line[160];
+        snprintf(line, sizeof line, "f12 %s", s->name);
+        request(line);
+        api->log("mapval f12 %s %.3f", s->name, t);
     } else if (s->kind == S_CAPTURE) {
         const char* dir = getenv("BBHOST_MAPVAL_CAPTURES");
         char line[1100];
@@ -649,7 +658,7 @@ static void tick(double t) {
     } else if (s->kind == S_HOLD) {
         heal();
         if (el >= s->hold) next = 1;
-    } else if (s->kind == S_MARK || s->kind == S_CAMERA || s->kind == S_QUIET || s->kind == S_DUMP || s->kind == S_CAPTURE) {
+    } else if (s->kind == S_MARK || s->kind == S_CAMERA || s->kind == S_QUIET || s->kind == S_DUMP || s->kind == S_CAPTURE || s->kind == S_F12) {
         next = 1; /* done in begin() */
     } else if (el >= s->hold) {
         next = 1;

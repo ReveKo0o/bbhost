@@ -205,7 +205,8 @@ const bool g_present_on_arrival = [] {
 // clock picks). Each <dir>/*.req file holds one line, carried out in name
 // order and then deleted:
 //   dump <path>           this displayed frame to <path>, as BBHOST_DUMP_FRAME writes one
-//   f12                   an F12 capture (BBHOST_CAPTURE_DIR says where)
+//   f12 [<name>]          an F12 capture (frame, render targets, draw list) on the next
+//                         flip, into the folder the log names
 //   capture <n> [<dir>]   with BBHOST_CAPTURE_ARMED=1, BBHOST_CAPTURE_DRAW may take up to n
 //                         more draws, into <dir> (draw_capture.h); 0 stops it
 //   tap <button> [<ms>]   press a pad button for <ms> (200), named as BBHOST_AUTOPRESS
@@ -278,8 +279,8 @@ void test_requests(std::uint64_t display_va, std::uint64_t count) {
             const bool ok = display_va && host_gpu_dump_display(display_va, arg.c_str());
             host_log("test: frame dump at flip %llu to %s%s", static_cast<unsigned long long>(count), arg.c_str(), ok ? "" : " failed");
         } else if (verb == "f12") {
+            host_log("test: F12 capture %s asked for at flip %llu", arg.empty() ? "-" : arg.c_str(), static_cast<unsigned long long>(count));
             host_gpu_request_dump();
-            host_log("test: F12 capture asked for at flip %llu", static_cast<unsigned long long>(count));
         } else if (verb == "capture" && !arg.empty()) {
             const int n = std::atoi(arg.c_str());
             host_gpu_capture_arm(n, arg2.c_str());
