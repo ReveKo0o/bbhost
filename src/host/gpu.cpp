@@ -3760,20 +3760,32 @@ ComputePipeline& pipeline_for(const GpuDispatch& d, std::uint64_t key, const std
         }
         host_log("gpu: creating compute pipeline %s", name.c_str());
     }
-    VkShaderModuleCreateInfo smci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
-    smci.codeSize = pl.meta.spirv.size() * 4;
-    smci.pCode = pl.meta.spirv.data();
-    if (vkCreateShaderModule(g.device, &smci, nullptr, &pl.module) != VK_SUCCESS) {
-        host_log("gpu: shader %s: module creation failed", name.c_str());
-        pl.failed = true;
-        return pl;
-    }
     const auto t0 = std::chrono::steady_clock::now();
-    pl.pipeline = first_compute_pipeline(pl.module, key, name, pl.meta.spirv, pl.standin, name + " (at its dispatch)");
-    if (!pl.pipeline) {
-        host_log("gpu: shader %s: pipeline creation failed", name.c_str());
-        pl.failed = true;
-        return pl;
+    for (;;) {
+        const char* failed = nullptr;
+        VkShaderModuleCreateInfo smci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+        smci.codeSize = pl.meta.spirv.size() * 4;
+        smci.pCode = pl.meta.spirv.data();
+        if (vkCreateShaderModule(g.device, &smci, nullptr, &pl.module) != VK_SUCCESS) {
+            pl.module = VK_NULL_HANDLE;
+            failed = "module creation";
+        } else {
+            pl.pipeline = first_compute_pipeline(pl.module, key, name, pl.meta.spirv, pl.standin, name + " (at its dispatch)");
+            if (!pl.pipeline) failed = "pipeline creation";
+        }
+        if (!failed) break;
+        if (!pl.lifted) {
+            host_log("gpu: shader %s: %s failed", name.c_str(), failed);
+            pl.failed = true;
+            return pl;
+        }
+        // The driver refused what the lift built: the translation instead.
+        host_log("gpu: shader %s: the lift's %s failed; it runs translated", name.c_str(), failed);
+        if (pl.module) vkDestroyShaderModule(g.device, pl.module, nullptr);
+        pl.module = VK_NULL_HANDLE;
+        pl.meta = translate_cached(prog, o);
+        pl.lifted = false;
+        pl.lift_why = std::string("the driver refused the lift's ") + failed;
     }
     // A lifted program runs its lift (render/next); ComputeLean, the translation
     // with its buffers pushed, is the form a translated one runs in.
@@ -3900,12 +3912,6 @@ void precompile_compute(const std::string& name, const std::vector<std::uint8_t>
                 std::fclose(f);
             }
         }
-        VkShaderModuleCreateInfo smci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
-        smci.codeSize = e.meta.spirv.size() * 4;
-        smci.pCode = e.meta.spirv.data();
-        if (vkCreateShaderModule(g.device, &smci, nullptr, &e.module) != VK_SUCCESS) why = "shader module";
-    }
-    if (why.empty()) {
         // BBHOST_CS_COMPILE_DELAY_MS=<ms> (checks): a compiler that takes that
         // long over every compute pipeline built at creation - the dispatch's
         // bounded wait and the watchdog's line, tried on a fast driver.
@@ -3915,8 +3921,27 @@ void precompile_compute(const std::string& name, const std::vector<std::uint8_t>
         }();
         if (delay_ms > 0) std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
         t_compute_worker = true;
-        e.pipeline = first_compute_pipeline(e.module, key, name, e.meta.spirv, e.standin, name);
-        if (!e.pipeline) why = "pipeline";
+        for (;;) {
+            VkShaderModuleCreateInfo smci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+            smci.codeSize = e.meta.spirv.size() * 4;
+            smci.pCode = e.meta.spirv.data();
+            if (vkCreateShaderModule(g.device, &smci, nullptr, &e.module) != VK_SUCCESS) {
+                e.module = VK_NULL_HANDLE;
+                why = "shader module";
+            } else {
+                e.pipeline = first_compute_pipeline(e.module, key, name, e.meta.spirv, e.standin, name);
+                if (!e.pipeline) why = "pipeline";
+            }
+            if (why.empty() || !e.lifted) break;
+            // The driver refused what the lift built: the translation instead.
+            host_log("gpu: shader %s: the lift's %s failed; it runs translated", name.c_str(), why.c_str());
+            if (e.module) vkDestroyShaderModule(g.device, e.module, nullptr);
+            e.module = VK_NULL_HANDLE;
+            e.meta = translate_cached(prog, co);
+            e.lifted = false;
+            e.lift_why = "the driver refused the lift's " + why;
+            why.clear();
+        }
     }
     if (why.empty() && !e.lifted) e.lean = build_compute_lean(prog, rsrc1, rsrc2, threads, dims, modes, e.meta, key, name);  // as in pipeline_for
     e.us = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count());
