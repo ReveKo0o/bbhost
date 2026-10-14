@@ -4160,6 +4160,38 @@ bool describe_sampler_locked(VkSampler sampler, VkSamplerCreateInfo& out) {
 
 void forget_view_locked(VkImageView view) { g_view_records.erase(view); }
 
+bool host_image_by_resource_locked(std::uint64_t memory, std::uint64_t gen, HostImageRef* out) {
+    if (!memory || !gen) return false;
+    if (const RtImage* r = find_render_target(memory); r && r->image && r->gx_gen == gen) {
+        if (out) {
+            *out = HostImageRef{};
+            out->image = r->image;
+            out->format = r->format;
+            out->width = r->width;
+            out->height = r->height;
+            out->layers = r->layers;
+            out->target = true;
+            out->depth = r->depth;
+            out->gpu_written = r->initialised;
+        }
+        return true;
+    }
+    const auto it = g_surfaces.find(memory);
+    if (it == g_surfaces.end() || it->second.failed || !it->second.image || it->second.gx_gen != gen) return false;
+    const Surface& sf = it->second;
+    if (out) {
+        *out = HostImageRef{};
+        out->image = sf.image;
+        out->format = sf.format;
+        out->width = sf.width;
+        out->height = sf.height;
+        out->layers = sf.type == 10 ? 1 : sf.layers;
+        out->levels = static_cast<std::uint32_t>(sf.levels.size());
+        out->gpu_written = sf.gpu_written;
+    }
+    return true;
+}
+
 std::uint64_t textures_upload_count() { return g_uploads.load(); }
 void textures_time_us(std::uint64_t out[5]) {
     out[0] = g_tex_image_us.load();

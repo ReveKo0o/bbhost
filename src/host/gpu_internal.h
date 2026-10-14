@@ -1282,6 +1282,19 @@ void textures_report();
 // "upload token", ...), for the census of surfaces no GX resource covers;
 // set for a scope by ResolveKind (textures.cpp defines it).
 extern thread_local const char* t_resolve_kind;
+// The host image of one GX resource (engine/gx_resources.h: its memory and
+// generation), a render target's, a copy's snapshot's or a texture surface's:
+// what a copy between resources can copy image to image. False when the host
+// has none of that generation there (a surface of another generation, or none).
+struct HostImageRef {
+    VkImage image = VK_NULL_HANDLE;
+    VkFormat format = VK_FORMAT_UNDEFINED;
+    std::uint32_t width = 0, height = 0, layers = 1, levels = 1;
+    bool target = false;         // a render target or snapshot (RtImage), else a texture surface
+    bool depth = false;          // a depth target
+    bool gpu_written = false;    // its image holds what the guest memory does not
+};
+bool host_image_by_resource_locked(std::uint64_t memory, std::uint64_t gen, HostImageRef* out);
 // Images belong to their GX resource's generation (BBHOST_RES_IDENTITY, on
 // unless 0): retired with it, never handed to a later resource at the same
 // memory (textures.cpp).
