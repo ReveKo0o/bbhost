@@ -637,11 +637,13 @@ int main(int argc, char** argv) {
             const Job& j = work[i];
             const char* stage = kind_name(j.kind);
             std::string result, reason;
+            std::uint64_t hlsl_hash = 0;  // FNV-1a of the printed source (a regression baseline for the printer)
             std::uint64_t ms = 0;
             const auto line = [&] {
                 if (!list) return;
                 std::lock_guard<std::mutex> lk(list_mu);
-                std::fprintf(list, "%s %s/%s %s %llu %s\n", stage, j.bundle.c_str(), j.name.c_str(), result.c_str(), static_cast<unsigned long long>(ms), reason.c_str());
+                std::fprintf(list, "%s %s/%s %s %llu %016llx %s\n", stage, j.bundle.c_str(), j.name.c_str(), result.c_str(), static_cast<unsigned long long>(ms),
+                             static_cast<unsigned long long>(hlsl_hash), reason.c_str());
             };
             {
                 std::lock_guard<std::mutex> lk(t.mu);
@@ -693,6 +695,8 @@ int main(int argc, char** argv) {
             const std::uint64_t emit_us = static_cast<std::uint64_t>(
                 std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - e0).count());
             if (out_dir && !h.source.empty()) write_bytes(stem.string() + ".hlsl", h.source.data(), h.source.size());
+            hlsl_hash = 1469598103934665603ull;
+            for (const char c : h.source) hlsl_hash = (hlsl_hash ^ static_cast<std::uint8_t>(c)) * 1099511628211ull;
             if (!h.ok()) {
                 result = "not-emitted", reason = h.errors[0];
                 std::lock_guard<std::mutex> lk(t.mu);

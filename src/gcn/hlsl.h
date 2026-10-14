@@ -67,6 +67,7 @@ struct HlslResult {
     std::string source;
     std::string profile;                  // ps_6_6, vs_6_6, hs_6_6, ds_6_6
     std::string entry = "main";
+    std::string language = "2021";        // -HV: 202x where vk::BufferPointer is used (a compute lift's atomics)
     std::vector<std::string> arguments;   // DXC arguments this module needs (-enable-16bit-types)
     std::vector<std::string> errors;      // what the printer does not take: empty on success
     bool ok() const { return errors.empty() && !source.empty(); }

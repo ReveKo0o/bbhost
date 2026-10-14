@@ -119,7 +119,6 @@ std::vector<std::string> dxc_arguments(const DxcOptions& options) {
     return {
         "-spirv",
         "-fspv-target-env=vulkan1.2",  // SPIR-V 1.5, as the lifter writes; discard stays OpKill
-        "-HV", "2021",
         // Every binding and interface variable the lift declares, used or not:
         // the module declares what the pipeline layout and the other stages
         // were made for.
@@ -228,6 +227,8 @@ bool Dxc::compile(const gcn::HlslResult& hlsl, const DxcOptions& options, std::v
     std::vector<std::wstring> args_w;
     for (const std::string& a : dxc_arguments(options)) args_w.push_back(wide(a));
     for (const std::string& a : hlsl.arguments) args_w.push_back(wide(a));
+    args_w.push_back(L"-HV");
+    args_w.push_back(wide(hlsl.language));
     args_w.push_back(L"-T");
     args_w.push_back(wide(hlsl.profile));
     args_w.push_back(L"-E");

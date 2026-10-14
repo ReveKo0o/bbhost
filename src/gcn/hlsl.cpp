@@ -142,7 +142,10 @@ struct Handle {
     // An image or sampler variable's name (OpLoad of a UniformConstant), a
     // sampled image (image + sampler), or an access chain (an lvalue, or a
     // byte-address buffer's dword).
-    enum class Kind { None, Image, Sampler, SampledImage, Lvalue, BufferWord } kind = Kind::None;
+    enum class Kind { None, Image, Sampler, SampledImage, Lvalue, BufferWord, Physical } kind = Kind::None;
+    // Physical: a raw address (a compute lift's OpConvertUToPtr) and what it points at.
+    std::string address;
+    std::uint32_t pointee = 0;
     std::uint32_t image_var = 0, sampler_var = 0;
     std::string lvalue;           // Lvalue: the expression; BufferWord: the buffer's name
     std::uint32_t index = 0;      // BufferWord: the dword index value
@@ -158,21 +161,31 @@ public:
         try {
             parse();
             prepare();
-            // Pass 1 finds each block's scope; pass 2 prints, with the values
-            // a use outside their scope needs declared at the top.
-            dry = true;
-            walk_function();
-            hoist_values();
-            dry = false;
-            body_text.clear();
-            scope_count = 0;
-            scope_parent.clear();
-            walk_function();
+            // Each function in two passes: the first finds each block's scope,
+            // the second prints, with the values a use outside their scope
+            // needs declared at the top.
+            for (Function& f : functions) {
+                fn = &f;
+                use_scopes.clear();
+                block_scope.clear();
+                dry = true;
+                walk_function();
+                hoist_values();
+                dry = false;
+                body_text.clear();
+                walk_function();
+                f.text = declarations(f) + body_text;
+            }
             r.source = assemble();
             r.profile = profile;
             r.arguments = arguments;
+            if (hv202x) r.language = "202x";
         } catch (const Unsupported& e) {
             r.errors.push_back(e.what());
+            r.source.clear();
+        } catch (const std::exception& e) {
+            // A module the printer misreads is the printer's bug, but never the game's: keep the lift.
+            r.errors.push_back(std::string("internal error: ") + e.what());
             r.source.clear();
         }
         return r;
@@ -205,16 +218,26 @@ private:
         const Ins* merge = nullptr;
         const Ins* term = nullptr;
     };
-    std::vector<Ins> fn_ins;
-    std::map<std::uint32_t, Block> blocks;
-    std::uint32_t first_block = 0;
+    // The module's functions: the entry point's, and the helpers it calls
+    // (a compute lift's page-table walk).
+    struct Function {
+        std::uint32_t id = 0, result_type = 0;
+        std::vector<Ins> ins;  // the body, after OpFunction
+        std::vector<std::uint32_t> params;
+        std::map<std::uint32_t, Block> blocks;
+        std::uint32_t first_block = 0;
+        std::map<std::uint32_t, std::size_t> preds;  // block -> branches into it
+        std::string name, text;                      // its HLSL name; the printed body with its declarations
+    };
+    std::vector<Function> functions;  // in module order
+    Function* fn = nullptr;           // the one being printed
+    std::vector<const Ins*> all_ins;  // every function's instructions
     std::map<std::uint32_t, const Ins*> defs;          // value -> its instruction
     std::map<std::uint32_t, std::uint32_t> def_block;  // value -> its block
-    std::map<std::uint32_t, std::size_t> preds;        // block -> branches into it
 
     void parse() {
         if (words.size() < 5 || words[0] != 0x07230203u) fail("not a SPIR-V module");
-        bool in_function = false, functions_seen = false;
+        bool in_function = false;
         for (std::size_t i = 5; i < words.size();) {
             const std::uint32_t n = words[i] >> 16;
             const std::uint16_t op = static_cast<std::uint16_t>(words[i] & 0xffff);
@@ -229,21 +252,27 @@ private:
             in.a.assign(words.begin() + static_cast<std::ptrdiff_t>(k), words.begin() + static_cast<std::ptrdiff_t>(i + n));
             i += n;
             if (op == spv::OpFunction) {
-                if (functions_seen) fail("more than one function");
-                functions_seen = in_function = true;
-                fn_ins.push_back(std::move(in));
+                in_function = true;
+                Function f;
+                f.id = in.id;
+                f.result_type = in.type;
+                functions.push_back(std::move(f));
                 continue;
             }
             if (op == spv::OpFunctionEnd) {
                 in_function = false;
                 continue;
             }
-            if (in_function) fn_ins.push_back(std::move(in));
+            if (in_function) functions.back().ins.push_back(std::move(in));
             else module_ins.push_back(std::move(in));
         }
         for (const Ins& in : module_ins) module_level(in);
         if (exec_model == 0 && entry_fn == 0) fail("no entry point");
-        build_blocks();
+        if (functions.empty()) fail("no function body");
+        for (Function& f : functions) build_blocks(f);
+        for (const Function& f : functions) {
+            for (const Ins& in : f.ins) all_ins.push_back(&in);
+        }
     }
 
     static std::string str_operand(const std::vector<std::uint32_t>& a, std::size_t from) {
@@ -261,13 +290,17 @@ private:
     void module_level(const Ins& in) {
         switch (in.op) {
         case spv::OpCapability: capabilities.insert(in.a.at(0)); break;
-        case spv::OpExtension: fail("extension " + str_operand(in.a, 0));
+        case spv::OpExtension:
+            // A compute lift's raw addresses (vk::RawBufferLoad / vk::BufferPointer in HLSL).
+            if (str_operand(in.a, 0) != "SPV_KHR_physical_storage_buffer") fail("extension " + str_operand(in.a, 0));
+            break;
         case spv::OpExtInstImport:
             if (str_operand(in.a, 0) != "GLSL.std.450") fail("extended instruction set " + str_operand(in.a, 0));
             glsl = in.id;
             break;
         case spv::OpMemoryModel:
-            if (in.a.at(0) != 0 || in.a.at(1) != 1) fail("a memory model other than Logical GLSL450");
+            if ((in.a.at(0) != 0 && in.a.at(0) != 5348 /* PhysicalStorageBuffer64 */) || in.a.at(1) != 1)
+                fail("a memory model other than Logical or PhysicalStorageBuffer64 GLSL450");
             break;
         case spv::OpEntryPoint: {
             if (entry_fn) fail("more than one entry point");
@@ -403,17 +436,22 @@ private:
         }
     }
 
-    void build_blocks() {
-        if (fn_ins.empty() || fn_ins[0].op != spv::OpFunction) fail("no function body");
-        if (fn_ins[0].id != entry_fn) fail("the function is not the entry point");
+    void build_blocks(Function& f) {
+        auto& blocks = f.blocks;
+        auto& preds = f.preds;
         Block* cur = nullptr;
-        for (std::size_t i = 1; i < fn_ins.size(); ++i) {
-            const Ins& in = fn_ins[i];
-            if (in.op == spv::OpFunctionParameter) fail("a function parameter");
+        for (std::size_t i = 0; i < f.ins.size(); ++i) {
+            const Ins& in = f.ins[i];
+            if (in.op == spv::OpFunctionParameter) {
+                if (cur || f.first_block) fail("a parameter after a block");
+                f.params.push_back(in.id);
+                defs[in.id] = &in;
+                continue;
+            }
             if (in.op == spv::OpLabel) {
                 cur = &blocks[in.id];
                 cur->label = in.id;
-                if (!first_block) first_block = in.id;
+                if (!f.first_block) f.first_block = in.id;
                 continue;
             }
             if (!cur) fail("an instruction outside a block");
@@ -442,7 +480,7 @@ private:
                 ++preds[b.term->a.at(2)];
             }
             if (b.term->op == spv::OpSwitch) fail("OpSwitch");
-            if (b.term->op == spv::OpReturnValue) fail("a return value");
+            if (b.term->op == spv::OpReturnValue && f.id == entry_fn) fail("an entry point that returns a value");
             if (b.term->op == kOpTerminateInvocation) fail("OpTerminateInvocation");
         }
     }
@@ -623,6 +661,8 @@ private:
     std::string tess_domain;                // [domain(...)] of a domain shader
     std::vector<std::uint32_t> tess_modes;  // spacing, winding, point mode
     std::uint32_t output_vertices = 0;      // a hull's OutputVertices
+    std::uint32_t local_size[3] = {0, 0, 0};  // a compute shader's [numthreads]
+    bool hv202x = false;                      // vk::BufferPointer (an atomic on a raw address) needs -HV 202x
     // The hull: its per-control-point output and the barrier its body crosses.
     std::uint32_t cp_out_var = 0, invocation_var = 0;
     bool past_barrier = false;
@@ -659,6 +699,7 @@ private:
         case spv::EmVertex: profile = "vs_6_6"; break;
         case spv::EmTessellationEvaluation: profile = "ds_6_6"; break;
         case spv::EmTessellationControl: profile = "hs_6_6"; break;
+        case spv::EmGLCompute: profile = "cs_6_6"; break;
         default: fail("execution model " + std::to_string(exec_model));
         }
         for (const std::uint32_t c : capabilities) {
@@ -666,7 +707,7 @@ private:
             case spv::CapShader: case spv::CapInt64: case spv::CapClipDistance: case spv::CapImageQuery: case spv::CapGroupNonUniform:
             case spv::CapGroupNonUniformQuad: case spv::CapDerivativeControl: case spv::CapSampled1D: case spv::CapImage1D: case spv::CapTessellation:
             case spv::CapSampledCubeArray: case spv::CapImageCubeArray: case spv::CapStorageImageReadWithoutFormat:
-            case spv::CapStorageImageWriteWithoutFormat: case spv::CapImageGatherExtended:
+            case spv::CapStorageImageWriteWithoutFormat: case spv::CapImageGatherExtended: case spv::CapPhysicalStorageBufferAddresses:
                 break;
             case spv::CapFloat16: case spv::CapDenormPreserve: case spv::CapRoundingModeRTZ:
                 fail("half precision with the device's rounding mode (native RTZ)");
@@ -692,14 +733,20 @@ private:
                 if (m.size() < 3) fail("OutputVertices without a count");
                 output_vertices = m[2];
                 break;
+            case spv::ExLocalSize:
+                if (m.size() < 5) fail("LocalSize without three sizes");
+                local_size[0] = m[2], local_size[1] = m[3], local_size[2] = m[4];
+                break;
             default: fail("execution mode " + std::to_string(m[1]));
             }
         }
         // Samplers by use: SampleCmp takes a SamplerComparisonState.
-        for (const Ins& in : fn_ins) {
+        for (const Ins* ip : all_ins) {
+            const Ins& in = *ip;
             if (in.op != kOpSampledImageOp) continue;
             bool compare = false, plain = false;
-            for (const Ins& u : fn_ins) {
+            for (const Ins* up : all_ins) {
+                const Ins& u = *up;
                 if (u.a.empty() || u.a[0] != in.id) continue;
                 if (u.op == spv::OpImageSampleDrefImplicitLod || u.op == spv::OpImageSampleDrefExplicitLod || u.op == spv::OpImageDrefGather) compare = true;
                 else plain = true;
@@ -708,7 +755,8 @@ private:
             if (compare) compare_samplers.insert(s);
             if (plain) plain_samplers.insert(s);
         }
-        for (const Ins& in : fn_ins) {
+        for (const Ins* ip : all_ins) {
+            const Ins& in = *ip;
             if (in.op == spv::OpStore || in.op == spv::OpAtomicStore) {
                 if (const std::uint32_t root = pointer_root(in.a.at(0)); root && type(type(var_type.at(root)).elem).k == TK::Struct &&
                                                                             type(var_type.at(root)).sc == spv::ScStorageBuffer) {
@@ -717,6 +765,11 @@ private:
             }
         }
         for (const std::uint32_t v : var_order) global(v);
+        for (Function& f : functions) {
+            if (f.id == entry_fn) continue;
+            f.name = unique(names.count(f.id) ? names.at(f.id) : "fn" + std::to_string(f.id));
+            global_names[f.id] = f.name;
+        }
     }
 
     std::uint32_t sampler_root(std::uint32_t value) const {
@@ -874,6 +927,10 @@ private:
         case spv::BiTessLevelOuter: return "gl_TessLevelOuter_";
         case spv::BiTessLevelInner: return "gl_TessLevelInner_";
         case spv::BiInvocationId: return "gl_InvocationID_";
+        case spv::BiLocalInvocationId: return "gl_LocalInvocationID_";
+        case spv::BiWorkgroupId: return "gl_WorkGroupID_";
+        case 28 /* GlobalInvocationId */: return "gl_GlobalInvocationID_";
+        case spv::BiLocalInvocationIndex: return "gl_LocalInvocationIndex_";
         default: fail("built-in " + std::to_string(b));
         }
     }
@@ -949,8 +1006,10 @@ private:
         for (const auto& [v, scopes] : use_scopes) {
             const auto d = defs.find(v);
             if (d == defs.end()) continue;
-            if (d->second->op == spv::OpPhi) continue;  // declared at the top anyway
-            const auto bs = block_scope.find(def_block.at(v));
+            if (d->second->op == spv::OpPhi || d->second->op == spv::OpFunctionParameter) continue;  // declared at the top anyway
+            const auto db = def_block.find(v);
+            if (db == def_block.end()) continue;
+            const auto bs = block_scope.find(db->second);
             if (bs == block_scope.end()) continue;
             for (const int s : scopes) {
                 if (!encloses(bs->second, s)) {
@@ -1097,7 +1156,45 @@ private:
             return define(in, ref(in.a.at(0)));
         case spv::OpUndef: return define(in, zero(in.type));
         case spv::OpNop: return;
-        case spv::OpControlBarrier: {
+        case spv::OpFunctionCall: {
+            const std::uint32_t callee = in.a.at(0);
+            if (!global_names.count(callee)) fail("a call of an unknown function");
+            std::string call = global_names.at(callee) + "(";
+            for (std::size_t k = 1; k < in.a.size(); ++k) call += (k > 1 ? ", " : "") + ref(in.a[k]);
+            call += ")";
+            if (type(in.type).k == TK::Void) line(call + ";");
+            else define(in, call);
+            return;
+        }
+        case 120 /* OpConvertUToPtr */: {
+            const Type& pt = type(in.type);
+            if (pt.k != TK::Pointer || pt.sc != spv::ScPhysicalStorageBuffer) fail("a pointer made of an integer outside physical storage");
+            Handle h;
+            h.kind = Handle::Kind::Physical;
+            h.address = as(in.a.at(0), 'U');
+            h.pointee = pt.elem;
+            h.uses = {in.a.at(0)};
+            handles[in.id] = h;
+            return;
+        }
+        case spv::OpAtomicIAdd: return atomic(in);
+        case spv::OpImageWrite: {
+            const auto hd = handles.find(in.a.at(0));
+            if (hd == handles.end() || !hd->second.image_var) fail("an image write to an image that is not a loaded variable");
+            if (in.a.size() > 3) fail("image write operands");
+            const std::uint32_t it = type(var_type.at(hd->second.image_var)).elem;
+            line(global_names.at(hd->second.image_var) + "[" + coords(in.a.at(1), coord_count(it, true), 'u') + "] = " +
+                 as(in.a.at(2), kind_of(type(it).elem) == 'h' ? 'f' : kind_of(type(it).elem)) + ";");
+            return;
+        }
+        case spv::OpControlBarrier:
+            if (exec_model == spv::EmGLCompute) {
+                // As the lift's: the scopes and semantics exactly (no HLSL barrier has these).
+                line(inline_op_void("spv_control_barrier", spv::OpControlBarrier, {in.a.at(0), in.a.at(1), in.a.at(2)}) + ";");
+                return;
+            }
+            [[fallthrough]];
+        case 0xffff: {
             // The hull's barrier between its control point and its patch: the
             // control-point phase ends here (see hlsl.h).
             if (exec_model != spv::EmTessellationControl) fail("a barrier outside a hull shader");
@@ -1133,6 +1230,7 @@ private:
 
     void load(const Ins& in) {
         const std::uint32_t p = in.a.at(0);
+        if (in.a.size() > 1 && !(handles.count(p) && handles.at(p).kind == Handle::Kind::Physical)) fail("a load with memory operands");
         if (var_type.count(p)) {
             const Type& pt = type(var_type.at(p));
             if (pt.sc == spv::ScUniformConstant) {
@@ -1147,6 +1245,11 @@ private:
         }
         const auto h = handles.find(p);
         if (h == handles.end()) fail("a load through a pointer that is no access chain");
+        if (h->second.kind == Handle::Kind::Physical) {
+            for (const std::uint32_t u : h->second.uses) use(u);
+            if (type(in.type).k != TK::Int && type(in.type).k != TK::Float && type(in.type).k != TK::Vector) fail("a raw load of an aggregate");
+            return define(in, "vk::RawBufferLoad<" + type_name(in.type) + ">(" + h->second.address + aligned(in, 1) + ")");
+        }
         if (h->second.kind == Handle::Kind::BufferWord) {
             for (const std::uint32_t u : h->second.uses) use(u);
             const std::string e = h->second.lvalue + ".Load(4u * " + as(h->second.index, 'u') + ")";
@@ -1169,9 +1272,18 @@ private:
         define(in, h->second.lvalue);
     }
 
+    // A raw load's or store's Aligned memory operand (from operand `at`), as RawBuffer*'s alignment argument.
+    std::string aligned(const Ins& in, std::size_t at) {
+        if (in.a.size() <= at) return "";
+        const std::uint32_t mask = in.a[at];
+        if (mask != 2 /* Aligned */ || in.a.size() != at + 2) fail("memory operands other than Aligned");
+        return ", " + std::to_string(in.a[at + 1]);
+    }
+
     void store(const Ins& in) {
         const std::uint32_t p = in.a.at(0), v = in.a.at(1);
-        if (in.a.size() > 2) fail("a store with memory operands");
+        const bool physical = handles.count(p) && handles.at(p).kind == Handle::Kind::Physical;
+        if (in.a.size() > 2 && !physical) fail("a store with memory operands");
         if (var_type.count(p)) {
             const Type& pt = type(var_type.at(p));
             if (pt.sc != spv::ScOutput) fail("a store to a variable that is no output");
@@ -1189,6 +1301,12 @@ private:
         }
         const auto h = handles.find(p);
         if (h == handles.end()) fail("a store through a pointer that is no access chain");
+        if (h->second.kind == Handle::Kind::Physical) {
+            for (const std::uint32_t u : h->second.uses) use(u);
+            const std::uint32_t t = type_of(v);
+            line("vk::RawBufferStore<" + type_name(t) + ">(" + h->second.address + ", " + ref(v) + aligned(in, 2) + ");");
+            return;
+        }
         if (hull_late_cp_access.count(p)) fail("a control point output written after the barrier");
         if (hull_early_cp_read.count(p)) fail("a control point output written at an index other than the invocation's");
         for (const std::uint32_t u : h->second.uses) use(u);
@@ -1201,6 +1319,35 @@ private:
 
     void access_chain(const Ins& in) {
         const std::uint32_t base = in.a.at(0);
+        if (const auto hb = handles.find(base); hb != handles.end() && hb->second.kind == Handle::Kind::Physical) {
+            // Offsets from the raw address, by the pointee's layout decorations.
+            Handle h = hb->second;
+            std::uint32_t t = h.pointee;
+            for (std::size_t k = 1; k < in.a.size(); ++k) {
+                const std::uint32_t idx = in.a[k];
+                const Type& ty = type(t);
+                const auto c = consts.find(idx);
+                const bool constant = c != consts.end() && !c->second.spec;
+                if (ty.k == TK::Struct) {
+                    if (!constant) fail("a struct member chosen at run time");
+                    const std::uint32_t m = static_cast<std::uint32_t>(const_bits(c->second));
+                    const std::uint32_t off = member_offset(t, m);
+                    if (off) h.address = "(" + h.address + " + " + std::to_string(off) + "ull)";
+                    t = ty.members.at(m);
+                } else if (ty.k == TK::Array || ty.k == TK::RuntimeArray) {
+                    const std::vector<std::uint32_t> stride = decoration(t, spv::DecArrayStride);
+                    if (stride.empty()) fail("a raw array without a stride");
+                    h.address = "(" + h.address + " + uint64_t(" + as(idx, kind_of(type_of(idx)) == 'i' ? 'i' : 'u') + ") * " + std::to_string(stride[0]) + "ull)";
+                    h.uses.push_back(idx);
+                    t = ty.elem;
+                } else {
+                    fail("a raw access chain into a vector or scalar");
+                }
+            }
+            h.pointee = t;
+            handles[in.id] = h;
+            return;
+        }
         if (!var_type.count(base)) fail("an access chain from another access chain");
         const Type& pt = type(var_type.at(base));
         Handle h;
@@ -1280,6 +1427,44 @@ private:
     std::string ref_quiet(std::uint32_t v) {
         if (consts.count(v)) return const_expr(v);
         return value_name(v);
+    }
+
+    // OpAtomicIAdd: on a raw address (a compute lift's counters) or a buffer word.
+    void atomic(const Ins& in) {
+        const std::uint32_t p = in.a.at(0), scope = in.a.at(1), sem = in.a.at(2), v = in.a.at(3);
+        const auto h = handles.find(p);
+        if (h == handles.end()) fail("an atomic through a pointer that is no access chain");
+        const auto sc = consts.find(scope), sm = consts.find(sem);
+        if (sc == consts.end() || sm == consts.end() || const_bits(sc->second) != spv::ScopeDevice || const_bits(sm->second) != 0)
+            fail("an atomic with a scope or semantics HLSL's InterlockedAdd does not write");
+        const char k = kind_of(in.type);
+        if (k != 'u' && k != 'i') fail("an atomic on a value that is not a 32-bit integer");
+        for (const std::uint32_t u : h->second.uses) use(u);
+        const std::string orig = value_name(in.id) + "_orig";
+        line(type_name(in.type) + " " + orig + ";");
+        if (h->second.kind == Handle::Kind::Physical) {
+            hv202x = true;
+            line("InterlockedAdd(vk::BufferPointer<" + type_name(in.type) + ", 4>(" + h->second.address + ").Get(), " + as(v, k) + ", " + orig + ");");
+        } else if (h->second.kind == Handle::Kind::BufferWord) {
+            line(h->second.lvalue + ".InterlockedAdd(4u * " + as(h->second.index, 'u') + ", " + as(v, 'u') + ", " + orig + ");");
+        } else {
+            fail("an atomic on a variable");
+        }
+        define(in, orig);
+    }
+    // An inline SPIR-V instruction with no result, declared once per signature.
+    std::string inline_op_void(const std::string& name, int opcode, const std::vector<std::uint32_t>& args) {
+        std::string sig = name, decl_args;
+        for (std::size_t k = 0; k < args.size(); ++k) {
+            const std::string tn = type_name(type_of(args[k]));
+            sig += "_" + tn;
+            decl_args += (k ? ", " : "") + tn + " a" + std::to_string(k);
+        }
+        if (helper_keys.insert(sig).second)
+            helper_decls.push_back("[[vk::ext_instruction(" + std::to_string(opcode) + ")]] void " + name + "(" + decl_args + ");");
+        std::string call = name + "(";
+        for (std::size_t k = 0; k < args.size(); ++k) call += (k ? ", " : "") + ref(args[k]);
+        return call + ")";
     }
 
     void arithmetic(const Ins& in) {
@@ -1496,6 +1681,7 @@ private:
         const std::uint32_t op = in.a.at(1);
         const std::vector<std::uint32_t> args(in.a.begin() + 2, in.a.end());
         const char rk = kind_of(in.type);
+        const bool wide = rk == 'U' || rk == 'I';
         const auto call = [&](const char* fn, char k) {
             std::string s = std::string(fn) + "(";
             for (std::size_t i = 0; i < args.size(); ++i) s += (i ? ", " : "") + as(args[i], k);
@@ -1519,10 +1705,11 @@ private:
         case spv::GlslFma: return define(in, call("mad", rk));
         case spv::GlslNMin: return define(in, call("min", rk));
         case spv::GlslNMax: return define(in, call("max", rk));
-        case spv::GlslUMin: return define(in, call("min", 'u'));
-        case spv::GlslUMax: return define(in, call("max", 'u'));
-        case spv::GlslSMin: return define(in, call("min", 'i'));
-        case spv::GlslSMax: return define(in, call("max", 'i'));
+        // (64-bit too: a compute lift's page-table walk clamps an address with UMin.)
+        case spv::GlslUMin: return define(in, as_kind_of(call("min", wide ? 'U' : 'u'), wide ? 'U' : 'u', rk));
+        case spv::GlslUMax: return define(in, as_kind_of(call("max", wide ? 'U' : 'u'), wide ? 'U' : 'u', rk));
+        case spv::GlslSMin: return define(in, as_kind_of(call("min", wide ? 'I' : 'i'), wide ? 'I' : 'i', rk));
+        case spv::GlslSMax: return define(in, as_kind_of(call("max", wide ? 'I' : 'i'), wide ? 'I' : 'i', rk));
         case spv::GlslFindILsb: return define(in, as_kind_of(call("firstbitlow", 'u'), 'u', rk));
         case spv::GlslFindUMsb: return define(in, as_kind_of(call("firstbithigh", 'u'), 'u', rk));
         case spv::GlslFindSMsb: return define(in, as_kind_of(call("firstbithigh", 'i'), 'i', rk));
@@ -1547,6 +1734,7 @@ private:
     }
     std::string as_kind_of(const std::string& e, char from, char to) {
         if (from == to) return e;
+        if ((from == 'U' && to == 'I') || (from == 'I' && to == 'U')) return std::string(to == 'U' ? "uint64_t(" : "int64_t(") + e + ")";
         return std::string(to == 'u' ? "asuint(" : to == 'i' ? "asint(" : "asfloat(") + e + ")";
     }
 
@@ -1668,6 +1856,10 @@ private:
             const std::string arg = "int" + std::to_string(n + 1) + "(" + c + ", " + lod + ")";
             return define(in, texel(iname + ".Load(" + arg + offset_arg(o, it) + ")"));
         }
+        case spv::OpImageRead: {
+            if (in.a.size() > 2) fail("image read operands");
+            return define(in, texel(iname + "[" + coords(in.a.at(1), coord_count(it, true), 'u') + "]"));
+        }
         case spv::OpImageQuerySizeLod: {
             const Type& im = type(it);
             const std::string id = value_name(in.id);
@@ -1720,8 +1912,8 @@ private:
 
     // The phis of `to` given their values for the edge from `from`.
     void copies(std::uint32_t from, std::uint32_t to) {
-        const auto b = blocks.find(to);
-        if (b == blocks.end()) return;
+        const auto b = fn->blocks.find(to);
+        if (b == fn->blocks.end()) return;
         std::vector<std::pair<std::uint32_t, std::uint32_t>> moves;  // phi, value
         for (const Ins* phi : b->second.phis) {
             for (std::size_t k = 0; k + 1 < phi->a.size(); k += 2) {
@@ -1762,7 +1954,7 @@ private:
         scope_count = 0;
         scope_parent.assign(1, 0);
         indent = 1;
-        chain(first_block, Ctx{});
+        chain(fn->first_block, Ctx{});
     }
 
     // Prints blocks from `b` on until control leaves the construct `ctx` describes.
@@ -1778,7 +1970,7 @@ private:
                 continue_block(ctx);
                 return;
             }
-            const Block& blk = blocks.at(b);
+            const Block& blk = fn->blocks.at(b);
             if (blk.merge && blk.merge->op == spv::OpLoopMerge) {
                 b = loop(b);
                 continue;
@@ -1827,6 +2019,7 @@ private:
             }
             case spv::OpKill: line("discard;"); return;
             case spv::OpReturn: line("return;"); return;
+            case spv::OpReturnValue: line("return " + ref(t.a.at(0)) + ";"); return;
             case spv::OpUnreachable: return;
             default: fail("terminator " + std::to_string(t.op));
             }
@@ -1835,10 +2028,10 @@ private:
 
     // A loop from its header; returns its merge block.
     std::uint32_t loop(std::uint32_t h) {
-        const Block& hb = blocks.at(h);
+        const Block& hb = fn->blocks.at(h);
         const std::uint32_t m = hb.merge->a.at(0), c = hb.merge->a.at(1);
         if (c == h) fail("a loop whose header is its continue target");
-        if (preds[c] != 1) fail("a continue block reached from more than one block");
+        if (fn->preds[c] != 1) fail("a continue block reached from more than one block");
         line("[loop] for (;;) {");
         open_scope();
         Ctx ctx;
@@ -1857,7 +2050,7 @@ private:
     }
 
     void continue_block(const Ctx& ctx) {
-        const Block& cb = blocks.at(ctx.loop_continue);
+        const Block& cb = fn->blocks.at(ctx.loop_continue);
         if (cb.merge) fail("a continue block that is a header");
         block_body(cb);
         const Ins& t = *cb.term;
@@ -1967,7 +2160,7 @@ private:
         for (const StageVar& v : stage_vars) {
             if (v.builtin == spv::BiInvocationId) invocation = v.name;
         }
-        s += "\nvoid lifted_main() {\n" + top + body_text + "}\n\n";
+        s += "\n" + helper_functions() + "void lifted_main() {\n" + body_text + "}\n\n";
         s += "// The patch's constants and factors: the body again as invocation 0, with every control point's output.\n";
         s += "PatchConstants patch_main(InputPatch<ControlPointIn, " + n + "> ip, OutputPatch<ControlPointOut, " + n + "> op" + params + ") {\n";
         s += copy_in + copy_pc;
@@ -1983,11 +2176,11 @@ private:
         return s;
     }
 
-    std::string assemble() {
-        // The phis and the values a use outside their scope reaches, declared at the top.
+    // A function's phis and the values a use outside their scope reaches, declared at its top.
+    std::string declarations(const Function& f) {
         std::string top;
-        for (const Ins& in : fn_ins) {
-            if (!in.id || !in.type) continue;
+        for (const Ins& in : f.ins) {
+            if (!in.id || !in.type || in.op == spv::OpFunctionParameter) continue;
             const bool phi = in.op == spv::OpPhi;
             if (!phi && !hoisted.count(in.id)) continue;
             if (parts.count(in.id)) {
@@ -1998,7 +2191,55 @@ private:
             const char k = kind_of(in.type);
             top += std::string("    ") + (k == 'f' || k == 'h' ? "precise " : "") + type_name(in.type) + " " + value_name(in.id) + ";\n";
         }
+        return top;
+    }
+    // The helper functions, prototypes first (one may call another declared after it).
+    std::string helper_functions() {
+        std::string protos, bodies;
+        for (Function& f : functions) {
+            if (f.id == entry_fn) continue;
+            const std::string ret = type(f.result_type).k == TK::Void ? std::string("void") : type_name(f.result_type);
+            std::string sig = ret + " " + f.name + "(";
+            for (std::size_t k = 0; k < f.params.size(); ++k) {
+                sig += (k ? ", " : "") + type_name(defs.at(f.params[k])->type) + " " + value_name(f.params[k]);
+            }
+            sig += ")";
+            protos += sig + ";\n";
+            bodies += sig + " {\n" + f.text + "}\n\n";
+        }
+        return protos.empty() ? std::string() : protos + "\n" + bodies;
+    }
 
+    // A compute shader: [numthreads], its built-ins as the entry point's parameters.
+    std::string assemble_compute() {
+        if (!local_size[0]) fail("a compute shader without LocalSize");
+        std::string s, params, copy;
+        for (const StageVar& v : stage_vars) {
+            if (!v.input || v.builtin < 0) fail("a compute shader stage variable that is no built-in input");
+            const char* sem = nullptr;
+            switch (v.builtin) {
+            case spv::BiLocalInvocationId: sem = "SV_GroupThreadID"; break;
+            case spv::BiWorkgroupId: sem = "SV_GroupID"; break;
+            case 28: sem = "SV_DispatchThreadID"; break;
+            case spv::BiLocalInvocationIndex: sem = "SV_GroupIndex"; break;
+            default: fail("compute built-in " + std::to_string(v.builtin));
+            }
+            s += "static " + declare(v.pointee, v.name) + ";\n";
+            params += std::string(params.empty() ? "" : ", ") + declare(v.pointee, "si_" + v.name) + " : " + sem;
+            copy += "    " + v.name + " = si_" + v.name + ";\n";
+        }
+        s += "\n" + helper_functions() + "void lifted_main() {\n" + body_text + "}\n\n";
+        s += "[numthreads(" + std::to_string(local_size[0]) + ", " + std::to_string(local_size[1]) + ", " + std::to_string(local_size[2]) + ")]\n";
+        s += "void main(" + params + ") {\n" + copy + "    lifted_main();\n}\n";
+        if (uses_half) arguments.push_back("-enable-16bit-types");
+        return s;
+    }
+
+    std::string assemble() {
+        std::string top;
+        for (const Function& f : functions) {
+            if (f.id == entry_fn) body_text = f.text;  // lifted_main's, declarations included
+        }
         std::string s;
         s += "// " + (opt.title.empty() ? std::string("lifted shader") : opt.title) + "\n";
         s += "// HLSL printed from the lifted SPIR-V by bbhost (gcn/hlsl.h), on this machine, from this game's own shader.\n";
@@ -2012,6 +2253,7 @@ private:
         if (!spec_decls.empty()) s += "\n";
 
         if (exec_model == spv::EmTessellationControl) return s + assemble_hull(top);
+        if (exec_model == spv::EmGLCompute) return s + assemble_compute();
 
         // Stage variables: statics, filled from and written to the entry point's.
         const bool tes = exec_model == spv::EmTessellationEvaluation;
@@ -2102,7 +2344,7 @@ private:
             if (patch_size) s += "struct ControlPoint {\n" + cp_struct + "};\n";
         }
         if (!out_struct.empty()) s += "struct StageOutput {\n" + out_struct + "};\n";
-        s += "\nvoid lifted_main() {\n" + top + body_text + "}\n\n";
+        s += "\n" + helper_functions() + "void lifted_main() {\n" + body_text + "}\n\n";
         if (early_tests) s += "[earlydepthstencil]\n";
         std::string args = in_struct.empty() ? "" : "StageInput si";
         if (tes) {
@@ -2267,6 +2509,15 @@ struct OpCensus {
 };
 
 OpCensus op_census(const std::vector<std::uint32_t>& w) {
+    // Counted per function, a call counting its callee's operations again
+    // (DXC inlines every function: a compute lift's page-table walk is in
+    // its module once, in DXC's once a call).
+    struct Fn {
+        std::map<std::string, std::size_t> ops;
+        std::vector<std::uint32_t> calls;
+    };
+    std::map<std::uint32_t, Fn> fns;
+    std::uint32_t entry = 0, current = 0;
     OpCensus c;
     std::set<std::uint32_t> nocontract, consts, quad_results;
     std::vector<std::uint32_t> float_arith;
@@ -2275,6 +2526,10 @@ OpCensus op_census(const std::vector<std::uint32_t>& w) {
         const std::uint32_t n = w[i] >> 16, op = w[i] & 0xffff;
         if (!n || i + n > w.size()) break;
         const std::uint32_t* a = &w[i + 1];
+        if (op == spv::OpEntryPoint) entry = a[1];
+        if (op == spv::OpFunction) current = a[1];
+        if (op == spv::OpFunctionCall && current) fns[current].calls.push_back(a[2]);
+        auto& ops = fns[current].ops;
         if (op == spv::OpExtInstImport) glsl_set = a[0];
         if (op == spv::OpGroupNonUniformQuadSwap || op == spv::OpGroupNonUniformQuadBroadcast) quad_results.insert(a[1]);
         if (op == spv::OpConstant || op == spv::OpConstantComposite || op == spv::OpConstantNull || op == spv::OpSpecConstant) consts.insert(a[1]);
@@ -2287,21 +2542,21 @@ OpCensus op_census(const std::vector<std::uint32_t>& w) {
                               op == spv::OpIsNan || op == spv::OpIsInf || (op >= spv::OpFOrdEqual && op <= spv::OpFUnordGreaterThanEqual) ||
                               (op >= 207 && op <= 215) || (op >= spv::OpImageSampleImplicitLod && op <= spv::OpImageQueryLevels) ||
                               (op >= 333 && op <= 366) || op == spv::OpKill || op == spv::OpDemoteToHelperInvocation || op == kOpIsHelperInvocation ||
-                              op == kOpTerminateInvocation;
+                              op == kOpTerminateInvocation || (op >= spv::OpAtomicLoad && op <= 242) || op == spv::OpControlBarrier;
         if (semantic) {
             if (op >= spv::OpFOrdEqual && op <= spv::OpFUnordGreaterThanEqual) {
                 // A comparison and the negation of its complement are the same
                 // (with NaNs too): spirv-opt folds !(a < b) into FUnordGreaterThanEqual.
                 // A quad read of a bool is one of a float DXC makes of it (1.0 or
                 // 0.0), compared with 0 again: part of the quad operation.
-                if (!(op == spv::OpFOrdNotEqual && (quad_results.count(a[2]) || quad_results.count(a[3])))) c.ops["float comparisons"]++;
+                if (!(op == spv::OpFOrdNotEqual && (quad_results.count(a[2]) || quad_results.count(a[3])))) ops["float comparisons"]++;
             } else if (op == spv::OpFNegate && consts.count(a[2])) {
                 // -0.5f in a precise expression: an exact negation DXC does not fold.
             } else {
-                c.ops["op " + std::to_string(op)]++;
+                ops["op " + std::to_string(op)]++;
             }
         }
-        if (op == spv::OpExtInst && n >= 5 && a[2] == glsl_set) c.ops["glsl " + std::to_string(a[3])]++;
+        if (op == spv::OpExtInst && n >= 5 && a[2] == glsl_set) ops["glsl " + std::to_string(a[3])]++;
         if (op == spv::OpFAdd || op == spv::OpFSub || op == spv::OpFMul || op == spv::OpFDiv || (op == spv::OpFNegate && !consts.count(a[2]))) {
             // Float scalars and vectors only reach these opcodes. A negated
             // literal (-1.0f) is exact whether or not it may contract.
@@ -2310,6 +2565,13 @@ OpCensus op_census(const std::vector<std::uint32_t>& w) {
         i += n;
     }
     for (const std::uint32_t id : float_arith) c.contractible += nocontract.count(id) ? 0 : 1;
+    // The entry point's counts with every call's callee counted at the call (depth-limited).
+    std::function<void(std::uint32_t, int)> add = [&](std::uint32_t f, int depth) {
+        if (depth > 8 || !fns.count(f)) return;
+        for (const auto& [k, n] : fns.at(f).ops) c.ops[k] += n;
+        for (const std::uint32_t callee : fns.at(f).calls) add(callee, depth + 1);
+    };
+    add(entry, 0);
     return c;
 }
 
