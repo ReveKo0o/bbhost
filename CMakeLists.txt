@@ -25,7 +25,7 @@ set_target_properties(monocypher PROPERTIES C_STANDARD 99 POSITION_INDEPENDENT_C
 
 # Sea Islands shader decoder and the offline tools built on it.
 find_package(ZLIB REQUIRED)
-add_library(gcn STATIC src/gcn/decode.cpp src/gcn/container.cpp src/gcn/spirv.cpp src/gcn/half.cpp src/gcn/translate.cpp src/gcn/lift.cpp src/gcn/image_dims.cpp src/gcn/wave.cpp src/gcn/names.cpp)
+add_library(gcn STATIC src/gcn/decode.cpp src/gcn/container.cpp src/gcn/spirv.cpp src/gcn/half.cpp src/gcn/translate.cpp src/gcn/lift.cpp src/gcn/image_dims.cpp src/gcn/wave.cpp src/gcn/names.cpp src/gcn/hlsl.cpp)
 target_include_directories(gcn PUBLIC src)
 target_link_libraries(gcn PUBLIC ZLIB::ZLIB)
 add_executable(gcndis tools/gcndis.cpp)
@@ -34,6 +34,10 @@ find_library(SPIRV_TOOLS_LIB SPIRV-Tools)
 if(SPIRV_TOOLS_LIB)
   add_executable(gcn2spv tools/gcn2spv.cpp)
   target_link_libraries(gcn2spv PRIVATE gcn ${SPIRV_TOOLS_LIB})
+  # The lifted shaders as HLSL, compiled with DXC (loaded at run time) and checked.
+  find_package(Threads REQUIRED)
+  add_executable(gcn2hlsl tools/gcn2hlsl.cpp src/host/dxc.cpp)
+  target_link_libraries(gcn2hlsl PRIVATE gcn ${SPIRV_TOOLS_LIB} ${CMAKE_DL_LIBS} Threads::Threads)
 endif()
 
 
