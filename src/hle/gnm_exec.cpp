@@ -111,15 +111,22 @@ bool cp_draw_packets() {
     }();
     return v;
 }
-// The dispatch packets run unless the dispatches come from tokens instead.
+// Dispatch packets run from the compute registers. With dispatch tokens
+// (hle_gx_dispatch_native) a dispatch the hooks took writes no packet, so a
+// packet that still arrives is one they left (gx-dispatch's fallbacks by
+// reason) and runs as before. BBHOST_CP_DISPATCH_PACKETS=0 drops them
+// instead, and the command processor keeps no compute registers (checks).
 bool cp_dispatch_packets() {
     static const bool v = [] {
         const char* e = std::getenv("BBHOST_CP_DISPATCH_PACKETS");
-        return (e && e[0] == '1') || !hle_gx_dispatch_native();
+        return !(e && e[0] == '0');
     }();
     return v;
 }
 std::atomic<std::uint64_t> g_dispatch_packets_dropped[2] = {};
+// Dispatch packets run from the register file while dispatches come from
+// their tokens: the fallbacks, direct and indirect.
+std::atomic<std::uint64_t> g_dispatch_fallbacks[2] = {};
 enum DroppedDraw { kDropIndex2, kDropAuto, kDropOffset2, kDropIndirect, kDropIndexIndirect, kDroppedDraws };
 const char* const kDroppedDrawName[kDroppedDraws] = {"DRAW_INDEX_2", "DRAW_INDEX_AUTO", "DRAW_INDEX_OFFSET_2", "DRAW_INDIRECT",
                                                      "DRAW_INDEX_INDIRECT"};
@@ -263,10 +270,15 @@ void run_dispatch(const char* kind, std::uint32_t x, std::uint32_t y, std::uint3
     }
     if (!cp_dispatch_packets()) {
         if (g_dispatch_packets_dropped[indirect_va ? 1 : 0].fetch_add(1, std::memory_order_relaxed) < 4) {
-            host_log("cp: %s %ux%ux%u at flip %llu not run: every dispatch is a token and the register file is not kept "
-                     "(BBHOST_CP_DISPATCH_PACKETS=1 runs it)", kind, x, y, z, static_cast<unsigned long long>(hle_video_flip_count()));
+            host_log("cp: %s %ux%ux%u at flip %llu not run: BBHOST_CP_DISPATCH_PACKETS=0 drops the dispatch packets", kind, x, y, z,
+                     static_cast<unsigned long long>(hle_video_flip_count()));
         }
         return;
+    }
+    if (hle_gx_dispatch_native() && g_dispatch_fallbacks[indirect_va ? 1 : 0].fetch_add(1, std::memory_order_relaxed) < 4) {
+        host_log("cp: %s %ux%ux%u of program 0x%llx at flip %llu runs from its packet and the register file: no token was made for it "
+                 "(gx-dispatch: fallbacks by reason)",
+                 kind, x, y, z, static_cast<unsigned long long>(d.code_va), static_cast<unsigned long long>(hle_video_flip_count()));
     }
     g_dispatches.fetch_add(1);
     hle_gx_trace_dispatch(t_packet_op, t_packet_va, x, sh[0x20C]);
@@ -445,6 +457,28 @@ const bool g_exec_cost = [] {
     const char* e = std::getenv("BBHOST_GX_COST");
     return e && std::atoi(e) != 0;
 }();
+// BBHOST_GX_COST: the command processor's time per dispatch, from the packet
+// (or token) to the dispatch handed to the renderer and back: [0] a dispatch
+// packet run from the register file, [1] a dispatch token.
+// The ones over a millisecond (a pipeline built, the page tables made anew)
+// are counted apart, so the rest's average is the steady cost.
+std::atomic<std::uint64_t> g_cp_dispatch_ns[2] = {}, g_cp_dispatch_n[2] = {}, g_cp_dispatch_slow_ns[2] = {}, g_cp_dispatch_slow_n[2] = {};
+struct CpDispatchTimer {
+    int path;
+    std::chrono::steady_clock::time_point t0;
+    explicit CpDispatchTimer(int p) : path(p), t0(g_exec_cost ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{}) {}
+    ~CpDispatchTimer() {
+        if (!g_exec_cost) return;
+        const auto ns =
+            static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count());
+        g_cp_dispatch_ns[path].fetch_add(ns, std::memory_order_relaxed);
+        g_cp_dispatch_n[path].fetch_add(1, std::memory_order_relaxed);
+        if (ns > 1000000) {
+            g_cp_dispatch_slow_ns[path].fetch_add(ns, std::memory_order_relaxed);
+            g_cp_dispatch_slow_n[path].fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+};
 std::atomic<std::uint64_t> g_token_nops{0};  // NOPs that were host-draw tokens (BBHOST_GX_NATIVE)
 std::atomic<std::uint64_t> g_copy_nops{0};   // NOPs that were copy tokens (BBHOST_GX_NATIVE_COPIES)
 std::atomic<std::uint64_t> g_exec_dwords{0};  // dwords of the packets executed, headers included
@@ -1824,8 +1858,12 @@ void execute_packet(std::uint32_t op, const std::uint32_t* b, std::size_t n, int
             break;
         }
         case kSetShReg:
-            // The SH registers stay while the dispatch packets run: a dispatch
-            // takes its program, thread counts and user data from them.
+            // The SH registers stay while dispatch packets can run: a dispatch
+            // from its packet takes its program, thread counts and user data
+            // from them. With dispatch tokens those are only the fallbacks
+            // (gx-dispatch: fallbacks by reason). The graphics stages' are kept
+            // with them as they always were: the tessellation paths still read
+            // a few (render.cpp, d.sh) for a draw without records.
             if (!cp_registers() && !cp_dispatch_packets()) {
                 g_register_dwords_skipped.fetch_add(n, std::memory_order_relaxed);
                 break;
@@ -1911,10 +1949,12 @@ void execute_packet(std::uint32_t op, const std::uint32_t* b, std::size_t n, int
                 trace_draw("DRAW_INDEX_OFFSET_2", b[2], t_index_base + static_cast<std::uint64_t>(b[1]) * ((t_index_type & 1) ? 4 : 2));
             }
             break;
-        case kDispatchDirect:
+        case kDispatchDirect: {
             // [0] dim_x, [1] dim_y, [2] dim_z, [3] dispatch_initiator
+            CpDispatchTimer timer(0);
             if (n >= 3) run_dispatch("DISPATCH_DIRECT", b[0], b[1], b[2]);
             break;
+        }
         case kSetBase:
             // [0] base_index[3:0], [1] addr_lo, [2] addr_hi[15:0]. Index 1 is
             // the indirect draw/dispatch argument table.
@@ -1923,6 +1963,7 @@ void execute_packet(std::uint32_t op, const std::uint32_t* b, std::size_t n, int
         case kDispatchIndirect: {
             // [0] byte offset from the SET_BASE table, [1] dispatch_initiator.
             // The dimensions come from memory: {x, y, z}.
+            CpDispatchTimer timer(0);
             if (n < 1 || !t_indirect_base) break;
             const std::uint64_t args = t_indirect_base + b[0];
             if (!hle_kernel_va_mapped(args, 12)) break;
@@ -2015,6 +2056,7 @@ void execute_packet(std::uint32_t op, const std::uint32_t* b, std::size_t n, int
             if (n >= 3 && b[0] == kGxImageCopyMagic) hle_gx_image_copy_token(b[1] | (static_cast<std::uint64_t>(b[2]) << 32));
             // A dispatch token.
             if (n >= 3 && b[0] == kGxDispatchMagic) {
+                CpDispatchTimer timer(1);
                 if (const GpuDispatch* dp = hle_gx_dispatch_token(b[1] | (static_cast<std::uint64_t>(b[2]) << 32))) {
                     g_dispatches.fetch_add(1);
                     GpuDispatch dd = *dp;
@@ -3119,6 +3161,17 @@ void hle_gnm_exec_histogram() {
                  static_cast<unsigned long long>(g_gds_stores_moved.load()), words, static_cast<unsigned long long>(g_counter_reads.load()),
                  static_cast<unsigned long long>(g_counter_writes.load()));
     }
+    for (int k = 0; k < 2; ++k) {
+        const std::uint64_t n = g_cp_dispatch_n[k].load();
+        if (!n) continue;
+        const std::uint64_t slow = g_cp_dispatch_slow_n[k].load(), slow_ns = g_cp_dispatch_slow_ns[k].load();
+        host_log("gnm: the command processor's time per dispatch %s: %llu, %llu ns each; %llu over a millisecond (%llu ms), the rest %llu ns "
+                 "each (BBHOST_GX_COST)",
+                 k ? "from its token" : "from its packet and the register file", static_cast<unsigned long long>(n),
+                 static_cast<unsigned long long>(g_cp_dispatch_ns[k].load() / n), static_cast<unsigned long long>(slow),
+                 static_cast<unsigned long long>(slow_ns / 1000000),
+                 static_cast<unsigned long long>(n > slow ? (g_cp_dispatch_ns[k].load() - slow_ns) / (n - slow) : 0));
+    }
     host_gpu_report();
     for (int op = 0; op < 256; ++op) {
         const std::uint64_t n = g_op_hist[op].load();
@@ -3216,10 +3269,14 @@ void hle_gnm_cp_report() {
     }
     host_log("cp: register file %s (%llu dwords of SET_*_REG skipped); draw packets %s%s; dispatch packets %s DISPATCH_DIRECT %llu, "
              "DISPATCH_INDIRECT %llu",
-             cp_registers() ? "kept" : "not kept", static_cast<unsigned long long>(g_register_dwords_skipped.load()),
-             cp_draw_packets() ? "drawn" : "not drawn:", dropped.empty() ? (cp_draw_packets() ? "" : " none") : dropped.c_str(),
-             cp_dispatch_packets() ? "run; dropped" : "not run:", static_cast<unsigned long long>(g_dispatch_packets_dropped[0].load()),
-             static_cast<unsigned long long>(g_dispatch_packets_dropped[1].load()));
+             cp_registers() ? "kept" : cp_dispatch_packets() ? "not kept but for the SH registers" : "not kept",
+             static_cast<unsigned long long>(g_register_dwords_skipped.load()), cp_draw_packets() ? "drawn" : "not drawn:",
+             dropped.empty() ? (cp_draw_packets() ? "" : " none") : dropped.c_str(), cp_dispatch_packets() ? "run; dropped" : "not run:",
+             static_cast<unsigned long long>(g_dispatch_packets_dropped[0].load()), static_cast<unsigned long long>(g_dispatch_packets_dropped[1].load()));
+    if (hle_gx_dispatch_native()) {
+        host_log("cp: dispatches from tokens; dispatch packets run from the register file (fallbacks): DISPATCH_DIRECT %llu, DISPATCH_INDIRECT %llu",
+                 static_cast<unsigned long long>(g_dispatch_fallbacks[0].load()), static_cast<unsigned long long>(g_dispatch_fallbacks[1].load()));
+    }
     std::size_t labels = 0;
     {
         std::lock_guard<std::mutex> lk(g_pending_mu);

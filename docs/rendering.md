@@ -25,13 +25,20 @@ buffer. When the command processor reaches the token, the draw is built from
 those inputs. No packet is decoded and no register file is consulted for a
 draw.
 
+**Compute dispatches** are tokens too. A dispatch through GX's compute
+commit - the GPU particles, the tone-map and depth-of-field look-up tables -
+takes its compute stage from the engine's objects at the call, as a draw does:
+the compute shader, its views, UAVs, samplers and constant buffers, from which
+the command processor builds the shader's user data, tables included. YEBIS's
+passes and GX's own resource passes take the user data their writers set. A
+dispatch the hooks did not take would still run from its packet and the
+register file (`BBHOST_GX_NATIVE_DISPATCH=0` runs them all that way), and the
+exit report counts those by reason.
+
 **The command processor.** bbhost still walks the game's command buffers, for
-what has not moved to tokens: compute dispatches, labels and fences the game
-waits on, and some clears and copies recognised from their packets. Compute
-dispatches go through an emulated register file, by decision for now: they
-are tightly interleaved with the constant engine's memory traffic, and most
-of them are fills and copies that never run a shader, which bbhost recognises
-and performs directly.
+what has not moved to tokens: labels and fences the game waits on, the
+counters the GPU particles keep in GDS, and some clears and copies recognised
+from their packets.
 
 **Recording.** The command processor leaves the Vulkan calls to a thread of
 its own, `bb-record`. Each draw goes into a packet, and most of its other
@@ -108,7 +115,7 @@ path at all:
 | Post-processing (YEBIS) | native resource building; the game's shaders |
 | Menus (Scaleform) | native draw building from the HAL |
 | Fills and copies without a shader | recognised and performed directly |
-| Other compute dispatches | emulated register state, the game's shaders |
+| Other compute dispatches | native: built at a token from the engine's objects (GX's compute stage) or the user data its writers set (YEBIS, GX's own passes); the game's shaders |
 | Clears and target copies | partly recognised from packets |
 | Labels and fences | emulated, on the command processor |
 | Shaders | decompiled (lifted) to SPIR-V; a few refused programs translated (see below) |
@@ -138,8 +145,6 @@ A draw whose setup the lifter hasn't seen still falls back to the translator. Th
 
 ## What comes next
 
-- Compute dispatches built from the engine's objects, like the draws, so the
-  register file can go.
 - Resources identified by the engine's own objects and generations rather than
   by guest address and write tracking.
 - Clears and copies from their GX calls rather than from packets, after which

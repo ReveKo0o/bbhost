@@ -247,17 +247,17 @@ bool hle_gx_shadow_wanted();
 void hle_gx_wrapper_compare(const GpuDrawInputs& in, std::uint32_t count, std::uint64_t index_va, std::uint32_t index_type,
                             std::uint32_t instances, std::uint32_t prim, const std::uint32_t* sh, const std::uint32_t* ctx);
 void hle_gnm_cp_report();  // the command processor's register-file and draw-packet counters, at exit
-// A compute dispatch emitted through the wrapper writes a
-// dispatch token, {kGxDispatchMagic, id low, id high}, built from the
-// wrapper's context state (the compute program and its user data).
-// BBHOST_GX_NATIVE_DISPATCH=2 returns the dispatch for the CP to run; =1
-// (shadow) keeps it for the dispatch packet that follows, which
-// hle_gx_dispatch_check compares against the register file. The default, 0,
-// leaves dispatches to their packets (gx_trace.cpp says why).
+// A compute dispatch emitted through the wrapper writes a dispatch token,
+// {kGxDispatchMagic, id low, id high}, instead of its packet: the compute
+// program, its user data (from GX's compute records, or as its writers set
+// it) and its group counts. BBHOST_GX_NATIVE_DISPATCH=2 (the default)
+// returns the dispatch for the CP to run; =1 (shadow) keeps it for the
+// dispatch packet that follows, which hle_gx_dispatch_check compares against
+// the register file; 0 leaves dispatches to their packets (gx_trace.cpp).
 constexpr std::uint32_t kGxDispatchMagic = 0x53444242u;  // "BBDS"
 struct GpuDispatch;
-// True when dispatches run from their tokens, so the command processor must
-// not also run the dispatch packet.
+// True when dispatches run from their tokens: a dispatch packet that still
+// arrives is one no token was made for, run from the register file (counted).
 bool hle_gx_dispatch_native();
 // True when dispatch tokens are shadowed (BBHOST_GX_NATIVE_DISPATCH=1): the
 // command processor notes which packet wrote each compute user-data slot.

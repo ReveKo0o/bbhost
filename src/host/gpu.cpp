@@ -6096,9 +6096,14 @@ const bool g_dispatch_cost = [] {
     const char* e = std::getenv("BBHOST_DISPATCH_COST");
     return e && e[0] == '1';
 }();
-enum DispatchPart { kDpLock, kDpProgram, kDpTables, kDpPaths, kDpPipeline, kDpWork, kDpParts };
+// The rest of the dispatch: its inputs prepared (recognised shapes, images
+// prefetched, imports, the counters' starts), the open render pass and the
+// pending transfers closed, its parameters and descriptor set, its commands
+// recorded, and what it wrote noted (store shadows, writebacks, the barrier).
+enum DispatchPart { kDpLock, kDpProgram, kDpTables, kDpPaths, kDpPipeline, kDpPrepare, kDpFlush, kDpSet, kDpRecord, kDpAfter, kDpParts };
 const char* const kDispatchPartName[kDpParts] = {"lock", "program lookup", "page tables", "paths and dims", "key and pipeline",
-                                                 "the work"};
+                                                 "inputs and counters", "pass end and transfers", "parameters and set", "recording",
+                                                 "what it wrote"};
 // What the dispatches actually are. The whole class is at L0,
 // and slice 2 was worth measuring before building - it turned out mostly done.
 // Counted by shader, and separately the ones that never reach a shader at all
@@ -6547,9 +6552,11 @@ bool host_gpu_dispatch(const GpuDispatch& d_in) {
                      words.empty() ? " none bound" : words.c_str());
         }
     }
+    stamp.to(kDpPrepare);
     transfer_flush_locked();
     render_end_pass_locked();
     copy_versions_flush_locked();  // a compute shader reads memory without looking at them
+    stamp.to(kDpFlush);
     // BBHOST_CAPTURE_DISPATCH (draw_capture.h): run everything recorded so
     // far - the counters' starts too - before this dispatch's set exists, so
     // memory and images hold its inputs.
@@ -6633,6 +6640,7 @@ bool host_gpu_dispatch(const GpuDispatch& d_in) {
         args_offset = loc.offset;
         if (!g_render_min) indirect_clamp_locked(loc.buffer, loc.offset, d.indirect_va, name, args_buffer, args_offset);
     }
+    stamp.to(kDpSet);
     rec().bind_pipeline(VK_PIPELINE_BIND_POINT_COMPUTE, lean ? lean->pipeline : pl.pipeline);
     const std::uint32_t params_offset = static_cast<std::uint32_t>(ubi.offset);
     const VkPipelineLayout layout = lean ? g.cs_buffers_layout : g.pipe_layout;
@@ -6694,6 +6702,7 @@ bool host_gpu_dispatch(const GpuDispatch& d_in) {
         if (!g_render_min) rec().dispatch(d.dim[0], d.dim[1], d.dim[2]);
     }
     profile_end_locked();
+    stamp.to(kDpRecord);
     // The dispatches by how their shader ran (BBHOST_LIFT_COMPUTE): per
     // pipeline for the exit report, and in all for the second's detail line.
     ++pl.dispatches;
@@ -6801,6 +6810,7 @@ bool host_gpu_dispatch(const GpuDispatch& d_in) {
                          nullptr, 0, nullptr);
     g.dispatches.fetch_add(1);
     if (capture_session) capture_dispatch_finish_locked(std::move(capture_session));
+    stamp.to(kDpAfter);
     return true;
 }
 

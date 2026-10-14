@@ -441,19 +441,23 @@ const int g_yebis_full = [] {
     return e && e[0] ? std::atoi(e) : 2;
 }();
 bool wrapper_complete_inputs(std::uint64_t cb, GpuDrawInputs& in, std::uint32_t* index_type);
-// BBHOST_GX_NATIVE_DISPATCH: compute dispatches as tokens
-// from the wrapper's context state, at the dispatch emitters (0x1474c50,
-// 0x148a350 direct; 0x1474de0 indirect through SET_BASE): 0 packet path
-// (the default), 1 shadow (token and packet, compared at the packet), 2
-// native. Default 0: a dispatch's compute user data is not all written on the thread
-// and buffer that dispatches - the resource builder mirrors some of it to the
-// asynchronous compute queue's buffer and the constant engine writes some of
-// it from the CCB, which the command processor interleaves by its counters.
-// 8% of dispatches a walk carried stale user data in the shadow, so compute
-// keeps its packets and the SH register file.
+// BBHOST_GX_NATIVE_DISPATCH: compute dispatches as tokens, at the dispatch
+// emitters (0x1474c50, 0x148a350 direct; 0x1474de0 indirect through
+// SET_BASE): 0 the packet path, 1 shadow (token and packet, compared at the
+// packet over the user data the program reads), 2 native (the default). A
+// dispatch through GX's compute commit takes its compute stage's records from
+// the engine's objects (snapshot_cs_records) and its user data is built from
+// them when it runs, as a draw's is; the others - YEBIS's, GX's own passes,
+// the compute ring's texture uploads - take the user data their writers set,
+// in call order on the thread. The 8% "stale user data" the first shadow saw
+// was never data a program reads: registers past USER_SGPR and, for YEBIS's
+// clear, s[2:3] loaded but overwritten before any read. Shadowed over a world
+// soak: 0 of 38,363 dispatches differ in what the program reads; the
+// records' user data, tables included, 0 of 848,260 dwords and table entries
+// (2026-10-14, notes/docs/gx-layer.md).
 const int g_native_dispatch = [] {
     const char* e = std::getenv("BBHOST_GX_NATIVE_DISPATCH");
-    return e && e[0] ? std::atoi(e) : 0;
+    return e && e[0] ? std::atoi(e) : 2;
 }();
 const int g_native_passes = [] {
     const char* e = std::getenv("BBHOST_GX_NATIVE_PASSES");
@@ -551,7 +555,7 @@ const bool g_gx_cost_enabled = [] {
 // The rest split kCostRecords, kCostNative and kCostToken into their parts.
 enum GxCost { kCostCall, kCostEmit, kCostRecords, kCostHandoff, kCostNative, kCostToken, kCostRecAlloc, kCostRecShader,
               kCostRecTex, kCostRecSmp, kCostRecCb, kCostRecHash, kCostNativeRecords, kCostNativeGuest, kCostNativeStore,
-              kCostTokenLookup, kGxCosts };
+              kCostTokenLookup, kCostDispatchHook, kCostDispatchRecords, kGxCosts };
 std::atomic<std::uint64_t> g_gx_cost_ns[kGxCosts] = {}, g_gx_cost_n[kGxCosts] = {};
 // dynamic_buffer_address under BBHOST_GX_COST: lookups through the key's table, and page scans with the pages they read.
 std::atomic<std::uint64_t> g_dynbuf_table{0}, g_dynbuf_scans{0}, g_dynbuf_pages{0};
@@ -4506,6 +4510,7 @@ int wrapper_dispatch(Kind kind, const std::uint64_t* f, std::uint64_t caller) {
     if (!g_native_dispatch || g_backend != 1) return 0;
     if (kind != kEmitDispatch && kind != kEmitDispatchQueue && kind != kEmitDispatchIndirect) return 0;
     if (g_native_dispatch == 2 && g_native != 2) return 0;
+    GxCostTimer hook_timer(kCostDispatchHook);
     const std::uint64_t cb = f[5];
     ComputeWrapperState w_copy;
     const ComputeWrapperState* w = wrapper_compute_copy(cb, w_copy) ? &w_copy : nullptr;
@@ -4561,6 +4566,7 @@ int wrapper_dispatch(Kind kind, const std::uint64_t* f, std::uint64_t caller) {
     // Through GX's compute commit: the compute stage's records, which the
     // user data is built from when the dispatch runs (as a draw's is).
     if (g_ds_records_mode && gx_cs_commit_caller(caller)) {
+        GxCostTimer records_timer(kCostDispatchRecords);
         auto rec = std::make_shared<GxStageRecords>();
         CsRecordsMiss why = kCsMissShader;
         if (snapshot_cs_records(cb - 0x10, *rec, &why)) {
@@ -4838,6 +4844,15 @@ void report_dispatch_tokens() {
         }
         host_log("gx-dispatch: compute records taken at %llu dispatches through GX's compute commit; not taken:%s",
                  static_cast<ull>(g_cs_records_taken.load()), missed.empty() ? " none" : missed.c_str());
+    }
+    if (g_gx_cost_enabled) {
+        const auto per = [](int k) {
+            const std::uint64_t c = g_gx_cost_n[k].load();
+            return static_cast<ull>(c ? g_gx_cost_ns[k].load() / c : 0);
+        };
+        host_log("gx-dispatch: cost on the recording threads, ns each: the dispatch hook %llu (%llu calls), of which the compute records %llu (%llu)",
+                 per(kCostDispatchHook), static_cast<ull>(g_gx_cost_n[kCostDispatchHook].load()), per(kCostDispatchRecords),
+                 static_cast<ull>(g_gx_cost_n[kCostDispatchRecords].load()));
     }
     {
         std::string why;
@@ -6380,7 +6395,9 @@ void hle_gx_scaleform_report() {
     report_dispatch_tokens();
     report_state_packets();
 }
-bool hle_gx_dispatch_native() { return g_native_dispatch == 2; }
+// Whether dispatches are made into tokens at all: native dispatch tokens need
+// native draws and the GX backend (wrapper_dispatch).
+bool hle_gx_dispatch_native() { return g_native_dispatch == 2 && g_native == 2 && g_backend == 1; }
 bool hle_gx_dispatch_shadow() { return g_native_dispatch == 1; }
 const GpuDispatch* hle_gx_dispatch_token(std::uint64_t id) { return dispatch_token_impl(id); }
 bool hle_gx_dispatch_pending() { return dispatch_pending_impl(); }
