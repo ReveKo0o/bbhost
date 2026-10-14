@@ -2669,12 +2669,16 @@ bool clear_dsv_view(const std::uint64_t* f) {
     c.depth_size = rd32(rt + 0x18);
     c.depth_view = rd32(rt + 0x20);
     c.htile_base = rd32(rt + 0x24);
-    c.htile = (c.z_info >> 29) & 1;                // 0x1472730
-    c.stencil_plane = (c.stencil_info >> 29) & 1;  // 0x1472750
+    c.htile = (c.z_info >> 29) & 1;                   // DB_Z_INFO.TILE_SURFACE_ENABLE (0x1472730)
+    c.tile_stencil_off = (c.stencil_info >> 29) & 1;  // DB_STENCIL_INFO.TILE_STENCIL_DISABLE (0x1472750)
     c.stencil = static_cast<std::uint32_t>(f[2]) & 0xff;
     c.flags = static_cast<std::uint32_t>(f[1]) & 3;
     std::memcpy(&c.depth_value, reinterpret_cast<const std::uint8_t*>(f) - 136, 4);
+    // The output merger (ctx+0xb558): +0xf8 its depth clear, +0xfc its
+    // stencil clear (0x2ad2b4f commits them to DB_DEPTH_CLEAR / DB_STENCIL_CLEAR).
     std::memcpy(&c.om_depth, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(ctx + 0xb650)), 4);
+    std::memcpy(&c.om_stencil, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(ctx + 0xb654)), 4);
+    c.om_stencil &= 0xff;
     c.extent = clear_view_extent(view, res, 0);
     // GX's own pass builds HTILE from the output merger's depth clear, and
     // its quad (no HTILE) writes the argument.

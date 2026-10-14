@@ -10963,6 +10963,44 @@ enum ClearViewKind { kCvRtv, kCvRtvFast, kCvDsvHtile, kCvDsv, kCvKinds };
 const char* const kClearViewKindName[kCvKinds] = {"colour", "colour (CMASK fast clear)", "depth with HTILE", "depth without HTILE"};
 int clear_view_kind(const GpuClearView& c) { return c.depth ? (c.htile ? kCvDsvHtile : kCvDsv) : (c.fast_clear ? kCvRtvFast : kCvRtv); }
 std::uint64_t g_cv_run[kCvKinds] = {}, g_cv_made[kCvKinds] = {}, g_cv_none[kCvKinds] = {}, g_cv_aspects[kCvKinds] = {};  // under g.mu
+
+// The planes a depth clear token clears, and their values: what GX's
+// ClearDepthStencilView (0x2ab5f50) leaves, which is not D3D11's flags (1
+// depth, 2 stencil) alone. With HTILE it fills the HTILE words whatever the
+// flags ask, so the depth reads as the output merger's depth clear (the
+// DB_DEPTH_CLEAR its commit writes); where those words hold the stencil
+// state too (TILE_STENCIL_DISABLE clear) the same fill marks the stencil
+// cleared (SMem 0) to the output merger's stencil clear (DB_STENCIL_CLEAR), so
+// there a depth-only clear clears the stencil as well. Its quad pass draws
+// only what HTILE does not cover: the stencil, to the argument, where the
+// HTILE words leave the stencil out and the flags ask; and for a view with no
+// HTILE, each plane the flags ask for, to the arguments.
+struct DepthClearPlanes {
+    bool depth = false, stencil = false;
+    float depth_value = 0.0f;
+    std::uint32_t stencil_value = 0;
+};
+DepthClearPlanes depth_clear_planes(const GpuClearView& c) {
+    DepthClearPlanes p;
+    if (c.htile) {
+        p.depth = true;
+        p.depth_value = c.om_depth;
+        p.stencil = !c.tile_stencil_off || (c.flags & 2);
+        p.stencil_value = c.tile_stencil_off ? c.stencil : c.om_stencil;
+    } else {
+        p.depth = (c.flags & 1) != 0;
+        p.depth_value = c.depth_value;
+        p.stencil = (c.flags & 2) != 0;
+        p.stencil_value = c.stencil;
+    }
+    p.stencil_value &= 0xff;
+    return p;
+}
+// Depth clear tokens whose planes are not their flags': the stencil cleared
+// with the depth by HTILE, the depth by HTILE on a stencil-only clear; and the
+// depth-only clears of HTILE words without the stencil state, whose stencil
+// the fill path cleared too (it cleared both planes at every HTILE fill).
+std::uint64_t g_cv_stencil_by_htile = 0, g_cv_depth_by_htile = 0, g_cv_stencil_kept = 0;  // under g.mu
 // What the clears cost: the bytes they write, the passes they had to end, and
 // the clears of an image no draw had bound since its last clear; by image.
 std::uint64_t g_cv_bytes[kCvKinds] = {}, g_cv_pass_ends[kCvKinds] = {}, g_cv_again[kCvKinds] = {};  // under g.mu
@@ -11048,7 +11086,8 @@ void ccheck_note(const RtImage* r, bool cleared, std::uint32_t first, std::uint3
     bool same_value;
     if (c.depth) {
         // The fill path's depth is the HTILE word's 14 bits; exact for 0 and 1.
-        same_value = std::fabs(depth - c.depth_value) <= 1.0f / 16383.0f && (!(c.flags & 2) || (stencil & 0xff) == (c.stencil & 0xff));
+        const DepthClearPlanes p = depth_clear_planes(c);
+        same_value = std::fabs(depth - p.depth_value) <= 1.0f / 16383.0f && (!p.stencil || (stencil & 0xff) == p.stencil_value);
     } else {
         same_value = rgba && std::memcmp(rgba, c.rgba, sizeof(c.rgba)) == 0;
     }
@@ -11108,8 +11147,9 @@ bool host_gpu_clear_view(const GpuClearView& c, bool apply, GpuClearViewResult* 
             (void)pitch;
             render_handle_fill_locked(base + slice_bytes * first, slice_bytes * std::max(1u, count), c.rgba, 0, 0);
         } else {
-            const auto scaled = static_cast<std::uint32_t>(std::floor(c.depth_value * 16383.0f));
-            g_pending_htile[static_cast<std::uint64_t>(c.z_read_base) << 8] = PendingHtile{scaled << 18, c.stencil};
+            const DepthClearPlanes p = depth_clear_planes(c);
+            const auto scaled = static_cast<std::uint32_t>(std::floor(p.depth_value * 16383.0f));
+            g_pending_htile[static_cast<std::uint64_t>(c.z_read_base) << 8] = PendingHtile{scaled << 18, p.stencil_value};
         }
         return true;
     }
@@ -11142,10 +11182,17 @@ bool host_gpu_clear_view(const GpuClearView& c, bool apply, GpuClearViewResult* 
         // Owed until the image is next used (render.cpp, lazy clears): an
         // older clear of it that this one does not cover is made first.
         VkImageAspectFlags aspects = VK_IMAGE_ASPECT_COLOR_BIT;
+        DepthClearPlanes planes;
         if (c.depth) {
+            planes = depth_clear_planes(c);
+            const bool has_stencil = r->format != VK_FORMAT_D32_SFLOAT && r->format != VK_FORMAT_D16_UNORM;
             aspects = 0;
-            if (c.flags & 1) aspects |= VK_IMAGE_ASPECT_DEPTH_BIT;
-            if ((c.flags & 2) && r->format != VK_FORMAT_D32_SFLOAT && r->format != VK_FORMAT_D16_UNORM) aspects |= VK_IMAGE_ASPECT_STENCIL_BIT;
+            if (planes.depth) aspects |= VK_IMAGE_ASPECT_DEPTH_BIT;
+            if (planes.stencil && has_stencil) aspects |= VK_IMAGE_ASPECT_STENCIL_BIT;
+            if (planes.depth && !(c.flags & 1)) ++g_cv_depth_by_htile;
+            if (planes.stencil && has_stencil && !(c.flags & 2)) ++g_cv_stencil_by_htile;
+            if (c.htile && has_stencil && !planes.stencil) ++g_cv_stencil_kept;
+            if (aspects != (has_stencil ? (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT) : VK_IMAGE_ASPECT_DEPTH_BIT)) ++g_cv_aspects[kind];
             if (!aspects) return true;
             if (r->htile_clear_pending) {  // an older HTILE clear from the fill path goes first
                 r->htile_clear_pending = false;
@@ -11172,7 +11219,7 @@ bool host_gpu_clear_view(const GpuClearView& c, bool apply, GpuClearViewResult* 
         r->view_clear_first = first;
         r->view_clear_count = count;
         if (c.depth) {
-            r->view_clear_value.depthStencil = {c.depth_value, c.stencil & 0xff};
+            r->view_clear_value.depthStencil = {planes.depth_value, planes.stencil_value};
         } else {
             std::memcpy(r->view_clear_value.color.float32, c.rgba, sizeof(c.rgba));
             note_fill_last(*r, r->base, rt_size_bytes(*r), c.rgba);
@@ -11197,9 +11244,13 @@ bool host_gpu_clear_view(const GpuClearView& c, bool apply, GpuClearViewResult* 
         std::memcpy(&dval, &r->htile_clear_depth, 4);
         clear_depth_layers_locked(*r, true, true, dval, r->htile_clear_stencil, 0, r->layers);
     }
-    const bool depth = (c.flags & 1) != 0, stencil = (c.flags & 2) != 0;
-    if (!depth || !stencil) ++g_cv_aspects[kind];
-    clear_depth_layers_locked(*r, depth, stencil, c.depth_value, c.stencil, first, count);
+    const DepthClearPlanes planes = depth_clear_planes(c);
+    const bool has_stencil = r->format != VK_FORMAT_D32_SFLOAT && r->format != VK_FORMAT_D16_UNORM;
+    if (planes.depth && !(c.flags & 1)) ++g_cv_depth_by_htile;
+    if (planes.stencil && has_stencil && !(c.flags & 2)) ++g_cv_stencil_by_htile;
+    if (c.htile && has_stencil && !planes.stencil) ++g_cv_stencil_kept;
+    if (!planes.depth || (has_stencil && !planes.stencil)) ++g_cv_aspects[kind];
+    clear_depth_layers_locked(*r, planes.depth, planes.stencil, planes.depth_value, planes.stencil_value, first, count);
     rt_written(*r);
     g_cv_by_image[r->base].written_ms = r->written_ms;
     return true;
@@ -11238,6 +11289,13 @@ std::string host_gpu_clear_view_report() {
             row += " " + std::string(kClearCheckName[o]) + " " + std::to_string(g_ccheck_counts[k][o]) + ",";
         }
         if (!row.empty()) checks += " [" + std::string(kClearViewKindName[k]) + ":" + row + "]";
+    }
+    if (g_cv_run[kCvDsvHtile] || g_cv_run[kCvDsv]) {
+        host_log("render: depth clear tokens as GX leaves them (HTILE's fill whatever the flags): %llu cleared the stencil with the depth "
+                 "(HTILE words with the stencil state, a depth-only clear), %llu the depth on a stencil-only clear; %llu depth-only "
+                 "clears of HTILE words without the stencil state kept a stencil the fill path cleared",
+                 static_cast<unsigned long long>(g_cv_stencil_by_htile), static_cast<unsigned long long>(g_cv_depth_by_htile),
+                 static_cast<unsigned long long>(g_cv_stencil_kept));
     }
     if (g_vc_set) {
         host_log("render: lazy clears: %llu owed, taken as a pass's load op %llu, made by transfer %llu (%llu of them for a draw that "

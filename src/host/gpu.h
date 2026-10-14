@@ -451,14 +451,18 @@ struct GpuClearView {
     float rgba[4] = {};
     // Depth: DB_Z_INFO, DB_STENCIL_INFO, DB_Z_READ_BASE, DB_DEPTH_SIZE,
     // DB_DEPTH_VIEW, DB_HTILE_DATA_BASE; D3D11's flags (1 depth, 2 stencil);
-    // the depth and stencil values; whether the view has HTILE and a stencil
-    // plane; the output merger's depth clear (ctx+0xb650), from which GX's
-    // own pass builds its HTILE word.
+    // the depth and stencil arguments; whether the view has HTILE
+    // (DB_Z_INFO.TILE_SURFACE_ENABLE) and whether its HTILE words leave the
+    // stencil state out (DB_STENCIL_INFO.TILE_STENCIL_DISABLE); the output
+    // merger's depth and stencil clears (ctx+0xb650, +0xb654: what its commit
+    // writes to DB_DEPTH_CLEAR / DB_STENCIL_CLEAR), from which GX's own pass
+    // builds its HTILE word. render.cpp depth_clear_planes says what GX's
+    // clear leaves from these.
     std::uint32_t z_info = 0, stencil_info = 0, z_read_base = 0, depth_size = 0, depth_view = 0, htile_base = 0;
     std::uint32_t flags = 0;
     float depth_value = 0.0f, om_depth = 0.0f;
-    std::uint32_t stencil = 0;
-    bool htile = false, stencil_plane = false;
+    std::uint32_t stencil = 0, om_stencil = 0;
+    bool htile = false, tile_stencil_off = false;
 };
 // What a clear (or, while BBHOST_GX_CLEAR_VIEWS=1 checks, the fill path's
 // clear that follows it) did. `apply` false resolves and reports only.
