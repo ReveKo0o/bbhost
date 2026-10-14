@@ -269,7 +269,7 @@ if(Vulkan_FOUND)
   target_include_directories(replay_common PUBLIC src)
   target_link_libraries(replay_common PUBLIC Vulkan::Headers)
   target_sources(bbhost PRIVATE src/host/gpu.cpp src/host/gpu_busy.cpp src/host/gpu_memtrack.cpp src/host/gpu_mutex.cpp src/host/buffer_shadow.cpp src/host/recorder.cpp src/host/bindless.cpp src/host/render.cpp src/host/textures.cpp src/host/gpu_untile.cpp src/host/depth_copy.cpp src/host/indirect_clamp.cpp src/host/fsr.cpp src/host/glitch.cpp src/host/occlusion.cpp src/host/draw_capture.cpp src/host/stream_selftest.cpp
-                                src/host/shader_patch.cpp src/host/translation_cache.cpp)
+                                src/host/shader_patch.cpp src/host/translation_cache.cpp src/host/dxc.cpp)
   target_link_libraries(bbhost PRIVATE Vulkan::Vulkan gcn replay_common)
   # Which user-data tables a no-fallback shader still reads, from the SPIRV-Tools
   # optimizer; without it every table is built.
@@ -579,9 +579,9 @@ if(UNIX)
   set_tests_properties(gcn_decode_test PROPERTIES SKIP_RETURN_CODE 77)
   # The translation cache (src/host/translation_cache.cpp, which it includes)
   # against the shipped shader bundles.
-  add_executable(translation_cache_test tests/translation_cache_test.cpp src/core/paced_file.cpp)
+  add_executable(translation_cache_test tests/translation_cache_test.cpp src/core/paced_file.cpp src/host/dxc.cpp)
   target_include_directories(translation_cache_test PRIVATE src ${CMAKE_BINARY_DIR}/gen)
-  target_link_libraries(translation_cache_test PRIVATE gcn ZLIB::ZLIB)
+  target_link_libraries(translation_cache_test PRIVATE gcn ZLIB::ZLIB ${CMAKE_DL_LIBS})
   add_dependencies(translation_cache_test bbhost_translator_fingerprint)
   add_test(NAME translation_cache_test COMMAND translation_cache_test)
   set_tests_properties(translation_cache_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)

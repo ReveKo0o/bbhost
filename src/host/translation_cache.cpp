@@ -4,6 +4,12 @@
 #include "core/portable.h"
 #include "log.h"
 #include "translator_fingerprint.h"
+#include "gcn/hlsl.h"
+#include "host/dxc.h"
+
+#ifdef BBHOST_HAVE_SPIRV_OPT
+#include <spirv-tools/libspirv.hpp>
+#endif
 
 #include <zlib.h>
 
@@ -16,6 +22,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <thread>
@@ -547,14 +554,180 @@ gcn::TranslateResult translate_cached(const gcn::Program& prog, const gcn::Trans
 namespace {
 template <typename Lift>
 gcn::LiftResult lift_through_cache(const Key& key, const Lift& lift);
+
+// ---- BBHOST_HLSL: the lift through HLSL and DXC ----
+int hlsl_level() {
+    static const int level = [] {
+        const char* e = std::getenv("BBHOST_HLSL_O");
+        return e && *e ? std::clamp(std::atoi(e), 0, 3) : 3;
+    }();
+    return level;
+}
+Dxc& hlsl_dxc() {
+    static Dxc dxc;
+    static std::once_flag once;
+    std::call_once(once, [] {
+        const char* e = std::getenv("BBHOST_HLSL_DXC");
+        if (dxc.load(e ? e : "")) host_log("render: HLSL path on: DXC %s from %s, -O%d", dxc.version().c_str(), dxc.path().c_str(), hlsl_level());
+        else host_log("render: HLSL path on, but %s: every lift keeps the lifter's SPIR-V", dxc.error().c_str());
+    });
+    return dxc;
+}
+struct HlslStats {
+    std::atomic<std::uint64_t> taken{0}, compiled{0}, compile_us{0}, cached{0}, kept{0};
+    std::mutex mu;
+    std::map<std::string, std::uint64_t> reasons;  // under mu: why a lift kept its SPIR-V
+} g_hlsl;
+// A reason without the numbers in it, so like ones count together.
+std::string hlsl_reason_key(const std::string& r) {
+    std::string k;
+    bool digits = false;
+    for (char c : r.substr(0, 160)) {
+        if (c == '\n') break;
+        if (c >= '0' && c <= '9') {
+            if (!digits) k += '#';
+            digits = true;
+            continue;
+        }
+        digits = false;
+        k += c;
+    }
+    return k;
+}
+std::string hlsl_validate(const std::vector<std::uint32_t>& spirv) {
+#ifdef BBHOST_HAVE_SPIRV_OPT
+    spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_2);
+    std::string msg;
+    tools.SetMessageConsumer([&](spv_message_level_t, const char*, const spv_position_t&, const char* m) {
+        if (msg.empty()) msg = m;
+    });
+    spvtools::ValidatorOptions vo;
+    vo.SetAllowOffsetTextureOperand(true);
+    return tools.Validate(spirv.data(), spirv.size(), vo) ? std::string() : (msg.empty() ? "invalid" : msg);
+#else
+    (void)spirv;
+    return {};
+#endif
+}
+// Prints, compiles and checks one lifted module: DXC's SPIR-V, or empty with `why`.
+std::vector<std::uint32_t> hlsl_compile(const std::vector<std::uint32_t>& lifted, const Dxc& dxc, std::string& why) {
+    const gcn::HlslResult h = gcn::emit_hlsl(lifted);
+    if (!h.ok()) {
+        why = "the printer does not take it: " + (h.errors.empty() ? std::string("no source") : h.errors[0]);
+        return {};
+    }
+    if (const char* dir = std::getenv("BBHOST_HLSL_DUMP"); dir && *dir) {
+        KeyHasher n;
+        for (const std::uint32_t w : lifted) n.u32(w);
+        char name[40];
+        std::snprintf(name, sizeof(name), "%016llx.%s.hlsl", static_cast<unsigned long long>(n.a), h.profile.substr(0, 2).c_str());
+        std::error_code ec;
+        std::filesystem::create_directories(dir, ec);
+        std::ofstream(std::filesystem::path(dir) / name, std::ios::binary) << h.source;
+    }
+    DxcOptions o;
+    o.optimize = hlsl_level();
+    std::vector<std::uint32_t> spirv;
+    std::string error;
+    if (!dxc.compile(h, o, spirv, error)) {
+        why = "DXC: " + error.substr(0, error.find('\n'));
+        return {};
+    }
+    if (std::string d = gcn::hlsl_interface_diff(lifted, spirv); !d.empty()) {
+        why = "another interface: " + d;
+        return {};
+    }
+    if (std::string d = gcn::hlsl_operation_diff(lifted, spirv); !d.empty()) {
+        why = "other operations: " + d;
+        return {};
+    }
+    if (std::string v = hlsl_validate(spirv); !v.empty()) {
+        why = "invalid SPIR-V: " + v;
+        return {};
+    }
+    return spirv;
+}
+void hlsl_keep(const std::string& why) {
+    g_hlsl.kept.fetch_add(1, std::memory_order_relaxed);
+    std::lock_guard<std::mutex> lk(g_hlsl.mu);
+    g_hlsl.reasons[hlsl_reason_key(why)]++;
+}
+// BBHOST_HLSL: `l`'s module through HLSL and DXC, cached; unchanged where that fails.
+void hlsl_stage(gcn::LiftResult& l);
+}  // namespace
+
+bool hlsl_on() {
+    static const bool on = [] {
+        const char* e = std::getenv("BBHOST_HLSL");
+        return e && e[0] == '1';
+    }();
+    return on;
+}
+
+namespace {
+void hlsl_stage(gcn::LiftResult& l) {
+    if (!hlsl_on() || !l.ok()) return;
+    const Dxc& dxc = hlsl_dxc();
+    if (!dxc.loaded()) {
+        hlsl_keep("DXC not found");
+        return;
+    }
+    const bool cache = g_tc.ready.load(std::memory_order_acquire) && g_tc.on;
+    KeyHasher h;
+    h.str(g_tc.switches);
+    h.u32(static_cast<std::uint32_t>(TranslationUse::kHlsl));
+    h.str(dxc.version());
+    DxcOptions o;
+    o.optimize = hlsl_level();
+    for (const std::string& a : dxc_arguments(o)) h.str(a);
+    h.u32(static_cast<std::uint32_t>(l.spirv.size()));
+    for (const std::uint32_t w : l.spirv) h.u32(w);
+    const Key key{h.a, h.b};
+    std::vector<std::uint32_t> spirv;
+    std::string why;
+    bool found = false;
+    if (cache) {
+        found = lookup(key, [&](Reader& r) {
+            const bool ok = r.u8() != 0;
+            r.words(spirv);
+            why = r.str();
+            if (ok == spirv.empty()) return false;
+            return r.ok && r.p == r.end;
+        });
+    }
+    if (found) {
+        g_hlsl.cached.fetch_add(1, std::memory_order_relaxed);
+    } else {
+        const auto t0 = std::chrono::steady_clock::now();
+        spirv = hlsl_compile(l.spirv, dxc, why);
+        g_hlsl.compiled.fetch_add(1, std::memory_order_relaxed);
+        g_hlsl.compile_us.fetch_add(us_since(t0), std::memory_order_relaxed);
+        if (cache) {
+            Writer w;
+            w.u8(spirv.empty() ? 0 : 1);
+            w.words(spirv);
+            w.str(why);
+            store(key, w);
+        }
+    }
+    if (spirv.empty()) {
+        hlsl_keep(why);
+        return;
+    }
+    g_hlsl.taken.fetch_add(1, std::memory_order_relaxed);
+    l.spirv = std::move(spirv);
+}
 }  // namespace
 
 gcn::LiftResult lift_cached(bool vertex, const gcn::Program& prog, const gcn::TranslateOptions& o, const gcn::TranslateResult& reference) {
     const auto lift = [&] {
         return vertex ? gcn::lift_vertex_shader(prog, o, reference) : gcn::lift_pixel_shader(prog, o, reference);
     };
-    if (!g_tc.ready.load(std::memory_order_acquire) || !g_tc.on) return lift();
-    return lift_through_cache(key_for(prog, o, vertex ? TranslationUse::kLiftVertex : TranslationUse::kLiftPixel), lift);
+    gcn::LiftResult l = !g_tc.ready.load(std::memory_order_acquire) || !g_tc.on
+                            ? lift()
+                            : lift_through_cache(key_for(prog, o, vertex ? TranslationUse::kLiftVertex : TranslationUse::kLiftPixel), lift);
+    hlsl_stage(l);
+    return l;
 }
 
 gcn::LiftResult lift_compute_cached(const gcn::Program& prog, const gcn::TranslateOptions& o, const gcn::TranslateResult& reference) {
@@ -570,7 +743,11 @@ gcn::LiftResult lift_tess_cached(TranslationUse use, const gcn::Program& prog, c
                : use == TranslationUse::kLiftHull ? gcn::lift_hull_shader(prog, o, reference, tess)
                                                   : gcn::lift_domain_shader(prog, o, reference, tess);
     };
-    if (!g_tc.ready.load(std::memory_order_acquire) || !g_tc.on) return lift();
+    if (!g_tc.ready.load(std::memory_order_acquire) || !g_tc.on) {
+        gcn::LiftResult l = lift();
+        hlsl_stage(l);
+        return l;
+    }
     KeyHasher h;
     h.str(g_tc.switches);
     h.u32(static_cast<std::uint32_t>(use));
@@ -583,7 +760,9 @@ gcn::LiftResult lift_tess_cached(TranslationUse use, const gcn::Program& prog, c
     for (const std::uint32_t v : {tess.control_points, tess.ls_stride, tess.cp_stride, tess.patch_constants, tess.params_binding}) h.u32(v);
     h.str(tess.constants_path);
     for (const std::uint32_t v : tess.constants) h.u32(v);
-    return lift_through_cache(Key{h.a, h.b}, lift);
+    gcn::LiftResult l = lift_through_cache(Key{h.a, h.b}, lift);
+    hlsl_stage(l);
+    return l;
 }
 
 namespace {
@@ -754,6 +933,18 @@ void translation_cache_save_async(const std::string& path) {
 }
 
 void translation_cache_report() {
+    if (hlsl_on()) {
+        std::string reasons;
+        {
+            std::lock_guard<std::mutex> lk(g_hlsl.mu);
+            for (const auto& [why, n] : g_hlsl.reasons) reasons += "; " + why + " x" + std::to_string(n);
+        }
+        host_log("render: HLSL: %llu lifted stages took DXC's module (%llu compiled at this start in %.1f s of worker time, %llu from the "
+                 "translation cache); %llu kept the lifter's SPIR-V%s",
+                 static_cast<unsigned long long>(g_hlsl.taken.load()), static_cast<unsigned long long>(g_hlsl.compiled.load()),
+                 g_hlsl.compile_us.load() / 1e6, static_cast<unsigned long long>(g_hlsl.cached.load()),
+                 static_cast<unsigned long long>(g_hlsl.kept.load()), reasons.c_str());
+    }
     if (!g_tc_enabled) return;
     std::size_t entries = 0;
     std::uint64_t bytes = 0;

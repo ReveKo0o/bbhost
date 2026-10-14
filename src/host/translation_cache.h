@@ -34,7 +34,7 @@ namespace gpu {
 // SPIR-V and the result has none, taken from the cache or not. The lifts'
 // entries are kept under uses of their own (lift_cached).
 enum class TranslationUse : std::uint8_t { kStage = 0, kPaths = 1, kLiftPixel = 2, kLiftVertex = 3, kLiftLs = 4, kLiftDomain = 5, kLiftHull = 6,
-                                           kLiftCompute = 7 };
+                                           kLiftCompute = 7, kHlsl = 8 };
 
 // gcn::translate through the cache.
 gcn::TranslateResult translate_cached(const gcn::Program& prog, const gcn::TranslateOptions& o,
@@ -53,6 +53,22 @@ gcn::LiftResult lift_compute_cached(const gcn::Program& prog, const gcn::Transla
 // kLiftDomain) the same way, keyed on its TessLift too.
 gcn::LiftResult lift_tess_cached(TranslationUse use, const gcn::Program& prog, const gcn::TranslateOptions& o, const gcn::TranslateResult& reference,
                                  const gcn::TessLift& tess);
+
+// BBHOST_HLSL=1 (off by default, while the path is checked against the direct
+// one): every lift lift_cached and lift_tess_cached return is printed as HLSL
+// (gcn/hlsl.h) and compiled by DXC (host/dxc.h, libdxcompiler loaded at run
+// time), and the stage takes DXC's SPIR-V in place of the lifter's when it
+// declares the same interface and keeps the lift's operations
+// (gcn::hlsl_interface_diff, hlsl_operation_diff). Anything else - DXC not
+// found, a module the printer does not take, a compile error, a difference -
+// keeps the lifter's SPIR-V and is counted by reason in the exit report. The
+// result is kept in this cache under its own use (kHlsl), keyed on the lifted
+// module, DXC's version and its arguments: a later start compiles nothing
+// again. BBHOST_HLSL_O=0..3 sets DXC's optimization level (default 3),
+// BBHOST_HLSL_DXC the library to load, BBHOST_HLSL_DUMP=<dir> writes each
+// compiled module's HLSL there (made from the game's shaders: it stays on this
+// machine).
+bool hlsl_on();
 
 // At device start, after the device's features are given to the translator
 // (they are part of every key).
