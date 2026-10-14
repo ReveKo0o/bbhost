@@ -575,6 +575,7 @@ struct Surface {
     // That resource's generation (GxResourceInfo::gen) at the last upload: the
     // surface is that resource's image, and goes with it (retire_surfaces_locked).
     std::uint64_t gx_gen = 0;
+    std::uint64_t gx_memory = 0, gx_bytes = 0;  // that resource's own memory: the surface's layout can reach past it
     std::uint8_t gx_type = 0;  // that resource's type (GxResourceInfo::type): 1 a buffer, 2-4 a texture
     bool gx_dirty = false;  // GX mapped it since its upload (textures_gx_written): upload it again
     // Created at the resource's creation, ahead of its first bind.
@@ -1736,6 +1737,8 @@ void census_upload(Surface& sf, const char* why) {
     sf.gx_registered = registered;
     sf.gx_gen = registered ? r.gen : 0;
     sf.gx_type = registered ? r.type : 0;
+    sf.gx_memory = registered ? r.memory : 0;
+    sf.gx_bytes = registered ? r.bytes : 0;
     sf.cp_dirty = false;
 }
 
@@ -4145,6 +4148,7 @@ bool surfaces_may_cover_locked(std::uint64_t va, std::size_t bytes) {
 }
 
 std::atomic<std::uint64_t> g_fill_marks_skipped{0};  // surfaces under a fill, not marked dirty (the fill wrote no memory)
+std::atomic<std::uint64_t> g_marks_outside_resource{0};  // GX textures a write reached only past their resource's memory
 int mark_surfaces_dirty_locked(std::uint64_t va, std::size_t bytes, bool memory_written) {
     if (!bytes) return 0;
     shadow_written_locked(va, bytes, true);  // GPU copies and fills land here too
@@ -4177,6 +4181,13 @@ int mark_surfaces_dirty_locked(std::uint64_t va, std::size_t bytes, bool memory_
         ++touched;
         if (!memory_written) {
             g_fill_marks_skipped.fetch_add(1, std::memory_order_relaxed);
+            continue;
+        }
+        // A GX texture's content is its resource's memory: a write that lands
+        // only where the surface's layout reaches past it (padding the T#
+        // describes over a neighbour's memory) is the neighbour's.
+        if (by_identity(sf) && sf.gx_bytes && (va >= sf.gx_memory + sf.gx_bytes || va + bytes <= sf.gx_memory)) {
+            g_marks_outside_resource.fetch_add(1, std::memory_order_relaxed);
             continue;
         }
         // Only lift the throttle - the content hash still decides whether the
@@ -4476,9 +4487,10 @@ void textures_report() {
              static_cast<unsigned long long>(g_view_other_gen.load()), static_cast<unsigned long long>(g_view_other_gen_kept.load()),
              static_cast<unsigned long long>(g_view_other_gen_adopted.load()), static_cast<unsigned long long>(g_ahead_adopted.load()),
              static_cast<unsigned long long>(g_unwatched_uploads.load()), static_cast<unsigned long long>(g_census_hash_skipped_written.load()));
-    host_log("texture: surfaces under a fill or an image copy not marked dirty (no memory written) %llu; GX textures the command processor "
-             "wrote found whole as uploaded, in step again %llu",
-             static_cast<unsigned long long>(g_fill_marks_skipped.load()), static_cast<unsigned long long>(g_cp_dirty_settled.load()));
+    host_log("texture: surfaces under a fill or an image copy not marked dirty (no memory written) %llu, GX textures a write reached only "
+             "past their resource's memory %llu; GX textures the command processor wrote found whole as uploaded, in step again %llu",
+             static_cast<unsigned long long>(g_fill_marks_skipped.load()), static_cast<unsigned long long>(g_marks_outside_resource.load()),
+             static_cast<unsigned long long>(g_cp_dirty_settled.load()));
     host_log("texture: identity (BBHOST_RES_IDENTITY%s): surfaces retired with their generation %llu (%llu of them over memory a newer resource "
              "holds), kept for another generation %llu, kept as written after their resource died %llu; made ahead over another generation's "
              "image %llu",
