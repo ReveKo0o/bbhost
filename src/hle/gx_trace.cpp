@@ -2548,10 +2548,141 @@ std::uint64_t native_fill(const std::uint64_t* f) {
     return fill_token(ctx, std::move(fills));
 }
 
+// BBHOST_GX_CLEAR_VIEWS: GX's clears as clear tokens in the view's own terms
+// (D3D11's ClearRenderTargetView and ClearDepthStencilView, which Dark Souls
+// III PC's GX calls through its wrappers 0x141920200 and 0x1419201a0). The
+// colour clear 0x2ab4ef0 and the depth-stencil clear 0x2ab5f50 are what
+// GX's immediate methods (0x2568630, 0x25685f0) call, and what the engine
+// calls itself in five places (0x2598c10, 0x2660670, 0x26635a0, 0x2690810,
+// 0x26f0530); every caller passes the view object + 0x10, its Gnm target
+// description. The token names the view - its registry id and the words a
+// draw binding it carries - and the value; the command processor clears the
+// image a draw binding that view draws into (host_gpu_clear_view), in stream
+// order. 0: the fill tokens as before (memory fills the renderer matches to a
+// target by address, HTILE and CMASK fills included). 1 (checks): both - the
+// clear token is resolved without clearing and the fill token that follows
+// reports what it did with the same clear (the exit report's `checked
+// against the fill path`). 2: the clear token alone; the method's work (the
+// fills, the depth-stencil quad) does not run. A view the host cannot clear
+// keeps the fill path (counted by reason).
+const int g_clear_views = [] {
+    const char* e = std::getenv("BBHOST_GX_CLEAR_VIEWS");
+    return e ? std::atoi(e) : 0;
+}();
+std::mutex g_clear_views_mu;
+std::unordered_map<std::uint64_t, GpuClearView> g_clear_records;  // by token id, until the CP walks the token
+std::atomic<std::uint64_t> g_cv_calls[2] = {}, g_cv_tokens[2] = {}, g_cv_unwritten{0}, g_cv_unmatched{0}, g_cv_failed{0},
+    g_cv_no_id{0}, g_cv_extent_from_resource{0}, g_cv_depth_differs{0}, g_cv_aspects[4] = {};
+std::mutex g_cv_refused_mu;
+std::map<std::string, std::uint64_t> g_cv_refused;  // fell back to the fill path, by reason
+
+// The view's extent at its mip: the registry's (gx_view_extent), else the
+// 2D texture it views (resource +0x2c / +0x2e, the holder's +0x44 / +0x46).
+std::uint32_t clear_view_extent(std::uint64_t view, std::uint64_t res, std::uint32_t mip) {
+    if (const std::uint32_t e = gx_view_extent(view)) return e;
+    std::uint8_t type = 0;
+    std::uint16_t w = 0, h = 0;
+    if (!res || !safe_read(res + 0x20, &type, 1) || type != 3 || !safe_read(res + 0x2c, &w, 2) || !safe_read(res + 0x2e, &h, 2)) return 0;
+    const std::uint32_t mw = std::max(1u, static_cast<std::uint32_t>(w) >> mip), mh = std::max(1u, static_cast<std::uint32_t>(h) >> mip);
+    g_cv_extent_from_resource.fetch_add(1, std::memory_order_relaxed);
+    return (mw << 16) | mh;
+}
+
+// Writes the clear token (the record first: the write can run the game's
+// refill, which can wait on the command processor). False keeps the fill
+// path: the host cannot clear this view, or there was no room.
+bool clear_view_token(std::uint64_t ctx, const GpuClearView& c) {
+    g_cv_calls[c.depth ? 1 : 0].fetch_add(1, std::memory_order_relaxed);
+    if (!c.view_id) g_cv_no_id.fetch_add(1, std::memory_order_relaxed);
+    const char* why = nullptr;
+    if (!host_gpu_clear_view_resolvable(c, &why)) {
+        std::lock_guard<std::mutex> lk(g_cv_refused_mu);
+        if (g_cv_refused.size() < 64) ++g_cv_refused[std::string(c.depth ? "depth: " : "colour: ") + why];
+        return false;
+    }
+    if (g_gnm_sources) note_source(ctx + 0x10, rd64(ctx + 0x20), rd64(ctx + 0x18), kSourceCopy);
+    const std::uint64_t id = next_native_id();
+    {
+        std::lock_guard<std::mutex> lk(g_clear_views_mu);
+        if (g_clear_records.size() > 65536) g_clear_records.clear();
+        g_clear_records[id] = c;
+    }
+    if (!write_native_token(ctx, kGxClearMagic, id)) {
+        std::lock_guard<std::mutex> lk(g_clear_views_mu);
+        g_clear_records.erase(id);
+        g_cv_unwritten.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    g_cv_tokens[c.depth ? 1 : 0].fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+
+// The colour clear's view: f is 0x2ab4ef0's frame (rdi ctx, rsi the view's
+// Gnm render target = view + 0x10, rdx resource, rcx value*).
+bool clear_rtv_view(const std::uint64_t* f) {
+    const std::uint64_t ctx = f[5], rt = f[4], res = f[3], value = f[2];
+    if (!ctx || !rt || !value) return false;
+    GpuClearView c;
+    const std::uint64_t view = rt - 0x10;
+    c.view_id = gx_object_id(view);
+    for (int k = 0; k < 5; ++k) c.color[k] = rd32(rt + 4 * static_cast<std::uint64_t>(k));
+    c.mip = rd32(rt + 0x34);
+    c.first_slice = rd32(rt + 0x38);
+    c.slices = rd32(rt + 0x3c);
+    c.fast_clear = (rd32(rt + 0x10) >> 13) & 1;  // CB_COLOR_INFO.FAST_CLEAR: what 0x1486d60 reads
+    c.extent = clear_view_extent(view, res, c.mip);
+    if (!safe_read(value, c.rgba, sizeof(c.rgba))) return false;
+    // A CMASK fast clear ignores the value on the console: the tiles read as
+    // the clear words GX keeps per bound slot (ctx+0xb658, 0x2ad1f80). Said
+    // for the first few, to see whether the two ever differ.
+    static std::atomic<int> fast_logs{0};
+    if (c.fast_clear && fast_logs.fetch_add(1, std::memory_order_relaxed) < 12) {
+        std::uint32_t words[16] = {};
+        safe_read(ctx + 0xb658, words, sizeof(words));
+        host_log("gx-clear: CMASK fast clear of view %u (base 0x%llx, info %08x) to %g %g %g %g; the output merger's clear words "
+                 "%08x %08x %08x %08x %08x %08x %08x %08x ...",
+                 c.view_id, static_cast<ull>(static_cast<std::uint64_t>(c.color[0]) << 8), c.color[4], c.rgba[0], c.rgba[1], c.rgba[2],
+                 c.rgba[3], words[0], words[1], words[2], words[3], words[4], words[5], words[6], words[7]);
+    }
+    return clear_view_token(ctx, c);
+}
+
+// The depth-stencil clear's view: f is 0x2ab5f50's frame (rdi ctx, rsi the
+// view's Gnm depth target = view + 0x10, rdx resource, rcx stencil, r8
+// flags: 1 depth, 2 stencil; the depth in xmm0, which the prologue stub
+// saved 136 bytes below the frame).
+bool clear_dsv_view(const std::uint64_t* f) {
+    const std::uint64_t ctx = f[5], rt = f[4], res = f[3];
+    if (!ctx || !rt) return false;
+    GpuClearView c;
+    c.depth = true;
+    const std::uint64_t view = rt - 0x10;
+    c.view_id = gx_object_id(view);
+    c.z_info = rd32(rt);
+    c.stencil_info = rd32(rt + 4);
+    c.z_read_base = rd32(rt + 8);
+    c.depth_size = rd32(rt + 0x18);
+    c.depth_view = rd32(rt + 0x20);
+    c.htile_base = rd32(rt + 0x24);
+    c.htile = (c.z_info >> 29) & 1;                // 0x1472730
+    c.stencil_plane = (c.stencil_info >> 29) & 1;  // 0x1472750
+    c.stencil = static_cast<std::uint32_t>(f[2]) & 0xff;
+    c.flags = static_cast<std::uint32_t>(f[1]) & 3;
+    std::memcpy(&c.depth_value, reinterpret_cast<const std::uint8_t*>(f) - 136, 4);
+    std::memcpy(&c.om_depth, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(ctx + 0xb650)), 4);
+    c.extent = clear_view_extent(view, res, 0);
+    // GX's own pass builds HTILE from the output merger's depth clear, and
+    // its quad (no HTILE) writes the argument.
+    if (c.htile && c.om_depth != c.depth_value) g_cv_depth_differs.fetch_add(1, std::memory_order_relaxed);
+    g_cv_aspects[c.flags].fetch_add(1, std::memory_order_relaxed);
+    return clear_view_token(ctx, c);
+}
+
 // f: rdi ctx, rsi view, rdx resource, rcx value*. A view over the whole
 // resource (0x1486d60 nonzero) fills it through 0x2ab5380, which the hook
 // above takes; the per-slice path is taken here.
 std::uint64_t native_clear_rtv(const std::uint64_t* f) {
+    if (g_clear_views && g_native == 2 && g_backend == 1 && clear_rtv_view(f) && g_clear_views == 2) return 1;
     if (!g_native_fills || g_native != 2 || g_backend != 1) return 0;
     const std::uint64_t ctx = f[5], view = f[4], res = f[3], value = f[2];
     if (!view || !res || !value) return 0;
@@ -4931,6 +5062,7 @@ void report_dispatch_tokens() {
 // and the stencil; the host's HTILE clear applies both at the target's next
 // draw, so the draw is not needed.
 std::uint64_t native_clear_pass(const std::uint64_t* f) {
+    if (g_clear_views && g_native == 2 && g_backend == 1 && clear_dsv_view(f) && g_clear_views == 2) return 1;
     if (!(g_native_passes & 4) || g_native != 2 || g_backend != 1 || !g_native_fills) return 0;
     const std::uint64_t ctx = f[5], view = f[4], res = f[3];
     if (!ctx || !view || !res) return 0;
@@ -5976,6 +6108,30 @@ void hle_gx_image_copy_token(std::uint64_t id) {
     host_gpu_copy_image_region(c);
 }
 
+void hle_gx_clear_token(std::uint64_t id) {
+    GpuClearView c;
+    {
+        std::lock_guard<std::mutex> lk(g_clear_views_mu);
+        const auto it = g_clear_records.find(id);
+        if (it == g_clear_records.end()) {
+            g_cv_unmatched.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+        c = it->second;
+        g_clear_records.erase(it);
+    }
+    if (g_clear_views == 1) {
+        GpuClearViewResult expect;
+        host_gpu_clear_view(c, false, &expect);
+        host_gpu_clear_view_check_begin(c, expect);
+        return;
+    }
+    if (!host_gpu_clear_view(c, true) && g_cv_failed.fetch_add(1, std::memory_order_relaxed) < 8) {
+        host_log("gx-clear: the %s clear of view %u (words %08x %08x %08x) found no image to clear", c.depth ? "depth" : "colour", c.view_id,
+                 c.depth ? c.z_info : c.color[0], c.depth ? c.z_read_base : c.color[3], c.depth ? c.depth_size : c.color[4]);
+    }
+}
+
 void hle_gx_upload_token(std::uint64_t id) {
     GuestUpload up;
     {
@@ -6431,6 +6587,22 @@ void report_clears_and_copies() {
         }
         host_log("gx-clears-copies: buffer-copy passes by caller:%s", by.empty() ? " none" : by.c_str());
     }
+    if (!g_clear_views) return;
+    std::string refused;
+    {
+        std::lock_guard<std::mutex> lk(g_cv_refused_mu);
+        for (const auto& [why, n] : g_cv_refused) appendf(refused, " %s %llu;", why.c_str(), static_cast<ull>(n));
+    }
+    host_log("gx-clear: BBHOST_GX_CLEAR_VIEWS=%d: colour clears %llu (tokens %llu), depth-stencil clears %llu (tokens %llu); views the "
+             "registry did not see made %llu, extents from the resource %llu; depth clears by flags: none %llu, depth %llu, stencil %llu, "
+             "both %llu; HTILE clears whose argument differs from the output merger's depth %llu; kept on the fill path:%s not written "
+             "%llu, unmatched %llu, found no image %llu",
+             g_clear_views, static_cast<ull>(g_cv_calls[0].load()), static_cast<ull>(g_cv_tokens[0].load()), static_cast<ull>(g_cv_calls[1].load()),
+             static_cast<ull>(g_cv_tokens[1].load()), static_cast<ull>(g_cv_no_id.load()), static_cast<ull>(g_cv_extent_from_resource.load()),
+             static_cast<ull>(g_cv_aspects[0].load()), static_cast<ull>(g_cv_aspects[1].load()), static_cast<ull>(g_cv_aspects[2].load()),
+             static_cast<ull>(g_cv_aspects[3].load()), static_cast<ull>(g_cv_depth_differs.load()), refused.empty() ? " none;" : refused.c_str(),
+             static_cast<ull>(g_cv_unwritten.load()), static_cast<ull>(g_cv_unmatched.load()), static_cast<ull>(g_cv_failed.load()));
+    host_log("gx-clear: %s", host_gpu_clear_view_report().c_str());
 }
 
 void hle_gx_scaleform_report() {

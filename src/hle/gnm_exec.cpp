@@ -2114,6 +2114,7 @@ void execute_packet(std::uint32_t op, const std::uint32_t* b, std::size_t n, int
             if (n >= 3 && b[0] == kGxFillMagic) hle_gx_fill_token(b[1] | (static_cast<std::uint64_t>(b[2]) << 32), t_regs.ctx);
             if (n >= 3 && b[0] == kGxUploadMagic) hle_gx_upload_token(b[1] | (static_cast<std::uint64_t>(b[2]) << 32));
             if (n >= 3 && b[0] == kGxImageCopyMagic) hle_gx_image_copy_token(b[1] | (static_cast<std::uint64_t>(b[2]) << 32));
+            if (n >= 3 && b[0] == kGxClearMagic) hle_gx_clear_token(b[1] | (static_cast<std::uint64_t>(b[2]) << 32));
             // A dispatch token.
             if (n >= 3 && b[0] == kGxDispatchMagic) {
                 CpDispatchTimer timer(1);

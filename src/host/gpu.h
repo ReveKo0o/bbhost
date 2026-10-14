@@ -432,6 +432,51 @@ std::uint64_t host_gpu_ring_place(const void* data, std::size_t bytes, std::size
 // begins at `base` clears at its next draw to the HTILE word's depth and the
 // stencil, as an HTILE fill does for one with HTILE.
 void host_gpu_depth_clear(std::uint64_t base, std::uint32_t word, std::uint32_t stencil);
+// GX's ClearRenderTargetView or ClearDepthStencilView, in the view's own
+// terms (a clear token, hle/gx_trace.cpp): the view's registry id and the
+// target words a draw binding that view carries (GpuDrawInputs::color /
+// z_info..htile_base), the view's extent, and the value. The command
+// processor clears the image a draw binding the view would draw into, in
+// stream order - D3D11's Clear*View, which Dark Souls III PC's GX calls.
+struct GpuClearView {
+    bool depth = false;           // a depth-stencil view
+    std::uint32_t view_id = 0;    // gx_object_id of the view (0: not seen made)
+    std::uint32_t extent = 0;     // gx_view_extent: (width << 16) | height, 0 when not known
+    // Colour: CB_COLOR BASE, PITCH, SLICE, VIEW, INFO; the view's own mip,
+    // first slice and slice count; whether CMASK fast clears it (CB_COLOR_INFO
+    // FAST_CLEAR, where GX fills CMASK instead of the surface).
+    std::uint32_t color[5] = {};
+    std::uint32_t mip = 0, first_slice = 0, slices = 1;
+    bool fast_clear = false;
+    float rgba[4] = {};
+    // Depth: DB_Z_INFO, DB_STENCIL_INFO, DB_Z_READ_BASE, DB_DEPTH_SIZE,
+    // DB_DEPTH_VIEW, DB_HTILE_DATA_BASE; D3D11's flags (1 depth, 2 stencil);
+    // the depth and stencil values; whether the view has HTILE and a stencil
+    // plane; the output merger's depth clear (ctx+0xb650), from which GX's
+    // own pass builds its HTILE word.
+    std::uint32_t z_info = 0, stencil_info = 0, z_read_base = 0, depth_size = 0, depth_view = 0, htile_base = 0;
+    std::uint32_t flags = 0;
+    float depth_value = 0.0f, om_depth = 0.0f;
+    std::uint32_t stencil = 0;
+    bool htile = false, stencil_plane = false;
+};
+// What a clear (or, while BBHOST_GX_CLEAR_VIEWS=1 checks, the fill path's
+// clear that follows it) did. `apply` false resolves and reports only.
+struct GpuClearViewResult {
+    const void* image = nullptr;  // the target image, null when none was made yet (apply false)
+    std::uint32_t first_layer = 0, layers = 0;
+    bool created = false;
+};
+bool host_gpu_clear_view(const GpuClearView& c, bool apply, GpuClearViewResult* out = nullptr);
+// Whether the command processor can clear this view (its format has a host
+// form, its words name memory); `why` says why not. Pure: callable at the call.
+bool host_gpu_clear_view_resolvable(const GpuClearView& c, const char** why);
+// BBHOST_GX_CLEAR_VIEWS=1: the fill tokens that follow a clear token (the
+// method's own work) report what they cleared against what the token
+// resolved, and the exit report counts agreements by kind.
+void host_gpu_clear_view_check_begin(const GpuClearView& c, const GpuClearViewResult& expect);
+void host_gpu_clear_view_check_end();
+std::string host_gpu_clear_view_report();
 // Cumulative counters for per-frame deltas in the flip log.
 struct GpuStats {
     std::uint64_t draws, dispatches, flushes, gpu_us, pipelines, transfers, transfer_batches;

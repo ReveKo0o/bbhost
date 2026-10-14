@@ -230,6 +230,13 @@ void hle_gx_upload_token(std::uint64_t id);
 // place of its dispatch; the command processor copies image to image.
 constexpr std::uint32_t kGxImageCopyMagic = 0x43494242u;  // "BBIC"
 void hle_gx_image_copy_token(std::uint64_t id);
+// GX's colour and depth-stencil clears (0x2ab4ef0 and 0x2ab5f50, which
+// ClearRenderTargetView and ClearDepthStencilView call and the engine also
+// calls directly) write a clear token, {kGxClearMagic, id low, id high},
+// naming the view (BBHOST_GX_CLEAR_VIEWS); the command processor clears the
+// view's image.
+constexpr std::uint32_t kGxClearMagic = 0x4c434242u;  // "BBCL"
+void hle_gx_clear_token(std::uint64_t id);
 // A Scaleform HAL draw (0x73e670, 0x73e6b0, 0x73e640)
 // writes a draw token built from the HAL's objects. BBHOST_GX_NATIVE_SCALEFORM=2
 // returns the draw's inputs (its objects through hle_gx_trace_objects) for the

@@ -1790,7 +1790,7 @@ RtImage* target_image(int slot, std::uint64_t base, VkFormat format, std::uint32
         std::uint32_t padded_w = 0, padded_h = 0, right = 0, bottom = 0, layers = 0, extent = 0;
         RtImage* rt = nullptr;
     };
-    static Memo memo[9];
+    static Memo memo[10];  // 0-7 colour, 8 depth, 9 clear tokens (render_clear_view_locked)
     Memo& m = memo[slot];
     if (m.rt && m.gen == g_rt_gen && m.base == base && m.format == format && m.padded_w == padded_w && m.padded_h == padded_h &&
         m.right == scissor_right && m.bottom == scissor_bottom && m.layers == layers && m.slice_bytes == slice_bytes && m.extent == extent) {
@@ -7766,6 +7766,10 @@ bool render_clear_target_locked(std::uint64_t va, std::size_t bytes, const float
 }
 
 
+// BBHOST_GX_CLEAR_VIEWS=1: what the fill path did with a clear being checked
+// against its clear token (defined with host_gpu_clear_view).
+void ccheck_note(const RtImage* r, bool cleared, std::uint32_t first, std::uint32_t count, const float* rgba, float depth, std::uint32_t stencil);
+
 bool render_htile_fill_locked(std::uint64_t va, std::size_t bytes, std::uint32_t word, std::uint32_t depth_clear, std::uint32_t stencil_clear) {
     bool any = false;
     if (!g_htile_bases.count(va)) return false;  // no depth target's HTILE was ever here
@@ -7778,6 +7782,7 @@ bool render_htile_fill_locked(std::uint64_t va, std::size_t bytes, std::uint32_t
         const float depth = htile_word_depth(word);
         std::memcpy(&r.htile_clear_depth, &depth, 4);
         r.htile_clear_stencil = stencil_clear;
+        ccheck_note(&r, false, 0, r.layers, nullptr, depth, stencil_clear);
         if (r.htile_clear_depth != depth_clear) {
             if (g_htile_fill_register_lag.fetch_add(1, std::memory_order_relaxed) < 8) {
                 host_log("render: HTILE fill 0x%llx at flip %llu clears to %g (word %08x) while DB_DEPTH_CLEAR still holds %08x",
@@ -7881,11 +7886,13 @@ bool render_handle_fill_locked(std::uint64_t va, std::size_t bytes, const float 
             const float depth = htile_word_depth(word);
             std::memcpy(&r->htile_clear_depth, &depth, 4);
             r->htile_clear_stencil = stencil_clear;
+            ccheck_note(r, false, 0, r->layers, nullptr, depth, stencil_clear);
             return true;
         }
         std::uint32_t first = 0, count = 0;
         fill_layers(*r, va, bytes, first, count);
         if (count) {
+            ccheck_note(r, true, first, count, rgba, 0.0f, 0);
             clear_image_locked(*r, rgba, first, count);
             note_fill_last(*r, va, bytes, rgba);
             g_fill_applied.fetch_add(1);
@@ -7901,6 +7908,7 @@ bool render_handle_fill_locked(std::uint64_t va, std::size_t bytes, const float 
     std::uint32_t word = 0;
     std::memcpy(&word, &rgba[0], 4);
     if (render_htile_fill_locked(va, bytes, word, depth_clear, stencil_clear)) return true;
+    ccheck_note(nullptr, false, 0, 0, rgba, 0.0f, 0);
     // No target: a texture under it takes the fill (textures_fill_surfaces_locked).
     // It still waits for a target placed there later, as before.
     if (g_fill_textures) textures_fill_surfaces_locked(va, bytes, rgba);
@@ -10754,9 +10762,284 @@ void host_gpu_depth_clear(std::uint64_t base, std::uint32_t word, std::uint32_t 
         const float depth = htile_word_depth(word);
         std::memcpy(&r.htile_clear_depth, &depth, 4);
         r.htile_clear_stencil = stencil;
+        ccheck_note(&r, false, 0, r.layers, nullptr, depth, stencil);
         any = true;
     }
-    if (!any) g_pending_htile[base] = PendingHtile{word, stencil};
+    if (!any) {
+        ccheck_note(nullptr, false, 0, 0, nullptr, htile_word_depth(word), stencil);
+        g_pending_htile[base] = PendingHtile{word, stencil};
+    }
+}
+
+// ---- clear tokens: GX's Clear*View in the view's own terms ----------------
+namespace {
+// What a clear token resolves to: the image a draw binding the view would
+// draw into, found exactly as the draw finds it (target_image, from the same
+// words), and the layers the view covers. `create` false only looks.
+RtImage* clear_view_target_locked(const GpuClearView& c, bool create, std::uint32_t* first, std::uint32_t* count) {
+    if (!c.depth) {
+        const std::uint32_t* w = c.color;
+        const CbInfo info = CbInfo::from(w[4]);
+        if (!w[0] || info.format == 0) return nullptr;
+        const VkFormat fmt = cb_format(info);
+        if (fmt == VK_FORMAT_UNDEFINED) return nullptr;
+        const std::uint32_t pitch = ((w[1] & 0x7ff) + 1) * 8;
+        const std::uint32_t slice_px = ((w[2] & 0x3fffff) + 1) * 64;
+        const std::uint32_t padded_h = pitch ? slice_px / pitch : 0;
+        if (!pitch || !padded_h) return nullptr;
+        // As a draw takes them (CB_COLOR*_VIEW: SLICE_START, SLICE_MAX; a
+        // LINEAR_GENERAL target keeps the low address byte in SLICE_START).
+        const bool linear_general = ((w[4] >> 7) & 1) != 0;
+        const std::uint64_t base = (static_cast<std::uint64_t>(w[0]) << 8) | (linear_general ? (w[3] & 0xff) : 0u);
+        const std::uint32_t layers = ((w[3] >> 13) & 0x7ff) + 1;
+        const std::uint32_t slice_start = linear_general ? 0 : std::min(w[3] & 0x7ff, layers - 1);
+        *first = slice_start;
+        *count = layers - slice_start;
+        if (!create) {
+            RtImage* r = pick_rt(base);
+            return r && !r->depth ? r : nullptr;
+        }
+        return target_image(9, base, fmt, pitch, padded_h, 0, 0, false, layers,
+                            static_cast<std::uint64_t>(pitch) * padded_h * format_bytes_per_pixel(fmt), c.extent);
+    }
+    const VkFormat df = db_format(c.z_info, c.stencil_info);
+    if (df == VK_FORMAT_UNDEFINED || !c.z_read_base) return nullptr;
+    const std::uint32_t w = ((c.depth_size & 0x7ff) + 1) * 8;
+    const std::uint32_t h = (((c.depth_size >> 11) & 0x7ff) + 1) * 8;
+    const std::uint64_t dbase = static_cast<std::uint64_t>(c.z_read_base) << 8;
+    const std::uint32_t layers = ((c.depth_view >> 13) & 0x7ff) + 1;
+    const std::uint32_t slice_start = std::min(c.depth_view & 0x7ff, layers - 1);
+    *first = slice_start;
+    *count = layers - slice_start;
+    if (!create) {
+        auto it = g_rts.find(dbase);
+        return it != g_rts.end() && it->second.depth ? &it->second : nullptr;
+    }
+    const std::size_t bpp = df == VK_FORMAT_D16_UNORM ? 2 : 4;
+    RtImage* r = target_image(9, dbase, df, w, h, 0, 0, true, layers, static_cast<std::uint64_t>(w) * h * bpp, c.extent);
+    if (r) {
+        // What a draw binding the view learns about its HTILE, so fills of
+        // that HTILE from anywhere else still find the target.
+        const std::uint64_t htile = static_cast<std::uint64_t>(c.htile_base) << 8;
+        r->htile = htile;
+        if (htile) g_htile_bases.insert(htile);
+        if (!g_pending_htile.empty()) take_pending_htile(htile, *r);
+    }
+    return r;
+}
+
+// Depth and stencil cleared over layers [first, first + count).
+void clear_depth_layers_locked(RtImage& r, bool depth, bool stencil, float dval, std::uint32_t sval, std::uint32_t first, std::uint32_t count) {
+    begin_recording_locked();
+    render_end_pass_locked();
+    ensure_initialised(r);
+    first = std::min(first, r.layers - 1);
+    VkImageSubresourceRange range{0, 0, 1, first, std::min(count, r.layers - first)};
+    if (depth) range.aspectMask |= VK_IMAGE_ASPECT_DEPTH_BIT;
+    if (stencil && r.format != VK_FORMAT_D32_SFLOAT && r.format != VK_FORMAT_D16_UNORM) range.aspectMask |= VK_IMAGE_ASPECT_STENCIL_BIT;
+    if (!range.aspectMask) return;
+    const VkClearDepthStencilValue v{dval, sval & 0xff};
+    rec().clear_depth_stencil_image(r.image, VK_IMAGE_LAYOUT_GENERAL, v, 1, &range);
+    VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    mb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    mb.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+    rec().pipeline_barrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
+    g_clears.fetch_add(1);
+}
+
+// Clear tokens: run, and images they made; by kind: colour, colour that
+// GX would fast clear through CMASK, depth with HTILE, depth without.
+enum ClearViewKind { kCvRtv, kCvRtvFast, kCvDsvHtile, kCvDsv, kCvKinds };
+const char* const kClearViewKindName[kCvKinds] = {"colour", "colour (CMASK fast clear)", "depth with HTILE", "depth without HTILE"};
+int clear_view_kind(const GpuClearView& c) { return c.depth ? (c.htile ? kCvDsvHtile : kCvDsv) : (c.fast_clear ? kCvRtvFast : kCvRtv); }
+std::uint64_t g_cv_run[kCvKinds] = {}, g_cv_made[kCvKinds] = {}, g_cv_none[kCvKinds] = {}, g_cv_aspects[kCvKinds] = {};  // under g.mu
+
+// BBHOST_GX_CLEAR_VIEWS=1: the fill path's clear checked against the token.
+// The token resolves (without making an image) and the fill token the
+// method writes next reports here what it did with the same clear.
+enum ClearCheckOutcome {
+    kCoSame,             // the same image, layers and value
+    kCoSameLayers,       // the same image and value, other layers
+    kCoSameValue,        // the same image, another value
+    kCoBothNone,         // no image yet either way (the fill waits for one)
+    kCoFillMissed,       // the token's image exists; the fill path left it as it was
+    kCoFillOther,        // the fill path cleared or marked another image
+    kCoViewNone,         // no image for the view; the fill path found one
+    kCoNoFill,           // no fill followed the token
+    kCoOutcomes
+};
+const char* const kClearCheckName[kCoOutcomes] = {"same image, layers and value", "same image and value, other layers", "same image, other value",
+                                                  "no image either way", "fill path left the image as it was", "fill path cleared another image",
+                                                  "no image for the view, the fill path found one", "no fill followed"};
+struct ClearCheck {
+    bool active = false;
+    GpuClearView view;
+    GpuClearViewResult expect;
+};
+ClearCheck g_ccheck;                                     // under g.mu
+std::uint64_t g_ccheck_counts[kCvKinds][kCoOutcomes] = {};  // under g.mu
+std::uint64_t g_ccheck_logged_by[kCvKinds][kCoOutcomes] = {};  // under g.mu
+
+// Depth views cleared while no image held them, for the report: whether one
+// was made there later (a draw bound the view) or never.
+std::map<std::uint64_t, std::pair<std::uint64_t, GpuClearView>> g_ccheck_imageless;  // base -> (clears, the view), under g.mu
+
+void ccheck_count(int outcome, const char* what) {
+    const int kind = clear_view_kind(g_ccheck.view);
+    ++g_ccheck_counts[kind][outcome];
+    if (outcome == kCoBothNone && g_ccheck.view.depth) {
+        const std::uint64_t base = static_cast<std::uint64_t>(g_ccheck.view.z_read_base) << 8;
+        if (g_ccheck_imageless.size() < 64 || g_ccheck_imageless.count(base)) {
+            auto& e = g_ccheck_imageless[base];
+            ++e.first;
+            e.second = g_ccheck.view;
+        }
+    }
+    if (outcome != kCoSame && outcome != kCoBothNone && g_ccheck_logged_by[kind][outcome]++ < 6) {
+        const GpuClearView& c = g_ccheck.view;
+        host_log("render: clear check (%s, view %u): %s - %s; token image %p layers %u+%u; %s", kClearViewKindName[kind], c.view_id,
+                 kClearCheckName[outcome], what, g_ccheck.expect.image, g_ccheck.expect.first_layer, g_ccheck.expect.layers,
+                 c.depth ? ("depth " + std::to_string(c.depth_value) + " (output merger " + std::to_string(c.om_depth) + ") stencil " +
+                            std::to_string(c.stencil) + " flags " + std::to_string(c.flags))
+                               .c_str()
+                         : ("rgba " + std::to_string(c.rgba[0]) + " " + std::to_string(c.rgba[1]) + " " + std::to_string(c.rgba[2]) + " " +
+                            std::to_string(c.rgba[3]))
+                               .c_str());
+    }
+}
+
+}  // namespace
+
+namespace gpu {
+// The fill path's outcome for the clear being checked: `r` the image it
+// cleared now (`cleared`) or marked to clear at its next draw, null when it
+// left the fill pending; the layers and the value it used.
+void ccheck_note(const RtImage* r, bool cleared, std::uint32_t first, std::uint32_t count, const float* rgba, float depth, std::uint32_t stencil) {
+    if (!g_ccheck.active) return;
+    g_ccheck.active = false;
+    const void* want = g_ccheck.expect.image;
+    char what[160];
+    std::snprintf(what, sizeof(what), "fill path image %p %s, layers %u+%u", static_cast<const void*>(r),
+                  !r ? "none (pending)" : cleared ? "cleared" : "marked for its next draw", first, count);
+    if (!want && !r) return ccheck_count(kCoBothNone, what);
+    if (!want) return ccheck_count(kCoViewNone, what);
+    if (!r) return ccheck_count(kCoFillMissed, what);
+    if (r != want) return ccheck_count(kCoFillOther, what);
+    const GpuClearView& c = g_ccheck.view;
+    bool same_value;
+    if (c.depth) {
+        // The fill path's depth is the HTILE word's 14 bits; exact for 0 and 1.
+        same_value = std::fabs(depth - c.depth_value) <= 1.0f / 16383.0f && (!(c.flags & 2) || (stencil & 0xff) == (c.stencil & 0xff));
+    } else {
+        same_value = rgba && std::memcmp(rgba, c.rgba, sizeof(c.rgba)) == 0;
+    }
+    if (!same_value) return ccheck_count(kCoSameValue, what);
+    const bool same_layers = c.depth || (first == g_ccheck.expect.first_layer && count == g_ccheck.expect.layers);
+    ccheck_count(same_layers ? kCoSame : kCoSameLayers, what);
+}
+}  // namespace gpu
+
+bool host_gpu_clear_view_resolvable(const GpuClearView& c, const char** why) {
+    if (c.depth) {
+        if (!c.z_read_base) return *why = "no depth surface", false;
+        if (db_format(c.z_info, c.stencil_info) == VK_FORMAT_UNDEFINED) return *why = "depth format", false;
+        return true;
+    }
+    const CbInfo info = CbInfo::from(c.color[4]);
+    if (!c.color[0]) return *why = "no colour surface", false;
+    if (info.format == 0 || cb_format(info) == VK_FORMAT_UNDEFINED) return *why = "colour format", false;
+    if (!(((c.color[1] & 0x7ff) + 1) * 8) || !(((c.color[2] & 0x3fffff) + 1) * 64)) return *why = "pitch", false;
+    return true;
+}
+
+bool host_gpu_clear_view(const GpuClearView& c, bool apply, GpuClearViewResult* out) {
+    std::lock_guard<GpuMutex> lk(g.mu);
+    if (!g.ok) return false;
+    const int kind = clear_view_kind(c);
+    std::uint32_t first = 0, count = 0;
+    const std::size_t before = g_rts.size();
+    RtImage* r = clear_view_target_locked(c, apply, &first, &count);
+    if (out) {
+        out->image = r;
+        out->first_layer = first;
+        out->layers = count;
+        out->created = apply && g_rts.size() > before;
+    }
+    if (!apply) return r != nullptr;
+    if (!r) {
+        ++g_cv_none[kind];
+        return false;
+    }
+    ++g_cv_run[kind];
+    if (g_rts.size() > before) ++g_cv_made[kind];
+    if (!c.depth) {
+        clear_image_locked(*r, c.rgba, first, count);
+        note_fill_last(*r, r->base, rt_size_bytes(*r), c.rgba);
+        rt_written(*r);
+        return true;
+    }
+    // An HTILE clear an earlier fill left for this target's next draw is
+    // older than this one: it goes first.
+    if (r->htile_clear_pending) {
+        r->htile_clear_pending = false;
+        float dval;
+        std::memcpy(&dval, &r->htile_clear_depth, 4);
+        clear_depth_layers_locked(*r, true, true, dval, r->htile_clear_stencil, 0, r->layers);
+    }
+    const bool depth = (c.flags & 1) != 0, stencil = (c.flags & 2) != 0;
+    if (!depth || !stencil) ++g_cv_aspects[kind];
+    clear_depth_layers_locked(*r, depth, stencil, c.depth_value, c.stencil, first, count);
+    rt_written(*r);
+    return true;
+}
+
+void host_gpu_clear_view_check_begin(const GpuClearView& c, const GpuClearViewResult& expect) {
+    std::lock_guard<GpuMutex> lk(g.mu);
+    if (g_ccheck.active) ccheck_count(kCoNoFill, "another clear token came first");
+    g_ccheck.active = true;
+    g_ccheck.view = c;
+    g_ccheck.expect = expect;
+}
+
+void host_gpu_clear_view_check_end() {
+    std::lock_guard<GpuMutex> lk(g.mu);
+    if (g_ccheck.active) ccheck_count(kCoNoFill, "the walk moved on");
+    g_ccheck.active = false;
+}
+
+std::string host_gpu_clear_view_report() {
+    std::lock_guard<GpuMutex> lk(g.mu);
+    std::string out;
+    for (int k = 0; k < kCvKinds; ++k) {
+        if (!g_cv_run[k] && !g_cv_none[k]) continue;
+        char buf[200];
+        std::snprintf(buf, sizeof(buf), " %s %llu (images made %llu, without an image %llu, one aspect only %llu);", kClearViewKindName[k],
+                      static_cast<unsigned long long>(g_cv_run[k]), static_cast<unsigned long long>(g_cv_made[k]),
+                      static_cast<unsigned long long>(g_cv_none[k]), static_cast<unsigned long long>(g_cv_aspects[k]));
+        out += buf;
+    }
+    std::string checks;
+    for (int k = 0; k < kCvKinds; ++k) {
+        std::string row;
+        for (int o = 0; o < kCoOutcomes; ++o) {
+            if (!g_ccheck_counts[k][o]) continue;
+            row += " " + std::string(kClearCheckName[o]) + " " + std::to_string(g_ccheck_counts[k][o]) + ",";
+        }
+        if (!row.empty()) checks += " [" + std::string(kClearViewKindName[k]) + ":" + row + "]";
+    }
+    std::string imageless;
+    for (const auto& [base, e] : g_ccheck_imageless) {
+        const GpuClearView& c = e.second;
+        auto it = g_rts.find(base);
+        char buf[256];
+        std::snprintf(buf, sizeof(buf), " 0x%llx x%llu (z_info %08x stencil_info %08x size %08x view %08x extent %ux%u: %s);",
+                      static_cast<unsigned long long>(base), static_cast<unsigned long long>(e.first), c.z_info, c.stencil_info, c.depth_size,
+                      c.depth_view, c.extent >> 16, c.extent & 0xffff,
+                      it == g_rts.end() ? "no image now" : it->second.depth ? "a depth image now" : "a colour image now");
+        imageless += buf;
+    }
+    if (!imageless.empty()) host_log("render: depth views cleared with no image there:%s", imageless.c_str());
+    return "clear tokens:" + (out.empty() ? std::string(" none;") : out) + (checks.empty() ? "" : " checked against the fill path:" + checks);
 }
 
 std::uint64_t host_gpu_ring_place(const void* data, std::size_t bytes, std::size_t align) {
@@ -16750,7 +17033,6 @@ bool host_gpu_dump_display(std::uint64_t display_va, const char* path, bool all_
                 if (record_stencil_readback(it->second, q.staging, *q.t)) pending.push_back(std::move(q));
             }
         }
-
         auto disp = g_rts.find(display_va);
         const bool have_display = disp != g_rts.end() && disp->second.initialised;
         if (have_display) add(disp->second, path ? path : "build/f12.ppm");
@@ -17040,7 +17322,6 @@ bool write_target_image(const TargetPixels& t) {
                      static_cast<unsigned long long>(at_one), static_cast<unsigned long long>(at_zero));
         }
     }
-
     if (fmt == VK_FORMAT_R16G16B16A16_SFLOAT || fmt == VK_FORMAT_B10G11R11_UFLOAT_PACK32) {
         host_log("render: %s float channels: max %g %g %g, infinite %llu %llu %llu, NaN %llu %llu %llu", t.path.c_str(), fmax[0], fmax[1],
                  fmax[2], static_cast<unsigned long long>(finf[0]), static_cast<unsigned long long>(finf[1]),

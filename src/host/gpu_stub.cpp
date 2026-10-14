@@ -41,6 +41,14 @@ bool host_gpu_copy_back(std::uint64_t, std::uint64_t, std::size_t) { return fals
 bool host_gpu_draw_window(std::uint64_t, const void*, std::uint32_t) { return false; }
 std::uint64_t host_gpu_guest_copy_targets() { return 0; }
 bool host_gpu_clear_target(std::uint64_t, std::uint32_t, std::size_t) { return false; }
+bool host_gpu_clear_view(const GpuClearView&, bool, GpuClearViewResult*) { return false; }
+bool host_gpu_clear_view_resolvable(const GpuClearView&, const char** why) {
+    *why = "no GPU";
+    return false;
+}
+void host_gpu_clear_view_check_begin(const GpuClearView&, const GpuClearViewResult&) {}
+void host_gpu_clear_view_check_end() {}
+std::string host_gpu_clear_view_report() { return {}; }
 GpuStats host_gpu_stats() { return {}; }
 void host_gpu_phase_add(int, std::uint64_t) {}
 GpuHandles host_gpu_handles() { return {}; }
