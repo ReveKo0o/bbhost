@@ -11,14 +11,18 @@ shader is a lift (the manifest's translate.ps_lifted / vs_lifted), runs
 gcn2hlsl prints the captured lift as HLSL and compiles it with DXC (the module
 the game would bind with BBHOST_HLSL=1); drawreplay renders the draw with the
 captured modules (A, the lift) and again with DXC's stage (the variant), and
-compares the outputs byte for byte. --lavapipe replays on the CPU Vulkan
-driver whose manifest --lavapipe-icd names (repeatable, independent of the
-GPU's scheduling); without it the replay runs on the system's device.
+compares the outputs byte for byte. --lavapipe <manifest> replays on Mesa's
+CPU Vulkan driver, named by its ICD manifest (lvp_icd.*.json): repeatable,
+independent of the GPU's scheduling. Without it the replay runs on the
+system's device.
 
-Prints one line per capture and stage and the totals: identical, different
-(with the differing texels), HLSL not made (the reason), not comparable (the
-capture's own replay failed its self-checks), not a lift. Writes
-<out>/summary.json. Replays keep report.json only unless --keep-replay.
+Prints one line per capture and stage and the totals: identical (with the
+texels the draw changed from the target's captured contents, and how many
+distinct values it left: "identical, nothing drawn" when it changed none),
+different (with the differing texels), HLSL not made (the reason), not
+comparable (the capture's own replay failed its self-checks), not a lift.
+Writes <out>/summary.json. Replays keep report.json only unless
+--keep-replay.
 """
 import argparse
 import json
@@ -29,7 +33,6 @@ from collections import Counter
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-LAVAPIPE = ROOT.parent / "recomp/tmp/lavapipe/lvp_icd.json"
 
 
 def load(path):
@@ -37,6 +40,34 @@ def load(path):
         return json.loads(Path(path).read_text())
     except (OSError, ValueError):
         return None
+
+
+def drawn(capture, replay_dir, targets):
+    """Per target: the texels the replayed draw (A) left different from the
+    capture's initial contents, and how many distinct texel values A holds -
+    so an identical verdict on a draw that wrote nothing shows as such."""
+    out = {}
+    for name, t in (targets or {}).items():
+        a, init = replay_dir / f"A-{name}.bin", capture / "blobs" / f"{name}-initial.bin"
+        w, h = t.get("width") or 0, t.get("height") or 0
+        if not a.is_file() or not init.is_file() or not w or not h:
+            continue
+        ab, ib = a.read_bytes(), init.read_bytes()
+        if len(ab) != len(ib) or len(ab) % (w * h):
+            continue
+        size = len(ab) // (w * h)
+        try:
+            import numpy
+            dt = {1: numpy.uint8, 2: numpy.uint16, 4: numpy.uint32, 8: numpy.uint64}.get(size)
+            if dt is None:
+                raise ImportError
+            av, iv = numpy.frombuffer(ab, dt), numpy.frombuffer(ib, dt)
+            out[name] = {"texels": w * h, "drawn": int((av != iv).sum()), "distinct": int(len(numpy.unique(av)))}
+        except ImportError:
+            texels = [ab[k:k + size] for k in range(0, len(ab), size)]
+            out[name] = {"texels": w * h, "drawn": sum(1 for k, tx in enumerate(texels) if tx != ib[k * size:(k + 1) * size]),
+                         "distinct": len(set(texels))}
+    return out
 
 
 def verify(capture, stage, out, args, env):
@@ -68,6 +99,8 @@ def verify(capture, stage, out, args, env):
     rep = load(replay_dir / "report.json")
     row["drawreplay_exit"] = replay.returncode
     variant = ((rep or {}).get("comparisons") or {}).get("A_vs_variant")
+    if variant:
+        row["drawn"] = drawn(capture, replay_dir, variant.get("targets"))
     if not args.keep_replay and replay_dir.is_dir():
         for f in replay_dir.iterdir():
             if f.suffix in (".bin", ".ppm"):
@@ -85,6 +118,9 @@ def verify(capture, stage, out, args, env):
         # The capture's self-checks can fail independently of the variant
         # (a draw that covers nothing); an identical variant is still identical.
         row["status"] = "identical"
+        cover = row.get("drawn") or {}
+        if cover and not any(c["drawn"] for c in cover.values()):
+            row["status"] = "identical, nothing drawn"
         if replay.returncode != 0:
             row["detail"] = ["the capture's own self-checks failed: " +
                              ", ".join(sorted(k for k, v in (rep.get("verdict") or {}).items() if v is False))]
@@ -101,8 +137,7 @@ def main():
     parser.add_argument("--stage", choices=("ps", "vs", "both"), default="both")
     parser.add_argument("--gcn2hlsl", type=Path, default=ROOT / "build/gcn2hlsl")
     parser.add_argument("--drawreplay", type=Path, default=ROOT / "build/drawreplay")
-    parser.add_argument("--lavapipe", action="store_true", help="replay on lavapipe (CPU Vulkan)")
-    parser.add_argument("--lavapipe-icd", type=Path, default=LAVAPIPE)
+    parser.add_argument("--lavapipe", type=Path, metavar="MANIFEST", help="replay on lavapipe (CPU Vulkan), by its ICD manifest")
     parser.add_argument("--O0", action="store_true", help="compile with DXC -O0")
     parser.add_argument("--timeout", type=float, default=600)
     parser.add_argument("--keep-replay", action="store_true")
@@ -110,10 +145,10 @@ def main():
 
     env = dict(os.environ)
     if args.lavapipe:
-        if not args.lavapipe_icd.is_file():
-            sys.exit(f"no lavapipe manifest at {args.lavapipe_icd}")
-        env["VK_DRIVER_FILES"] = str(args.lavapipe_icd)
-        env["VK_ICD_FILENAMES"] = str(args.lavapipe_icd)
+        if not args.lavapipe.is_file():
+            sys.exit(f"no lavapipe manifest at {args.lavapipe}")
+        env["VK_DRIVER_FILES"] = str(args.lavapipe)
+        env["VK_ICD_FILENAMES"] = str(args.lavapipe)
     args.out.mkdir(parents=True, exist_ok=True)
     captures = sorted(p for p in args.captures.iterdir() if (p / "manifest.json").is_file())
     stages = ("ps", "vs") if args.stage == "both" else (args.stage,)
@@ -123,7 +158,9 @@ def main():
             row = verify(capture, stage, args.out, args, env)
             rows.append(row)
             if row["status"] != "not a lift":
-                print(f"{row['status']:16} {stage} {row['name']}" + (f"  {row['detail'][0]}" if row.get("detail") else ""), flush=True)
+                cover = ", ".join(f"{n} {c['drawn']}/{c['texels']} drawn, {c['distinct']} values" for n, c in (row.get("drawn") or {}).items())
+                print(f"{row['status']:16} {stage} {row['name']}" + (f"  [{cover}]" if cover else "") +
+                      (f"  {row['detail'][0]}" if row.get("detail") else ""), flush=True)
     totals = Counter(r["status"] for r in rows)
     (args.out / "summary.json").write_text(json.dumps({"totals": totals, "rows": rows}, indent=1))
     print("totals: " + ", ".join(f"{k} {v}" for k, v in sorted(totals.items())))
