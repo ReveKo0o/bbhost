@@ -1078,6 +1078,7 @@ void clear_image_locked(RtImage& r, const float rgba[4], std::uint32_t first_lay
 std::vector<std::uint64_t> g_view_clear_list;  // bases with a pending view clear (some may be stale), under g.mu
 bool g_in_view_flush = false;
 std::uint64_t g_vc_set = 0, g_vc_load = 0, g_vc_transfer = 0, g_vc_merged = 0, g_vc_dropped = 0, g_vc_flushes = 0, g_vc_sampled = 0;  // under g.mu
+std::uint64_t g_vc_merged_planes = 0;  // depth clears joined with an owed one of other planes, under g.mu
 std::uint64_t g_vc_why[kVcwCount] = {}, g_vc_why_bytes[kVcwCount] = {};  // owed clears made by transfer, by what made them; under g.mu
 const char* const kVcwName[kVcwCount] = {"a draw's attachment its pass does not cover whole", "sampled by a draw", "a tessellated draw",
                                          "an older clear a newer one does not cover", "another clear", "a copy", "a texture view",
@@ -11234,11 +11235,20 @@ bool host_gpu_clear_view(const GpuClearView& c, bool apply, GpuClearViewResult* 
         }
         first = std::min(first, r->layers - 1);
         count = std::min(std::max(count, 1u), r->layers - first);
+        // A depth clear of the same layers as the owed one, of other planes
+        // (the depth alone after both): one clear of both planes, each to
+        // the value its newest clear gave it.
+        VkClearDepthStencilValue ds{planes.depth_value, planes.stencil_value};
         if (r->view_clear) {
-            const bool covers = (aspects & r->view_clear_aspects) == r->view_clear_aspects && first <= r->view_clear_first &&
-                                first + count >= r->view_clear_first + r->view_clear_count;
+            const bool layers_cover = first <= r->view_clear_first && first + count >= r->view_clear_first + r->view_clear_count;
+            const bool covers = (aspects & r->view_clear_aspects) == r->view_clear_aspects && layers_cover;
             if (covers) {
                 ++g_vc_merged;
+            } else if (c.depth && first == r->view_clear_first && count == r->view_clear_count) {
+                if (!(aspects & VK_IMAGE_ASPECT_DEPTH_BIT)) ds.depth = r->view_clear_value.depthStencil.depth;
+                if (!(aspects & VK_IMAGE_ASPECT_STENCIL_BIT)) ds.stencil = r->view_clear_value.depthStencil.stencil;
+                aspects |= r->view_clear_aspects;
+                ++g_vc_merged_planes;
             } else {
                 view_clear_apply_locked(*r, kVcwOlder);
             }
@@ -11250,7 +11260,7 @@ bool host_gpu_clear_view(const GpuClearView& c, bool apply, GpuClearViewResult* 
         r->view_clear_first = first;
         r->view_clear_count = count;
         if (c.depth) {
-            r->view_clear_value.depthStencil = {planes.depth_value, planes.stencil_value};
+            r->view_clear_value.depthStencil = ds;
         } else {
             std::memcpy(r->view_clear_value.color.float32, c.rgba, sizeof(c.rgba));
             note_fill_last(*r, r->base, rt_size_bytes(*r), c.rgba);
@@ -11330,11 +11340,12 @@ std::string host_gpu_clear_view_report() {
     }
     if (g_vc_set) {
         host_log("render: lazy clears: %llu owed, taken as a pass's load op %llu, made by transfer %llu (%llu of them for a draw that "
-                 "samples the image; %llu batches), covered by a later clear %llu, dropped with their image %llu",
+                 "samples the image; %llu batches), covered by a later clear %llu, joined with a later clear of other planes %llu, "
+                 "dropped with their image %llu",
                  static_cast<unsigned long long>(g_vc_set), static_cast<unsigned long long>(g_vc_load),
                  static_cast<unsigned long long>(g_vc_transfer), static_cast<unsigned long long>(g_vc_sampled),
                  static_cast<unsigned long long>(g_vc_flushes), static_cast<unsigned long long>(g_vc_merged),
-                 static_cast<unsigned long long>(g_vc_dropped));
+                 static_cast<unsigned long long>(g_vc_merged_planes), static_cast<unsigned long long>(g_vc_dropped));
         std::string why;
         for (int w = 0; w < kVcwCount; ++w) {
             if (!g_vc_why[w]) continue;
