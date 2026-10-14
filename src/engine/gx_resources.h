@@ -65,6 +65,12 @@ bool gx_resource_at(std::uint64_t va, std::size_t bytes, GxResourceInfo* out);
 // The first live resource whose memory overlaps [va, va + bytes) at all, if
 // any (the census of surfaces no resource covers whole).
 bool gx_resource_overlapping(std::uint64_t va, std::size_t bytes, GxResourceInfo* out);
+// The registry's write sequence now (bumped by every creation with data and
+// every Map), and the latest of the live resources overlapping [va, va +
+// bytes) (0: none overlaps) - whether GX wrote any of them since a moment
+// (the buffer shadow's census of what its write watch catches).
+std::uint64_t gx_write_seq_now();
+std::uint64_t gx_write_seq_overlapping(std::uint64_t va, std::size_t bytes, bool* any_resource);
 // The live resource a GX holder (the object GX's methods take: CopyResource's,
 // a view's +0x08) stands for, if the registry has it - by identity, not by
 // address. A 1D texture's holder is found by its memory (+0x20).

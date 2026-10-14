@@ -1021,6 +1021,27 @@ bool gx_resource_overlapping(std::uint64_t va, std::size_t bytes, GxResourceInfo
     return false;
 }
 
+std::uint64_t gx_write_seq_now() { return g_write_seq.load(std::memory_order_relaxed); }
+
+std::uint64_t gx_write_seq_overlapping(std::uint64_t va, std::size_t bytes, bool* any_resource) {
+    if (any_resource) *any_resource = false;
+    if (!bytes) return 0;
+    std::lock_guard<std::mutex> lk(g_mu);
+    std::uint64_t seq = 0;
+    auto it = g_by_memory.lower_bound(va);
+    const auto take = [&](std::map<std::uint64_t, std::uint64_t>::const_iterator m) {
+        auto h = g_by_holder.find(m->second);
+        if (h == g_by_holder.end()) return;
+        const GxResourceInfo& r = h->second.info;
+        if (r.memory >= va + bytes || r.memory + r.bytes <= va) return;
+        if (any_resource) *any_resource = true;
+        seq = std::max(seq, r.write_seq);
+    };
+    if (it != g_by_memory.begin()) take(std::prev(it));
+    for (; it != g_by_memory.end() && it->first < va + bytes; ++it) take(it);
+    return seq;
+}
+
 bool gx_resource_newer_overlapping(std::uint64_t va, std::size_t bytes, std::uint64_t after_flip) {
     if (!bytes) return false;
     std::lock_guard<std::mutex> lk(g_mu);

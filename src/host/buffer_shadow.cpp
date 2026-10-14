@@ -44,6 +44,7 @@
 // (buffer_shadow_on).
 
 #include "core/write_watch.h"
+#include "engine/gx_resources.h"
 #include "host/gpu_internal.h"
 #include "log.h"
 
@@ -99,6 +100,7 @@ struct Page {
     std::uint32_t window_uploads = 0;
     std::uint64_t gpu_written = 0;    // the recording a GPU write over it was recorded in (0: none)
     std::uint64_t hash = 0;           // BBHOST_SHADOW_VERIFY: its contents when copied
+    std::uint64_t gx_seq = 0;         // BBHOST_RESOURCE_CENSUS: the GX registry's write sequence when copied
     bool valid = false;               // the mirror holds it (or will, once this submission's copies run)
     bool dynamic = false;             // bound from the import from now on (rewritten, unwatchable)
 };
@@ -441,10 +443,25 @@ VkCommandBuffer upload_cmd_locked() {
     return cmd;
 }
 
+// BBHOST_RESOURCE_CENSUS=1: of the pages the write watch found written,
+// those a GX write (a Map, a creation with data) of a resource over them
+// explains since their copy, those on a GX resource it does not, and those
+// on none - whether GX's own calls could tell the mirrors what changed.
+const bool g_map_census = [] {
+    const char* e = std::getenv("BBHOST_RESOURCE_CENSUS");
+    return e && e[0] == '1';
+}();
+std::atomic<std::uint64_t> g_written_by_gx{0}, g_written_not_gx{0}, g_written_no_resource{0};
+
 // Written since its copy, through the CPU view or the GPU alias.
 bool written(Page& pg) {
     bool w = write_watch_dirty(pg.va, pg.bytes, pg.watch) != 0;
     if (pg.alias_va) w |= write_watch_dirty(pg.alias_va, pg.bytes, pg.alias_watch) != 0;
+    if (w && g_map_census && pg.bytes) {
+        bool any = false;
+        const std::uint64_t seq = gx_write_seq_overlapping(pg.va, pg.bytes, &any);
+        (!any ? g_written_no_resource : seq > pg.gx_seq ? g_written_by_gx : g_written_not_gx).fetch_add(1, std::memory_order_relaxed);
+    }
     return w;
 }
 
@@ -667,6 +684,7 @@ void shadow_locate_locked(std::uint64_t va, std::uint64_t bytes, Located& loc) {
         pg.bytes = hi - lo;
         pg.valid = true;
         pg.checked = stamp;
+        if (g_map_census) pg.gx_seq = gx_write_seq_now();
         if (g_verify) {
             const auto* src = reinterpret_cast<const std::uint8_t*>(static_cast<std::uintptr_t>(lo));
             pg.hash = fnv1a(src, hi - lo);
@@ -1508,7 +1526,16 @@ std::string shadow_report() {
                   "still to land %llu",
                   static_cast<unsigned long long>(g_snapshots.load()), static_cast<double>(g_snapshot_bytes.load()) / (1 << 20),
                   static_cast<unsigned long long>(g_snapshot_staged.load()), static_cast<unsigned long long>(g_snapshot_pending.load()));
-    return out + st + sn;
+    out += st;
+    out += sn;
+    if (g_map_census) {
+        char mc[200];
+        std::snprintf(mc, sizeof(mc), "; pages the write watch found written: a GX write explains %llu, on a GX resource it does not %llu, on none %llu",
+                      static_cast<unsigned long long>(g_written_by_gx.load()), static_cast<unsigned long long>(g_written_not_gx.load()),
+                      static_cast<unsigned long long>(g_written_no_resource.load()));
+        out += mc;
+    }
+    return out;
 }
 
 }  // namespace gpu
