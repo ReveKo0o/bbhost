@@ -53,6 +53,10 @@ struct Config {
 const Config& config() {
     static const Config c = [] {
         Config c;
+        // The directory and the first flip serve dispatch captures too
+        // (BBHOST_CAPTURE_DISPATCH), with or without draw captures.
+        if (const char* f = std::getenv("BBHOST_CAPTURE_MIN_FLIP")) c.min_flip = std::strtoull(f, nullptr, 10);
+        if (const char* d = std::getenv("BBHOST_CAPTURE_DIR"); d && *d) c.dir = d;
         const char* e = std::getenv("BBHOST_CAPTURE_DRAW");
         if (!e || !*e) return c;
         std::string s(e);
@@ -65,8 +69,6 @@ const Config& config() {
         c.each = s == "*" || c.each_ps;
         c.enabled = !s.empty();
         if (const char* a = std::getenv("BBHOST_CAPTURE_ARMED")) c.armed = a[0] == '1';
-        if (const char* f = std::getenv("BBHOST_CAPTURE_MIN_FLIP")) c.min_flip = std::strtoull(f, nullptr, 10);
-        if (const char* d = std::getenv("BBHOST_CAPTURE_DIR"); d && *d) c.dir = d;
         if (const char* n = std::getenv("BBHOST_CAPTURE_COUNT")) c.count = std::max(1, std::atoi(n));
         if (const char* n = std::getenv("BBHOST_CAPTURE_EVERY")) c.every = std::max(1, std::atoi(n));
         return c;
