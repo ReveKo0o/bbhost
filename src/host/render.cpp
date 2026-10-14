@@ -16063,6 +16063,7 @@ struct TargetPixels {
     std::uint32_t width = 0, height = 0;
     VkFormat format = VK_FORMAT_UNDEFINED;
     bool depth = false;
+    bool stencil = false;  // the stencil plane of a depth target (one byte a texel)
     std::size_t bpp = 0;
     std::vector<std::uint8_t> px;
     // F12: the texels stay in their host-cached staging buffer, which the
@@ -16072,6 +16073,7 @@ struct TargetPixels {
 };
 
 bool record_target_readback(RtImage& r, DevBuffer& staging, TargetPixels& out);
+bool record_stencil_readback(RtImage& r, DevBuffer& staging, TargetPixels& out);
 void take_target_pixels(DevBuffer& staging, TargetPixels& t);
 bool write_target_image(const TargetPixels& t);
 }  // namespace
@@ -16726,6 +16728,29 @@ bool host_gpu_dump_display(std::uint64_t display_va, const char* path, bool all_
             if (it == g_rts.end() || it->second.depth || !it->second.initialised) continue;
             add(it->second, image_beside(stem, "rt", base, ext));
         }
+        // BBHOST_F12_DEPTH=1: the depth targets the recorded draws used too,
+        // their depth ("dpt") and stencil ("stn") planes, layer 0.
+        static const bool f12_depth = [] {
+            const char* e = std::getenv("BBHOST_F12_DEPTH");
+            return e && e[0] == '1';
+        }();
+        if (f12_depth) {
+            std::set<std::uint64_t> depths;
+            const std::uint64_t first = g_draw_rec_next > kDrawRecs ? g_draw_rec_next - kDrawRecs : 0;
+            for (std::uint64_t i = first; i < g_draw_rec_next; ++i) {
+                if (const std::uint64_t d = g_draw_recs[i % kDrawRecs].depth) depths.insert(d);
+            }
+            for (std::uint64_t base : depths) {
+                auto it = g_rts.find(base);
+                if (it == g_rts.end() || !it->second.depth || !it->second.initialised) continue;
+                add(it->second, image_beside(stem, "dpt", base, ext));
+                Pending q;
+                q.t = std::make_unique<TargetPixels>();
+                q.t->path = image_beside(stem, "stn", base, ext);
+                if (record_stencil_readback(it->second, q.staging, *q.t)) pending.push_back(std::move(q));
+            }
+        }
+
         auto disp = g_rts.find(display_va);
         const bool have_display = disp != g_rts.end() && disp->second.initialised;
         if (have_display) add(disp->second, path ? path : "build/f12.ppm");
@@ -16891,6 +16916,25 @@ bool record_target_readback(RtImage& r, DevBuffer& staging, TargetPixels& out) {
     return true;
 }
 
+// The stencil plane of a depth target with one, layer 0 (F12 with BBHOST_F12_DEPTH).
+bool record_stencil_readback(RtImage& r, DevBuffer& staging, TargetPixels& out) {
+    if (!r.depth || r.format == VK_FORMAT_D32_SFLOAT || r.format == VK_FORMAT_D16_UNORM) return false;
+    out.width = r.width;
+    out.height = r.height;
+    out.format = r.format;
+    out.depth = false;
+    out.stencil = true;
+    out.bpp = 1;
+    if (!create_dev_buffer(staging, (static_cast<std::uint64_t>(r.width) * r.height + 3) & ~3ull, true, true)) return false;
+    begin_recording_locked();
+    render_end_pass_locked();
+    VkBufferImageCopy region{};
+    region.imageSubresource = {VK_IMAGE_ASPECT_STENCIL_BIT, 0, 0, 1};
+    region.imageExtent = {r.width, r.height, 1};
+    vkCmdCopyImageToBuffer(g_cmd(), r.image, VK_IMAGE_LAYOUT_GENERAL, staging.buffer, 1, &region);
+    return true;
+}
+
 void take_target_pixels(DevBuffer& staging, TargetPixels& t) {
     const auto* px = static_cast<const std::uint8_t*>(staging.map);
     t.px.assign(px, px + static_cast<std::size_t>(t.width) * t.height * t.bpp);
@@ -16945,7 +16989,16 @@ bool write_target_image(const TargetPixels& t) {
                 row[x * 3 + 0] = tone8(f11(v));
                 row[x * 3 + 1] = tone8(f11(v >> 11));
                 row[x * 3 + 2] = tone8(f10(v >> 22));
-            } else if (fmt == VK_FORMAT_R32_SFLOAT || t.depth) {
+            } else if (t.stencil) {
+                row[x * 3 + 0] = row[x * 3 + 1] = row[x * 3 + 2] = static_cast<std::uint8_t>(p[0] * 17);
+            } else if (t.depth) {
+                // Depth near 1 is where a scene's detail is: 1 - d stretched.
+                float fv;
+                std::memcpy(&fv, p, 4);
+                note_float(0, fv);
+                const float v = std::clamp((1.0f - fv) * 32.0f, 0.0f, 1.0f);
+                row[x * 3 + 0] = row[x * 3 + 1] = row[x * 3 + 2] = static_cast<std::uint8_t>(std::sqrt(v) * 255.0f + 0.5f);
+            } else if (fmt == VK_FORMAT_R32_SFLOAT) {
                 float fv;
                 std::memcpy(&fv, p, 4);
                 row[x * 3 + 0] = row[x * 3 + 1] = row[x * 3 + 2] = tone8(fv);
@@ -16960,6 +17013,34 @@ bool write_target_image(const TargetPixels& t) {
         return false;
     }
     host_log("render: wrote %s (%ux%u, format %d)", t.path.c_str(), t.width, t.height, fmt);
+    if (t.depth || t.stencil) {
+        // What the picture leaves out: the depth range, or the stencil values used.
+        const std::size_t n = static_cast<std::size_t>(t.width) * t.height;
+        if (t.stencil) {
+            std::uint64_t hist[256] = {};
+            for (std::size_t i = 0; i < n; ++i) ++hist[t.data()[i]];
+            std::string used;
+            for (int v = 0; v < 256; ++v) {
+                if (hist[v]) used += " " + std::to_string(v) + ":" + std::to_string(hist[v]);
+            }
+            host_log("render: %s stencil values (value:texels):%s", t.path.c_str(), used.c_str());
+        } else {
+            double sum = 0;
+            std::uint64_t at_one = 0, at_zero = 0;
+            float lo = 1e30f;
+            for (std::size_t i = 0; i < n; ++i) {
+                float v;
+                std::memcpy(&v, t.data() + i * 4, 4);
+                sum += v;
+                lo = std::min(lo, v);
+                at_one += v == 1.0f;
+                at_zero += v == 0.0f;
+            }
+            host_log("render: %s depth: min %g max %g mean %.6f, texels at 1 %llu, at 0 %llu", t.path.c_str(), lo, fmax[0], n ? sum / n : 0.0,
+                     static_cast<unsigned long long>(at_one), static_cast<unsigned long long>(at_zero));
+        }
+    }
+
     if (fmt == VK_FORMAT_R16G16B16A16_SFLOAT || fmt == VK_FORMAT_B10G11R11_UFLOAT_PACK32) {
         host_log("render: %s float channels: max %g %g %g, infinite %llu %llu %llu, NaN %llu %llu %llu", t.path.c_str(), fmax[0], fmax[1],
                  fmax[2], static_cast<unsigned long long>(finf[0]), static_cast<unsigned long long>(finf[1]),
