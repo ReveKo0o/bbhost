@@ -2137,7 +2137,7 @@ private:
 
     // ---- the whole source -----------------------------------------------------------------
     // The hull shader's two phases from the one body (hlsl.h).
-    std::string assemble_hull(const std::string& top) {
+    std::string assemble_hull() {
         if (!output_vertices) fail("a hull shader without OutputVertices");
         if (!cp_out_var || !invocation_var) fail("a hull shader without its control-point output or invocation id");
         if (!past_barrier) fail("a hull shader without a barrier");
@@ -2290,7 +2290,6 @@ private:
     }
 
     std::string assemble() {
-        std::string top;
         for (const Function& f : functions) {
             if (f.id == entry_fn) body_text = f.text;  // lifted_main's, declarations included
         }
@@ -2306,7 +2305,7 @@ private:
         for (const std::string& d : spec_decls) s += d + "\n";
         if (!spec_decls.empty()) s += "\n";
 
-        if (exec_model == spv::EmTessellationControl) return s + assemble_hull(top);
+        if (exec_model == spv::EmTessellationControl) return s + assemble_hull();
         if (exec_model == spv::EmGLCompute) return s + assemble_compute();
 
         // Stage variables: statics, filled from and written to the entry point's.
