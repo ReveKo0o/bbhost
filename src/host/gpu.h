@@ -38,6 +38,7 @@ struct GpuDispatch {
         std::uint64_t from = 0;    // kGdsCopy
         std::uint32_t value = 0;   // kGdsSet
         GdsStart start = kGdsKeep;
+        std::uint32_t buffer_id = 0;  // the GX id of the buffer the word belongs to, from a token (0: not known)
     };
     static constexpr std::uint32_t kGdsCounters = 8;  // gcn::kGdsCounters
     std::uint32_t gds_base = 0;

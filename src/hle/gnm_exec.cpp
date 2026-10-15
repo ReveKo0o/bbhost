@@ -1446,8 +1446,10 @@ void bind_gds_counters(GpuDispatch& d) {
 // followed (3,176,062,614 workgroups). Counted, and the first few logged with
 // the buffer they belong to.
 std::mutex g_counters_given_mu;
-std::set<std::uint64_t> g_counters_given, g_counters_unset_logged;  // under g_counters_given_mu
-std::atomic<std::uint64_t> g_tc_adopted{0}, g_tc_kept_unset{0}, g_tc_check_dispatches{0}, g_tc_check_same{0}, g_tc_check_differ{0};
+std::set<std::uint64_t> g_counters_given;  // words a CP write or a set count gave a count, under g_counters_given_mu
+std::set<std::uint64_t> g_counters_given_buffers;  // (word, buffer id) first counted in kept, under g_counters_given_mu
+std::atomic<std::uint64_t> g_tc_adopted{0}, g_tc_kept_unset{0}, g_tc_kept_unset_nonzero{0}, g_tc_check_dispatches{0}, g_tc_check_same{0},
+    g_tc_check_differ{0};
 
 void note_counter_given(std::uint64_t word) {
     std::lock_guard<std::mutex> lk(g_counters_given_mu);
@@ -1466,30 +1468,34 @@ void adopt_token_counters(const GpuDispatch& d) {
             h.kind = GdsHeld::kWord;
             h.word = c.word;
         }
+        const std::uint64_t key = (c.word & 0xffffffffffull) | (static_cast<std::uint64_t>(c.buffer_id) << 40);
         if (c.start == GpuDispatch::kGdsSet) {
-            note_counter_given(c.word);
+            std::lock_guard<std::mutex> lk(g_counters_given_mu);
+            if (g_counters_given_buffers.size() < 65536) g_counters_given_buffers.insert(key);
             continue;
         }
-        bool given = false, logged = false;
+        // Kept: the first dispatch to count in a word nothing gave a count -
+        // a word of this buffer: memory reused for a new buffer is a new
+        // counter (GX's resource id names the buffer). From then on the word
+        // holds a count the GPU made, so it is noted given; this is about
+        // the first one.
         {
             std::lock_guard<std::mutex> lk(g_counters_given_mu);
-            given = g_counters_given.count(c.word) != 0;
-            // The first 16 such words are logged, each once.
-            if (!given) logged = g_counters_unset_logged.size() >= 16 || !g_counters_unset_logged.insert(c.word).second;
+            if (g_counters_given.count(c.word) || g_counters_given_buffers.count(key) || g_counters_given_buffers.size() >= 65536) continue;
+            g_counters_given_buffers.insert(key);
         }
-        if (given) continue;
         g_tc_kept_unset.fetch_add(1, std::memory_order_relaxed);
-        if (logged) continue;
         std::uint32_t now = 0;
         if (hle_kernel_va_mapped(c.word, 4)) std::memcpy(&now, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(c.word)), 4);
-        GxResourceInfo info;
-        const bool known = gx_resource_at(c.word, 4, &info);
+        if (now) g_tc_kept_unset_nonzero.fetch_add(1, std::memory_order_relaxed);
+        // The first few, and every one that holds something (up to 16):
+        // those count on from what the buffer's memory held.
+        static std::atomic<int> logs_zero{0}, logs_held{0};
+        if (now ? logs_held.fetch_add(1, std::memory_order_relaxed) >= 16 : logs_zero.fetch_add(1, std::memory_order_relaxed) >= 4) continue;
         host_log("gnm exec: a dispatch of program 0x%llx (%ux%ux%u%s) keeps the counter at 0x%llx (UAV %u) that nothing gave a count: "
-                 "memory holds %u (0x%08x) there%s; buffer %s id %u at 0x%llx, %u bytes, made at flip %llu %s initial data; flip %llu",
+                 "memory holds %u (0x%08x) there%s; flip %llu",
                  static_cast<unsigned long long>(d.code_va), d.dim[0], d.dim[1], d.dim[2], d.indirect_va ? ", indirect" : "",
-                 static_cast<unsigned long long>(c.word), k, now, now, now > 0xffff ? " - garbage for a count" : "", known ? "" : "(none known)",
-                 known ? info.id : 0u, static_cast<unsigned long long>(known ? info.memory : 0), known ? info.bytes : 0u,
-                 static_cast<unsigned long long>(known ? info.created_flip : 0), known && info.initial_data ? "with" : "without",
+                 static_cast<unsigned long long>(c.word), k, now, now, now > 0xffff ? " - garbage for a count" : "",
                  static_cast<unsigned long long>(hle_video_flip_count()));
     }
     if (any) g_tc_adopted.fetch_add(1, std::memory_order_relaxed);
@@ -3460,9 +3466,10 @@ void hle_gnm_exec_histogram() {
                  static_cast<unsigned long long>(g_counter_writes.load()));
         if (g_tc_adopted.load() || g_tc_check_dispatches.load()) {
             host_log("gnm: GPU particle counters from the dispatch tokens (BBHOST_GX_TOKEN_COUNTERS): %llu dispatches counted with them; "
-                     "%llu counters kept from memory that nothing gave a count; checked against the moves through GDS: %llu dispatches, "
-                     "%llu counters the same, %llu differing",
+                     "%llu counter words first counted in kept from memory that nothing gave a count, %llu of them holding something else "
+                     "than 0; checked against the moves through GDS: %llu dispatches, %llu counters the same, %llu differing",
                      static_cast<unsigned long long>(g_tc_adopted.load()), static_cast<unsigned long long>(g_tc_kept_unset.load()),
+                     static_cast<unsigned long long>(g_tc_kept_unset_nonzero.load()),
                      static_cast<unsigned long long>(g_tc_check_dispatches.load()), static_cast<unsigned long long>(g_tc_check_same.load()),
                      static_cast<unsigned long long>(g_tc_check_differ.load()));
         }

@@ -4740,6 +4740,7 @@ bool take_cs_counters(std::uint64_t ctx, const GxStageRecords& s, GpuDispatch& d
         }
         GpuDispatch::GdsCounter& c = d.gds[j];
         c.word = rd64(holder + 0x20) + rd32(holder + 0x30) - 8;
+        c.buffer_id = rd32(holder + 0x28) & 0xffffff;  // GX's resource id (engine/gx_resources.h)
         const std::uint32_t init = rd32(ctx + 0x1fd0 + 4 * static_cast<std::uint64_t>(j));
         c.start = init == 0xffffffffu ? GpuDispatch::kGdsKeep : GpuDispatch::kGdsSet;
         c.value = init == 0xffffffffu ? 0 : init;
