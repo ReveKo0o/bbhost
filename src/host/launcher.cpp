@@ -188,12 +188,13 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
     bool debug_camera = host_opt_get("debug_camera");
     int frame_cap = host_opt_frame_cap();
     int resolution = host_opt_resolution_index();
-    static const char* const kResolutions[] = {"1280x720",         "1600x900",         "1920x1080",        "2560x1440",
-                                               "3200x1800",        "3840x2160",        "2560x1080 (21:9)", "3440x1440 (21:9)",
-                                               "5120x2160 (21:9)", "3840x1080 (32:9)", "5120x1440 (32:9)", "1280x800 (16:10)",
-                                               "960x600 (16:10, upscaled)", "1024x640 (16:10, upscaled)",
-                                               "640x360",          "960x540",          "1440x810",         "2880x1620",
-                                               "1920x1200 (16:10)", "2560x1600 (16:10)", "1280x960 (4:3)", "1440x1080 (4:3)"};
+    // In the setting's order (host/options.cpp): by size within each shape.
+    static const char* const kResolutions[] = {"640x360",           "960x540",           "1280x720",          "1440x810",
+                                               "1600x900",          "1920x1080",         "2560x1440",         "2880x1620",
+                                               "3200x1800",         "3840x2160",         "960x600 (16:10, upscaled)",
+                                               "1024x640 (16:10, upscaled)",             "1280x800 (16:10)",  "1920x1200 (16:10)",
+                                               "2560x1600 (16:10)", "1280x960 (4:3)",    "1440x1080 (4:3)",   "2560x1080 (21:9)",
+                                               "3440x1440 (21:9)",  "5120x2160 (21:9)",  "3840x1080 (32:9)",  "5120x1440 (32:9)"};
     // The game's frame rate (engine/frame_rate.h): 0 is uncapped.
     static const int kCaps[] = {30, 60, 90, 120, 0};
     constexpr int kCapCount = static_cast<int>(sizeof(kCaps) / sizeof(kCaps[0]));

@@ -219,18 +219,18 @@ Setting g_set[kSettingCount] = {
     // The render resolution. res_width and res_height are two int32s the eboot
     // never writes, so this is a data patch and every pass scales together -
     // see engine/graphics_patch.cpp. The game's pick list shows six entries
-    // and scrolls through more; the ultrawide ones and
-    // the Steam Deck's 16:10 go after the 16:9 ones so a saved entry keeps its
-    // place, and the other shapes are engine/live_resolution.cpp's. 960x600
-    // and 1024x640 are the Deck's screen at 75% and 80%: it holds 60 fps there
-    // (pixel-bound at 1280x800, ~45), and the presenter upscales by FSR 1.
-    // Then the rest of Kyo's shadPS4 resolution patches' sizes, after them for
-    // the same reason: 640x360 to 2880x1620 at 16:9, 16:10 and 4:3.
-    {"resolution", "Resolution", {"1280x720", "1600x900", "1920x1080", "2560x1440", "3200x1800",
-                                  "3840x2160", "2560x1080", "3440x1440", "5120x2160", "3840x1080",
-                                  "5120x1440", "1280x800", "960x600", "1024x640", "640x360",
-                                  "960x540", "1440x810", "2880x1620", "1920x1200", "2560x1600",
-                                  "1280x960", "1440x1080"}, 2,
+    // and scrolls through more. In order of size within each shape - 16:9,
+    // then 16:10, 4:3, 21:9 and 32:9 - and saved by name, not by place, so a
+    // saved entry survives the order changing (engine/option_menu.cpp's
+    // kResolutions and host/launcher.cpp's labels follow this list). The
+    // other shapes are engine/live_resolution.cpp's. 960x600 and 1024x640 are
+    // the Deck's screen at 75% and 80%: it holds 60 fps there (pixel-bound at
+    // 1280x800, ~45), and the presenter upscales by FSR 1.
+    {"resolution", "Resolution", {"640x360", "960x540", "1280x720", "1440x810", "1600x900",
+                                  "1920x1080", "2560x1440", "2880x1620", "3200x1800", "3840x2160",
+                                  "960x600", "1024x640", "1280x800", "1920x1200", "2560x1600",
+                                  "1280x960", "1440x1080", "2560x1080", "3440x1440", "5120x2160",
+                                  "3840x1080", "5120x1440"}, 5,
      "What the game renders at. 1920x1080 is what it shipped with; wide and 16:10 screens are filled, the HUD kept 16:9. "
      "The largest sizes can need a restart: the memory for them is set aside when the game starts.",
      true},

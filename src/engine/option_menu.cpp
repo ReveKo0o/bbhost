@@ -556,16 +556,19 @@ std::int32_t g_frame_cap = 30;
 
 // The render resolution, as the index into the setting's own list of names -
 // the row stores an int32 and the host owns what each one means, so the two
-// front ends cannot disagree about the order. Six 16:9 entries, then the
-// ultrawide ones and the Steam Deck's 16:10 (the pick list scrolls past six),
-// then the rest of the shadPS4 resolution patches' sizes.
+// front ends cannot disagree about the order. The setting's order (host/
+// options.cpp): by size within each shape, 16:9, 16:10, 4:3, 21:9, 32:9 (the
+// pick list scrolls past six). Each entry's text is its size's message, which
+// keeps its id whatever its place.
 const Choice kResolutions[] = {
-    {0, 117010}, {1, 117011}, {2, 117012}, {3, 117013}, {4, 117014}, {5, 117015},
-    {6, 117030}, {7, 117031}, {8, 117032}, {9, 117033}, {10, 117034}, {11, 117035},
-    {12, 117036}, {13, 117037}, {14, 117038}, {15, 117039}, {16, 117040}, {17, 117041},
-    {18, 117042}, {19, 117043}, {20, 117044}, {21, 117045},
+    {0, 117038},  {1, 117039},  {2, 117010},  {3, 117040},  {4, 117011},  {5, 117012},   // 640x360 .. 1920x1080
+    {6, 117013},  {7, 117041},  {8, 117014},  {9, 117015},                              // 2560x1440 .. 3840x2160
+    {10, 117036}, {11, 117037}, {12, 117035}, {13, 117042}, {14, 117043},               // 16:10
+    {15, 117044}, {16, 117045},                                                         // 4:3
+    {17, 117030}, {18, 117031}, {19, 117032},                                           // 21:9
+    {20, 117033}, {21, 117034},                                                         // 32:9
 };
-std::int32_t g_resolution = 2;
+std::int32_t g_resolution = 5;
 std::int32_t g_last_resolution = -1;
 std::int32_t g_last_frame_cap = -1;
 bool g_seeded = false;
