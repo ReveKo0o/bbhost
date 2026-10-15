@@ -31,7 +31,15 @@ target_link_libraries(gcn PUBLIC ZLIB::ZLIB)
 add_executable(gcndis tools/gcndis.cpp)
 target_link_libraries(gcndis PRIVATE gcn)
 find_library(SPIRV_TOOLS_LIB SPIRV-Tools)
+# The headers: the system's on Linux, the dependency prefix's in the Windows
+# cross build (tools/win_deps.sh), where the toolchain searches only the
+# sysroot and the prefix.
+find_path(SPIRV_TOOLS_INCLUDE_DIR spirv-tools/libspirv.hpp)
+if(SPIRV_TOOLS_LIB AND NOT SPIRV_TOOLS_INCLUDE_DIR)
+  set(SPIRV_TOOLS_LIB "")
+endif()
 if(SPIRV_TOOLS_LIB)
+  include_directories(SYSTEM ${SPIRV_TOOLS_INCLUDE_DIR})
   add_executable(gcn2spv tools/gcn2spv.cpp)
   target_link_libraries(gcn2spv PRIVATE gcn ${SPIRV_TOOLS_LIB})
   # The lifted shaders as HLSL, compiled with DXC (loaded at run time) and checked.
@@ -271,11 +279,19 @@ if(Vulkan_FOUND)
   target_sources(bbhost PRIVATE src/host/gpu.cpp src/host/gpu_busy.cpp src/host/gpu_memtrack.cpp src/host/gpu_mutex.cpp src/host/buffer_shadow.cpp src/host/recorder.cpp src/host/bindless.cpp src/host/render.cpp src/host/textures.cpp src/host/gpu_untile.cpp src/host/depth_copy.cpp src/host/indirect_clamp.cpp src/host/fsr.cpp src/host/glitch.cpp src/host/occlusion.cpp src/host/draw_capture.cpp src/host/stream_selftest.cpp
                                 src/host/shader_patch.cpp src/host/translation_cache.cpp src/host/dxc.cpp)
   target_link_libraries(bbhost PRIVATE Vulkan::Vulkan gcn replay_common)
+  # The SPIR-V validator: the HLSL path validates the modules DXC compiled
+  # without its own validator (a sample's run-time offset; host/translation_cache.cpp).
+  # Without it those keep the lift.
+  if(SPIRV_TOOLS_LIB)
+    target_compile_definitions(bbhost PRIVATE BBHOST_HAVE_SPIRV_TOOLS=1)
+    target_link_libraries(bbhost PRIVATE ${SPIRV_TOOLS_LIB})
+  endif()
   # Which user-data tables a no-fallback shader still reads, from the SPIRV-Tools
-  # optimizer; without it every table is built.
+  # optimizer; without it every table is built. Not in the Windows build yet,
+  # though its prefix has the optimizer: it has not been run there.
   target_sources(bbhost PRIVATE src/host/shader_liveness.cpp)
   find_library(SPIRV_TOOLS_OPT_LIB SPIRV-Tools-opt)
-  if(SPIRV_TOOLS_LIB AND SPIRV_TOOLS_OPT_LIB)
+  if(SPIRV_TOOLS_LIB AND SPIRV_TOOLS_OPT_LIB AND NOT WIN32)
     target_compile_definitions(bbhost PRIVATE BBHOST_HAVE_SPIRV_OPT=1)
     target_link_libraries(bbhost PRIVATE ${SPIRV_TOOLS_OPT_LIB} ${SPIRV_TOOLS_LIB})
   endif()

@@ -7,7 +7,7 @@
 #include "gcn/hlsl.h"
 #include "host/dxc.h"
 
-#ifdef BBHOST_HAVE_SPIRV_OPT
+#ifdef BBHOST_HAVE_SPIRV_TOOLS
 #include <spirv-tools/libspirv.hpp>
 #endif
 
@@ -596,13 +596,13 @@ std::string hlsl_reason_key(const std::string& r) {
     return k;
 }
 constexpr bool kHlslValidator =
-#ifdef BBHOST_HAVE_SPIRV_OPT
+#ifdef BBHOST_HAVE_SPIRV_TOOLS
     true;
 #else
     false;
 #endif
 std::string hlsl_validate(const std::vector<std::uint32_t>& spirv) {
-#ifdef BBHOST_HAVE_SPIRV_OPT
+#ifdef BBHOST_HAVE_SPIRV_TOOLS
     spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_2);
     std::string msg;
     tools.SetMessageConsumer([&](spv_message_level_t, const char*, const spv_position_t&, const char* m) {
