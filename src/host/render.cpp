@@ -1080,6 +1080,7 @@ void clear_image_locked(RtImage& r, const float rgba[4], std::uint32_t first_lay
 // on, as a transfer clear (view_clear_apply_locked); a dispatch, the
 // submission and a dump make every owed clear (view_clears_flush_locked).
 std::vector<std::uint64_t> g_view_clear_list;  // bases with a pending view clear (some may be stale), under g.mu
+std::uint64_t g_view_clear_list_gen = 1;       // bumped when entries leave g_view_clear_list (appends keep it), under g.mu
 bool g_in_view_flush = false;
 std::uint64_t g_vc_set = 0, g_vc_load = 0, g_vc_transfer = 0, g_vc_merged = 0, g_vc_dropped = 0, g_vc_flushes = 0, g_vc_sampled = 0;  // under g.mu
 std::uint64_t g_vc_merged_planes = 0;  // depth clears joined with an owed one of other planes, under g.mu
@@ -11090,6 +11091,7 @@ void view_clears_flush_locked(int why) {
     if (g_in_view_flush) return;
     std::vector<std::uint64_t> list;
     list.swap(g_view_clear_list);
+    ++g_view_clear_list_gen;
     std::vector<std::uint64_t> kept;
     bool made = false;
     for (const std::uint64_t base : list) {
@@ -15900,10 +15902,44 @@ static bool draw_impl(const GpuDraw& d) {
         // The rest stay owed past this pass.
         const bool all = s.tess_hw || s.domain_level;
         bool made = false;
-        for (const std::uint64_t base : g_view_clear_list) {
-            auto it = g_rts.find(base);
-            if (it == g_rts.end() || !it->second.view_clear || it->second.view_clear_load) continue;
-            RtImage& r = it->second;
+        // The draw's sampled images' bases, worked out once - for the first
+        // owed clear that is not an attachment - rather than for each.
+        std::uint64_t sampled[64];
+        std::size_t nsampled = 0;
+        bool sampled_known = false, sampled_all = false;
+        const auto know_sampled = [&] {
+            sampled_known = true;
+            for (int st = 0; st < 2; ++st) {
+                for (const StageImages::Image& im : stage_images[st].images) {
+                    if (im.resolved && nsampled < 64) sampled[nsampled++] = tsharp_base(im.w);
+                }
+            }
+            sampled_all = nsampled < 64;  // else (more than fit): the scan below as it was
+        };
+        // The list's targets as g_rts holds them, found once for each entry
+        // while no target is made, dropped or replaced (g_rt_gen, which
+        // target_image's memo relies on too): a map lookup for every entry at
+        // every draw was 2.7% of the command processor at the Central Yharnam
+        // lamp.
+        static std::vector<RtImage*> rts;
+        static std::uint64_t rts_gen = 0, rts_list = 0;
+        if (rts_gen != g_rt_gen || rts_list != g_view_clear_list_gen || rts.size() > g_view_clear_list.size()) {
+            rts.clear();
+            rts_gen = g_rt_gen;
+            rts_list = g_view_clear_list_gen;
+        }
+        for (std::size_t i = rts.size(); i < g_view_clear_list.size(); ++i) {
+            auto it = g_rts.find(g_view_clear_list[i]);
+            rts.push_back(it == g_rts.end() ? nullptr : &it->second);
+        }
+        for (std::size_t i = 0; i < g_view_clear_list.size(); ++i) {
+            RtImage* rp = rts_gen == g_rt_gen ? rts[i] : nullptr;
+            if (rts_gen != g_rt_gen) {  // a clear made below changed the targets: look the rest up
+                auto it = g_rts.find(g_view_clear_list[i]);
+                rp = it == g_rts.end() ? nullptr : &it->second;
+            }
+            if (!rp || !rp->view_clear || rp->view_clear_load) continue;
+            RtImage& r = *rp;
             bool read = all;
             int why = kVcwTess;
             for (int t = 0; t < 8 && !read; ++t) read = s.color[t] == &r;
@@ -15911,15 +15947,27 @@ static bool draw_impl(const GpuDraw& d) {
             if (read && !all) why = kVcwAttachment;
             if (!read) {
                 const std::uint64_t end = r.base + std::max<std::size_t>(rt_size_bytes(r), 1);
-                for (int st = 0; st < 2 && !read; ++st) {
-                    for (const StageImages::Image& im : stage_images[st].images) {
-                        if (!im.resolved) continue;
-                        const std::uint64_t b = tsharp_base(im.w);
-                        if (b >= r.base && b < end) {
+                if (!sampled_known) know_sampled();
+                if (sampled_all) {
+                    for (std::size_t k = 0; k < nsampled; ++k) {
+                        if (sampled[k] >= r.base && sampled[k] < end) {
                             read = true;
                             why = kVcwSampled;
                             ++g_vc_sampled;
                             break;
+                        }
+                    }
+                } else {
+                    for (int st = 0; st < 2 && !read; ++st) {
+                        for (const StageImages::Image& im : stage_images[st].images) {
+                            if (!im.resolved) continue;
+                            const std::uint64_t b = tsharp_base(im.w);
+                            if (b >= r.base && b < end) {
+                                read = true;
+                                why = kVcwSampled;
+                                ++g_vc_sampled;
+                                break;
+                            }
                         }
                     }
                 }
