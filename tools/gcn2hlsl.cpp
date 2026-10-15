@@ -25,7 +25,28 @@
 // --out writes, per program, <name>.<stage>.lift.spv, .hlsl and .dxc.spv.
 // They are made from the game's own shaders: they stay on this machine.
 // --list writes one line per program: stage, name, result, compile ms, reason.
+// --app0 DIR takes the bundles from the game folder (DIR/dvdroot_ps4/shader,
+// the 1.09 update's copies from DIR-UPDATE where it is kept beside it).
 // Exit 0: every lift compiled to a valid module with the lift's interface.
+//
+//   gcn2hlsl --sweep --app0 <game folder> [--gpu N|NAME] [--list FILE] [--validate] [--monolithic]
+//            the driver-acceptance sweep: every vertex, pixel and tessellation
+//            program lifted as the renderer lifts it on this machine's GPU (its
+//            run-time sample offsets and half rounding), printed, compiled by
+//            DXC and checked as the HLSL path checks it, and then the lift's
+//            module and DXC's each built into the pipelines the renderer makes
+//            of the stage on that GPU (tools/pipeline_probe.h: graphics
+//            pipeline libraries, a fast and an optimized link; a game hull's
+//            LS, hull and domain shader as one native hull pipeline). The
+//            summary counts, by stage, what the driver built and refused, and
+//            names every DXC module the driver refused where it builds the
+//            lift - the stages the game's fallback would give back the lift.
+//            --device does the same for the stages chosen with --ps/--vs/--tess.
+//            The driver's own shader disk cache is off for the run
+//            (__GL_SHADER_DISK_CACHE, MESA_SHADER_CACHE_DISABLE), so the sweep
+//            neither reads the game's pipelines from it nor pushes them out;
+//            --driver-cache keeps it. Exit 0: as above, and no DXC module
+//            refused where its lift was built.
 #include "gcn/container.h"
 #include "gcn/hlsl.h"
 #include "gcn/isa.h"
@@ -33,12 +54,16 @@
 #include "gcn/names.h"
 #include "gcn/translate.h"
 #include "host/dxc.h"
+#ifdef GCN2HLSL_HAVE_VULKAN
+#include "pipeline_probe.h"
+#endif
 
 #include <spirv-tools/libspirv.hpp>
 
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <csignal>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -123,6 +148,7 @@ struct Job {
     gcn::TranslateOptions options;
     gcn::TessLift tess;
     std::vector<std::uint8_t> container;
+    int set = -1;  // a game hull's LS, hull and domain shader share a set (one native hull pipeline)
 };
 
 // ---- tessellation: the stages as tests/gcn_tess_lift_test.cpp lifts them ----
@@ -178,7 +204,7 @@ bool tess_reads_lds(const gcn::Program& p) {
 }
 // The particles' LS and domain shaders (one control point, carried as stage
 // attributes) and every game hull's LS, hull and domain shader in its window.
-void tess_jobs(const std::string& bundle_path, std::vector<gcn::BundleEntry>& entries, std::vector<Job>& out) {
+void tess_jobs(const std::string& bundle_path, std::vector<gcn::BundleEntry>& entries, std::vector<Job>& out, int& next_set) {
     std::string bundle = fs::path(bundle_path).filename().string();
     bundle = bundle.substr(0, bundle.find('.'));
     std::vector<TessShader> all;
@@ -279,6 +305,7 @@ void tess_jobs(const std::string& bundle_path, std::vector<gcn::BundleEntry>& en
         const bool quads = (tf & 3) == 2;
         const int spacing = ((tf >> 2) & 7) == 2 ? 1 : ((tf >> 2) & 7) == 3 ? 2 : 0;
         const bool cw = ((tf >> 5) & 7) != 3;
+        const int set = next_set++;
         {
             Job j;
             j.bundle = bundle;
@@ -305,6 +332,7 @@ void tess_jobs(const std::string& bundle_path, std::vector<gcn::BundleEntry>& en
             j.tess.own_params = true;
             j.tess.params_binding = 1;
             j.tess.constants_path = tess_constants_path(hs);
+            j.set = set;
             out.push_back(std::move(j));
         }
         {
@@ -335,6 +363,7 @@ void tess_jobs(const std::string& bundle_path, std::vector<gcn::BundleEntry>& en
             o.cb_no_fallback = true;
             j.tess = tl;
             j.tess.constants_path = tess_constants_path(*ds);
+            j.set = set;
             out.push_back(std::move(j));
         }
         {
@@ -360,6 +389,7 @@ void tess_jobs(const std::string& bundle_path, std::vector<gcn::BundleEntry>& en
             j.tess.attr_vec4s = ls_stride / 16;
             j.tess.own_params = true;
             j.tess.params_binding = 0;
+            j.set = set;
             if (!o.vertex_input.empty()) out.push_back(std::move(j));
         }
     }
@@ -374,6 +404,98 @@ struct Totals {
     std::vector<std::uint32_t> compile_ms;  // per compiled program
     std::uint64_t lift_words = 0, dxc_words = 0, hlsl_bytes = 0;
 };
+
+// The game's shader bundles under a game folder: DIR/dvdroot_ps4/shader (or
+// DIR/shader, or DIR itself), each from DIR-UPDATE when the 1.09 update is
+// kept beside the game, as bbhost reads it.
+std::vector<std::string> app0_bundles(const std::string& app0) {
+    fs::path root(app0);
+    while (!root.empty() && !root.has_filename()) root = root.parent_path();  // a trailing separator
+    fs::path dir;
+    std::string rel;
+    for (const char* sub : {"dvdroot_ps4/shader", "shader", ""}) {
+        const fs::path d = *sub ? root / sub : root;
+        std::error_code ec;
+        if (fs::is_directory(d, ec)) {
+            dir = d;
+            rel = sub;
+            break;
+        }
+    }
+    std::vector<std::string> out;
+    if (dir.empty()) return out;
+    const fs::path update = root.parent_path() / (root.filename().string() + "-UPDATE");
+    std::set<std::string> names;
+    for (const fs::path& d : {update / rel, dir}) {
+        std::error_code ec;
+        if (!fs::is_directory(d, ec)) continue;
+        for (const auto& e : fs::directory_iterator(d, ec)) {
+            const std::string n = e.path().filename().string();
+            if (n.size() > 4 && n.compare(n.size() - 4, 4, ".dcx") == 0 && n.find(".shaderbnd") != std::string::npos && names.insert(n).second)
+                out.push_back(e.path().string());
+        }
+    }
+    std::sort(out.begin(), out.end(), [](const std::string& a, const std::string& b) { return fs::path(a).filename() < fs::path(b).filename(); });
+    return out;
+}
+
+void set_env(const char* name, const char* value) {
+#ifdef _WIN32
+    _putenv_s(name, value);
+#else
+    setenv(name, value, 1);
+#endif
+}
+
+// The programs each worker is building pipelines of, for a driver that
+// crashes inside one: the handler names them before the process ends.
+constexpr int kMaxWorkers = 64;
+std::atomic<const char*> g_in_flight[kMaxWorkers];
+extern "C" void on_crash(int sig) {
+    std::fputs("gcn2hlsl: crashed while building the pipelines of:", stderr);
+    for (std::atomic<const char*>& f : g_in_flight) {
+        const char* n = f.load();
+        if (n) {
+            std::fputs(" ", stderr);
+            std::fputs(n, stderr);
+        }
+    }
+    std::fputs("\n", stderr);
+    std::signal(sig, SIG_DFL);
+    std::raise(sig);
+}
+
+#ifdef GCN2HLSL_HAVE_VULKAN
+// The driver's verdicts on one program, the lift's module and DXC's.
+struct Probed {
+    bool lift_tried = false, dxc_tried = false;
+    probe::Verdict lift, dxc;
+    std::uint64_t us = 0;  // the driver's time on both
+    std::vector<std::uint32_t> lift_spirv, dxc_spirv;  // a hull set's member, kept for the set's pipeline
+};
+// Driver tallies for one kind of stage.
+struct DriverTally {
+    std::size_t lifts = 0, lift_built = 0, lift_refused = 0, lift_untried = 0;
+    std::size_t dxc = 0, dxc_built = 0, dxc_refused = 0, dxc_untried = 0, dxc_only = 0, both = 0, lift_only = 0, notes = 0, warnings = 0;
+    std::uint64_t us = 0;
+    void add(const Probed& p) {
+        us += p.us;
+        if (p.lift_tried) {
+            ++lifts;
+            (p.lift.ok ? lift_built : p.lift.skipped ? lift_untried : lift_refused)++;
+        }
+        if (p.dxc_tried) {
+            ++dxc;
+            (p.dxc.ok ? dxc_built : p.dxc.skipped ? dxc_untried : dxc_refused)++;
+            if (p.dxc.refused() && p.lift_tried && p.lift.ok) ++dxc_only;
+            if (p.dxc.refused() && p.lift_tried && p.lift.refused()) ++both;
+            if (p.dxc.ok && p.lift_tried && p.lift.refused()) ++lift_only;
+        }
+        notes += !p.lift.note.empty() + !p.dxc.note.empty();
+        warnings += !p.lift.warning.empty() + !p.dxc.warning.empty();
+    }
+};
+#endif
 
 }  // namespace
 
@@ -439,9 +561,18 @@ int main(int argc, char** argv) {
     const char* out_dir = nullptr;
     const char* list_path = nullptr;
     std::vector<std::string> bundles;
+    bool device = false, validate_layer = false, monolithic = false, driver_cache = false, sweep = false;
+    std::string gpu_select, app0;
     for (int a = 1; a < argc; ++a) {
         const std::string arg = argv[a];
-        if (arg == "--ps") ps = true;
+        if (arg == "--sweep") sweep = device = true;
+        else if (arg == "--device") device = true;
+        else if (arg == "--gpu" && a + 1 < argc) gpu_select = argv[++a];
+        else if (arg == "--validate") validate_layer = true;
+        else if (arg == "--monolithic") monolithic = true;
+        else if (arg == "--driver-cache") driver_cache = true;
+        else if (arg == "--app0" && a + 1 < argc) app0 = argv[++a];
+        else if (arg == "--ps") ps = true;
         else if (arg == "--vs") vs = true;
         else if (arg == "--clip") clip = true;
         else if (arg == "--tess") tess = true;
@@ -468,28 +599,72 @@ int main(int argc, char** argv) {
             bundles.push_back(arg);
         }
     }
+    if (!app0.empty()) {
+        const std::vector<std::string> found = app0_bundles(app0);
+        if (found.empty()) {
+            std::fprintf(stderr, "%s: no shader bundles (dvdroot_ps4/shader/*.shaderbnd*.dcx)\n", app0.c_str());
+            return 2;
+        }
+        bundles.insert(bundles.end(), found.begin(), found.end());
+    }
     if (bundles.empty()) {
-        std::fprintf(stderr, "usage: gcn2hlsl [--ps] [--vs] [--tess] [--clip] [--runtime-offsets] [--invariant] [--O0] [--jobs N] [--only NAME,..] [--out DIR] [--list FILE] [--no-dxc] <bundle.dcx>...\n");
+        std::fprintf(stderr, "usage: gcn2hlsl [--ps] [--vs] [--tess] [--clip] [--runtime-offsets] [--invariant] [--O0] [--jobs N] [--only NAME,..] [--out DIR] [--list FILE] [--no-dxc] <bundle.dcx>...\n"
+                             "       gcn2hlsl --sweep --app0 <game folder> [--gpu N|NAME] [--list FILE] [--validate] [--monolithic] [--driver-cache]\n");
         return 2;
     }
+    if (sweep) ps = vs = tess = true;
     if (!ps && !vs && !tess) ps = vs = true;
     if (out_dir) fs::create_directories(out_dir);
+    if (device && !use_dxc) {
+        std::fprintf(stderr, "--device and --sweep need DXC\n");
+        return 2;
+    }
+    if (device && !driver_cache) {
+        // The driver's shader disk cache: neither read nor filled by the sweep.
+        set_env("__GL_SHADER_DISK_CACHE", "0");
+        set_env("MESA_SHADER_CACHE_DISABLE", "true");
+    }
     gpu::Dxc dxc;
     if (use_dxc && !dxc.load()) {
         std::fprintf(stderr, "DXC: %s\n", dxc.error().c_str());
         return 2;
     }
     if (use_dxc) std::printf("DXC: %s (%s)\n", dxc.version().c_str(), dxc.path().c_str());
+#ifdef GCN2HLSL_HAVE_VULKAN
+    // Before any program is lifted: the device sets the lifter's switches.
+    std::unique_ptr<probe::Prober> prober;
+    if (device) {
+        prober = std::make_unique<probe::Prober>(dxc);
+        std::string error;
+        if (!prober->init(gpu_select, validate_layer, monolithic, error)) {
+            std::fprintf(stderr, "device: %s\n", error.c_str());
+            return 2;
+        }
+        std::printf("%s\n", prober->info().describe().c_str());
+        std::signal(SIGSEGV, on_crash);
+        std::signal(SIGABRT, on_crash);
+        std::signal(SIGILL, on_crash);
+    }
+#else
+    if (device) {
+        std::fprintf(stderr, "--device and --sweep: this gcn2hlsl was built without Vulkan\n");
+        return 2;
+    }
+    (void)validate_layer;
+    (void)monolithic;
+    (void)gpu_select;
+#endif
 
     // The programs, with the options the renderer lifts them with at creation.
     std::vector<Job> work;
     std::size_t seen = 0;
+    int next_set = 0;
     for (const std::string& path : bundles) {
         std::vector<gcn::BundleEntry> entries;
         if (!load_bundle(path, entries)) return 1;
         if (tess) {
             std::vector<Job> t;
-            tess_jobs(path, entries, t);
+            tess_jobs(path, entries, t, next_set);
             for (Job& j : t) {
                 if (!only.empty() && !only.count(j.name)) continue;
                 if (seen++ % static_cast<std::size_t>(sample) == 0) work.push_back(std::move(j));
@@ -638,7 +813,35 @@ int main(int argc, char** argv) {
     gpu::DxcOptions dopt;
     dopt.optimize = opt_level;
     dopt.passes = passes;
-    const auto worker = [&] {
+#ifdef GCN2HLSL_HAVE_VULKAN
+    // --device: the driver's verdicts by program, and the time spent on them.
+    std::vector<Probed> probed(prober ? work.size() : 0);
+    std::atomic<std::uint64_t> probe_us{0};
+    const auto probe_one = [&](int wid, const Job& j, const std::vector<std::uint32_t>& m, std::uint32_t wave64_needs,
+                               const std::vector<std::uint32_t>& lift, std::uint64_t& us) {
+        g_in_flight[wid].store(j.name.c_str());
+        const auto p0 = std::chrono::steady_clock::now();
+        probe::Verdict v;
+        switch (j.kind) {
+        case Kind::Pixel: v = prober->pixel(m, wave64_needs); break;
+        case Kind::Vertex:
+        case Kind::Ls: v = prober->vertex(m); break;
+        case Kind::Domain: v = prober->domain(m, lift); break;
+        case Kind::Hull:
+            v.ok = false;
+            v.skipped = true;
+            v.what = "a hull shader with no LS and domain shader of its own";
+            break;
+        }
+        const std::uint64_t spent = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - p0).count());
+        probe_us.fetch_add(spent, std::memory_order_relaxed);
+        us += spent;
+        g_in_flight[wid].store(nullptr);
+        return v;
+    };
+#endif
+    const auto worker = [&](int wid) {
+        (void)wid;
         for (;;) {
             const std::size_t i = next.fetch_add(1);
             if (i >= work.size()) return;
@@ -649,9 +852,25 @@ int main(int argc, char** argv) {
             std::uint64_t ms = 0;
             const auto line = [&] {
                 if (!list) return;
+                std::string driver;
+#ifdef GCN2HLSL_HAVE_VULKAN
+                if (prober) {
+                    const Probed& p = probed[i];
+                    driver = j.set >= 0 ? "lift=set dxc=set " : "lift=" + (p.lift_tried ? p.lift.token() : std::string("-")) + " dxc=" +
+                                                                    (p.dxc_tried ? p.dxc.token() : std::string("-")) + " ";
+                    // What the driver said of a refusal, a retry or a validation error, after the HLSL path's own reason.
+                    for (const probe::Verdict* v : {&p.lift, &p.dxc}) {
+                        const std::string said = v == &p.lift ? "lift: " : "dxc: ";
+                        if (!v->ok) reason += (reason.empty() ? "" : "; ") + said + v->str();
+                        else if (!v->note.empty()) reason += (reason.empty() ? "" : "; ") + said + v->note;
+                        if (!v->warning.empty()) reason += (reason.empty() ? "" : "; ") + said + "validation: " + v->warning;
+                    }
+                }
+#endif
                 std::lock_guard<std::mutex> lk(list_mu);
-                std::fprintf(list, "%s %s/%s %s %llu %016llx %s\n", stage, j.bundle.c_str(), j.name.c_str(), result.c_str(), static_cast<unsigned long long>(ms),
-                             static_cast<unsigned long long>(hlsl_hash), reason.c_str());
+                std::fprintf(list, "%s %s/%s %s %llu %016llx %s%s\n", stage, j.bundle.c_str(), j.name.c_str(), result.c_str(), static_cast<unsigned long long>(ms),
+                             static_cast<unsigned long long>(hlsl_hash), driver.c_str(), reason.c_str());
+                std::fflush(list);
             };
             {
                 std::lock_guard<std::mutex> lk(t.mu);
@@ -688,6 +907,18 @@ int main(int argc, char** argv) {
                 ++t.lifted;
                 t.lift_words += l.spirv.size();
             }
+#ifdef GCN2HLSL_HAVE_VULKAN
+            // The lift's own pipelines: what the game builds where it keeps the lift.
+            if (prober) {
+                Probed& p = probed[i];
+                if (j.set >= 0) {
+                    p.lift_spirv = l.spirv;  // the set's pipeline, below
+                } else {
+                    p.lift = probe_one(wid, j, l.spirv, ref.wave64_needs, l.spirv, p.us);
+                    p.lift_tried = true;
+                }
+            }
+#endif
             const fs::path stem = out_dir ? fs::path(out_dir) / j.bundle / (j.name + "." + stage) : fs::path();
             if (out_dir) fs::create_directories(stem.parent_path());
             if (out_dir) write_bytes(stem.string() + ".lift.spv", l.spirv.data(), l.spirv.size() * 4);
@@ -764,22 +995,98 @@ int main(int argc, char** argv) {
                 const std::string ops = gcn::hlsl_operation_diff(l.spirv, spirv);
                 if (!ops.empty()) diff = "operations: " + ops;
             }
-            std::lock_guard<std::mutex> lk(t.mu);
-            ++t.valid;
-            if (diff.empty()) {
-                ++t.same_interface;
-                result = "ok";
-            } else {
-                t.interface_diffs[reason_key(diff)]++;
-                result = diff.rfind("operations", 0) == 0 ? "operations" : "interface", reason = diff;
+#ifdef GCN2HLSL_HAVE_VULKAN
+            // DXC's module, where the HLSL path would take it.
+            if (prober && diff.empty()) {
+                Probed& p = probed[i];
+                if (j.set >= 0) {
+                    p.dxc_spirv = spirv;
+                } else {
+                    p.dxc = probe_one(wid, j, spirv, ref.wave64_needs, l.spirv, p.us);
+                    p.dxc_tried = true;
+                }
+            }
+#endif
+            {
+                std::lock_guard<std::mutex> lk(t.mu);
+                ++t.valid;
+                if (diff.empty()) {
+                    ++t.same_interface;
+                    result = "ok";
+                } else {
+                    t.interface_diffs[reason_key(diff)]++;
+                    result = diff.rfind("operations", 0) == 0 ? "operations" : "interface", reason = diff;
+                }
             }
             line();
         }
     };
     const auto t0 = std::chrono::steady_clock::now();
     std::vector<std::thread> threads;
-    for (unsigned k = 0; k < jobs; ++k) threads.emplace_back(worker);
+    jobs = std::min<unsigned>(jobs, kMaxWorkers);
+    for (unsigned k = 0; k < jobs; ++k) threads.emplace_back(worker, static_cast<int>(k));
     for (std::thread& th : threads) th.join();
+    threads.clear();
+#ifdef GCN2HLSL_HAVE_VULKAN
+    // A game hull's LS, hull and domain shader as one native hull pipeline: the lifts', and DXC's where all three are taken.
+    struct SetProbe {
+        std::size_t ls = SIZE_MAX, hs = SIZE_MAX, ds = SIZE_MAX;
+        bool lift_tried = false, dxc_tried = false;
+        probe::Verdict lift, dxc;
+        std::uint64_t us = 0;
+    };
+    std::vector<SetProbe> sets;
+    if (prober) {
+        std::map<int, SetProbe> by_set;
+        for (std::size_t i = 0; i < work.size(); ++i) {
+            const Job& j = work[i];
+            if (j.set < 0) continue;
+            SetProbe& sp = by_set[j.set];
+            (j.kind == Kind::Ls ? sp.ls : j.kind == Kind::Hull ? sp.hs : sp.ds) = i;
+        }
+        for (auto& kv : by_set) sets.push_back(kv.second);
+        std::atomic<std::size_t> next_probe{0};
+        const auto set_worker = [&](int wid) {
+            for (;;) {
+                const std::size_t k = next_probe.fetch_add(1);
+                if (k >= sets.size()) return;
+                SetProbe& sp = sets[k];
+                if (sp.ls == SIZE_MAX || sp.hs == SIZE_MAX || sp.ds == SIZE_MAX) continue;  // part of a set left out (--only, --sample)
+                const Probed &pl = probed[sp.ls], &ph = probed[sp.hs], &pd = probed[sp.ds];
+                if (pl.lift_spirv.empty() || ph.lift_spirv.empty() || pd.lift_spirv.empty()) continue;
+                const std::uint32_t cp = work[sp.hs].tess.control_points;
+                g_in_flight[wid].store(work[sp.hs].name.c_str());
+                const auto p0 = std::chrono::steady_clock::now();
+                sp.lift = prober->hull_set(pl.lift_spirv, ph.lift_spirv, pd.lift_spirv, cp);
+                sp.lift_tried = true;
+                if (!pl.dxc_spirv.empty() && !ph.dxc_spirv.empty() && !pd.dxc_spirv.empty()) {
+                    sp.dxc = prober->hull_set(pl.dxc_spirv, ph.dxc_spirv, pd.dxc_spirv, cp);
+                    sp.dxc_tried = true;
+                }
+                sp.us = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - p0).count());
+                probe_us.fetch_add(sp.us, std::memory_order_relaxed);
+                g_in_flight[wid].store(nullptr);
+            }
+        };
+        for (unsigned k = 0; k < jobs; ++k) threads.emplace_back(set_worker, static_cast<int>(k));
+        for (std::thread& th : threads) th.join();
+        if (list) {
+            for (const SetProbe& sp : sets) {
+                if (!sp.lift_tried) continue;
+                const Job& h = work[sp.hs];
+                std::string said;
+                for (const probe::Verdict* v : {&sp.lift, &sp.dxc}) {
+                    if (v == &sp.dxc && !sp.dxc_tried) continue;
+                    const std::string who = v == &sp.lift ? "lift: " : "dxc: ";
+                    if (!v->ok) said += (said.empty() ? "" : "; ") + who + v->str();
+                    if (!v->warning.empty()) said += (said.empty() ? "" : "; ") + who + "validation: " + v->warning;
+                }
+                std::fprintf(list, "set %s/%s - 0 0 lift=%s dxc=%s %s\n", h.bundle.c_str(), h.name.c_str(), sp.lift.token().c_str(),
+                             sp.dxc_tried ? sp.dxc.token().c_str() : "-", said.c_str());
+            }
+        }
+    }
+#endif
     const double wall = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     if (list) std::fclose(list);
 
@@ -806,5 +1113,73 @@ int main(int argc, char** argv) {
     dump("not compiled", t.not_compiled);
     dump("invalid", t.invalid);
     dump("interface or operations", t.interface_diffs);
-    return t.same_interface == t.lifted ? 0 : 1;
+    std::size_t dxc_only = 0;
+#ifdef GCN2HLSL_HAVE_VULKAN
+    if (prober) {
+        // The driver's verdicts: each stage kind on its own, the hull sets as one pipeline each.
+        std::map<std::string, DriverTally> by_kind;
+        std::map<std::string, std::size_t> untried;
+        std::vector<std::string> refused_dxc, refused_lift;
+        const auto note_untried = [&](const probe::Verdict& v) {
+            if (v.skipped) untried[reason_key(v.what)]++;
+        };
+        for (std::size_t i = 0; i < work.size(); ++i) {
+            const Job& j = work[i];
+            const Probed& p = probed[i];
+            if (j.set >= 0 || (!p.lift_tried && !p.dxc_tried)) continue;
+            by_kind[kind_name(j.kind)].add(p);
+            note_untried(p.lift);
+            note_untried(p.dxc);
+            const std::string name = std::string(kind_name(j.kind)) + " " + j.bundle + "/" + j.name;
+            if (p.dxc_tried && p.dxc.refused() && p.lift_tried && p.lift.ok) refused_dxc.push_back(name + ": " + p.dxc.str());
+            if (p.lift_tried && p.lift.refused()) refused_lift.push_back(name + ": " + p.lift.str());
+        }
+        DriverTally set_tally;
+        for (const SetProbe& sp : sets) {
+            if (!sp.lift_tried) continue;
+            Probed p;
+            p.lift_tried = sp.lift_tried;
+            p.lift = sp.lift;
+            p.dxc_tried = sp.dxc_tried;
+            p.dxc = sp.dxc;
+            p.us = sp.us;
+            set_tally.add(p);
+            note_untried(p.lift);
+            note_untried(p.dxc);
+            const std::string name = "hull set " + work[sp.hs].bundle + "/" + work[sp.hs].name;
+            if (p.dxc_tried && p.dxc.refused() && p.lift.ok) refused_dxc.push_back(name + ": " + p.dxc.str());
+            if (p.lift.refused()) refused_lift.push_back(name + ": " + p.lift.str());
+        }
+        const probe::DeviceInfo& d = prober->info();
+        std::printf("driver, %s (%s): each lift's module and each DXC module the HLSL path takes, built as the renderer builds the stage "
+                    "(%.1f s of pipelines over %u threads)\n",
+                    d.name.c_str(), d.driver.c_str(), probe_us.load() / 1e6, jobs);
+        const auto row = [](const char* what, const DriverTally& k) {
+            std::printf("  %-27s lifts %5zu: built %5zu, refused %zu, not tried %zu;  DXC modules %5zu: built %5zu, refused %zu (%zu where the lift is "
+                        "built), not tried %zu;  %.0f s\n",
+                        what, k.lifts, k.lift_built, k.lift_refused, k.lift_untried, k.dxc, k.dxc_built, k.dxc_refused, k.dxc_only, k.dxc_untried, k.us / 1e6);
+        };
+        static const char* const kinds[][2] = {{"ps", "pixel shaders"}, {"vs", "vertex shaders"}, {"ls", "LS (particles', alone)"},
+                                               {"ds", "domain shaders (particles')"}};
+        DriverTally total = set_tally;
+        for (const auto& k : kinds) {
+            const auto it = by_kind.find(k[0]);
+            if (it == by_kind.end()) continue;
+            row(k[1], it->second);
+            const DriverTally& x = it->second;
+            total.dxc_only += x.dxc_only;
+            total.notes += x.notes;
+            total.warnings += x.warnings;
+        }
+        if (set_tally.lifts) row("hull sets (LS+hull+domain)", set_tally);
+        if (total.notes) std::printf("  subgroup size refused and built at the driver's default, as the renderer retries: %zu\n", total.notes);
+        if (total.warnings) std::printf("  built, but with a validation error: %zu (--list has them)\n", total.warnings);
+        for (const auto& [why, n] : untried) std::printf("  not tried x%zu: %s\n", n, why.c_str());
+        for (const std::string& r : refused_lift) std::printf("  the lift refused: %s\n", r.c_str());
+        dxc_only = refused_dxc.size();
+        std::printf("DXC modules the driver refused where it builds the lift - the stages the game's fallback gives the lift: %zu\n", dxc_only);
+        for (const std::string& r : refused_dxc) std::printf("  %s\n", r.c_str());
+    }
+#endif
+    return t.same_interface == t.lifted && !dxc_only ? 0 : 1;
 }

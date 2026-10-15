@@ -295,6 +295,13 @@ if(Vulkan_FOUND)
     target_compile_definitions(bbhost PRIVATE BBHOST_HAVE_SPIRV_OPT=1)
     target_link_libraries(bbhost PRIVATE ${SPIRV_TOOLS_OPT_LIB} ${SPIRV_TOOLS_LIB})
   endif()
+  # gcn2hlsl --sweep: each module built into the renderer's pipelines on a
+  # device, for the driver's verdict (tools/pipeline_probe.h).
+  if(TARGET gcn2hlsl)
+    target_sources(gcn2hlsl PRIVATE tools/pipeline_probe.cpp)
+    target_compile_definitions(gcn2hlsl PRIVATE GCN2HLSL_HAVE_VULKAN=1)
+    target_link_libraries(gcn2hlsl PRIVATE Vulkan::Vulkan)
+  endif()
   # The HLSL path against the lift on random inputs (run it on lavapipe).
   add_executable(hlsl_equiv tools/hlsl_equiv.cpp src/host/dxc.cpp)
   target_include_directories(hlsl_equiv PRIVATE src)
