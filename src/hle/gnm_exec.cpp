@@ -2087,11 +2087,18 @@ void execute_packet(std::uint32_t op, const std::uint32_t* b, std::size_t n, int
                                      static_cast<unsigned long long>(va), fn, ref, mask, v);
                             host_log("  packet: %08x %08x %08x %08x %08x %08x depth=%d", b[0], b[1], b[2], b[3], b[4],
                                      n > 5 ? b[5] : 0u, depth);
-                            const std::uint32_t* m = p - 8;
-                            host_log("  mem-32: %08x %08x %08x %08x %08x %08x %08x %08x", m[0], m[1], m[2], m[3], m[4],
-                                     m[5], m[6], m[7]);
-                            host_log("  mem+00: %08x %08x %08x %08x %08x %08x %08x %08x", p[0], p[1], p[2], p[3], p[4],
-                                     p[5], p[6], p[7]);
+                            // Only what is mapped: a wait at the first bytes of
+                            // a mapping (0x100000001 during a load, a malformed
+                            // address) has nothing below it to show.
+                            if (hle_kernel_va_mapped(va - 32, 32)) {
+                                const std::uint32_t* m = p - 8;
+                                host_log("  mem-32: %08x %08x %08x %08x %08x %08x %08x %08x", m[0], m[1], m[2], m[3],
+                                         m[4], m[5], m[6], m[7]);
+                            }
+                            if (hle_kernel_va_mapped(va, 32)) {
+                                host_log("  mem+00: %08x %08x %08x %08x %08x %08x %08x %08x", p[0], p[1], p[2], p[3],
+                                         p[4], p[5], p[6], p[7]);
+                            }
                         }
                         // BBHOST_FORCE_LABELS=1 also writes the expected value so CPU
                         // pollers proceed; default leaves the label alone (garbage
