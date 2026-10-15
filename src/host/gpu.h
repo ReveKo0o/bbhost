@@ -751,6 +751,11 @@ void host_gpu_texture_time_us(std::uint64_t out[5]);
 // Graphics pipeline builds on the command processor so far: [0] translation us, [1] shader modules us,
 // [2] vkCreateGraphicsPipelines us, [3] stage translations, [4] stages served by the stage cache.
 void host_gpu_pipeline_time_us(std::uint64_t out[5]);
+// What the command processor's pipeline builds spent in the driver so far, microseconds in [0..5], counts in
+// [6..11]: shader libraries, interface libraries (vertex input, fragment output), links, whole pipelines,
+// descriptor set and pipeline layouts, and waits for a library another thread was building; then compute
+// pipelines a dispatch built itself, microseconds [12] and count [13].
+void host_gpu_pipeline_work(std::uint64_t out[14]);
 // Surfaces and render targets thrown away because their memory changed shape;
 // each costs a full device idle.
 std::uint64_t host_gpu_surface_replacements();

@@ -430,8 +430,12 @@ GUEST_ABI int hle_gnm_submit_flip(unsigned count, void** dcb, unsigned* dcb_byte
         std::uint64_t tex_us[5], pl_us[5];
         host_gpu_texture_time_us(tex_us);
         host_gpu_pipeline_time_us(pl_us);
+        std::uint64_t work[14];
+        host_gpu_pipeline_work(work);
         static std::uint64_t prev_tex_us[5] = {tex_us[0], tex_us[1], tex_us[2], tex_us[3], tex_us[4]};
         static std::uint64_t prev_pl_us[5] = {pl_us[0], pl_us[1], pl_us[2], pl_us[3], pl_us[4]};
+        static std::uint64_t prev_work[14] = {work[0], work[1], work[2], work[3], work[4],  work[5],  work[6],
+                                              work[7], work[8], work[9], work[10], work[11], work[12], work[13]};
         static auto prev_t = t;
         static GpuStats prev = s;
         static std::uint64_t prev_uploads = uploads, prev_hashes = hashes, prev_hash_us = hash_us, prev_repl = repl, stalls = 0;
@@ -447,7 +451,9 @@ GUEST_ABI int hle_gnm_submit_flip(unsigned count, void** dcb, unsigned* dcb_byte
             host_log("stall: flip #%d came %llu ms after the previous one (cp-backlog %llu); in between cp-thread ms:%s; graphics pipelines %llu, "
                      "draws %llu, dispatches %llu, texture uploads %llu, texture hashes %llu in %llu ms, surfaces replaced %llu; "
                      "texture ms: images %llu, staging %llu, untile %llu, record %llu, views %llu; pipeline ms: translate %llu, "
-                     "modules %llu, create %llu; stage translations %llu, stages reused %llu",
+                     "modules %llu, create %llu; stage translations %llu, stages reused %llu; pipeline work ms: shader libraries "
+                     "%llu (%llu), interface libraries %llu (%llu), links %llu (%llu), whole pipelines %llu (%llu), layouts %llu "
+                     "(%llu), waiting for a library %llu, compute pipelines %llu (%llu)",
                      n, static_cast<unsigned long long>(gap_ms), static_cast<unsigned long long>(hle_gnm_cp_backlog()), ph.c_str(),
                      static_cast<unsigned long long>(s.pipelines - prev.pipelines), static_cast<unsigned long long>(s.draws - prev.draws),
                      static_cast<unsigned long long>(s.dispatches - prev.dispatches), static_cast<unsigned long long>(uploads - prev_uploads),
@@ -459,8 +465,16 @@ GUEST_ABI int hle_gnm_submit_flip(unsigned count, void** dcb, unsigned* dcb_byte
                      static_cast<unsigned long long>((tex_us[4] - prev_tex_us[4]) / 1000),
                      static_cast<unsigned long long>((pl_us[0] - prev_pl_us[0]) / 1000), static_cast<unsigned long long>((pl_us[1] - prev_pl_us[1]) / 1000),
                      static_cast<unsigned long long>((pl_us[2] - prev_pl_us[2]) / 1000), static_cast<unsigned long long>(pl_us[3] - prev_pl_us[3]),
-                     static_cast<unsigned long long>(pl_us[4] - prev_pl_us[4]));
+                     static_cast<unsigned long long>(pl_us[4] - prev_pl_us[4]),
+                     static_cast<unsigned long long>((work[0] - prev_work[0]) / 1000), static_cast<unsigned long long>(work[6] - prev_work[6]),
+                     static_cast<unsigned long long>((work[1] - prev_work[1]) / 1000), static_cast<unsigned long long>(work[7] - prev_work[7]),
+                     static_cast<unsigned long long>((work[2] - prev_work[2]) / 1000), static_cast<unsigned long long>(work[8] - prev_work[8]),
+                     static_cast<unsigned long long>((work[3] - prev_work[3]) / 1000), static_cast<unsigned long long>(work[9] - prev_work[9]),
+                     static_cast<unsigned long long>((work[4] - prev_work[4]) / 1000), static_cast<unsigned long long>(work[10] - prev_work[10]),
+                     static_cast<unsigned long long>((work[5] - prev_work[5]) / 1000),
+                     static_cast<unsigned long long>((work[12] - prev_work[12]) / 1000), static_cast<unsigned long long>(work[13] - prev_work[13]));
         }
+        std::copy(work, work + 14, prev_work);
         for (int i = 0; i < 5; ++i) {
             prev_tex_us[i] = tex_us[i];
             prev_pl_us[i] = pl_us[i];

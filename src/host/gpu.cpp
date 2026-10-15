@@ -3785,6 +3785,9 @@ std::string compute_optimize_window() {
 
 namespace {
 
+// Compute pipelines dispatches built on the command processor (pipeline_for).
+std::atomic<std::uint64_t> g_cp_compute_us{0}, g_cp_compute_n{0};
+
 // A dispatch's first build of a pipeline (under g.mu): take what a worker
 // compiled for the same key, waiting while it builds - but not for ever: a
 // driver can take minutes over one, and the command processor waiting on it
@@ -3938,6 +3941,16 @@ ComputePipeline& pipeline_for(const GpuDispatch& d, std::uint64_t key, const std
     case Precompiled::kBuildHere:
         break;
     }
+    // The dispatch builds it itself: what that costs the command processor
+    // (host_gpu_pipeline_work), however it ends.
+    struct BuildTime {
+        std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+        ~BuildTime() {
+            if (t_compute_worker) return;
+            g_cp_compute_us.fetch_add(cs_us_since(t0), std::memory_order_relaxed);
+            g_cp_compute_n.fetch_add(1, std::memory_order_relaxed);
+        }
+    } build_time;
     pl.meta = translate_cached(prog, o);
     if (!pl.meta.ok()) {
         host_log("gpu: shader %s: %s", name.c_str(), pl.meta.errors[0].c_str());
@@ -4034,6 +4047,11 @@ ComputePipeline& pipeline_for(const GpuDispatch& d, std::uint64_t key, const std
 }
 
 }  // namespace
+
+void compute_pipeline_work(std::uint64_t out[2]) {
+    out[0] = g_cp_compute_us.load(std::memory_order_relaxed);
+    out[1] = g_cp_compute_n.load(std::memory_order_relaxed);
+}
 
 bool compute_precompile_enabled() {
     static const bool on = [] {

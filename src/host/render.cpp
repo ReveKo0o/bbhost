@@ -2926,6 +2926,82 @@ bool use_pipeline_library() {
     }();
     return on && g.has_gpl && g_set_layouts;
 }
+// Set on the threads that build pipelines behind the game (the precompile
+// workers, the no-fallback variants' builders); the command processor's builds
+// are the ones a draw waits for.
+thread_local bool t_pipeline_worker = false;
+// What pipeline builds spend in the driver, by part: the shader libraries
+// (pre-rasterization, fragment shader), the small interface libraries (vertex
+// input, fragment output), links of libraries, whole pipelines (without
+// libraries), descriptor set and pipeline layouts, and the time a build waited
+// for a library another thread was building. The command processor's count
+// for the stall line (host_gpu_pipeline_work_us: what a hitch went to); every
+// thread's per build, for BBHOST_LOG_PIPELINE_BUILDS.
+enum PipelineWork { kWorkShaderLibrary, kWorkInterfaceLibrary, kWorkLink, kWorkWhole, kWorkLayout, kWorkLibraryWait, kWorkCount };
+std::atomic<std::uint64_t> g_cp_work_us[kWorkCount] = {}, g_cp_work_n[kWorkCount] = {};
+thread_local std::uint64_t t_work_us[kWorkCount] = {}, t_work_n[kWorkCount] = {};
+thread_local std::uint64_t t_stage_translations = 0;  // this thread's stage translations, for the build's line
+void note_pipeline_work(PipelineWork w, std::uint64_t us) {
+    t_work_us[w] += us;
+    ++t_work_n[w];
+    if (t_pipeline_worker) return;
+    g_cp_work_us[w].fetch_add(us, std::memory_order_relaxed);
+    g_cp_work_n[w].fetch_add(1, std::memory_order_relaxed);
+}
+std::uint64_t work_us_since(std::chrono::steady_clock::time_point t0) {
+    return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count());
+}
+// BBHOST_LOG_PIPELINE_BUILDS=<ms>: each pipeline build on the command processor
+// that took at least that long (0: every one), with what it spent - the parts
+// above, the stages it translated itself, and the rest (translations, modules,
+// bookkeeping). The outermost build of a thread logs; one inside it adds to it.
+const long g_log_pipeline_builds = [] {
+    const char* e = std::getenv("BBHOST_LOG_PIPELINE_BUILDS");
+    return e && *e ? std::atol(e) : -1L;
+}();
+thread_local int t_build_depth = 0;
+struct PipelineBuildScope {
+    const GfxPipeline& pl;
+    const char* what;
+    bool outer;
+    std::chrono::steady_clock::time_point t0{};
+    std::uint64_t us0[kWorkCount] = {}, n0[kWorkCount] = {}, translations0 = 0;
+    PipelineBuildScope(const GfxPipeline& p, const char* w)
+        : pl(p), what(w), outer(t_build_depth++ == 0 && g_log_pipeline_builds >= 0 && !t_pipeline_worker) {
+        if (!outer) return;
+        t0 = std::chrono::steady_clock::now();
+        std::copy(t_work_us, t_work_us + kWorkCount, us0);
+        std::copy(t_work_n, t_work_n + kWorkCount, n0);
+        translations0 = t_stage_translations;
+    }
+    PipelineBuildScope(const PipelineBuildScope&) = delete;
+    PipelineBuildScope& operator=(const PipelineBuildScope&) = delete;
+    ~PipelineBuildScope() {
+        --t_build_depth;
+        if (!outer) return;
+        const std::uint64_t us = work_us_since(t0);
+        if (us < static_cast<std::uint64_t>(g_log_pipeline_builds) * 1000) return;
+        std::uint64_t du[kWorkCount], dn[kWorkCount], parts = 0;
+        for (int k = 0; k < kWorkCount; ++k) {
+            du[k] = t_work_us[k] - us0[k];
+            dn[k] = t_work_n[k] - n0[k];
+            if (k != kWorkLibraryWait) parts += du[k];
+        }
+        parts += du[kWorkLibraryWait];
+        host_log("render: pipeline build %s%s on the command processor at flip %llu: %.2f ms (%s, %s): shader libraries %llu in %.2f ms, "
+                 "interface libraries %llu in %.2f ms, links %llu in %.2f ms, whole pipelines %llu in %.2f ms, layouts %llu in %.2f ms, "
+                 "waiting for another thread's library %.2f ms; stage translations %llu; the rest %.2f ms",
+                 pl.name.c_str(), pl.lean ? " (no-fallback)" : pl.layout_only ? " (fallback, laid out)" : "",
+                 static_cast<unsigned long long>(hle_video_flip_count()), us / 1000.0, what,
+                 pl.failed ? "failed" : pl.library ? "linked" : pl.pipeline ? "whole" : "not created",
+                 static_cast<unsigned long long>(dn[kWorkShaderLibrary]), du[kWorkShaderLibrary] / 1000.0,
+                 static_cast<unsigned long long>(dn[kWorkInterfaceLibrary]), du[kWorkInterfaceLibrary] / 1000.0,
+                 static_cast<unsigned long long>(dn[kWorkLink]), du[kWorkLink] / 1000.0, static_cast<unsigned long long>(dn[kWorkWhole]),
+                 du[kWorkWhole] / 1000.0, static_cast<unsigned long long>(dn[kWorkLayout]), du[kWorkLayout] / 1000.0,
+                 du[kWorkLibraryWait] / 1000.0, static_cast<unsigned long long>(t_stage_translations - translations0),
+                 (us > parts ? us - parts : 0) / 1000.0);
+    }
+};
 std::mutex g_stage_layout_mu;  // pipelines are built on worker threads too
 std::unordered_map<std::uint64_t, VkDescriptorSetLayout> g_stage_set_layouts;  // by binding list, under g_stage_layout_mu
 std::unordered_map<std::uint64_t, VkPipelineLayout> g_stage_pipe_layouts;       // by set layout pair, under g_stage_layout_mu
@@ -2973,7 +3049,10 @@ VkDescriptorSetLayout stage_set_layout(const gcn::TranslateResult& meta) {
     lci.bindingCount = static_cast<std::uint32_t>(binds.size());
     lci.pBindings = binds.data();
     VkDescriptorSetLayout layout = VK_NULL_HANDLE;
-    if (vkCreateDescriptorSetLayout(g.device, &lci, nullptr, &layout) != VK_SUCCESS) {
+    const auto t0 = std::chrono::steady_clock::now();
+    const VkResult r = vkCreateDescriptorSetLayout(g.device, &lci, nullptr, &layout);
+    note_pipeline_work(kWorkLayout, work_us_since(t0));
+    if (r != VK_SUCCESS) {
         host_log("render: descriptor set layout with %zu bindings failed", binds.size());
         return VK_NULL_HANDLE;
     }
@@ -2991,7 +3070,10 @@ VkPipelineLayout stage_pipeline_layout(VkDescriptorSetLayout vs, VkDescriptorSet
     plci.setLayoutCount = g.bindless ? 4 : cb_push_on() ? 3 : 2;  // set 3: the global views and samplers
     plci.pSetLayouts = sets;
     VkPipelineLayout layout = VK_NULL_HANDLE;
-    if (vkCreatePipelineLayout(g.device, &plci, nullptr, &layout) != VK_SUCCESS) return VK_NULL_HANDLE;
+    const auto t0 = std::chrono::steady_clock::now();
+    const VkResult r = vkCreatePipelineLayout(g.device, &plci, nullptr, &layout);
+    note_pipeline_work(kWorkLayout, work_us_since(t0));
+    if (r != VK_SUCCESS) return VK_NULL_HANDLE;
     g_stage_pipe_layouts.emplace(key, layout);
     return layout;
 }
@@ -3007,7 +3089,6 @@ VkPipelineLayout stage_pipeline_layout(VkDescriptorSetLayout vs, VkDescriptorSet
 // and the options that change its translation; stages the cache served are
 // counted as reused (with BBHOST_STAGE_CACHE=0, translations whose key was
 // seen before).
-thread_local bool t_pipeline_worker = false;
 std::atomic<std::uint64_t> g_pl_translate_us{0}, g_pl_module_us{0}, g_pl_create_us{0}, g_pl_stage_translations{0}, g_pl_stage_repeats{0};
 std::mutex g_stage_keys_mu;
 std::unordered_set<std::uint64_t> g_stage_keys;
@@ -4166,7 +4247,10 @@ VkDescriptorSetLayout tess_native_set_layout(const gcn::TranslateResult& ls, con
     lci.bindingCount = static_cast<std::uint32_t>(binds.size());
     lci.pBindings = binds.data();
     VkDescriptorSetLayout layout = VK_NULL_HANDLE;
-    if (vkCreateDescriptorSetLayout(g.device, &lci, nullptr, &layout) != VK_SUCCESS) return VK_NULL_HANDLE;
+    const auto t0 = std::chrono::steady_clock::now();
+    const VkResult r = vkCreateDescriptorSetLayout(g.device, &lci, nullptr, &layout);
+    note_pipeline_work(kWorkLayout, work_us_since(t0));
+    if (r != VK_SUCCESS) return VK_NULL_HANDLE;
     g_stage_set_layouts.emplace(key, layout);
     return layout;
 }
@@ -4187,7 +4271,10 @@ VkPipelineLayout tess_native_pipeline_layout(VkDescriptorSetLayout vs, VkDescrip
     plci.setLayoutCount = 5;
     plci.pSetLayouts = sets;
     VkPipelineLayout layout = VK_NULL_HANDLE;
-    if (vkCreatePipelineLayout(g.device, &plci, nullptr, &layout) != VK_SUCCESS) return VK_NULL_HANDLE;
+    const auto t0 = std::chrono::steady_clock::now();
+    const VkResult r = vkCreatePipelineLayout(g.device, &plci, nullptr, &layout);
+    note_pipeline_work(kWorkLayout, work_us_since(t0));
+    if (r != VK_SUCCESS) return VK_NULL_HANDLE;
     g_stage_pipe_layouts.emplace(key, layout);
     return layout;
 }
@@ -4345,6 +4432,7 @@ GfxPipeline& build_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const std::
                                 bool cb_no_fallback, const VertexInputPlan* vertex_input, bool create = true, bool layout_only = false) {
     pl.name = vs_name + "+" + ps_name;
     pl.lean = cb_no_fallback;
+    const PipelineBuildScope build_scope(pl, create ? "built" : "laid out");
     // A fallback laid out from its no-fallback stages is built again in place
     // (BBHOST_LAYOUT_FROM_LEAN): what the tessellation stages were lifted to
     // is decided again below.
@@ -4437,6 +4525,7 @@ GfxPipeline& build_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const std::
                 g_pl_translate_us.fetch_add(pl_us_since(t_stage), std::memory_order_relaxed);
                 g_pl_stage_translations.fetch_add(1, std::memory_order_relaxed);
             }
+            ++t_stage_translations;
             if (!g_stage_cache_on) note_stage_key(ps_key);
             if (!pl.ps.meta().ok()) return fail("PS: " + pl.ps.meta().errors[0]);
             manifest_note_ps(ps_key, ps_name, ps_in, ps_lift);
@@ -4588,6 +4677,7 @@ GfxPipeline& build_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const std::
             g_pl_translate_us.fetch_add(pl_us_since(t_stage), std::memory_order_relaxed);
             g_pl_stage_translations.fetch_add(1, std::memory_order_relaxed);
         }
+        ++t_stage_translations;
         if (!g_stage_cache_on) note_stage_key(vs_key);
         if (!pl.vs.meta().ok()) return fail("VS: " + pl.vs.meta().errors[0]);
         if (!vs_in.tess_window) manifest_note_vs(vs_key, vs_name, vs_in, vs_decomp || ds_lift);  // the manifest keeps no tessellation shape
@@ -4893,14 +4983,18 @@ VkPipeline pipeline_library(LibraryKind kind, std::uint64_t key, const char* wha
     key = fnv1a(&kind, sizeof(kind), key);
     {
         std::unique_lock<std::mutex> lk(g_libs.mu);
+        std::chrono::steady_clock::time_point waiting{};
         for (;;) {
             if (auto it = g_libs.ready.find(key); it != g_libs.ready.end()) {
                 g_libs.hits[kind].fetch_add(1, std::memory_order_relaxed);
+                if (waiting != std::chrono::steady_clock::time_point{}) note_pipeline_work(kWorkLibraryWait, work_us_since(waiting));
                 return it->second;
             }
             if (!g_libs.building.count(key)) break;
+            if (waiting == std::chrono::steady_clock::time_point{}) waiting = std::chrono::steady_clock::now();
             g_libs.cv.wait(lk);
         }
+        if (waiting != std::chrono::steady_clock::time_point{}) note_pipeline_work(kWorkLibraryWait, work_us_since(waiting));
         g_libs.building.insert(key);
     }
     const auto t0 = std::chrono::steady_clock::now();
@@ -4910,6 +5004,7 @@ VkPipeline pipeline_library(LibraryKind kind, std::uint64_t key, const char* wha
     }
     const VkPipeline p = build();
     const std::uint64_t us = pl_us_since(t0);
+    note_pipeline_work(kind == kLibPreRaster || kind == kLibFragment ? kWorkShaderLibrary : kWorkInterfaceLibrary, us);
     if (g_library_trace) host_log("render: library %s %016llx done", what, static_cast<unsigned long long>(key));
     g_libs.us[kind].fetch_add(us, std::memory_order_relaxed);
     g_libs.built[kind].fetch_add(1, std::memory_order_relaxed);
@@ -6403,6 +6498,7 @@ bool link_gfx_pipeline(GfxPipeline& pl, const GfxFixedState& f, const VertexInpu
     gpci.layout = pl.layout;
     const auto t0 = std::chrono::steady_clock::now();
     const bool ok = vkCreateGraphicsPipelines(g.device, PipelineCacheUse().cache, 1, &gpci, nullptr, &pl.pipeline) == VK_SUCCESS;
+    note_pipeline_work(kWorkLink, pl_us_since(t0));
     g_libs.link_us.fetch_add(pl_us_since(t0), std::memory_order_relaxed);
     g_libs.links.fetch_add(1, std::memory_order_relaxed);
     pl.library = ok;
@@ -6510,6 +6606,7 @@ bool hlsl_test_refused(const GfxPipeline& pl) {
 // The Vulkan pipeline of a translated and laid-out GfxPipeline, from any draw
 // state with its key (the key covers the fixed state and vertex input).
 bool create_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const VertexInputPlan* vertex_input, std::size_t fetch_dwords) {
+    const PipelineBuildScope build_scope(pl, "created");
     std::vector<VkPipelineShaderStageCreateInfo> stages;
     auto stage = [&](VkShaderStageFlagBits bit, VkShaderModule m) {
         VkPipelineShaderStageCreateInfo si{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
@@ -6623,16 +6720,23 @@ bool create_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const VertexInputP
     gpci.pDynamicState = &dsi;
     gpci.layout = pl.layout ? pl.layout : g.gfx_pipe_layout;
     const auto t0 = std::chrono::steady_clock::now();
+    // A whole pipeline, without libraries: the driver compiles every stage.
+    const auto create_whole = [&] {
+        const auto w0 = std::chrono::steady_clock::now();
+        const bool ok = vkCreateGraphicsPipelines(g.device, PipelineCacheUse().cache, 1, &gpci, nullptr, &pl.pipeline) == VK_SUCCESS;
+        note_pipeline_work(kWorkWhole, work_us_since(w0));
+        return ok;
+    };
     if (g_dump_spirv) host_log("render: creating pipeline %s", pl.name.c_str());
     // The host tessellator's pipelines link from libraries like the rest: built
     // whole, each took ~1.6 ms from a warm cache (50-165 ms cold), 14 of them in
     // the frame after a fight, and left the draw after it to set every dynamic
     // value again.
     bool created = linked ? link_gfx_pipeline(pl, f, vertex_input)
-                          : vkCreateGraphicsPipelines(g.device, PipelineCacheUse().cache, 1, &gpci, nullptr, &pl.pipeline) == VK_SUCCESS;
+                          : create_whole();
     if (!created && ps_sized) {
         fragment_stage_unsized(stages.back());
-        created = vkCreateGraphicsPipelines(g.device, PipelineCacheUse().cache, 1, &gpci, nullptr, &pl.pipeline) == VK_SUCCESS;
+        created = create_whole();
         fragment_stage_wave_refused(created);
     }
     if (created && hlsl_test_refused(pl)) {
@@ -6653,10 +6757,10 @@ bool create_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const VertexInputP
                 gpci.pStages = stages.data();
                 ps_wave = {};
                 const bool sized = pl.ps.module && fragment_stage_wave(pl.ps.meta(), stages.back(), ps_wave);
-                created = vkCreateGraphicsPipelines(g.device, PipelineCacheUse().cache, 1, &gpci, nullptr, &pl.pipeline) == VK_SUCCESS;
+                created = create_whole();
                 if (!created && sized) {
                     fragment_stage_unsized(stages.back());
-                    created = vkCreateGraphicsPipelines(g.device, PipelineCacheUse().cache, 1, &gpci, nullptr, &pl.pipeline) == VK_SUCCESS;
+                    created = create_whole();
                     fragment_stage_wave_refused(created);
                 }
             }
@@ -9236,6 +9340,16 @@ bool render_blit_display_locked(VkCommandBuffer cmd, std::uint64_t display_va, V
     return true;
 }
 
+// The command processor's pipeline work so far, by part (PipelineWork):
+// microseconds in out[0..5], counts in out[6..11].
+void render_pipeline_work(std::uint64_t out[12]) {
+    static_assert(2 * kWorkCount == 12, "host_gpu_pipeline_work's layout");
+    for (int k = 0; k < kWorkCount; ++k) {
+        out[k] = g_cp_work_us[k].load(std::memory_order_relaxed);
+        out[kWorkCount + k] = g_cp_work_n[k].load(std::memory_order_relaxed);
+    }
+}
+
 void render_pipeline_time_us(std::uint64_t out[5]) {
     out[0] = g_pl_translate_us.load();
     out[1] = g_pl_module_us.load();
@@ -9377,6 +9491,10 @@ std::string host_gpu_target_copy_report() {
     return g.ok ? render_target_copy_report() : std::string();
 }
 void host_gpu_pipeline_time_us(std::uint64_t out[5]) { render_pipeline_time_us(out); }
+void host_gpu_pipeline_work(std::uint64_t out[14]) {
+    render_pipeline_work(out);
+    compute_pipeline_work(out + 12);
+}
 
 // Dynamic state already recorded into the command buffer being built. Every
 // graphics pipeline declares the same dynamic set, and that state lasts for the

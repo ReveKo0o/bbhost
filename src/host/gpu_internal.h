@@ -1461,6 +1461,10 @@ std::string render_fill_stats();  // " fill-pending=N fill-applied=M"
 // Command-processor pipeline builds so far: [0] translate us, [1] modules us, [2] vkCreateGraphicsPipelines us,
 // [3] stage translations, [4] stages the cache served (with BBHOST_STAGE_CACHE=0: translations whose key was seen before).
 void render_pipeline_time_us(std::uint64_t out[5]);
+// host_gpu_pipeline_work's graphics part, [0..11].
+void render_pipeline_work(std::uint64_t out[12]);
+// Compute pipelines a dispatch built on the command processor so far: [0] microseconds, [1] count.
+void compute_pipeline_work(std::uint64_t out[2]);
 // A shader copies a render target's memory elsewhere: copy the image into a snapshot at dst
 // (or into the target there of its shape); a copy one smaller destination long gets the
 // source's top-left overlap (copy_overlap_locked). `via` names the copy in the log ("copy
