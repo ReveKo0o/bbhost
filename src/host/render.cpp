@@ -16844,6 +16844,10 @@ bool gpu::dump_rt_locked(RtImage& r, const char* path) {
 
 namespace gpu {
 
+// BBHOST_PIPELINE_STATS for a compute shader (gpu.cpp first_compute_pipeline).
+bool compute_pipeline_stats_wanted(const std::string& name) { return pipeline_stats_wanted(name); }
+void write_compute_pipeline_stats(VkPipeline p, const std::string& name) { write_pipeline_stats(p, name); }
+
 // A loading screen up or down, and the first in-game frame (engine/loading.cpp
 // through gpu.cpp): the precompile workers' number (g_precompile_boost).
 void precompile_set_loading(bool loading) {

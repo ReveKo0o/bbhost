@@ -1623,6 +1623,10 @@ bool set_cache_on();
 // than in the stage's set, which the cache then keys without them: with the
 // cache, whenever the device has push descriptors.
 bool cb_push_on();
+// BBHOST_PIPELINE_STATS=<name>: whether a compute shader is named, and its
+// pipeline's statistics and disassembly to build/pipeline-stats (render.cpp).
+bool compute_pipeline_stats_wanted(const std::string& name);
+void write_compute_pipeline_stats(VkPipeline p, const std::string& name);
 VkDescriptorType params_descriptor_type();
 // The params descriptor with the cache on (set up with the ring).
 extern VkDescriptorBufferInfo g_params_desc;

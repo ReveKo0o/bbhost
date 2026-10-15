@@ -3224,6 +3224,31 @@ void queue_compute_optimize(std::uint64_t key, const std::string& name, const st
 VkPipeline first_compute_pipeline(VkShaderModule module, std::uint64_t opt_key, const std::string& name,
                                   const std::vector<std::uint32_t>& spirv, bool& standin, const std::string& watch) {
     standin = false;
+    // BBHOST_PIPELINE_STATS=<name>: its optimized build once more with the
+    // driver's statistics and disassembly captured, written and let go.
+    if (g.pipeline_stats && compute_pipeline_stats_wanted(name)) {
+        static std::mutex mu;
+        static std::set<std::string> done;
+        bool first;
+        {
+            std::lock_guard<std::mutex> lk(mu);
+            first = done.insert(name).second;
+        }
+        if (first) {
+            VkComputePipelineCreateInfo cpci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+            cpci.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+            cpci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+            cpci.stage.module = module;
+            cpci.stage.pName = "main";
+            cpci.layout = g.pipe_layout;
+            cpci.flags = VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR | VK_PIPELINE_CREATE_CAPTURE_INTERNAL_REPRESENTATIONS_BIT_KHR;
+            VkPipeline p = VK_NULL_HANDLE;
+            if (vkCreateComputePipelines(g.device, VK_NULL_HANDLE, 1, &cpci, nullptr, &p) == VK_SUCCESS) {
+                write_compute_pipeline_stats(p, name + "-cs");
+                vkDestroyPipeline(g.device, p, nullptr);
+            }
+        }
+    }
     switch (cs_optimize_mode()) {
     case CsOptimize::kNever:
         return create_compute(module, CsBuild::kUnoptimized, watch, &spirv);
