@@ -418,7 +418,29 @@ VkResult host_span(Chunk& c, void* ptr, std::uint64_t size) {
 // memfd's pages instead, 64 MiB at most (the module's size_limit_mb), and a
 // longer span is a sparse buffer with its pieces bound in order, so it keeps
 // one range of device addresses.
-constexpr std::uint64_t kDmabufPiece = 64ull << 20;
+// The pieces are as large as the module allows: every dma-buf is a buffer
+// object the kernel makes resident at every submission (RADV attaches all of
+// them, since shaders reach memory by address), ~60 of them for a Steam
+// Deck's direct memory at the default 64 MiB. A system whose udmabuf takes
+// more (size_limit_mb, a module parameter root can raise) gets fewer, up to
+// 1 GiB each; BBHOST_DMABUF_PIECE_MB asks for less (tests).
+std::uint64_t dmabuf_piece_bytes() {
+    static const std::uint64_t bytes = [] {
+        std::uint64_t mb = 64;
+        if (FILE* f = std::fopen("/sys/module/udmabuf/parameters/size_limit_mb", "r")) {
+            unsigned long v = 0;
+            if (std::fscanf(f, "%lu", &v) == 1 && v >= 64) mb = std::min<unsigned long>(v, 1024);
+            std::fclose(f);
+        }
+        if (const char* e = std::getenv("BBHOST_DMABUF_PIECE_MB"); e && *e) {
+            const unsigned long v = std::strtoul(e, nullptr, 10);
+            if (v >= 64) mb = std::min<std::uint64_t>(mb, v);
+        }
+        mb &= ~std::uint64_t{63};  // a whole number of 64 MiB: whole pages, and the sparse binding's alignment
+        return mb << 20;
+    }();
+    return bytes;
+}
 
 // [offset, offset + size) of direct memory as one dma-buf import, of a memory
 // type in `bits`. VK_NULL_HANDLE when it cannot be made.
@@ -469,7 +491,8 @@ VkDeviceMemory dmabuf_memory(std::uint64_t offset, std::uint64_t size, std::uint
 // buffer bound to one, or a sparse buffer over several. Under the GPU lock,
 // as every use of the renderer's queue is: the sparse binds go on it.
 VkResult dmabuf_span(Chunk& c, std::uint64_t offset, std::uint64_t size) {
-    const bool sparse = size > kDmabufPiece;
+    const std::uint64_t piece = dmabuf_piece_bytes();
+    const bool sparse = size > piece;
     if (sparse && !g.dmabuf_sparse) {
         static std::atomic<int> said{0};
         if (said.fetch_add(1) < 4)
@@ -489,14 +512,14 @@ VkResult dmabuf_span(Chunk& c, std::uint64_t offset, std::uint64_t size) {
     VkMemoryRequirements req{};
     vkGetBufferMemoryRequirements(g.device, c.buffer, &req);
     // Spans are whole 64 KiB pages, so the pieces meet the binding alignment.
-    if (req.size != size || (sparse && kDmabufPiece % req.alignment)) {
+    if (req.size != size || (sparse && piece % req.alignment)) {
         host_log("gpu: a buffer over %llu bytes of direct memory wants %llu (alignment %llu)", static_cast<unsigned long long>(size),
                  static_cast<unsigned long long>(req.size), static_cast<unsigned long long>(req.alignment));
         return VK_ERROR_INITIALIZATION_FAILED;
     }
     std::vector<VkSparseMemoryBind> binds;
-    for (std::uint64_t at = 0; at < size; at += kDmabufPiece) {
-        const std::uint64_t n = std::min(kDmabufPiece, size - at);
+    for (std::uint64_t at = 0; at < size; at += piece) {
+        const std::uint64_t n = std::min(piece, size - at);
         const VkDeviceMemory m = dmabuf_memory(offset + at, n, req.memoryTypeBits);
         if (!m) return VK_ERROR_INVALID_EXTERNAL_HANDLE;
         c.pieces.push_back(m);
@@ -593,8 +616,10 @@ void choose_dmem_import() {
         const VkResult d = dmabuf_span(c, 0, 1ull << gcn::kPageShift);
         free_import(c);
         if (d == VK_SUCCESS) {
-            host_log("gpu: the driver refuses direct memory as a host pointer (%d); importing it as dma-bufs (/dev/udmabuf)%s", r,
-                     g.dmabuf_sparse ? "" : ", 64 MiB at most: no sparse binding");
+            host_log("gpu: the driver refuses direct memory as a host pointer (%d); importing it as dma-bufs (/dev/udmabuf) of %llu MiB "
+                     "(udmabuf's size_limit_mb)%s",
+                     r, static_cast<unsigned long long>(dmabuf_piece_bytes() >> 20),
+                     g.dmabuf_sparse ? "" : ", one at most a span: no sparse binding");
             return;
         }
         g.dmem_dmabuf = false;
