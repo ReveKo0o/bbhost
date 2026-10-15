@@ -4173,9 +4173,11 @@ void manifest_note_hit(std::uint64_t key) {
 // are made again from them at that start, in the background. A recipe that no
 // longer builds is dropped; one no draw took for kRecipeIdleRuns starts is
 // dropped too, and past kRecipeMax recipes or kRecipeMaxBytes the least
-// recently used go first. Tessellated pipelines are not recorded (their
-// stages read guest programs at the build). BBHOST_PIPELINE_MANIFEST=0 turns
-// it off; it is off with the pipeline cache (BBHOST_PIPELINE_CACHE=0).
+// recently used go first. A tessellated pipeline holds copies of its LS, its
+// hull and the LS's fetch shader too (the build reads those instead of guest
+// memory); the LS's own compute pipeline, for the host-tessellated path, is
+// not recorded. BBHOST_PIPELINE_MANIFEST=0 turns it off; it is off with the
+// pipeline cache (BBHOST_PIPELINE_CACHE=0).
 struct PipelineRecipe {
     // Copied at the build; the pointers into the run's own objects are set
     // to the copies below for each build from it (recipe_draw_state).

@@ -69,7 +69,7 @@ as one (`BBHOST_SUBMIT_MERGE=1` keeps them apart, to compare).
 
 **Shaders.** GCN shaders are converted to SPIR-V when the game creates them,
 and GX creates every shader of the game's bundles at the start (1,663 vertex
-and 1,346 pixel programs; only the debug bundle's wait), so their stages and
+and 1,346 pixel programs; all but the debug bundle's), so their stages and
 pipeline libraries are compiled behind the title. What a draw still has to
 make itself is a variant creation does not know of - most of them the
 pixel shader of a pair that clips by a varying - and the eboot's own
