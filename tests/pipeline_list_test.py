@@ -21,6 +21,7 @@ def recipe(key, last_run, vs, ps, vs_name="0000aaaa", ps_name="0000bbbb", vertex
     state = bytes(19 * 4 + 8 + 57 * 4 + pl.GX_BLEND + pl.GX_DEPTH + pl.GX_RASTER)
     tail = struct.pack("<I", 0) * 4 + struct.pack("<I", 1) + struct.pack("<4I", 0, 1, 4, 0x8C) + struct.pack("<I", 0) * 2 + \
         struct.pack("<Q", 0x1234) + bytes(128 + 128 + 4)
+    tail += struct.pack("<I", 0) + bytes(9 * 4 + 16 + 8 + 48 + 8)  # no tessellation
     body = b"".join([struct.pack("<IQII", flags, key, 1, last_run), state, struct.pack("<I", len(vs) // 4), vs,
                      struct.pack("<I", 0), struct.pack("<I", len(ps) // 4), ps, pl.wstr(vs_name), pl.wstr(ps_name), tail])
     return pl.Recipe().parse(body)
@@ -64,6 +65,22 @@ class PipelineListTest(unittest.TestCase):
             self.assertEqual((recs[0].vs, recs[0].ps), (None, None))
             self.assertEqual(recs[0].vs_ref, (3, pl.fnv1a(vs)))
             self.assertEqual((recs[0].vs_name, recs[0].ps_name), ("0000aaaa", "0000bbbb"))
+
+
+    def test_tessellated_record(self):
+        vs, ps, ls, hs = (struct.pack("<2I", 1, 2), struct.pack("<I", 3), struct.pack("<3I", 4, 5, 6), struct.pack("<I", 7))
+        rc = recipe(9, 1, vs, ps)
+        # A tessellated one: the LS and the hull after the tessellation state.
+        tess = struct.pack("<I", 1 | pl.TESS_HAS_LS | pl.TESS_HAS_HS) + bytes(9 * 4 + 16 + 8 + 48 + 8)
+        body = rc.body()[:-len(rc.tess)] + tess + struct.pack("<I", 3) + ls + pl.wstr("0000cccc") + struct.pack("<I", 2) + \
+            struct.pack("<I", 1) + hs + pl.wstr("0000dddd") + struct.pack("<I", 0xFFFFFFFF)
+        rc = pl.Recipe().parse(body)
+        self.assertEqual((rc.ls, rc.hs, rc.ls_name, rc.hs_name, rc.ls_sgpr), (ls, hs, "0000cccc", "0000dddd", 2))
+        self.assertEqual(rc.body(), body)
+        rc.flags |= pl.LS_REF
+        rc.ls_ref, rc.ls = (3, pl.fnv1a(ls)), None
+        again = pl.Recipe().parse(rc.body())
+        self.assertEqual((again.ls, again.ls_ref, again.hs), (None, (3, pl.fnv1a(ls)), hs))
 
 
 if __name__ == "__main__":

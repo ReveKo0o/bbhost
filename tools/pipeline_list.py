@@ -37,8 +37,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import shaderbnd  # noqa: E402
 
 MAGIC = 0x4D504242  # "BBPM"
-VERSION = 1
-VS_REF, PS_REF = 256, 512
+VERSION = 2  # 2: tessellated pipelines (their LS and hull programs, the LS's fetch shader)
+VS_REF, PS_REF, LS_REF, HS_REF = 256, 512, 1024, 2048
+TESS_HAS_LS, TESS_HAS_HS, TESS_HAS_FETCH = 64, 128, 256
 HAS_VERTEX_INPUT, RELINK = 4, 8
 GX_BLEND, GX_DEPTH, GX_RASTER = 66, 16, 20  # sizeof GxBlendDesc, GxDepthStencilDesc, GxRasterDesc
 BUNDLES = ("gxshader.shaderbnd.dcx", "gxrenderershader.shaderbnd.dcx", "gxposteffect.shaderbnd.dcx", "gxgui.shaderbnd.dcx",
@@ -94,6 +95,19 @@ def wstr(s):
     return w32(len(b)) + b
 
 
+def program(r, by_ref):
+    """A program's words (bytes), or None and its (count, hash) when named."""
+    if by_ref:
+        return None, (r.u32(), r.u64())
+    return r.words(), None
+
+
+def program_bytes(words, ref):
+    if words is None:
+        return w32(ref[0]) + struct.pack("<Q", ref[1])
+    return w32(len(words) // 4) + words
+
+
 class Recipe:
     """One record, kept as the bytes around its programs so it is written back as it was."""
 
@@ -106,34 +120,45 @@ class Recipe:
         state_at = r.p
         r.take(19 * 4 + 8 + (8 + 8 + 32 + 8 + 1) * 4 + GX_BLEND + GX_DEPTH + GX_RASTER)
         self.state = body[state_at:r.p]
-        if self.flags & VS_REF:
-            self.vs = None
-            self.vs_ref = (r.u32(), r.u64())
-        else:
-            self.vs = r.words()
+        self.vs, self.vs_ref = program(r, self.flags & VS_REF)
         self.fetch = r.words()
-        if self.flags & PS_REF:
-            self.ps = None
-            self.ps_ref = (r.u32(), r.u64())
-        else:
-            self.ps = r.words()
+        self.ps, self.ps_ref = program(r, self.flags & PS_REF)
         self.vs_name = r.str()
         self.ps_name = r.str()
-        self.tail = body[r.p:]  # dims, modes, vertex input, the relink's specialization
+        mid_at = r.p
+        # dims and modes of both stages, the vertex input, the relink's specialization
+        for size in (5, 5, 1, 1, 16, 12, 16):
+            r.take(size * r.u32())
+        r.take(8 + 128 + 128 + 4)
+        self.mid = body[mid_at:r.p]
+        tess_at = r.p
+        self.tess_flags = r.u32()
+        r.take(9 * 4 + 16 + 8 + 48 + 8)  # its registers, factors, constants and constant buffers
+        self.tess = body[tess_at:r.p]
+        self.ls = self.ls_ref = self.hs = self.hs_ref = None
+        self.ls_name = self.hs_name = ""
+        self.ls_sgpr = self.hs_sgpr = 0
+        if self.tess_flags & TESS_HAS_LS:
+            self.ls, self.ls_ref = program(r, self.flags & LS_REF)
+            self.ls_name, self.ls_sgpr = r.str(), r.u32()
+        if self.tess_flags & TESS_HAS_HS:
+            self.hs, self.hs_ref = program(r, self.flags & HS_REF)
+            self.hs_name, self.hs_sgpr = r.str(), r.u32()
+        self.ls_fetch = r.words() if self.tess_flags & TESS_HAS_FETCH else None
+        if r.p != r.end:
+            raise ValueError("a record longer than its fields")
         return self
 
     def body(self):
-        out = [w32(self.flags), struct.pack("<Q", self.key), w32(self.uses), w32(self.last_run), self.state]
-        if self.flags & VS_REF:
-            out.append(w32(self.vs_ref[0]) + struct.pack("<Q", self.vs_ref[1]))
-        else:
-            out.append(w32(len(self.vs) // 4) + self.vs)
-        out.append(w32(len(self.fetch) // 4) + self.fetch)
-        if self.flags & PS_REF:
-            out.append(w32(self.ps_ref[0]) + struct.pack("<Q", self.ps_ref[1]))
-        else:
-            out.append(w32(len(self.ps) // 4) + self.ps)
-        out += [wstr(self.vs_name), wstr(self.ps_name), self.tail]
+        out = [w32(self.flags), struct.pack("<Q", self.key), w32(self.uses), w32(self.last_run), self.state,
+               program_bytes(self.vs, self.vs_ref), w32(len(self.fetch) // 4) + self.fetch, program_bytes(self.ps, self.ps_ref),
+               wstr(self.vs_name), wstr(self.ps_name), self.mid, self.tess]
+        if self.tess_flags & TESS_HAS_LS:
+            out += [program_bytes(self.ls, self.ls_ref), wstr(self.ls_name), w32(self.ls_sgpr)]
+        if self.tess_flags & TESS_HAS_HS:
+            out += [program_bytes(self.hs, self.hs_ref), wstr(self.hs_name), w32(self.hs_sgpr)]
+        if self.tess_flags & TESS_HAS_FETCH:
+            out.append(w32(len(self.ls_fetch) // 4) + self.ls_fetch)
         return b"".join(out)
 
 
@@ -230,11 +255,13 @@ def describe(path, run, origin, recipes):
     for rc in recipes:
         names[rc.vs_name] += 1
         names[rc.ps_name] += 1
-    words = sum(len(rc.vs or b"") + len(rc.ps or b"") + len(rc.fetch) for rc in recipes)
-    print("%s: run %d, %d pipelines (%d with an optimized relink's specialization, %d on vertex input), %d programs by name; "
+    words = sum(len(rc.vs or b"") + len(rc.ps or b"") + len(rc.fetch) + len(rc.ls or b"") + len(rc.hs or b"") + len(rc.ls_fetch or b"")
+                for rc in recipes)
+    print("%s: run %d, %d pipelines (%d with an optimized relink's specialization, %d on vertex input, %d tessellated), %d programs by name; "
           "%.1f KiB of program words; made by translator %s on device %04x:%04x driver %08x%s" % (
               path, run, len(recipes), sum(1 for rc in recipes if rc.flags & RELINK),
-              sum(1 for rc in recipes if rc.flags & HAS_VERTEX_INPUT), len(names), words / 1024.0, origin["translator"][:12],
+              sum(1 for rc in recipes if rc.flags & HAS_VERTEX_INPUT), sum(1 for rc in recipes if rc.tess_flags & 1 or rc.tess_flags & 32),
+              len(names), words / 1024.0, origin["translator"][:12],
               origin["vendor"], origin["device"], origin["driver"], ", with pipeline libraries" if origin["libraries"] else ", whole pipelines"))
     used = Counter(rc.uses for rc in recipes)
     print("  starts that used each: %s" % ", ".join("%d: %d" % (k, used[k]) for k in sorted(used)))
@@ -292,8 +319,11 @@ def main():
                 left["a program neither the bundles nor the eboot hold" if args.eboot else
                      "a program the bundles do not hold (the eboot's own: give --eboot)"] += 1
                 continue
-            if rc.fetch and not rc.flags & HAS_VERTEX_INPUT:
+            if (rc.fetch and not rc.flags & HAS_VERTEX_INPUT) or rc.ls_fetch is not None:
                 left["a fetch shader's words (made at run time)"] += 1
+                continue
+            if (rc.ls is not None and rc.ls_name not in progs) or (rc.hs is not None and rc.hs_name not in progs):
+                left["a tessellation program neither the bundles nor the eboot hold"] += 1
                 continue
             for prog, name in ((rc.vs, rc.vs_name), (rc.ps, rc.ps_name)):
                 if prog:
@@ -309,6 +339,12 @@ def main():
                 rc.ps_ref = (len(rc.ps) // 4, fnv1a(rc.ps))
                 rc.ps = None
             rc.fetch = b""  # unused on vertex input (vs_translate_options)
+            if rc.ls is not None:
+                rc.flags |= LS_REF
+                rc.ls_ref, rc.ls = (len(rc.ls) // 4, fnv1a(rc.ls)), None
+            if rc.hs is not None:
+                rc.flags |= HS_REF
+                rc.hs_ref, rc.hs = (len(rc.hs) // 4, fnv1a(rc.hs)), None
             rc.uses = rc.last_run = 0
             out.append(rc)
         write_file(args.out, 0, origin, out)
@@ -325,7 +361,8 @@ def main():
         progs.setdefault(name, code)
     ok = bad = patched = 0
     for rc in recipes:
-        for flag, ref, name in ((VS_REF, getattr(rc, "vs_ref", None), rc.vs_name), (PS_REF, getattr(rc, "ps_ref", None), rc.ps_name)):
+        for flag, ref, name in ((VS_REF, rc.vs_ref, rc.vs_name), (PS_REF, rc.ps_ref, rc.ps_name), (LS_REF, rc.ls_ref, rc.ls_name),
+                                (HS_REF, rc.hs_ref, rc.hs_name)):
             if not rc.flags & flag:
                 continue
             code = progs.get(name)

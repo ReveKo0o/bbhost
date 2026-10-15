@@ -2950,6 +2950,11 @@ bool use_pipeline_library() {
 // workers, the no-fallback variants' builders); the command processor's builds
 // are the ones a draw waits for.
 thread_local bool t_pipeline_worker = false;
+// On a precompile worker building a recipe of the pipeline manifest:
+// create_gfx_pipeline keeps what it creates for the draws to take, and the
+// build leaves the run's statistics, the stage manifest and the table masks
+// alone (nothing draws with it).
+thread_local bool t_replaying = false;
 // What pipeline builds spend in the driver, by part: the shader libraries
 // (pre-rasterization, fragment shader), the small interface libraries (vertex
 // input, fragment output), links of libraries, whole pipelines (without
@@ -3923,6 +3928,24 @@ struct TessHullModule {
 };
 std::mutex g_tess_hull_mu;
 std::unordered_map<std::uint64_t, TessHullModule> g_tess_hull_modules;  // under g_tess_hull_mu
+// The LS and the hull of a tessellated pipeline built off the command
+// processor - the copies queue_native_pipeline made for a worker, or a
+// recipe's (the pipeline manifest) - and the LS's fetch shader for a recipe;
+// null elsewhere. program_at and fetch_program_at are the command processor's.
+thread_local const CachedProgram* t_tess_native_programs[2] = {nullptr, nullptr};
+thread_local const FetchProgram* t_tess_ls_fetch = nullptr;
+// A tessellated draw's LS (0) or hull (1): the copy above, else the program
+// at its address (on the command processor; a recipe's build has no other).
+const CachedProgram* tess_program(const DrawState& s, int which) {
+    if (t_tess_native_programs[which]) return t_tess_native_programs[which];
+    if (t_replaying) return nullptr;
+    return program_at(which ? s.hs_va : s.ls_va);
+}
+const FetchProgram* tess_ls_fetch_program(const DrawState& s) {
+    if (t_tess_ls_fetch) return t_tess_ls_fetch;
+    if (t_replaying || !s.ls_fetch_va) return nullptr;
+    return fetch_program_at(s.ls_fetch_va);
+}
 std::uint64_t tess_hull_key(const DrawState& s, const CachedProgram& hs) {
     const std::uint32_t k[6] = {s.hs_rsrc1, s.hs_rsrc2, s.tess_window, s.tess_control_points,
                                 (s.tess_quads ? 1u : 0u) | (s.tess_cw ? 2u : 0u) | static_cast<std::uint32_t>(s.tess_spacing) << 2,
@@ -3931,14 +3954,14 @@ std::uint64_t tess_hull_key(const DrawState& s, const CachedProgram& hs) {
 }
 // The control stage tess_hull_module made for a draw's state, or null.
 std::vector<std::uint32_t> tess_hull_spirv(const DrawState& s) {
-    CachedProgram* hs = program_at(s.hs_va);
+    const CachedProgram* hs = tess_program(s, 1);
     if (!hs) return {};
     std::lock_guard<std::mutex> lk(g_tess_hull_mu);
     const auto it = g_tess_hull_modules.find(tess_hull_key(s, *hs));
     return it == g_tess_hull_modules.end() ? std::vector<std::uint32_t>() : it->second.spirv;
 }
 VkShaderModule tess_hull_module(const DrawState& s, const std::string& dump_name) {
-    CachedProgram* hs = program_at(s.hs_va);
+    const CachedProgram* hs = tess_program(s, 1);
     if (!hs) return VK_NULL_HANDLE;
     const std::uint64_t key = tess_hull_key(s, *hs);
     std::lock_guard<std::mutex> lk(g_tess_hull_mu);
@@ -4168,6 +4191,11 @@ struct PipelineRecipe {
     bool cb_no_fallback = false, layout_only = false;
     bool has_vertex_input = false;
     VertexInputPlan vertex_input;  // its elements, bindings, attributes and hash (no buffers)
+    // A tessellated pipeline's LS and hull and the LS's fetch shader, as the
+    // build read them (tess_program; a recipe's build reads these copies).
+    bool has_ls = false, has_hs = false, has_ls_fetch = false;
+    CachedProgram ls, hs;
+    FetchProgram ls_fetch;
     // The optimized relink's specialization by its first draw (queue_library_relink).
     bool relink = false;
     std::uint32_t spec_w3[2][16] = {}, spec_stride[2][16] = {};
@@ -4207,14 +4235,20 @@ bool pipeline_manifest_on() {
     }();
     return on;
 }
-// The pipelines a recipe can describe: no tessellation of any kind.
-bool recipe_recordable(const DrawState& s) {
-    return !s.tess_hw && !s.domain_level && !s.tess_native && !s.tess_attrs && !s.tess_hull;
+bool recipe_tessellated(const DrawState& s) { return s.tess_hw || s.domain_level || s.tess_native || s.tess_attrs || s.tess_hull; }
+// A tessellated pipeline's LS fetch shader, where it may be asked for: the
+// recipe's copy, else on the command processor (fetch_program_at is its own).
+const FetchProgram* tess_ls_fetch_safe(const DrawState& s) {
+    if (t_tess_ls_fetch || t_replaying) return t_tess_ls_fetch;
+    return t_pipeline_worker || !s.tess_attrs ? nullptr : tess_ls_fetch_program(s);
 }
-// On a precompile worker building a recipe: create_gfx_pipeline keeps what it
-// creates for the draws to take, and the build leaves the run's statistics,
-// the stage manifest and the table masks alone (nothing draws with it).
-thread_local bool t_replaying = false;
+// The pipelines a recipe can describe: every one whose tessellation
+// programs, if it has any, can be read where it is built (a worker reads only
+// the copies it was given).
+bool recipe_recordable(const DrawState& s) {
+    if (!recipe_tessellated(s)) return true;
+    return !t_pipeline_worker || t_tess_native_programs[0] || t_tess_native_programs[1];
+}
 thread_local std::uint64_t t_replay_key = 0;  // the content key create_gfx_pipeline gave the pipeline built from a recipe
 constexpr std::size_t kRecipeMax = 16384;
 constexpr std::uint64_t kRecipeMaxBytes = 64ull << 20;
@@ -4249,7 +4283,8 @@ static_assert(sizeof(GfxFixedState) == 184, "a new GfxFixedState field: add it t
 // links from libraries, the geometry shader of a rect list, the vertex input
 // and the fixed state - where it links from libraries only what the libraries
 // take (depth, stencil, cull and front face are set per draw).
-std::uint64_t pipeline_content_key(const GfxPipeline& pl, const GfxFixedState& f, const VertexInputPlan* vertex_input, bool linked) {
+std::uint64_t pipeline_content_key(const GfxPipeline& pl, const DrawState& s, const GfxFixedState& f, const VertexInputPlan* vertex_input,
+                                   bool linked) {
     struct Head {
         std::uint64_t vs, ps, vi;
         std::uint32_t linked, gs, topology, polygon, clamp, lean, layout_only, formats_from_params, clip_discard, pad;
@@ -4292,6 +4327,37 @@ std::uint64_t pipeline_content_key(const GfxPipeline& pl, const GfxFixedState& f
         r.back = f.back;
         k = fnv1a(&r, sizeof(r), k ^ 0x7710);
     }
+    if (recipe_tessellated(s)) {
+        // What the tessellation stages are made from: the draw's state for
+        // them and the programs (their words' hashes).
+        struct Tess {
+            std::uint32_t hw, control_points, attrs, attr_vec4s, ls_rsrc1, ls_rsrc2, hull, hs_rsrc1, hs_rsrc2, window, shape, native, domain_level;
+            float outer[4], inner[2];
+            std::uint32_t constants[12], cb[2];
+            std::uint64_t ls, hs, fetch;
+        } t{};
+        t.hw = s.tess_hw;
+        t.control_points = s.tess_control_points;
+        t.attrs = s.tess_attrs;
+        t.attr_vec4s = s.tess_attr_vec4s;
+        t.ls_rsrc1 = s.ls_rsrc1;
+        t.ls_rsrc2 = s.ls_rsrc2;
+        t.hull = s.tess_hull;
+        t.hs_rsrc1 = s.hs_rsrc1;
+        t.hs_rsrc2 = s.hs_rsrc2;
+        t.window = s.tess_window;
+        t.shape = (s.tess_quads ? 1u : 0u) | (s.tess_cw ? 2u : 0u) | static_cast<std::uint32_t>(s.tess_spacing) << 2;
+        t.native = s.tess_native;
+        t.domain_level = s.domain_level;
+        std::memcpy(t.outer, s.tess_outer, sizeof(t.outer));
+        std::memcpy(t.inner, s.tess_inner, sizeof(t.inner));
+        std::memcpy(t.constants, s.tess_constants, sizeof(t.constants));
+        std::memcpy(t.cb, s.tess_cb, sizeof(t.cb));
+        if (const CachedProgram* ls = s.ls_va || t_tess_native_programs[0] ? tess_program(s, 0) : nullptr) t.ls = ls->hash;
+        if (const CachedProgram* hs = s.hs_va || t_tess_native_programs[1] ? tess_program(s, 1) : nullptr) t.hs = hs->hash;
+        if (const FetchProgram* fp = tess_ls_fetch_safe(s)) t.fetch = fp->hash;
+        k = fnv1a(&t, sizeof(t), k ^ 0x7e55ull);
+    }
     return k ? k : 1;
 }
 // At a build (not one from a recipe): what it was built from, for the
@@ -4308,6 +4374,31 @@ void recipe_note_build(GfxPipeline& pl, const DrawState& s, const std::vector<st
     }
     auto r = std::make_shared<PipelineRecipe>();
     r->s = s;
+    if (recipe_tessellated(s)) {
+        // Copies of the programs the build reads; one it cannot read now
+        // leaves the pipeline unrecorded (its build would fail anyway).
+        const CachedProgram* ls = s.ls_va || t_tess_native_programs[0] ? tess_program(s, 0) : nullptr;
+        const CachedProgram* hs = s.hs_va || t_tess_native_programs[1] ? tess_program(s, 1) : nullptr;
+        if ((s.ls_va && !ls) || (s.hs_va && !hs)) {
+            pl.recipe.reset();
+            return;
+        }
+        if (ls) {
+            r->has_ls = true;
+            r->ls = *ls;
+        }
+        if (hs) {
+            r->has_hs = true;
+            r->hs = *hs;
+        }
+        if (const FetchProgram* fp = tess_ls_fetch_safe(s)) {
+            r->has_ls_fetch = true;
+            r->ls_fetch = *fp;
+        } else if (s.tess_attrs && s.ls_fetch_va) {
+            pl.recipe.reset();
+            return;
+        }
+    }
     for (int t = 0; t < 8; ++t) r->color_format[t] = s.color[t] ? static_cast<std::uint32_t>(s.color[t]->format) : 0u;
     r->depth_format = s.depth ? static_cast<std::uint32_t>(s.depth->format) : 0u;
     if (s.gx_blend) r->blend = *s.gx_blend;
@@ -4517,9 +4608,6 @@ void note_vs_precompile_miss(const std::string& name, const VsStageInputs& in);
 // --native replays.
 constexpr std::uint32_t kTessNativeSet = 4, kTessNativeLsParams = 0, kTessNativeHsParams = 1, kTessNativeLsBuffers = 16,
                         kTessNativeHsBuffers = 32;
-// The LS and hull of the native hull pipeline a worker is building
-// (queue_native_pipeline), null elsewhere.
-thread_local const CachedProgram* t_tess_native_programs[2] = {nullptr, nullptr};
 
 // Where a stage reads the tessellation constants (tess_constants_where): the
 // constant buffer's V# in its user SGPRs, or in the extended user data table
@@ -4618,8 +4706,8 @@ bool tess_native_first(const std::string& name) {
 bool build_tess_native_stages(GfxPipeline& pl, const DrawState& s, const VertexInputPlan* vertex_input, std::string& why) {
     // On a worker, the copies queue_native_pipeline made (program_at is the
     // command processor's); in place, the programs themselves.
-    const CachedProgram* ls = t_tess_native_programs[0] ? t_tess_native_programs[0] : program_at(s.ls_va);
-    const CachedProgram* hs = t_tess_native_programs[1] ? t_tess_native_programs[1] : program_at(s.hs_va);
+    const CachedProgram* ls = tess_program(s, 0);
+    const CachedProgram* hs = tess_program(s, 1);
     if (!ls || !hs) {
         why = "the LS or the hull shader is not a known program";
         return false;
@@ -5104,8 +5192,8 @@ GfxPipeline& build_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const std::
     pl.tess_attrs = s.tess_attrs;
     pl.tess_attr_vec4s = s.tess_attr_vec4s;
     if (pl.tess_attrs) {
-        CachedProgram* ls = program_at(s.ls_va);
-        const FetchProgram* fetch = s.ls_fetch_va ? fetch_program_at(s.ls_fetch_va) : nullptr;
+        const CachedProgram* ls = tess_program(s, 0);
+        const FetchProgram* fetch = tess_ls_fetch_program(s);
         if (!ls || (s.ls_fetch_va && !fetch)) return fail("tessellation LS program");
         // On the vertex input the draw planned for the LS's elements, its lift
         // (gcn::lift_ls_shader) takes them in place of the fetch shader: a key
@@ -5236,7 +5324,7 @@ GfxPipeline& build_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const std::
         // gcn::lift_constant_hull shows the program is only that: the same
         // factors as the host's own reading of them (hs_constant_factors),
         // nothing else it writes that the evaluation stage reads.
-        if (CachedProgram* hs = (g_lift_tess & kLiftTessHull) && pl.tess_attrs ? program_at(s.hs_va) : nullptr; hs && decomp_selects(hs->name)) {
+        if (const CachedProgram* hs = (g_lift_tess & kLiftTessHull) && pl.tess_attrs ? tess_program(s, 1) : nullptr; hs && decomp_selects(hs->name)) {
             const gcn::Program hprog = gcn::decode(hs->words.data(), hs->words.size());
             const gcn::HullLift lifted = gcn::lift_constant_hull(hprog);
             float host[6] = {};
@@ -6198,6 +6286,8 @@ void replay_recipe(Precompiler& w, const std::shared_ptr<const PipelineRecipe>& 
     const VertexInputPlan* vi = r.has_vertex_input ? &r.vertex_input : nullptr;
     reflection_from_bundle(r.vs_name);
     reflection_from_bundle(r.ps_name);
+    if (r.has_ls) reflection_from_bundle(r.ls.name);
+    if (r.has_hs) reflection_from_bundle(r.hs.name);
     // Whether the pixel shader can discard, learnt as its compile at creation
     // learns it (precompile_ps): its key's early fragment tests follow that
     // (ps_early_tests_matter), and a draw later in the run asks with it known.
@@ -6215,10 +6305,15 @@ void replay_recipe(Precompiler& w, const std::shared_ptr<const PipelineRecipe>& 
     t_replaying = true;
     t_replay_key = 0;
     t_library_owner = r.vs_name.c_str();
+    t_tess_native_programs[0] = r.has_ls ? &r.ls : nullptr;
+    t_tess_native_programs[1] = r.has_hs ? &r.hs : nullptr;
+    t_tess_ls_fetch = r.has_ls_fetch ? &r.ls_fetch : nullptr;
     build_gfx_pipeline(*pl, s, r.vs_words, r.fetch_words, r.ps_words, r.vs_name, r.ps_name, r.vs_dims, r.ps_dims, r.vs_modes, r.ps_modes,
                        r.cb_no_fallback, vi, false, r.layout_only);
     bool ok = !pl->failed && create_gfx_pipeline(*pl, s, vi, r.fetch_words.size());
     const std::uint64_t key = t_replay_key;
+    t_tess_native_programs[0] = t_tess_native_programs[1] = nullptr;
+    t_tess_ls_fetch = nullptr;
     t_library_owner = nullptr;
     t_replaying = false;
     ok = ok && key != 0 && pl->pipeline;
@@ -7226,7 +7321,7 @@ bool read(Reader& r, ManifestStage& m) {
 
 namespace recipe_file {
 constexpr std::uint32_t kMagic = 0x4d504242;  // "BBPM"
-constexpr std::uint32_t kVersion = 1;
+constexpr std::uint32_t kVersion = 2;  // 2: tessellated pipelines
 using manifest_file::Reader;
 using manifest_file::Writer;
 // What made the file: the translator and the device, for the report (the
@@ -7367,6 +7462,25 @@ void write(Writer& out, const PipelineRecipe& rc) {
     pod(w, rc.spec_w3);
     pod(w, rc.spec_stride);
     pod(w, rc.spec_w3_mask);
+    // Tessellation: the draw state for it, then the programs (a list names the
+    // LS and the hull as it names the others: flags 1024 and 2048).
+    w.u32((s.tess_hw ? 1u : 0u) | (s.tess_attrs ? 2u : 0u) | (s.tess_hull ? 4u : 0u) | (s.tess_quads ? 8u : 0u) | (s.tess_cw ? 16u : 0u) |
+          (s.tess_native ? 32u : 0u) | (rc.has_ls ? 64u : 0u) | (rc.has_hs ? 128u : 0u) | (rc.has_ls_fetch ? 256u : 0u));
+    for (std::uint32_t v : {s.tess_control_points, s.tess_attr_vec4s, s.ls_rsrc1, s.ls_rsrc2, s.hs_rsrc1, s.hs_rsrc2, s.tess_window,
+                            static_cast<std::uint32_t>(s.tess_spacing), s.domain_level}) {
+        w.u32(v);
+    }
+    pod(w, s.tess_outer);
+    pod(w, s.tess_inner);
+    pod(w, s.tess_constants);
+    pod(w, s.tess_cb);
+    for (const CachedProgram* cp : {rc.has_ls ? &rc.ls : nullptr, rc.has_hs ? &rc.hs : nullptr}) {
+        if (!cp) continue;
+        words(w, cp->words);
+        str(w, cp->name);
+        w.u32(static_cast<std::uint32_t>(cp->fetch_sgpr));
+    }
+    if (rc.has_ls_fetch) words(w, rc.ls_fetch.words);
     out.u32(static_cast<std::uint32_t>(w.out.size()));
     out.out.insert(out.out.end(), w.out.begin(), w.out.end());
 }
@@ -7474,7 +7588,54 @@ bool read(Reader& in, PipelineRecipe& rc) {
     pod(r, rc.spec_w3);
     pod(r, rc.spec_stride);
     pod(r, rc.spec_w3_mask);
-    return r.ok && !rc.vs_words.empty() && rc.key != 0;
+    const std::uint32_t tf = r.u32();
+    s.tess_hw = tf & 1;
+    s.tess_attrs = tf & 2;
+    s.tess_hull = tf & 4;
+    s.tess_quads = tf & 8;
+    s.tess_cw = tf & 16;
+    s.tess_native = tf & 32;
+    rc.has_ls = tf & 64;
+    rc.has_hs = tf & 128;
+    rc.has_ls_fetch = tf & 256;
+    std::uint32_t spacing = 0;
+    for (std::uint32_t* v : {&s.tess_control_points, &s.tess_attr_vec4s, &s.ls_rsrc1, &s.ls_rsrc2, &s.hs_rsrc1, &s.hs_rsrc2, &s.tess_window, &spacing,
+                             &s.domain_level}) {
+        *v = r.u32();
+    }
+    s.tess_spacing = static_cast<int>(spacing);
+    pod(r, s.tess_outer);
+    pod(r, s.tess_inner);
+    pod(r, s.tess_constants);
+    pod(r, s.tess_cb);
+    const bool ls_ref = f & 1024, hs_ref = f & 2048;
+    for (CachedProgram* cp : {rc.has_ls ? &rc.ls : nullptr, rc.has_hs ? &rc.hs : nullptr}) {
+        if (!cp) continue;
+        const bool ref = cp == &rc.ls ? ls_ref : hs_ref;
+        std::uint32_t count = 0;
+        std::uint64_t hash = 0;
+        if (ref) {
+            count = r.u32();
+            pod(r, hash);
+        } else {
+            words(r, cp->words);
+        }
+        if (!str(r, cp->name)) return false;
+        cp->fetch_sgpr = static_cast<int>(r.u32());
+        if (ref && !from_bundle(cp->name, count, hash, cp->words)) return false;
+        cp->hash = fnv1a(cp->words.data(), cp->words.size() * 4);
+        std::memset(cp->head, 0, sizeof(cp->head));
+    }
+    if (rc.has_ls_fetch) {
+        words(r, rc.ls_fetch.words);
+        rc.ls_fetch.hash = fnv1a(rc.ls_fetch.words.data(), rc.ls_fetch.words.size() * 4);
+    }
+    // The addresses the build tests for a program are the run's that recorded
+    // it; the recipe's build takes the copies (tess_program).
+    if (!rc.has_ls) s.ls_va = 0;
+    if (!rc.has_hs) s.hs_va = 0;
+    if (!rc.has_ls_fetch) s.ls_fetch_va = 0;
+    return r.ok && r.p == r.end && !rc.vs_words.empty() && rc.key != 0;
 }
 }  // namespace recipe_file
 
@@ -7806,8 +7967,8 @@ bool create_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const VertexInputP
     const GfxFixedState f = fixed_state(s);
     // The pipeline manifest: a pipeline the start built from a recipe is
     // taken as it is; one built here goes into the manifest for the next.
-    const std::uint64_t content_key = g_pmanifest.recording.load(std::memory_order_relaxed) && recipe_recordable(s) && !pl.tess_hw
-                                          ? pipeline_content_key(pl, f, vertex_input, linked)
+    const std::uint64_t content_key = g_pmanifest.recording.load(std::memory_order_relaxed) && recipe_recordable(s)
+                                          ? pipeline_content_key(pl, s, f, vertex_input, linked)
                                           : 0;
     t_replay_key = t_replaying ? content_key : 0;
     if (content_key && !t_replaying && take_prebuilt(pl, content_key)) {
