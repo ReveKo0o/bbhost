@@ -14278,6 +14278,26 @@ static bool draw_impl(const GpuDraw& d) {
             for (std::uint64_t m = st->obj_tex_set; m; m &= m - 1) texture_view_by_id_prefetch(st->obj_tex_id[__builtin_ctzll(m)]);
         }
     }
+    // And the constant buffers' first lines, which the snapshots copy a few
+    // microseconds on (resolve_stage_buffers): written by the game on other
+    // cores, they were a miss each as the copy reached them. A prefetch of a
+    // bad address is harmless. BBHOST_CB_PREFETCH=0: not asked for.
+    static const bool cb_prefetch = [] {
+        const char* e = std::getenv("BBHOST_CB_PREFETCH");
+        return !(e && e[0] == '0');
+    }();
+    if (cb_prefetch) {
+        for (const GxStageRecords* st : gx_stage) {
+            if (!st) continue;
+            for (std::uint32_t m = st->obj_cb_set; m; m &= m - 1) {
+                std::uint32_t rec[3];
+                std::memcpy(rec, st->obj_cb + __builtin_ctz(m) * 16, sizeof(rec));
+                const std::uint64_t va = rec[0] | (static_cast<std::uint64_t>(rec[1] & 0xfff) << 32);
+                const std::uint64_t bytes = std::min<std::uint64_t>(static_cast<std::uint64_t>(rec[2]) * 16, 256);
+                for (std::uint64_t off = 0; off < bytes; off += 64) __builtin_prefetch(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(va + off)));
+            }
+        }
+    }
     // With binding plans the index is only a reset: the few resolutions left
     // outside the plans scan the descriptors, and a recycled record set must
     // not find the last draw's index.
