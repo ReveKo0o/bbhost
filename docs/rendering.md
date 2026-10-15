@@ -60,7 +60,12 @@ stream as typed records (`src/host/recorder.cpp`, `src/host/stream_ops.h`).
 `bb-record` replays the stream into command buffers, begins and ends each one
 and hands it to the thread that submits, while the command processor goes on
 to the next draw. With `BBHOST_STREAM_SUBMIT=0` the command processor begins,
-ends and submits the command buffers itself, to compare.
+ends and submits the command buffers itself, to compare. The submitting
+thread, `bb-submit`, gives the queue the game's submissions as they come; when
+it falls behind - where the kernel's half of a submission is costly, as on a
+Steam Deck, whose driver makes every import of the game's memory resident
+again at each one - the submissions queued behind each other go to the queue
+as one (`BBHOST_SUBMIT_MERGE=1` keeps them apart, to compare).
 
 **Shaders.** GCN shaders are converted to SPIR-V when the game creates them
 (the few that cannot be, at their first draw), so most pipelines are ready
