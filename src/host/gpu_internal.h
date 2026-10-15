@@ -773,6 +773,11 @@ void shadow_locate_locked(std::uint64_t va, std::uint64_t bytes, Located& loc);
 // becomes the copy. False, `loc` unchanged, for a range past 1 MiB, one the
 // GPU writes earlier in this recording, or no room left in the staging chunks.
 bool shadow_stage_locked(std::uint64_t va, std::uint64_t bytes, Located& loc);
+// The bytes [va, va+bytes) of a page the game keeps rewriting, copied on the
+// CPU as the draw records into a ring the GPU reads; `loc` becomes the copy.
+// False, `loc` unchanged, for a range on no dynamic page, past 1 MiB, or one a
+// GPU write is still to land on (BBHOST_VERTEX_SNAPSHOT).
+bool shadow_snapshot_locked(std::uint64_t va, std::uint64_t bytes, Located& loc);
 void shadow_written_locked(std::uint64_t va, std::uint64_t bytes, bool by_gpu);
 // BBHOST_INDIRECT_STATS=1: an indirect dispatch (kind 0) or draw (1, 2
 // indexed) recorded now, whose arguments are read once its submission is
@@ -995,6 +1000,8 @@ void vb_race_retired_locked(std::uint64_t serial);
 // land - recorded in a submission that has not retired. Caller holds the lock.
 void gpu_writes_note_locked(std::uint64_t va, std::uint64_t bytes);
 bool gpu_writes_pending_locked(std::uint64_t va, std::uint64_t bytes);
+// Whether a GPU write over [va, va+bytes) was recorded in recording `serial` or later.
+bool gpu_wrote_since_locked(std::uint64_t va, std::uint64_t bytes, std::uint64_t serial);
 extern std::uint64_t g_draw_rec_next;
 
 // A compute shader's pipeline at its first use, with or without the driver's

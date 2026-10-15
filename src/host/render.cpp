@@ -405,6 +405,7 @@ const int g_vertex_input = [] {
 std::atomic<std::uint64_t> g_vertex_input_draws{0}, g_vertex_input_kept{0}, g_vertex_tables_read{0};
 std::atomic<std::uint64_t> g_vertex_tables_with_input{0};  // vertex-input draws whose vertex shader still reads the table
 std::atomic<std::uint64_t> g_vertex_staged_records{0};  // plan_vertex_input: records copied into device memory for their draw
+std::atomic<std::uint64_t> g_vertex_snapshot_records{0};  // plan_vertex_input: records the game rewrites, copied as recorded
 std::atomic<std::uint64_t> g_vertex_window_records{0};  // plan_vertex_input: records read from the draw's window copy
 std::atomic<std::uint64_t> g_vertex_input_no_gx_draws{0}, g_vertex_input_no_gx_kept{0};  // BBHOST_VERTEX_INPUT_NO_GX
 // BBHOST_GX_SKIP_TABLES (on unless 0): GX draws leave out of the
@@ -885,8 +886,82 @@ const bool g_vb_race = [] {
 }();
 std::deque<VbWatch> g_vb_watch;
 std::uint64_t g_vb_checked = 0, g_vb_changed = 0, g_vb_changed_bytes = 0;
+std::uint64_t g_vb_gpu_written = 0;  // changed by a GPU write recorded with or after the draw: not a race
 std::map<std::string, std::uint64_t> g_vb_changed_by_pipeline;
+// A watched range's bytes: all of them up to 64 KiB, past that its first and
+// last 16 KiB - a vertex ring the game rewrites changes there too, and hashing
+// every draw's whole vertex records would make the run CPU-bound, which is
+// when the race goes away. Eight bytes a step.
+std::uint64_t vb_race_hash(std::uint64_t va, std::uint64_t bytes) {
+    const auto span = [](const std::uint8_t* p, std::uint64_t n, std::uint64_t h) {
+        std::uint64_t i = 0;
+        for (; i + 8 <= n; i += 8) {
+            std::uint64_t w;
+            std::memcpy(&w, p + i, 8);
+            h = (h ^ w) * 0x100000001b3ull;
+            h ^= h >> 29;
+        }
+        for (; i < n; ++i) h = (h ^ p[i]) * 0x100000001b3ull;
+        return h;
+    };
+    const auto* p = reinterpret_cast<const std::uint8_t*>(static_cast<std::uintptr_t>(va));
+    constexpr std::uint64_t kWhole = 64u << 10, kEnd = 16u << 10;
+    if (bytes <= kWhole) return span(p, bytes, 0x9e3779b97f4a7c15ull ^ bytes);
+    return span(p + bytes - kEnd, kEnd, span(p, kEnd, 0x9e3779b97f4a7c15ull ^ bytes));
+}
 }  // namespace
+// The vertex records and the index range of the draw being resolved
+// (plan_vertex_input, the draw's record), watched under BBHOST_VB_RACE.
+struct VbRaceRange {
+    std::uint64_t va, bytes;
+};
+thread_local VbRaceRange t_vb_race_ranges[8];
+thread_local std::size_t t_vb_race_n = 0;
+// The vertices the draw being resolved reads - for a copy of a vertex record
+// the game rewrites taken as it records (shadow_snapshot_locked), the bytes up
+// to its last vertex rather than the record's whole extent (a 4 MiB ring an
+// effect's draw reads a few hundred bytes of). Set by draw_impl before its
+// vertex input is planned; known only for a draw whose count and base it
+// records with (not indirect, not tessellated).
+struct DrawVertexSpan {
+    bool known = false;
+    std::uint64_t index_va = 0;  // indexed: its indices, read for the highest
+    std::uint32_t count = 0, index_type = 0;
+    std::int64_t base = 0;  // VGT_INDX_OFFSET: added to every index, or the first vertex
+    bool worked_out = false;
+    std::int64_t last = -1;  // the highest vertex read (-1: unknown)
+};
+thread_local DrawVertexSpan t_vertex_span;
+
+// The draw's highest vertex, once per draw: the base plus the count, or the
+// largest of its indices (primitive restart is off: every index is a vertex).
+bool draw_last_vertex(std::int64_t& last) {
+    DrawVertexSpan& v = t_vertex_span;
+    if (!v.known || !v.count) return false;
+    if (!v.worked_out) {
+        v.worked_out = true;
+        v.last = -1;
+        if (!v.index_va) {
+            v.last = v.base + v.count - 1;
+        } else {
+            const std::uint64_t ib = static_cast<std::uint64_t>(v.count) * (v.index_type ? 4u : 2u);
+            if (hle_kernel_va_mapped(v.index_va, ib) && !gpu_writes_pending_locked(v.index_va, ib)) {
+                std::uint32_t hi = 0;
+                if (v.index_type) {
+                    const auto* p = reinterpret_cast<const std::uint32_t*>(static_cast<std::uintptr_t>(v.index_va));
+                    for (std::uint32_t i = 0; i < v.count; ++i) hi = std::max(hi, p[i]);
+                } else {
+                    const auto* p = reinterpret_cast<const std::uint16_t*>(static_cast<std::uintptr_t>(v.index_va));
+                    for (std::uint32_t i = 0; i < v.count; ++i) hi = std::max<std::uint32_t>(hi, p[i]);
+                }
+                v.last = v.base + hi;
+            }
+        }
+    }
+    if (v.last < 0) return false;
+    last = v.last;
+    return true;
+}
 
 bool vb_race_on() { return g_vb_race; }
 
@@ -900,12 +975,19 @@ void vb_race_note_locked(const char* name, std::uint64_t va, std::uint64_t bytes
         if (g.timeline && vkGetSemaphoreCounterValue(g.device, g.timeline, &done) == VK_SUCCESS && done)
             vb_race_retired_locked(done - 1);
     }
-    if (!bytes || bytes > (64u << 10) || g_vb_watch.size() > (1u << 20) || !hle_kernel_va_mapped(va, bytes)) return;
+    if (!bytes || bytes > (16u << 20) || g_vb_watch.size() > (1u << 20) || !hle_kernel_va_mapped(va, bytes)) return;
+    // Once a submission: a mesh's records are read by many of its draws.
+    static std::uint64_t seen_key[4096], seen_serial[4096];
+    const std::uint64_t key = va ^ (bytes << 40);
+    const std::size_t slot = static_cast<std::size_t>((key * 0x9e3779b97f4a7c15ull) >> 52);
+    if (seen_key[slot] == key && seen_serial[slot] == g.flushes + 1) return;
+    seen_key[slot] = key;
+    seen_serial[slot] = g.flushes + 1;
     VbWatch w{};
     w.serial = g.flushes;
     w.va = va;
     w.bytes = bytes;
-    w.hash = fnv1a(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(va)), bytes);
+    w.hash = vb_race_hash(va, bytes);
     std::memcpy(w.head, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(va)), std::min<std::uint64_t>(bytes, sizeof(w.head)));
     w.flip = hle_video_flip_count();
     std::snprintf(w.name, sizeof(w.name), "%s", name);
@@ -917,7 +999,12 @@ void vb_race_retired_locked(std::uint64_t serial) {
     while (!g_vb_watch.empty() && g_vb_watch.front().serial <= serial) {
         const VbWatch& w = g_vb_watch.front();
         ++g_vb_checked;
-        if (fnv1a(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(w.va)), w.bytes) != w.hash) {
+        const bool changed = hle_kernel_va_mapped(w.va, w.bytes) && vb_race_hash(w.va, w.bytes) != w.hash;
+        // A GPU write recorded with or after the draw (a simulation dispatch
+        // rewriting its ring): the draw read before it in the GPU's order.
+        if (changed && gpu_wrote_since_locked(w.va, w.bytes, w.serial)) {
+            ++g_vb_gpu_written;
+        } else if (changed) {
             ++g_vb_changed;
             g_vb_changed_bytes += w.bytes;
             ++g_vb_changed_by_pipeline[w.name];
@@ -950,9 +1037,10 @@ void vb_race_retired_locked(std::uint64_t serial) {
         reported = g_vb_checked;
         std::string top;
         for (const auto& [n, c] : g_vb_changed_by_pipeline) top += " " + n + ":" + std::to_string(c);
-        host_log("vb race: %llu of %llu draws' vertices changed before their submission retired (%llu bytes);%s",
+        host_log("vb race: %llu of %llu draws' vertices changed before their submission retired (%llu bytes), %llu more by a GPU "
+                 "write recorded with or after the draw (in order: not a race);%s",
                  static_cast<unsigned long long>(g_vb_changed), static_cast<unsigned long long>(g_vb_checked),
-                 static_cast<unsigned long long>(g_vb_changed_bytes), top.c_str());
+                 static_cast<unsigned long long>(g_vb_changed_bytes), static_cast<unsigned long long>(g_vb_gpu_written), top.c_str());
     }
 }
 std::uint32_t g_draw_dummies = 0;
@@ -4244,6 +4332,34 @@ GfxPipeline& build_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const std::
             // descriptor sets are unchanged; a rejection keeps the translation.
             if (ps_lift) {
                 gcn::LiftResult lifted = lift_cached(false, ps_prog, po, pl.ps.meta());
+                // BBHOST_LIFT_LISTING=<PS>[,<PS>...]: its lift's listing (the
+                // program with each write's typed value, regions marked) in
+                // build/pipeline-stats, lifted again past the cache, which keeps
+                // no listing.
+                static const std::string listing_for = [] {
+                    const char* e = std::getenv("BBHOST_LIFT_LISTING");
+                    return std::string(e ? e : "");
+                }();
+                if (!listing_for.empty() && listing_for.find(ps_name) != std::string::npos) {
+                    static std::mutex listed_mu;
+                    static std::set<std::string> listed;
+                    bool fresh;
+                    {
+                        std::lock_guard<std::mutex> lk(listed_mu);
+                        fresh = listed.insert(ps_name).second;
+                    }
+                    if (fresh) {
+                        const gcn::LiftResult again = gcn::lift_pixel_shader(ps_prog, po, pl.ps.meta());
+                        std::error_code ec;
+                        std::filesystem::create_directories("build/pipeline-stats", ec);
+                        if (FILE* f = std::fopen(("build/pipeline-stats/" + ps_name + ".lift.txt").c_str(), "w")) {
+                            std::fputs(again.listing.c_str(), f);
+                            for (const std::string& p : again.proof) std::fprintf(f, "proof: %s\n", p.c_str());
+                            for (const auto& r : again.rejections) std::fprintf(f, "rejected: %s\n", r.c_str());
+                            std::fclose(f);
+                        }
+                    }
+                }
                 static std::mutex logged_mu;  // no-fallback variants build on the pipeline workers
                 static std::set<std::string> logged;
                 bool first;
@@ -8108,8 +8224,10 @@ void render_report() {
                  "read them %llu; tables the game bound itself, read from memory %llu",
                  static_cast<unsigned long long>(g_vertex_input_draws.load()), static_cast<unsigned long long>(g_vertex_input_kept.load()),
                  static_cast<unsigned long long>(g_vertex_tables_with_input.load()), static_cast<unsigned long long>(g_vertex_tables_read.load()));
-        host_log("render: vertex records the buffer shadow keeps in host memory, copied into device memory for their draw %llu",
-                 static_cast<unsigned long long>(g_vertex_staged_records.load()));
+        host_log("render: vertex records the buffer shadow keeps in host memory, copied into device memory for their draw %llu; "
+                 "records the game rewrites, copied as their draw recorded %llu",
+                 static_cast<unsigned long long>(g_vertex_staged_records.load()),
+                 static_cast<unsigned long long>(g_vertex_snapshot_records.load()));
         host_log("render: draws without GX geometry with vertex input from their fetch shader's table %llu, fetch shader kept %llu; "
                  "vertex records read from the draw's window copy %llu",
                  static_cast<unsigned long long>(g_vertex_input_no_gx_draws.load()), static_cast<unsigned long long>(g_vertex_input_no_gx_kept.load()),
@@ -9310,8 +9428,40 @@ void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t
                 params.cb_bias_dw[i] = static_cast<std::uint32_t>(bias / 4);
                 outcome = kBound;
                 if (in_window) note_copy_binding_locked(info, base - bias);
-                if (!b.written && version == kCopyVersionNone && !in_window)
-                    vb_race_note_locked(t_draw_pipeline ? t_draw_pipeline : "constants", base, bytes);
+                // BBHOST_INPLACE_STATS=1: constant buffers a draw reads where
+                // they are, by pipeline and why - on a discrete GPU that is
+                // host memory, read across the bus at every access.
+                static const bool inplace_stats = [] {
+                    const char* e = std::getenv("BBHOST_INPLACE_STATS");
+                    return e && e[0] == '1';
+                }();
+                if (inplace_stats) {
+                    struct Use {
+                        std::uint64_t binds = 0, bytes = 0;
+                    };
+                    static std::map<std::string, Use> uses;
+                    static std::uint64_t total = 0;
+                    const char* why = in_window ? "window" : version != kCopyVersionNone ? "version" : b.written ? "stored"
+                                      : gpu_writes_pending_locked(base, bytes)            ? "gpu-pending"
+                                                                                          : "cpu";
+                    Use& u = uses[std::string(why) + ":" + (t_draw_pipeline ? t_draw_pipeline : "?")];
+                    ++u.binds;
+                    u.bytes += bytes;
+                    if (++total % 2'000'000 == 0) {
+                        std::vector<std::pair<std::uint64_t, std::string>> top;
+                        for (const auto& [k, v] : uses) top.push_back({v.binds, k + " " + std::to_string(v.binds) + " (" + std::to_string(v.bytes >> 20) + " MiB)"});
+                        std::sort(top.rbegin(), top.rend());
+                        std::string line;
+                        for (std::size_t k = 0; k < top.size() && k < 16; ++k) line += "; " + top[k].second;
+                        host_log("render: constant buffers bound in place, %llu so far, by why:pipeline%s", static_cast<unsigned long long>(total),
+                                 line.c_str());
+                    }
+                }
+                if (vb_race_on() && !b.written && version == kCopyVersionNone && !in_window && !gpu_writes_pending_locked(base, bytes)) {
+                    char tag[40];
+                    std::snprintf(tag, sizeof(tag), "c:%s", t_draw_pipeline ? t_draw_pipeline : "constants");
+                    vb_race_note_locked(tag, base, bytes);
+                }
                 note_arena_read(kArenaConstants, base, bytes);
                 // The draw writes this memory as it runs: no mirror copy made in
                 // this recording serves it as vertex or index data before that.
@@ -9868,6 +10018,7 @@ bool vertex_table_from_memory(const std::vector<std::uint32_t>& fetch_words, std
 thread_local int t_vertex_input_refusal = kVsWhyShape;
 bool plan_vertex_input(const std::vector<std::uint32_t>& fetch_words, std::uint64_t fetch_hash, const GxDrawObjects& o,
                        VertexInputPlan& p, FetchById* memo = nullptr) {
+    t_vb_race_n = 0;
     auto keep = [&](const char* why) {
         static std::atomic<int> logs{0};
         if (logs.fetch_add(1) < 16) {
@@ -9979,19 +10130,59 @@ bool plan_vertex_input(const std::vector<std::uint32_t>& fetch_words, std::uint6
             RecordShadow& ns = shadows[n_shadows++];
             ns.w = w;
             ns.whole = {};
+            // The bytes the draw reads of the record: up to its last vertex's
+            // furthest element (the record's whole extent when not known).
+            std::uint64_t read_bytes = record_bytes;
+            if (std::int64_t last = 0; draw_last_vertex(last)) {
+                std::uint64_t elem_end = 0;
+                for (std::size_t k = 0; k < n; ++k) {
+                    const std::uint32_t* wk = o.vtx_rec[els[k].slot];
+                    if (((o.vtx_valid >> els[k].slot) & 1) && std::memcmp(wk, w, 12) == 0)
+                        elem_end = std::max<std::uint64_t>(elem_end, els[k].offset + vertex_format_bytes((wk[3] >> 15) & 0xf));
+                }
+                read_bytes = std::min(record_bytes, static_cast<std::uint64_t>(last) * stride + elem_end);
+            }
+            bool in_place = false;
             if (windowed) {
                 bump(g_vertex_window_records);
             } else if (loc.offset >= fe.offset && loc.avail + fe.offset >= record_bytes) {
                 ns.whole = {loc.buffer, loc.offset - fe.offset, record_bytes};
                 shadow_locate_locked(record_va, record_bytes, ns.whole);
                 if (ns.whole.buffer == loc.buffer) {  // stays in host memory
-                    if (g_vertex_stage && shadow_stage_locked(record_va, record_bytes, ns.whole)) {
+                    // A ring the game rewrites: the bytes as the draw records
+                    // (shadow_snapshot_locked); otherwise staged as the GPU
+                    // reaches the submission, or read in place.
+                    if (version == kCopyVersionNone && shadow_snapshot_locked(record_va, read_bytes, ns.whole)) {
+                        bump(g_vertex_snapshot_records);
+                    } else if (vb_race_on() && read_bytes > (1u << 20)) {
+                        static int logs = 0;
+                        if (logs++ < 12) {
+                            const DrawVertexSpan& v = t_vertex_span;
+                            host_log("vb race: a %llu-byte vertex record at 0x%llx left in place, its draw's vertices unknown: known %d, "
+                                     "count %u, indices 0x%llx (%s), base %lld, worked out %d last %lld",
+                                     static_cast<unsigned long long>(read_bytes), static_cast<unsigned long long>(record_va), v.known ? 1 : 0,
+                                     v.count, static_cast<unsigned long long>(v.index_va), v.index_type ? "32-bit" : "16-bit",
+                                     static_cast<long long>(v.base), v.worked_out ? 1 : 0, static_cast<long long>(v.last));
+                        }
+                        ns.whole = {};
+                        in_place = true;
+                    } else if (g_vertex_stage && shadow_stage_locked(record_va, record_bytes, ns.whole)) {
                         bump(g_vertex_staged_records);
                     } else {
                         ns.whole = {};
+                        in_place = true;
                     }
                 }
+            } else {
+                in_place = true;
             }
+            // BBHOST_VB_RACE: the bytes the draw reads where the GPU reads
+            // them in place - not a window's, a copy version's or a snapshot's
+            // copy, nor memory a GPU write is still to land on (the draw's own
+            // order covers that).
+            if (vb_race_on() && in_place && version == kCopyVersionNone && t_vb_race_n < 8 &&
+                !gpu_writes_pending_locked(record_va, read_bytes))
+                t_vb_race_ranges[t_vb_race_n++] = {record_va, read_bytes};
             rs = &ns;
         }
         if (rs->whole.buffer) {
@@ -12524,6 +12715,7 @@ static bool draw_impl(const GpuDraw& d) {
         merged.ps_col_format = d.gx->ps_col_format;
     }
     const GpuDrawInputs& in = d.gx && d.gx_render ? (d.gx_partial ? merged : *d.gx) : reg_inputs;
+    t_vertex_span = DrawVertexSpan{};  // set where its vertex input is planned (below)
     log_draw_state(d, in);
     draw_stamp.to(kRenderCostRegisters);
     DrawState s;
@@ -12954,6 +13146,14 @@ static bool draw_impl(const GpuDraw& d) {
                 return e && e[0] == '1';
             }();
             if (log_fetch && gx_geometry) log_fetch_shader(fetch_hash, fetch->words, *gx_geometry);
+            // The vertices it reads, for a snapshot of a vertex record the
+            // game rewrites (plan_vertex_input): as it records them below.
+            t_vertex_span = DrawVertexSpan{};
+            t_vertex_span.known = !d.indirect_va && !t_tess && !s.tess_hw && !s.domain_level;
+            t_vertex_span.index_va = d.index_va;
+            t_vertex_span.count = d.index_count;
+            t_vertex_span.index_type = d.index_type;
+            t_vertex_span.base = in.base_vertex;
             if (gx_geometry && d.gx_render && g_vertex_input) {
                 const GxDrawObjects* geometry = gx_geometry;
                 static thread_local GxDrawObjects own_table;
@@ -12992,6 +13192,17 @@ static bool draw_impl(const GpuDraw& d) {
     if (t_tess && t_tess->hw && (t_tess->native || (t_tess->attrs && (g_lift_tess & kLiftTessLs))) && gx_geometry && d.gx_render &&
         g_vertex_input && !use_vertex_input) {
         if (const FetchProgram* lf = t_tess->ls_fetch_va ? fetch_program_at(t_tess->ls_fetch_va) : nullptr) {
+            // The vertices its LS reads, for a snapshot of a vertex ring the
+            // game rewrites (three effect pipelines' in Kyo's room): at most
+            // the largest of the draw's indices (all its chunks') plus the
+            // base vertex, which a native hull pipeline adds and the lifted
+            // LS may not - more than it reads, never less.
+            t_vertex_span = DrawVertexSpan{};
+            t_vertex_span.known = !d.indirect_va;
+            t_vertex_span.index_va = d.index_va;
+            t_vertex_span.count = d.index_count;
+            t_vertex_span.index_type = d.index_type;
+            t_vertex_span.base = std::max<std::int64_t>({0, in.base_vertex, t_tess->base_vertex});
             use_vertex_input = plan_vertex_input(lf->words, lf->hash, *gx_geometry, vertex_input);
         }
     }
@@ -14690,6 +14901,34 @@ static bool draw_impl(const GpuDraw& d) {
                                                            (bind_pl->ps.lifted ? ", lifted PS" : "");
         host_log("render: first bind of pipeline %s (storage-buffer constants: VS %zu, PS %zu%s)", pl.name.c_str(),
                  pl.vs.meta().buffers.size(), pl.ps.meta().buffers.size(), bind_note.c_str());
+        // BBHOST_PIPELINE_STATS: the console's own register counts beside the
+        // driver's (SPI_SHADER_PGM_RSRC1: VGPRs in fours, SGPRs in eights).
+        if (pipeline_stats_wanted(pl.name)) {
+            host_log("render: pipeline %s on the console: VS %u VGPRs %u SGPRs, PS %u VGPRs %u SGPRs", pl.name.c_str(),
+                     ((s.vs_rsrc1 & 0x3f) + 1) * 4, (((s.vs_rsrc1 >> 6) & 0xf) + 1) * 8, ((s.ps_rsrc1 & 0x3f) + 1) * 4,
+                     (((s.ps_rsrc1 >> 6) & 0xf) + 1) * 8);
+            // And the console program's instructions, beside the driver's ISA:
+            // its vector ones, the regions a wave skips when no lane wants them
+            // (s_cbranch_execz), and selects and legacy multiplies.
+            const auto mix = [](const std::vector<std::uint32_t>& words) {
+                const gcn::Program p = gcn::decode(words.data(), words.size());
+                std::size_t valu = 0, execz = 0, cndmask = 0, legacy = 0, branches = 0;
+                for (const gcn::Inst& in : p.insts) {
+                    const char* m = gcn::mnemonic(in);
+                    if (!m) continue;
+                    if (m[0] == 'v' && m[1] == '_') ++valu;
+                    if (!std::strcmp(m, "s_cbranch_execz")) ++execz;
+                    if (!std::strncmp(m, "s_cbranch", 9) || !std::strcmp(m, "s_branch")) ++branches;
+                    if (!std::strncmp(m, "v_cndmask", 9)) ++cndmask;
+                    if (std::strstr(m, "_legacy")) ++legacy;
+                }
+                char b[160];
+                std::snprintf(b, sizeof(b), "%zu instructions, %zu vector, %zu branches (%zu s_cbranch_execz), %zu v_cndmask, %zu legacy",
+                              p.insts.size(), valu, branches, execz, cndmask, legacy);
+                return std::string(b);
+            };
+            host_log("render: pipeline %s on the console: VS %s; PS %s", pl.name.c_str(), mix(vs_words).c_str(), mix(ps_words).c_str());
+        }
         if (pl.vs.meta().unnormalized_samples || pl.ps.meta().unnormalized_samples) {
             host_log("render: %s unnormalized image_sample (texel coords / QuerySize) vs=%u ps=%u", pl.name.c_str(),
                      pl.vs.meta().unnormalized_samples, pl.ps.meta().unnormalized_samples);
@@ -15280,8 +15519,23 @@ static bool draw_impl(const GpuDraw& d) {
             r.vb[k] = bound ? vertex_input.va[k] : 0;
             r.vb_stride[k] = bound ? vertex_input.bindings[k].stride : 0;
         }
-        if (!r.indexed && !r.indirect_va && r.vb[0] && r.vb_stride[0])
-            vb_race_note_locked(r.name, r.vb[0], static_cast<std::uint64_t>(r.vb_stride[0]) * (static_cast<std::uint64_t>(vtx_off > 0 ? vtx_off : 0) + r.count));
+        // BBHOST_VB_RACE: the vertex records the draw reads in place (every
+        // record, indexed or not: an effect's quads are indexed over a vertex
+        // ring) and its indices, by kind: v: vertices, i: indices.
+        if (vb_race_on()) {
+            char tag[40];
+            if (use_vertex_input) {
+                std::snprintf(tag, sizeof(tag), "v:%s", r.name);
+                for (std::size_t k = 0; k < t_vb_race_n; ++k) vb_race_note_locked(tag, t_vb_race_ranges[k].va, t_vb_race_ranges[k].bytes);
+            }
+            const std::uint64_t ibytes = static_cast<std::uint64_t>(d.index_count) * (d.index_type ? 4u : 2u);
+            if (r.indexed && !r.indirect_va && !gpu_writes_pending_locked(d.index_va, ibytes) &&
+                copy_version_lookup_locked(d.index_va, ibytes, nullptr) == kCopyVersionNone) {
+                std::snprintf(tag, sizeof(tag), "i:%s", r.name);
+                vb_race_note_locked(tag, d.index_va, ibytes);
+            }
+        }
+        t_vb_race_n = 0;
         r.dummies = g_draw_dummies;
         g_draw_dummies = 0;
         r.tex0 = 0;

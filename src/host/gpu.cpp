@@ -6005,7 +6005,10 @@ bool host_gpu_dispatch(const GpuDispatch& d) {
                 const std::uint64_t base = v[0] | (static_cast<std::uint64_t>(v[1] & 0xff) << 32);
                 const std::uint32_t stride = (v[1] >> 16) & 0x3fff;
                 const std::uint64_t bytes = std::min<std::uint64_t>(stride ? std::uint64_t{v[2]} * stride : v[2], b.max_dw * 4ull);
-                if (base && bytes && !gpu_writes_pending_locked(base, bytes)) vb_race_note_locked(pl.name.c_str(), base, bytes);
+                if (!base || !bytes || gpu_writes_pending_locked(base, bytes)) continue;
+                char tag[40];
+                std::snprintf(tag, sizeof(tag), "d:%s", pl.name.c_str());  // a dispatch's buffer (render.cpp: c:, v:, i:)
+                vb_race_note_locked(tag, base, bytes);
             }
         }
         if (pl.meta.gds_counters) {

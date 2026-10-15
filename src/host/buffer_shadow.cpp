@@ -475,7 +475,30 @@ void begin_recording(Mirror& m, std::uint64_t stamp) {
 // gigabyte a chunk, and on a Steam Deck (1 GiB of VRAM, 8 GiB of GTT, which
 // every submission's buffers have to fit together) the second one made the
 // submissions fail.
-bool buffer_shadow_on() { return g_shadow_env >= 0 ? g_shadow_env == 1 : !g.integrated && !g.tight; }
+//
+// An integrated GPU with 8 GiB or more of video memory (a Strix Halo's
+// carve-out) takes the mirrors too: only their page tracking says which
+// vertex data the game rewrites, which is copied as its draws record
+// (shadow_snapshot_locked) - read in place, it was the effects flickering
+// whenever the GPU was behind. The meshes then come from the carve-out
+// rather than the imports: on the Radeon 8060S in Kyo's room GPU-bound, 102
+// fps with the mirrors against 105 without, back to back (2026-10-15) - no
+// faster, about 1.7 GiB more of the carve-out in use.
+bool integrated_with_room() {
+    static int known = -1;
+    if (known < 0 && g.mem_props.memoryHeapCount) {
+        VkDeviceSize local = 0;
+        for (std::uint32_t i = 0; i < g.mem_props.memoryHeapCount; ++i) {
+            if (g.mem_props.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)
+                local = std::max(local, g.mem_props.memoryHeaps[i].size);
+        }
+        known = local >= (8ull << 30) ? 1 : 0;
+    }
+    return known == 1;
+}
+bool buffer_shadow_on() {
+    return g_shadow_env >= 0 ? g_shadow_env == 1 : !g.tight && (!g.integrated || integrated_with_room());
+}
 
 void shadow_locate_locked(std::uint64_t va, std::uint64_t bytes, Located& loc) {
     if (!buffer_shadow_on() || !bytes || !loc.buffer) return;
@@ -783,6 +806,127 @@ bool shadow_stage_locked(std::uint64_t va, std::uint64_t bytes, Located& loc) {
     return true;
 }
 
+// ---- copies, taken as the draw records, of vertex data the game rewrites ------
+// A dynamic page holds a ring the game writes on the CPU every frame (effects'
+// and particles' quads, YEBIS's full-screen triangles). Read in place - or
+// staged above, which copies it as the GPU reaches the submission - a draw
+// read it when the GPU got to it: up to 16 submissions on, a frame and a half
+// GPU-bound, by when the game had written later draws' vertices over it. In
+// Kyo's room GPU-bound (BBHOST_VB_RACE=1, 2026-10-15), YEBIS's triangles and
+// the 4 MiB rings of two effect pipelines changed under queued draws - the
+// effects flickering whenever the GPU was behind, on an RTX 2060 as on the
+// 8060S, as the constants did before they were copied as recorded (render.cpp,
+// BBHOST_CB_SNAPSHOT). The bytes the draw reads are copied here on the CPU as
+// it records, into a ring the GPU reads (in video memory the CPU writes when
+// there is some: an integrated GPU's, or a discrete one's BAR), and staged
+// into device memory from there when the ring is in host memory. Memory a GPU
+// write is still to land on is left alone (gpu_writes_pending_locked): its
+// draws read it in the GPU's order. BBHOST_VERTEX_SNAPSHOT=0: as before.
+namespace {
+const bool g_snapshot_on = [] {
+    const char* e = std::getenv("BBHOST_VERTEX_SNAPSHOT");
+    return !(e && e[0] == '0');
+}();
+constexpr VkDeviceSize kSnapRing = 64ull << 20, kSnapSegment = 4ull << 20;
+constexpr VkDeviceSize kSnapMaxBytes = 1ull << 20;
+struct SnapRing {
+    VkBuffer buffer = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    std::uint8_t* map = nullptr;
+    bool device_local = false, failed = false;
+    VkDeviceSize next = 0;
+    std::uint64_t lap = 1;
+    // The recording that last copied into each segment, and in which lap.
+    std::uint64_t segment_serial[kSnapRing / kSnapSegment] = {};
+    std::uint64_t segment_lap[kSnapRing / kSnapSegment] = {};
+};
+SnapRing g_snap;
+std::atomic<std::uint64_t> g_snapshots{0}, g_snapshot_bytes{0}, g_snapshot_staged{0}, g_snapshot_pending{0};
+
+bool snap_ring_make() {
+    VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    bci.size = kSnapRing;
+    bci.usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+    if (vkCreateBuffer(g.device, &bci, nullptr, &g_snap.buffer) != VK_SUCCESS) return false;
+    VkMemoryRequirements req{};
+    vkGetBufferMemoryRequirements(g.device, g_snap.buffer, &req);
+    VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    mai.allocationSize = req.size;
+    const VkMemoryPropertyFlags visible = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    // Video memory the CPU writes on an integrated GPU, and on a discrete one
+    // where the rings go there (rings_in_vram); else host memory.
+    std::uint32_t type = UINT32_MAX;
+    if (g.integrated || rings_in_vram()) type = find_memory_type(req.memoryTypeBits, visible | VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    if (type != UINT32_MAX) {
+        mai.memoryTypeIndex = type;
+        if (vkAllocateMemory(g.device, &mai, nullptr, &g_snap.memory) == VK_SUCCESS) g_snap.device_local = true;
+    }
+    if (!g_snap.memory) {
+        mai.memoryTypeIndex = find_memory_type(req.memoryTypeBits, visible);
+        if (mai.memoryTypeIndex == UINT32_MAX || vkAllocateMemory(g.device, &mai, nullptr, &g_snap.memory) != VK_SUCCESS) {
+            vkDestroyBuffer(g.device, g_snap.buffer, nullptr);
+            g_snap.buffer = VK_NULL_HANDLE;
+            return false;
+        }
+    }
+    vkBindBufferMemory(g.device, g_snap.buffer, g_snap.memory, 0);
+    void* p = nullptr;
+    if (vkMapMemory(g.device, g_snap.memory, 0, VK_WHOLE_SIZE, 0, &p) != VK_SUCCESS) return false;
+    g_snap.map = static_cast<std::uint8_t*>(p);
+    host_log("buffer shadow: vertex data the game rewrites is copied as its draws record, into a %llu MiB ring in %s "
+             "(BBHOST_VERTEX_SNAPSHOT=0: read as the GPU reaches it)",
+             static_cast<unsigned long long>(kSnapRing >> 20),
+             g_snap.device_local ? "video memory the CPU writes" : "host memory, staged into video memory per draw");
+    return true;
+}
+}  // namespace
+
+bool shadow_snapshot_locked(std::uint64_t va, std::uint64_t bytes, Located& loc) {
+    if (!g_snapshot_on || !buffer_shadow_on() || !bytes || bytes > kSnapMaxBytes) return false;
+    // Only a range on a page the game keeps rewriting: a static page the
+    // mirrors had no room for is staged as before, not copied by the CPU at
+    // every draw.
+    std::uint32_t chunk = 0;
+    std::uint64_t off = 0;
+    if (!phys_of(va, bytes, chunk, off)) return false;
+    const Mirror& m = g_mirrors[chunk];
+    if (m.pages.empty() || !any_set(m.dyn, static_cast<std::uint32_t>(off >> kPageShift), static_cast<std::uint32_t>((off + bytes - 1) >> kPageShift)))
+        return false;
+    if (gpu_writes_pending_locked(va, bytes)) {
+        bump(g_snapshot_pending);
+        return false;
+    }
+    if (g_snap.failed || (!g_snap.buffer && !snap_ring_make())) {
+        g_snap.failed = true;
+        return false;
+    }
+    if (g_snap.next + bytes + 256 > kSnapRing) {
+        g_snap.next = 0;
+        ++g_snap.lap;
+    }
+    const VkDeviceSize at = (g_snap.next + 255) & ~VkDeviceSize{255};
+    // A lap round the ring: the draws that read a segment in the lap before
+    // have run before it is written again (nearly always long since).
+    for (VkDeviceSize s = at / kSnapSegment; s <= (at + bytes - 1) / kSnapSegment; ++s) {
+        if (g_snap.segment_lap[s] != g_snap.lap) {
+            if (g_snap.segment_lap[s]) wait_submission_locked(g_snap.segment_serial[s]);
+            g_snap.segment_lap[s] = g_snap.lap;
+        }
+        g_snap.segment_serial[s] = g.flushes;
+    }
+    std::memcpy(g_snap.map + at, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(va)), bytes);
+    g_snap.next = at + bytes;
+    bump(g_snapshots);
+    g_snapshot_bytes.fetch_add(bytes, std::memory_order_relaxed);
+    loc.buffer = g_snap.buffer;
+    loc.offset = at;
+    loc.avail = bytes;
+    // A ring in host memory: the copy staged into device memory for the draw,
+    // from the ring - what the draw read when it recorded.
+    if (!g_snap.device_local && shadow_stage_locked(va, bytes, loc)) bump(g_snapshot_staged);
+    return true;
+}
+
 void shadow_probe_locked(std::uint64_t va, std::uint64_t bytes, char* out, std::size_t n) {
     if (!out || !n) return;
     out[0] = 0;
@@ -852,6 +996,12 @@ public:
         const Slot& s = slots_[find(page + 1)];
         return s.key && s.serial >= g.completed_submits;
     }
+    // The latest recording a GPU write over the page was made in (0: none).
+    std::uint64_t latest(std::uint64_t page) const {
+        if (!used_) return 0;
+        const Slot& s = slots_[find(page + 1)];
+        return s.key ? s.serial : 0;
+    }
 
 private:
     struct Slot {
@@ -903,6 +1053,17 @@ bool gpu_writes_pending_locked(std::uint64_t va, std::uint64_t bytes) {
     }
     for (std::uint64_t p = va >> kSmallShift; p <= (va + bytes - 1) >> kSmallShift; ++p) {
         if (g_gpu_write_small.pending(p)) return true;
+    }
+    return false;
+}
+
+bool gpu_wrote_since_locked(std::uint64_t va, std::uint64_t bytes, std::uint64_t serial) {
+    if (!bytes) return false;
+    for (std::uint64_t p = va >> kPageShift; p <= (va + bytes - 1) >> kPageShift; ++p) {
+        if (g_gpu_write_pages.latest(p) >= serial) return true;
+    }
+    for (std::uint64_t p = va >> kSmallShift; p <= (va + bytes - 1) >> kSmallShift; ++p) {
+        if (g_gpu_write_small.latest(p) >= serial) return true;
     }
     return false;
 }
@@ -1325,7 +1486,13 @@ std::string shadow_report() {
                   static_cast<unsigned long long>(g_stage_shared.load()), static_cast<double>(g_stage_shared_bytes.load()) / (1 << 20),
                   static_cast<unsigned long long>(g_stage_refused.load()), g_stage_chunks,
                   static_cast<std::size_t>((g_stage_chunks * kStageChunkBytes) >> 20));
-    return out + st;
+    char sn[192];
+    std::snprintf(sn, sizeof(sn),
+                  "; rewritten vertex ranges copied as recorded %llu (%.1f MiB, %llu staged from host memory), left for a GPU write "
+                  "still to land %llu",
+                  static_cast<unsigned long long>(g_snapshots.load()), static_cast<double>(g_snapshot_bytes.load()) / (1 << 20),
+                  static_cast<unsigned long long>(g_snapshot_staged.load()), static_cast<unsigned long long>(g_snapshot_pending.load()));
+    return out + st + sn;
 }
 
 }  // namespace gpu
