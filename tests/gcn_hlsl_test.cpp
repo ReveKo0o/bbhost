@@ -23,6 +23,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <functional>
 #include <string>
@@ -632,7 +633,16 @@ void native_half_rtz() {
 
 int main() {
     g_have_dxc = g_dxc.load();
-    if (!g_have_dxc) std::printf("gcn_hlsl_test: DXC not found (%s): printing only\n", g_dxc.error().c_str());
+    // A library named by BBHOST_HLSL_DXC must load: the continuous-integration
+    // build names the release DXC the packages carry, which this test then
+    // compiles every lift with.
+    const char* wanted = std::getenv("BBHOST_HLSL_DXC");
+    if (!g_have_dxc && wanted && *wanted) {
+        std::fprintf(stderr, "gcn_hlsl_test: BBHOST_HLSL_DXC=%s did not load: %s\n", wanted, g_dxc.error().c_str());
+        ++g_failures;
+    }
+    if (!g_have_dxc) std::printf("gcn_hlsl_test: %s: printing only\n", g_dxc.error().c_str());
+    else std::printf("gcn_hlsl_test: DXC %s from %s\n", g_dxc.version().c_str(), g_dxc.path().c_str());
     swizzles();
     cndmask();
     samples_and_loops();

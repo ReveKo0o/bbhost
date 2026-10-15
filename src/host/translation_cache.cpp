@@ -569,8 +569,7 @@ Dxc& hlsl_dxc() {
     static Dxc dxc;
     static std::once_flag once;
     std::call_once(once, [] {
-        const char* e = std::getenv("BBHOST_HLSL_DXC");
-        if (dxc.load(e ? e : "")) host_log("render: HLSL path on: DXC %s from %s, -O%d", dxc.version().c_str(), dxc.path().c_str(), hlsl_level());
+        if (dxc.load()) host_log("render: HLSL path on: DXC %s from %s, -O%d", dxc.version().c_str(), dxc.path().c_str(), hlsl_level());
         else host_log("render: HLSL path on, but %s: every lift keeps the lifter's SPIR-V", dxc.error().c_str());
     });
     return dxc;

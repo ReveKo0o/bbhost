@@ -2,6 +2,7 @@
 
 #include "gcn/hlsl.h"
 
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 
@@ -137,107 +138,72 @@ Dxc::~Dxc() {
 #endif
 }
 
-bool Dxc::load(const std::string& path) {
-    std::call_once(once_, [&] {
-        tried_ = true;
-        std::vector<std::string> tries;
-        if (!path.empty()) {
-            tries.push_back(path);
-        } else {
-            const std::string dir = exe_dir();
-            if (!dir.empty()) tries.push_back((std::filesystem::path(dir) / kLibName).string());
-            tries.push_back(kLibName);
-        }
-        std::string why;
-        for (const std::string& t : tries) {
+namespace {
+
+void close_library(void* h) {
 #ifdef _WIN32
-            if (t.find_first_of("\\/") != std::string::npos && !std::filesystem::exists(t)) continue;
-            HMODULE h = LoadLibraryW(std::filesystem::path(t).wstring().c_str());
-            if (!h) {
-                why = t + ": error " + std::to_string(GetLastError());
-                continue;
-            }
-            void* f = reinterpret_cast<void*>(GetProcAddress(h, "DxcCreateInstance"));
+    FreeLibrary(static_cast<HMODULE>(h));
 #else
-            if (t.find('/') != std::string::npos && !std::filesystem::exists(t)) continue;
-            void* h = dlopen(t.c_str(), RTLD_NOW | RTLD_LOCAL);
-            if (!h) {
-                const char* e = dlerror();
-                why = e ? e : t;
-                continue;
-            }
-            void* f = dlsym(h, "DxcCreateInstance");
+    dlclose(h);
 #endif
-            if (!f) {
-                why = t + ": no DxcCreateInstance";
-#ifdef _WIN32
-                FreeLibrary(h);
-#else
-                dlclose(h);
-#endif
-                continue;
-            }
-            lib_ = h;
-            create_ = f;
-            path_ = t;
-            break;
-        }
-        if (!create_) {
-            error_ = "DXC not found (" + std::string(kLibName) + (why.empty() ? "" : ": " + why) + ")";
-            return;
-        }
-        // Its version, for the shader cache's key: another DXC compiles again.
-        const auto create = reinterpret_cast<CreateInstance>(create_);
-        Ref<Compiler3> compiler;
-        if (create(kClsidCompiler, kIidCompiler3, compiler.out()) != 0 || !compiler.p) {
-            error_ = path_ + ": no compiler instance";
-            create_ = nullptr;
-            return;
-        }
-        Ref<VersionInfo> info;
-        std::uint32_t major = 0, minor = 0;
-        if (compiler.p->QueryInterface(kIidVersionInfo, info.out()) == 0 && info.p) info.p->GetVersion(&major, &minor);
-        version_ = std::to_string(major) + "." + std::to_string(minor);
-        Ref<VersionInfo2> info2;
-        if (compiler.p->QueryInterface(kIidVersionInfo2, info2.out()) == 0 && info2.p) {
-            std::uint32_t commits = 0;
-            char* hash = nullptr;
-            if (info2.p->GetCommitInfo(&commits, &hash) == 0) {
-                version_ += " (" + std::to_string(commits) + (hash ? " " + std::string(hash) : std::string()) + ")";
-                // The hash is DXC's allocation (CoTaskMemAlloc): a few bytes, once.
-            }
-        }
-    });
-    return create_ != nullptr;
 }
 
-bool Dxc::compile(const gcn::HlslResult& hlsl, const DxcOptions& options, std::vector<std::uint32_t>& spirv, std::string& error) const {
+// Opens `t` (a path, or a bare name for the system's search) and finds
+// DxcCreateInstance in it; null with `why` when it cannot.
+void* open_library(const std::string& t, void*& create, std::string& why) {
+    create = nullptr;
+#ifdef _WIN32
+    const bool has_dir = t.find_first_of("\\/") != std::string::npos;
+    if (has_dir && !std::filesystem::exists(std::filesystem::path(t))) {
+        why = t + ": no such file";
+        return nullptr;
+    }
+    // A path: its own directory first for what it loads in turn; a bare name:
+    // Windows' search (the executable's directory, System32, PATH).
+    HMODULE h = has_dir ? LoadLibraryExW(std::filesystem::path(t).wstring().c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH)
+                        : LoadLibraryW(std::filesystem::path(t).wstring().c_str());
+    if (!h) {
+        why = t + ": error " + std::to_string(GetLastError());
+        return nullptr;
+    }
+    create = reinterpret_cast<void*>(GetProcAddress(h, "DxcCreateInstance"));
+#else
+    if (t.find('/') != std::string::npos && !std::filesystem::exists(t)) {
+        why = t + ": no such file";
+        return nullptr;
+    }
+    void* h = dlopen(t.c_str(), RTLD_NOW | RTLD_LOCAL);
+    if (!h) {
+        const char* e = dlerror();
+        why = e ? e : t;
+        return nullptr;
+    }
+    create = dlsym(h, "DxcCreateInstance");
+#endif
+    if (!create) {
+        why = t + ": no DxcCreateInstance";
+        close_library(h);
+        return nullptr;
+    }
+    return h;
+}
+
+// One compile through `create_fn`'s compiler: `args` besides the source.
+bool run_compile(void* create_fn, const std::string& source, const std::vector<std::wstring>& args_w, std::vector<std::uint32_t>& spirv,
+                 std::string& error) {
     spirv.clear();
     error.clear();
-    if (!create_) {
-        error = error_.empty() ? "DXC not loaded" : error_;
-        return false;
-    }
-    const auto create = reinterpret_cast<CreateInstance>(create_);
+    const auto create = reinterpret_cast<CreateInstance>(create_fn);
     Ref<Compiler3> compiler;
     if (create(kClsidCompiler, kIidCompiler3, compiler.out()) != 0 || !compiler.p) {
         error = "no compiler instance";
         return false;
     }
-    std::vector<std::wstring> args_w;
-    for (const std::string& a : dxc_arguments(options)) args_w.push_back(wide(a));
-    for (const std::string& a : hlsl.arguments) args_w.push_back(wide(a));
-    args_w.push_back(L"-HV");
-    args_w.push_back(wide(hlsl.language));
-    args_w.push_back(L"-T");
-    args_w.push_back(wide(hlsl.profile));
-    args_w.push_back(L"-E");
-    args_w.push_back(wide(hlsl.entry));
     std::vector<const WChar*> args;
     for (const std::wstring& a : args_w) args.push_back(a.c_str());
-    const Buffer source{hlsl.source.data(), hlsl.source.size(), kCpUtf8};
+    const Buffer src{source.data(), source.size(), kCpUtf8};
     Ref<OperationResult> result;
-    const HResult hr = compiler.p->Compile(&source, args.data(), static_cast<std::uint32_t>(args.size()), nullptr, kIidOperationResult, result.out());
+    const HResult hr = compiler.p->Compile(&src, args.data(), static_cast<std::uint32_t>(args.size()), nullptr, kIidOperationResult, result.out());
     if (hr != 0 || !result.p) {
         error = "DXC failed to run (" + std::to_string(hr) + ")";
         return false;
@@ -267,6 +233,101 @@ bool Dxc::compile(const gcn::HlslResult& hlsl, const DxcOptions& options, std::v
         return false;
     }
     return true;
+}
+
+// A loaded library's version, "1.9 (5184 21d28f72)", and whether it compiles
+// to SPIR-V at all: a DXC built without SPIR-V code generation (the DXIL-only
+// builds some systems carry) cannot serve and is passed over.
+bool probe(void* create_fn, std::string& version, std::string& why) {
+    const auto create = reinterpret_cast<CreateInstance>(create_fn);
+    Ref<Compiler3> compiler;
+    if (create(kClsidCompiler, kIidCompiler3, compiler.out()) != 0 || !compiler.p) {
+        why = "no compiler instance";
+        return false;
+    }
+    Ref<VersionInfo> info;
+    std::uint32_t major = 0, minor = 0;
+    if (compiler.p->QueryInterface(kIidVersionInfo, info.out()) == 0 && info.p) info.p->GetVersion(&major, &minor);
+    version = std::to_string(major) + "." + std::to_string(minor);
+    Ref<VersionInfo2> info2;
+    if (compiler.p->QueryInterface(kIidVersionInfo2, info2.out()) == 0 && info2.p) {
+        std::uint32_t commits = 0;
+        char* hash = nullptr;
+        if (info2.p->GetCommitInfo(&commits, &hash) == 0) {
+            version += " (" + std::to_string(commits) + (hash ? " " + std::string(hash) : std::string()) + ")";
+            // The hash is DXC's allocation (CoTaskMemAlloc): a few bytes, once.
+        }
+    }
+    std::vector<std::wstring> args = {L"-spirv", L"-fspv-target-env=vulkan1.2", L"-T", L"cs_6_0", L"-E", L"main"};
+    std::vector<std::uint32_t> spirv;
+    std::string error;
+    if (!run_compile(create_fn, "[numthreads(1, 1, 1)] void main() {}\n", args, spirv, error)) {
+        why = "DXC " + version + " does not compile to SPIR-V (" + error.substr(0, error.find('\n')) + ")";
+        return false;
+    }
+    return true;
+}
+
+}  // namespace
+
+bool Dxc::load(const std::string& path) {
+    std::call_once(once_, [&] {
+        tried_ = true;
+        // `path`, else BBHOST_HLSL_DXC, and only that library when either
+        // names one; else the one beside the executable (the packages carry
+        // it there), then the system's by name.
+        std::string wanted = path;
+        if (wanted.empty()) {
+            if (const char* e = std::getenv("BBHOST_HLSL_DXC"); e && *e) wanted = e;
+        }
+        std::vector<std::string> tries;
+        if (!wanted.empty()) {
+            tries.push_back(wanted);
+        } else {
+            const std::string dir = exe_dir();
+            if (!dir.empty()) tries.push_back((std::filesystem::path(dir) / kLibName).string());
+            tries.push_back(kLibName);
+        }
+        std::string why;
+        for (const std::string& t : tries) {
+            void* create = nullptr;
+            void* h = open_library(t, create, why);
+            if (!h) continue;
+            std::string version, bad;
+            if (!probe(create, version, bad)) {
+                why = t + ": " + bad;
+                close_library(h);
+                continue;
+            }
+            lib_ = h;
+            create_ = create;
+            path_ = t;
+            version_ = version;  // the shader cache's key holds it: another DXC compiles again
+            break;
+        }
+        // `why` names the last library tried and what was wrong with it.
+        if (!create_) error_ = "DXC not found (" + (why.empty() ? (wanted.empty() ? std::string(kLibName) : wanted) : why) + ")";
+    });
+    return create_ != nullptr;
+}
+
+bool Dxc::compile(const gcn::HlslResult& hlsl, const DxcOptions& options, std::vector<std::uint32_t>& spirv, std::string& error) const {
+    spirv.clear();
+    error.clear();
+    if (!create_) {
+        error = error_.empty() ? "DXC not loaded" : error_;
+        return false;
+    }
+    std::vector<std::wstring> args_w;
+    for (const std::string& a : dxc_arguments(options)) args_w.push_back(wide(a));
+    for (const std::string& a : hlsl.arguments) args_w.push_back(wide(a));
+    args_w.push_back(L"-HV");
+    args_w.push_back(wide(hlsl.language));
+    args_w.push_back(L"-T");
+    args_w.push_back(wide(hlsl.profile));
+    args_w.push_back(L"-E");
+    args_w.push_back(wide(hlsl.entry));
+    return run_compile(create_, hlsl.source, args_w, spirv, error);
 }
 
 }  // namespace gpu
