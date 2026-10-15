@@ -3347,10 +3347,17 @@ void record_shader_created(int creator, const std::uint8_t* container, std::size
                 }
             }
         }
-        if (stage == 1 && precompile_enabled() && (precompile_stage_mask() & 2)) {
+        // Only with pipeline libraries: without them a shader alone is a
+        // translation and a module, which the draws used for about half of
+        // the shaders GX creates (950 of 1,987 pixel stages over the 12-place
+        // tour), kept at a cost of 0.7 GiB at every start (and 30 s of
+        // compiles at a first one) against 0.45 s of the command processor's
+        // translations in a first session. The stage and pipeline manifests
+        // make a later start's stages for the draws that need them.
+        if (stage == 1 && precompile_enabled() && use_pipeline_library() && (precompile_stage_mask() & 2)) {
             queue_ps_precompile(name, std::vector<std::uint8_t>(container, container + size));
         }
-        if (stage == 0 && precompile_enabled() && (precompile_stage_mask() & 1)) {
+        if (stage == 0 && precompile_enabled() && use_pipeline_library() && (precompile_stage_mask() & 1)) {
             queue_vs_precompile(name, std::vector<std::uint8_t>(container, container + size));
         }
     }
