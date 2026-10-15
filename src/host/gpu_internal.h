@@ -608,6 +608,17 @@ void stage_manifest_load(const std::string& path);
 void stage_manifest_save(const std::string& path);
 void stage_manifest_save_async(const std::string& path);
 std::string stage_manifest_path();
+// The pipeline manifest (render.cpp PipelineRecipe): <data root>/bbhost/pipeline-manifest.bin.
+void pipeline_manifest_load(const std::string& path, const std::string& list_path);
+void pipeline_manifest_save(const std::string& path);
+void pipeline_manifest_save_async(const std::string& path);
+std::string pipeline_manifest_path();
+// The shader sweep (render.cpp): every shader in the game's bundles compiled
+// into the caches at the first start for this translator and device, the
+// stamp at `stamp_path` (<data root>/bbhost/shader-sweep.txt) saying it ran.
+void shader_sweep_start(const std::string& stamp_path, const std::string& eboot_path);
+// What it has left while the title or a loading screen is up (else 0).
+std::size_t shader_sweep_left();
 // render.cpp: the precompile workers run on half the hardware threads until
 // the first in-game frame and while a loading screen is up, a quarter of them
 // otherwise.
@@ -1465,6 +1476,9 @@ void render_pipeline_time_us(std::uint64_t out[5]);
 void render_pipeline_work(std::uint64_t out[12]);
 // Compute pipelines a dispatch built on the command processor so far: [0] microseconds, [1] count.
 void compute_pipeline_work(std::uint64_t out[2]);
+// A compute pipeline the command processor built for a draw (the host
+// tessellator's LS pass), for the same count.
+void note_cp_compute_build(std::uint64_t us);
 // A shader copies a render target's memory elsewhere: copy the image into a snapshot at dst
 // (or into the target there of its shape); a copy one smaller destination long gets the
 // source's top-left overlap (copy_overlap_locked). `via` names the copy in the log ("copy

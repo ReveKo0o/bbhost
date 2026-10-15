@@ -408,6 +408,7 @@ struct Cache {
     std::chrono::steady_clock::time_point saved{};         // under mu: the last write
     std::size_t loaded = 0;
     std::atomic<std::uint64_t> hits{0}, hit_us{0}, misses{0}, miss_us{0}, stored{0}, store_us{0}, bad{0}, early{0};
+    std::atomic<std::uint64_t> bounded_left_out{0};  // translation_cache_bounded's, past the byte limit
     std::atomic<std::uint64_t> raw_hit_bytes{0};
     std::atomic<std::uint64_t> lift_hits{0}, lift_hit_us{0}, lift_misses{0}, lift_miss_us{0};
 } g_tc;
@@ -475,7 +476,16 @@ bool lookup(const Key& key, Parse&& parse) {
     return false;
 }
 
+thread_local bool t_bounded = false;  // translation_cache_bounded
+
 void store(const Key& key, const Writer& w) {
+    if (t_bounded) {
+        std::lock_guard<std::mutex> lk(g_tc.mu);
+        if (g_tc.bytes + w.out.size() / 4 > kMaxBytes) {  // a typical entry compresses to a third or less
+            g_tc.bounded_left_out.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+    }
     const auto t0 = std::chrono::steady_clock::now();
     uLongf n = compressBound(static_cast<uLong>(w.out.size()));
     std::unique_ptr<std::uint8_t[]> data(new std::uint8_t[n]);
@@ -1211,6 +1221,9 @@ std::string translation_cache_window() {
 }
 
 const char* translator_fingerprint() { return BBHOST_TRANSLATOR_FINGERPRINT; }
+
+void translation_cache_bounded(bool on) { t_bounded = on; }
+std::uint64_t translation_cache_bounded_left_out() { return g_tc.bounded_left_out.load(std::memory_order_relaxed); }
 
 bool translation_cache_cold() { return g_tc.ready.load(std::memory_order_acquire) && g_tc.on && g_tc.loaded == 0; }
 

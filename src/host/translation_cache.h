@@ -105,6 +105,12 @@ std::string translation_cache_window();
 // The translator's fingerprint (cmake/translator_fingerprint.cmake), which the
 // shader caches are stamped with: another one starts them all again.
 const char* translator_fingerprint();
+// The calling thread's translations and lifts join the cache only while it
+// holds less than its byte limit, so they never push out what the game used:
+// the first start's compile of every shader in the game's bundles (render.cpp,
+// the shader sweep). Their count left out, for its report.
+void translation_cache_bounded(bool on);
+std::uint64_t translation_cache_bounded_left_out();
 // This start had no translations to take: the cache was empty, unreadable or
 // another translator's, so every shader is translated again. False with the
 // cache off, and before it is loaded.

@@ -8,6 +8,7 @@
 #include "engine/gx_resources.h"
 #include "engine/gx_state.h"
 #include "host/gpu_internal.h"
+#include "host/shader_bundles.h"
 #include "host/shader_patch.h"
 #include "host/tess_lds.h"
 #include "host/translation_cache.h"
@@ -295,6 +296,14 @@ struct GfxPipeline {
     // `name`, "~fallback" for the variant with the page-table paths, "~walks"
     // for one that still walks.
     std::string profile_name;
+    // The stage cache's keys of its vertex and pixel stages (build_gfx_pipeline),
+    // which the pipeline manifest knows a pipeline by.
+    std::uint64_t vs_key = 0, ps_key = 0;
+    // The pipeline manifest's record of what built it (its inputs, copied at
+    // the build; kept in the manifest once the pipeline is created), and
+    // whether its Vulkan pipeline was the one the manifest built at the start.
+    std::shared_ptr<struct PipelineRecipe> recipe;
+    bool prebuilt = false;
 };
 std::unordered_map<std::uint64_t, GfxPipeline> g_gfx;  // never erased, so references to pipelines stay valid
 std::map<std::uint64_t, std::vector<std::uint32_t>> g_program_cache;  // code va -> words (validated by hash on use)
@@ -3228,6 +3237,19 @@ std::shared_ptr<const gcn::ShaderReflection> reflection_for(const std::string& n
     const auto it = g_reflections.find(name);
     return it == g_reflections.end() ? nullptr : it->second;
 }
+// A program's reflection from the game's bundles, where GX has not created it
+// yet: a stage built ahead of GX's creation (the pipeline manifest, the stage
+// manifest) then carries the engine's names as the draw's build would, and
+// is the same module - the same libraries, the same driver cache entries.
+void reflection_from_bundle(const std::string& name) {
+    if (!g_shader_names || name.empty() || reflection_for(name)) return;
+    const std::shared_ptr<const std::vector<std::uint8_t>> c = shader_bundle_container(name);
+    if (!c) return;
+    auto r = std::make_shared<gcn::ShaderReflection>();
+    if (!gcn::parse_reflection(*c, *r)) return;
+    std::lock_guard<std::mutex> lk(g_reflections_mu);
+    g_reflections.emplace(name, std::move(r));
+}
 // The engine's names on a lifted stage, where GX created the program.
 void name_stage(gcn::LiftResult& lifted, const gcn::TranslateResult& reference, const std::string& name) {
     if (!g_shader_names || !lifted.ok()) return;
@@ -4100,6 +4122,291 @@ void manifest_note_hit(std::uint64_t key) {
     if (g_manifest.ready.count(key)) g_manifest.hits.fetch_add(1, std::memory_order_relaxed);
 }
 
+// ---- The pipeline manifest (<data root>/bbhost/pipeline-manifest.bin) ----
+// Every graphics pipeline a draw created, as what built it: the draw state
+// build_gfx_pipeline and create_gfx_pipeline read (registers, the GX state
+// objects' descriptions, the targets' formats), the programs' words, the image
+// dimensions and sampler modes, the vertex input, and the specialization its
+// optimized relink took from its first draw. The next start builds each one
+// again on the precompile workers - its stages, its libraries, the link (or
+// the whole pipeline where there are no libraries) and the relink - so a draw
+// that needs it later finds its Vulkan pipeline made (create_gfx_pipeline
+// takes it by pipeline_content_key): no pipeline is compiled on first sight
+// in an area an earlier run has seen. It holds the game's inputs, not what was
+// built from them, so a new translator or another driver changes nothing in
+// it - the stage translations (the translation cache, by the translator's
+// fingerprint) and the driver's pipelines (its cache, by pipelineCacheUUID)
+// are made again from them at that start, in the background. A recipe that no
+// longer builds is dropped; one no draw took for kRecipeIdleRuns starts is
+// dropped too, and past kRecipeMax recipes or kRecipeMaxBytes the least
+// recently used go first. Tessellated pipelines are not recorded (their
+// stages read guest programs at the build). BBHOST_PIPELINE_MANIFEST=0 turns
+// it off; it is off with the pipeline cache (BBHOST_PIPELINE_CACHE=0).
+struct PipelineRecipe {
+    // Copied at the build; the pointers into the run's own objects are set
+    // to the copies below for each build from it (recipe_draw_state).
+    DrawState s;
+    std::uint32_t color_format[8] = {}, depth_format = 0;
+    GxBlendDesc blend{};
+    GxDepthStencilDesc depth{};
+    GxRasterDesc raster{};
+    std::vector<std::uint32_t> vs_words, fetch_words, ps_words;
+    std::string vs_name, ps_name;
+    std::vector<std::pair<std::uint32_t, bool>> vs_dims, ps_dims;
+    std::vector<bool> vs_modes, ps_modes;
+    bool cb_no_fallback = false, layout_only = false;
+    bool has_vertex_input = false;
+    VertexInputPlan vertex_input;  // its elements, bindings, attributes and hash (no buffers)
+    // The optimized relink's specialization by its first draw (queue_library_relink).
+    bool relink = false;
+    std::uint32_t spec_w3[2][16] = {}, spec_stride[2][16] = {};
+    std::uint16_t spec_w3_mask[2] = {};
+    // Bookkeeping: the content key it was created under, how many starts'
+    // draws took it, and the last start that did (or recorded it).
+    std::uint64_t key = 0;
+    std::uint32_t uses = 0, last_run = 0;
+    bool listed = false;  // from a shipped list (pipeline_manifest_load), not this player's own record
+    bool loaded = false;  // read at the start (else recorded in this run)
+};
+// The state a build from `r` reads, its pointers aimed at `formats` and the
+// recipe's descriptions.
+DrawState recipe_draw_state(const PipelineRecipe& r, RtImage formats[9]) {
+    DrawState s = r.s;
+    for (int t = 0; t < 8; ++t) {
+        s.color[t] = nullptr;
+        if (r.color_format[t]) {
+            formats[t].format = static_cast<VkFormat>(r.color_format[t]);
+            s.color[t] = &formats[t];
+        }
+    }
+    s.depth = nullptr;
+    if (r.depth_format) {
+        formats[8].format = static_cast<VkFormat>(r.depth_format);
+        s.depth = &formats[8];
+    }
+    s.gx_blend = r.s.gx_blend ? &r.blend : nullptr;
+    s.gx_depth = r.s.gx_depth ? &r.depth : nullptr;
+    s.gx_raster = r.s.gx_raster ? &r.raster : nullptr;
+    return s;
+}
+bool pipeline_manifest_on() {
+    static const bool on = [] {
+        const char* e = std::getenv("BBHOST_PIPELINE_MANIFEST");
+        return !(e && e[0] == '0');
+    }();
+    return on;
+}
+// The pipelines a recipe can describe: no tessellation of any kind.
+bool recipe_recordable(const DrawState& s) {
+    return !s.tess_hw && !s.domain_level && !s.tess_native && !s.tess_attrs && !s.tess_hull;
+}
+// On a precompile worker building a recipe: create_gfx_pipeline keeps what it
+// creates for the draws to take, and the build leaves the run's statistics,
+// the stage manifest and the table masks alone (nothing draws with it).
+thread_local bool t_replaying = false;
+thread_local std::uint64_t t_replay_key = 0;  // the content key create_gfx_pipeline gave the pipeline built from a recipe
+constexpr std::size_t kRecipeMax = 16384;
+constexpr std::uint64_t kRecipeMaxBytes = 64ull << 20;
+constexpr std::uint32_t kRecipeIdleRuns = 16;
+struct PipelineManifest {
+    std::mutex mu;
+    std::unordered_map<std::uint64_t, std::shared_ptr<PipelineRecipe>> by_key;  // under mu
+    std::uint32_t run = 1;  // this start's number (the file's + 1)
+    bool dirty = false;     // under mu
+    // Pipelines built from recipes at this start, by content key; never erased
+    // (their Vulkan pipelines are the draws').
+    std::unordered_map<std::uint64_t, GfxPipeline*> built;  // under mu
+    std::deque<GfxPipeline> pipelines;                      // under mu: the built ones' objects
+    std::atomic<std::uint64_t> loaded{0}, queued{0}, done{0}, failed{0}, relinked{0}, build_us{0}, recorded{0};
+    std::atomic<std::uint64_t> taken{0}, not_ready{0}, layout_differs{0}, unrecordable{0}, dropped{0};
+    std::atomic<std::uint64_t> wait_us{0};
+    std::chrono::steady_clock::time_point loaded_at{};
+    std::atomic<bool> done_logged{false};
+    std::atomic<bool> recording{false};  // a manifest file to keep: set when it is read (pipeline_manifest_load)
+};
+PipelineManifest g_pmanifest;
+// Everything a graphics pipeline's Vulkan creation is made from that is not
+// the run's own handles: its stages (by the stage cache's keys), whether it
+// links from libraries, the geometry shader of a rect list, the vertex input
+// and the fixed state - where it links from libraries only what the libraries
+// take (depth, stencil, cull and front face are set per draw).
+std::uint64_t pipeline_content_key(const GfxPipeline& pl, const GfxFixedState& f, const VertexInputPlan* vertex_input, bool linked) {
+    struct Head {
+        std::uint64_t vs, ps, vi;
+        std::uint32_t linked, gs, topology, polygon, clamp, lean, layout_only, formats_from_params, clip_discard, pad;
+    } h{};
+    h.vs = pl.vs_key;
+    h.ps = pl.ps.module ? pl.ps_key : 0;
+    h.vi = vertex_input ? vertex_input->hash : 0;
+    h.linked = linked ? 1u : 0u;
+    h.gs = pl.gs.module ? 1u : 0u;
+    h.topology = static_cast<std::uint32_t>(f.topology);
+    h.polygon = static_cast<std::uint32_t>(f.polygon_mode);
+    h.clamp = f.depth_clamp && !(linked && g.dynamic_depth_clamp) ? 1u : 0u;
+    h.lean = pl.lean ? 1u : 0u;
+    h.layout_only = pl.layout_only ? 1u : 0u;
+    h.formats_from_params = pl.vs_formats_from_params ? 1u : 0u;
+    h.clip_discard = pl.clip_discard;
+    std::uint64_t k = fnv1a(&h, sizeof(h), 0x9b9e7ac0ffee0001ull);
+    k = fnv1a(f.blends.data(), f.blends.size() * sizeof(VkPipelineColorBlendAttachmentState), k);
+    k = fnv1a(f.color_formats.data(), f.color_formats.size() * sizeof(VkFormat), k);
+    const VkFormat ds[2] = {f.depth_format, f.stencil_format};
+    k = fnv1a(ds, sizeof(ds), k);
+    if (!linked) {
+        struct Rest {
+            std::uint32_t cull, front_face, depth_test, depth_write, bounds, stencil, compare, bias;
+            float bias_constant, bias_clamp, bias_slope;
+            VkStencilOpState front, back;
+        } r{};
+        r.cull = f.cull_mode;
+        r.front_face = static_cast<std::uint32_t>(f.front_face);
+        r.depth_test = f.depth_test;
+        r.depth_write = f.depth_write;
+        r.bounds = f.depth_bounds_test;
+        r.stencil = f.stencil_test;
+        r.compare = static_cast<std::uint32_t>(f.depth_compare);
+        r.bias = f.depth_bias;
+        r.bias_constant = f.bias_constant;
+        r.bias_clamp = f.bias_clamp;
+        r.bias_slope = f.bias_slope;
+        r.front = f.front;
+        r.back = f.back;
+        k = fnv1a(&r, sizeof(r), k ^ 0x7710);
+    }
+    return k ? k : 1;
+}
+// At a build (not one from a recipe): what it was built from, for the
+// manifest once its pipeline is created.
+void recipe_note_build(GfxPipeline& pl, const DrawState& s, const std::vector<std::uint32_t>& vs_words,
+                       const std::vector<std::uint32_t>& fetch_words, const std::vector<std::uint32_t>& ps_words, const std::string& vs_name,
+                       const std::string& ps_name, const std::vector<std::pair<std::uint32_t, bool>>& vs_dims,
+                       const std::vector<std::pair<std::uint32_t, bool>>& ps_dims, const std::vector<bool>& vs_modes,
+                       const std::vector<bool>& ps_modes, bool cb_no_fallback, bool layout_only, const VertexInputPlan* vertex_input) {
+    if (!g_pmanifest.recording.load(std::memory_order_relaxed) || t_replaying) return;
+    if (!recipe_recordable(s)) {
+        pl.recipe.reset();
+        return;
+    }
+    auto r = std::make_shared<PipelineRecipe>();
+    r->s = s;
+    for (int t = 0; t < 8; ++t) r->color_format[t] = s.color[t] ? static_cast<std::uint32_t>(s.color[t]->format) : 0u;
+    r->depth_format = s.depth ? static_cast<std::uint32_t>(s.depth->format) : 0u;
+    if (s.gx_blend) r->blend = *s.gx_blend;
+    if (s.gx_depth) r->depth = *s.gx_depth;
+    if (s.gx_raster) r->raster = *s.gx_raster;
+    r->vs_words = vs_words;
+    r->fetch_words = fetch_words;
+    r->ps_words = ps_words;
+    r->vs_name = vs_name;
+    r->ps_name = ps_name;
+    r->vs_dims = vs_dims;
+    r->ps_dims = ps_dims;
+    r->vs_modes = vs_modes;
+    r->ps_modes = ps_modes;
+    r->cb_no_fallback = cb_no_fallback;
+    r->layout_only = layout_only;
+    if (vertex_input) {
+        r->has_vertex_input = true;
+        r->vertex_input.elements = vertex_input->elements;
+        r->vertex_input.bindings = vertex_input->bindings;
+        r->vertex_input.attributes = vertex_input->attributes;
+        r->vertex_input.hash = vertex_input->hash;
+    }
+    pl.recipe = std::move(r);
+}
+// A pipeline was created (not from a recipe): its recipe joins the manifest,
+// or the one there counts this start's use.
+void recipe_note_created(GfxPipeline& pl, std::uint64_t key) {
+    if (!pl.recipe || !key) return;
+    std::lock_guard<std::mutex> lk(g_pmanifest.mu);
+    const auto [it, fresh] = g_pmanifest.by_key.try_emplace(key, pl.recipe);
+    if (fresh) {
+        pl.recipe->key = key;
+        pl.recipe->uses = 1;
+        pl.recipe->last_run = g_pmanifest.run;
+        g_pmanifest.recorded.fetch_add(1, std::memory_order_relaxed);
+        g_pmanifest.dirty = true;
+    } else {
+        pl.recipe = it->second;  // a later relink's specialization goes to the kept one
+        if (it->second->last_run != g_pmanifest.run) {
+            it->second->last_run = g_pmanifest.run;
+            ++it->second->uses;
+            g_pmanifest.dirty = true;
+        }
+    }
+}
+// Its first draw queued the optimized relink: the specialization that took.
+void recipe_note_relink(const GfxPipeline& pl) {
+    if (!pl.recipe) return;
+    std::lock_guard<std::mutex> lk(g_pmanifest.mu);
+    PipelineRecipe& r = *pl.recipe;
+    if (r.relink && !std::memcmp(r.spec_w3, pl.spec_w3, sizeof(r.spec_w3)) && !std::memcmp(r.spec_stride, pl.spec_stride, sizeof(r.spec_stride)) &&
+        !std::memcmp(r.spec_w3_mask, pl.spec_w3_mask, sizeof(r.spec_w3_mask))) {
+        return;
+    }
+    r.relink = true;
+    std::memcpy(r.spec_w3, pl.spec_w3, sizeof(r.spec_w3));
+    std::memcpy(r.spec_stride, pl.spec_stride, sizeof(r.spec_stride));
+    std::memcpy(r.spec_w3_mask, pl.spec_w3_mask, sizeof(r.spec_w3_mask));
+    g_pmanifest.dirty = true;
+}
+// A draw built a stage itself: count it when the shader sweep had compiled it
+// into the caches (defined with the sweep).
+void note_sweep_hit(std::uint64_t key);
+// A draw's pipeline the start built from a recipe: its Vulkan pipeline, its
+// optimized relink and that relink's specialization, taken by `pl`. False
+// when there is none (yet).
+bool take_prebuilt(GfxPipeline& pl, std::uint64_t key) {
+    GfxPipeline* pre = nullptr;
+    std::shared_ptr<PipelineRecipe> recipe;
+    {
+        std::lock_guard<std::mutex> lk(g_pmanifest.mu);
+        if (g_pmanifest.built.empty()) return false;
+        const auto it = g_pmanifest.built.find(key);
+        if (it == g_pmanifest.built.end()) {
+            // One the start read but has not built yet (its build still
+            // queued or running), not one this run recorded a moment ago.
+            if (const auto r = g_pmanifest.by_key.find(key); r != g_pmanifest.by_key.end() && r->second->loaded) {
+                g_pmanifest.not_ready.fetch_add(1, std::memory_order_relaxed);
+            }
+            return false;
+        }
+        pre = it->second;
+        if (const auto r = g_pmanifest.by_key.find(key); r != g_pmanifest.by_key.end()) recipe = r->second;
+    }
+    if (!pre->pipeline || pre->failed) return false;
+    if (pre->layout != pl.layout) {  // the same stages lay out alike: a pipeline layout made for another set
+        g_pmanifest.layout_differs.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    pl.pipeline = pre->pipeline;
+    pl.library = pre->library;
+    pl.generic = pre->generic;
+    std::memcpy(pl.spec_w3, pre->spec_w3, sizeof(pl.spec_w3));
+    std::memcpy(pl.spec_stride, pre->spec_stride, sizeof(pl.spec_stride));
+    std::memcpy(pl.spec_w3_mask, pre->spec_w3_mask, sizeof(pl.spec_w3_mask));
+    // Relinked at the start, or (no specialization recorded, or the relink
+    // failed) relinked at its first draw as any other.
+    std::copy(pre->relink_libs, pre->relink_libs + 4, pl.relink_libs);
+    pl.relink_formats = pre->relink_formats;
+    std::copy(pre->relink_vertex_formats, pre->relink_vertex_formats + 16, pl.relink_vertex_formats);
+    pl.relink_polygon = pre->relink_polygon;
+    pl.relink_clamp = pre->relink_clamp;
+    pl.relink_pending = pre->relink_pending;
+    pl.prebuilt = true;
+    if (recipe) {
+        std::lock_guard<std::mutex> lk(g_pmanifest.mu);
+        pl.recipe = recipe;
+        if (recipe->last_run != g_pmanifest.run) {
+            recipe->last_run = g_pmanifest.run;
+            ++recipe->uses;
+            g_pmanifest.dirty = true;
+        }
+    }
+    g_pmanifest.taken.fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+
 // BBHOST_TESS_PATCH_CULL=<clip w>: a patch whose centre is nearer the camera
 // plane than this is not drawn. A camera-facing quad beside or behind the eye
 // has no projection - the clipper turns it into a wedge across the frame, and
@@ -4445,6 +4752,8 @@ GfxPipeline& build_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const std::
     // a draw that has to create it (fallback_for_draw).
     const bool stage_lean = cb_no_fallback || layout_only;
     pl.layout_only = layout_only;
+    recipe_note_build(pl, s, vs_words, fetch_words, ps_words, vs_name, ps_name, vs_dims, ps_dims, vs_sampler_modes, ps_sampler_modes,
+                      cb_no_fallback, layout_only, vertex_input);
     auto fail = [&](const std::string& why) -> GfxPipeline& {
         host_log("render: pipeline %s: %s", pl.name.c_str(), why.c_str());
         pl.failed = true;
@@ -4487,14 +4796,15 @@ GfxPipeline& build_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const std::
                                   &ps_dims, &ps_sampler_modes, &ps_input_map, clip_discard};
         const bool ps_lift = stage_lean && decomp_selects(ps_name);
         const std::uint64_t ps_key = lift_key(ps_stage_key(ps_in), ps_lift);
+        pl.ps_key = ps_key;
         const bool ps_cacheable = g_stage_cache_on;
         const std::shared_ptr<const CachedStage> ps_hit = ps_cacheable ? cached_stage(ps_key) : nullptr;
         if (ps_hit) {
             pl.ps.take(ps_hit);
             pl.ps.module = ps_hit->module;
             if (!t_pipeline_worker) g_pl_stage_repeats.fetch_add(1, std::memory_order_relaxed);
-            manifest_note_hit(ps_key);
-            if (note_precompile_hit(ps_key) && g_precompile_check && !ps_lift) {
+            if (!t_replaying) manifest_note_hit(ps_key);
+            if (!t_replaying && note_precompile_hit(ps_key) && g_precompile_check && !ps_lift) {
                 const gcn::Program p = gcn::decode(ps_words.data(), ps_words.size());
                 check_precompiled_stage("PS", ps_name, ps_hit->meta, gcn::translate(p, ps_translate_options(ps_in)));
             }
@@ -4503,12 +4813,15 @@ GfxPipeline& build_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const std::
             if (!ps_prog.errors.empty()) return fail("PS decode: " + ps_prog.errors[0].what);
             const gcn::TranslateOptions po = ps_translate_options(ps_in);
             pl.ps.fresh() = translate_cached(ps_prog, po);
-            note_stage_translation(1, ps_words, ps_key, stage_lean);
             note_ps_early_tests(ps_words, pl.ps.meta().spirv);
-            note_precompile_miss(ps_name, ps_in);
-            note_image_dims(1, ps_name, ps_prog, pl.ps.meta(), ps_dims);
-            note_first_translation(1, ps_name);
-            {
+            if (!t_replaying) note_sweep_hit(ps_key);
+            if (!t_replaying) {
+                note_stage_translation(1, ps_words, ps_key, stage_lean);
+                note_precompile_miss(ps_name, ps_in);
+                note_image_dims(1, ps_name, ps_prog, pl.ps.meta(), ps_dims);
+                note_first_translation(1, ps_name);
+            }
+            if (!t_replaying) {
                 bool all_2d = true, modes_default = true, map_identity = true;
                 for (const auto& d : ps_dims) all_2d &= (d.first & 0xff) == 1 && !d.second;
                 for (bool m : ps_sampler_modes) modes_default &= !m;
@@ -4528,7 +4841,7 @@ GfxPipeline& build_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const std::
             ++t_stage_translations;
             if (!g_stage_cache_on) note_stage_key(ps_key);
             if (!pl.ps.meta().ok()) return fail("PS: " + pl.ps.meta().errors[0]);
-            manifest_note_ps(ps_key, ps_name, ps_in, ps_lift);
+            if (!t_replaying) manifest_note_ps(ps_key, ps_name, ps_in, ps_lift);
             // BBHOST_DECOMP: the no-fallback variant of a selected pixel shader runs
             // its typed lift. The lift declares the translation's bindings, so the
             // descriptor sets are unchanged; a rejection keeps the translation.
@@ -4585,7 +4898,7 @@ GfxPipeline& build_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const std::
         }
         if (g_dump_spirv || g_token_user_data_check) {
             table_slots_read(pl.ps.meta(), pl.table_reads[1], &pl.user_reads[1]);
-        } else if (cb_no_fallback && g_skip_tables) {
+        } else if (cb_no_fallback && g_skip_tables && !t_replaying) {
             queue_table_mask(pl, 1, pl.ps);
         }
         dump_spirv(ps_name + variant + (pl.ps.lifted ? "-ps-lifted" : "-ps"), pl.ps.meta().spirv);
@@ -4642,14 +4955,15 @@ GfxPipeline& build_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const std::
         vs_key = fnv1a(s.tess_constants, sizeof(s.tess_constants), vs_key ^ 0x7e5a71f3ull);
         vs_key = fnv1a(&s.tess_cb[0], sizeof(s.tess_cb[0]), vs_key);
     }
+    pl.vs_key = vs_key;
     const bool vs_cacheable = g_stage_cache_on;
     const std::shared_ptr<const CachedStage> vs_hit = vs_cacheable ? cached_stage(vs_key) : nullptr;
     if (vs_hit) {
         pl.vs.take(vs_hit);
         pl.vs.module = vs_hit->module;
         if (!t_pipeline_worker) g_pl_stage_repeats.fetch_add(1, std::memory_order_relaxed);
-        manifest_note_hit(vs_key);
-        if (note_vs_precompile_hit(vs_key) && g_precompile_check && !vs_decomp && !ds_lift && !ds_native) {
+        if (!t_replaying) manifest_note_hit(vs_key);
+        if (!t_replaying && note_vs_precompile_hit(vs_key) && g_precompile_check && !vs_decomp && !ds_lift && !ds_native) {
             const gcn::Program p = gcn::decode(vs_words.data(), vs_words.size());
             check_precompiled_stage("VS", vs_name, vs_hit->meta, gcn::translate(p, vs_translate_options(vs_in, nullptr)));
         }
@@ -4663,12 +4977,15 @@ GfxPipeline& build_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const std::
         }
         const gcn::TranslateOptions vo = vs_translate_options(vs_in, fetch_words.empty() ? nullptr : &fetch_prog);
         pl.vs.fresh() = translate_cached(vs_prog, vo);
-        note_stage_translation(0, vs_words, vs_key, stage_lean);
-        note_vs_precompile_miss(vs_name, vs_in);
-        note_image_dims(0, vs_name, vs_prog, pl.vs.meta(), vs_dims);
-        note_first_translation(0, vs_name);
-        note_vs_dependencies(vs_name, vs_words, vs_input, output_links, stage_lean, s, vs_dims, vs_sampler_modes);
-        {
+        if (!t_replaying) note_sweep_hit(vs_key);
+        if (!t_replaying) {
+            note_stage_translation(0, vs_words, vs_key, stage_lean);
+            note_vs_precompile_miss(vs_name, vs_in);
+            note_image_dims(0, vs_name, vs_prog, pl.vs.meta(), vs_dims);
+            note_first_translation(0, vs_name);
+            note_vs_dependencies(vs_name, vs_words, vs_input, output_links, stage_lean, s, vs_dims, vs_sampler_modes);
+        }
+        if (!t_replaying) {
             std::lock_guard<std::mutex> lk(g_stage_variants.mu);
             if (vo.fetch) g_stage_variants.vs_with_fetch += 1;
             if (vs_input) g_stage_variants.vs_with_vertex_input += 1;
@@ -4680,7 +4997,7 @@ GfxPipeline& build_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const std::
         ++t_stage_translations;
         if (!g_stage_cache_on) note_stage_key(vs_key);
         if (!pl.vs.meta().ok()) return fail("VS: " + pl.vs.meta().errors[0]);
-        if (!vs_in.tess_window) manifest_note_vs(vs_key, vs_name, vs_in, vs_decomp || ds_lift);  // the manifest keeps no tessellation shape
+        if (!vs_in.tess_window && !t_replaying) manifest_note_vs(vs_key, vs_name, vs_in, vs_decomp || ds_lift);  // the manifest keeps no tessellation shape
         // The lift declares the translation's bindings and outputs (lift.cpp
         // checks the outputs), so layouts and linkage are unchanged; a rejection
         // keeps the translation.
@@ -4751,7 +5068,7 @@ GfxPipeline& build_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const std::
     if (ds_native && !pl.vs.lifted) return fail("native hull pipeline: its domain shader's cached stage is not a lift");
     if (g_dump_spirv || g_token_user_data_check) {
         table_slots_read(pl.vs.meta(), pl.table_reads[0], &pl.user_reads[0]);
-    } else if (cb_no_fallback && g_skip_tables) {
+    } else if (cb_no_fallback && g_skip_tables && !t_replaying) {
         queue_table_mask(pl, 0, pl.vs);
     }
     dump_spirv(vs_name + variant + (pl.vs.lifted ? "-vs-lifted" : "-vs"), pl.vs.meta().spirv);
@@ -4978,9 +5295,24 @@ const bool g_library_trace = [] {
 }();
 thread_local const char* t_library_owner = nullptr;
 
+// What pipeline_library returns for a library it built for the driver's cache
+// only (`keep` false: the shader sweep): not a pipeline, only "it was made".
+const VkPipeline kLibraryWarmed = reinterpret_cast<VkPipeline>(static_cast<std::uintptr_t>(1));
 template <typename Build>
-VkPipeline pipeline_library(LibraryKind kind, std::uint64_t key, const char* what, std::size_t words, Build build) {
+VkPipeline pipeline_library(LibraryKind kind, std::uint64_t key, const char* what, std::size_t words, Build build, bool keep = true) {
     key = fnv1a(&kind, sizeof(kind), key);
+    if (!keep) {
+        // Into the driver's cache and gone: one this run has (or is building)
+        // is there already.
+        {
+            std::lock_guard<std::mutex> lk(g_libs.mu);
+            if (g_libs.ready.count(key) || g_libs.building.count(key)) return kLibraryWarmed;
+        }
+        const VkPipeline p = build();
+        if (!p) return VK_NULL_HANDLE;
+        vkDestroyPipeline(g.device, p, nullptr);
+        return kLibraryWarmed;
+    }
     {
         std::unique_lock<std::mutex> lk(g_libs.mu);
         std::chrono::steady_clock::time_point waiting{};
@@ -5155,9 +5487,9 @@ struct TessLibraryStages {
 // params) stays; null keeps every default.
 VkPipeline pre_raster_library(const ShaderStage& vs, const ShaderStage& gs, VkPolygonMode polygon_mode, bool draw_clamp, VkPipelineLayout layout,
                               const VkDescriptorSetLayout set_layouts[2], const TessLibraryStages* tess = nullptr,
-                              const std::uint32_t* vertex_formats = nullptr) {
+                              const std::uint32_t* vertex_formats = nullptr, bool keep = true) {
     const bool depth_clamp = draw_clamp && !g.dynamic_depth_clamp;  // else the draw sets it (DrawLibraryState)
-    if (!vertex_formats) {
+    if (!vertex_formats && keep) {
         const std::uint64_t vs_hash = fnv1a(vs.meta().spirv.data(), vs.meta().spirv.size() * 4);
         const std::uint32_t bit = 1u << ((static_cast<std::uint32_t>(polygon_mode) & 3) * 4 + (depth_clamp ? 2 : 0) + (gs.module ? 1 : 0));
         std::lock_guard<std::mutex> lk(g_pre_raster_states.mu);
@@ -5238,7 +5570,7 @@ VkPipeline pre_raster_library(const ShaderStage& vs, const ShaderStage& gs, VkPo
         gpci.layout = layout;
         VkPipelineRenderingCreateInfo no_formats{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
         return create_library(gpci, VK_GRAPHICS_PIPELINE_LIBRARY_PRE_RASTERIZATION_SHADERS_BIT_EXT, &no_formats);
-    });
+    }, keep);
 }
 
 // ---- Pixel shaders at wave32 (g.ps_wave, decided in gpu.cpp) ----
@@ -5342,7 +5674,7 @@ std::string ps_wave_census(bool changed_only) {
 // specialization constants (gcn::kCbW3SpecId, gcn::kCbStrideSpecId), for an
 // optimized relink; null keeps the defaults.
 VkPipeline fragment_library(const gcn::TranslateResult& meta, VkShaderModule module, VkDescriptorSetLayout ps_set, VkPipelineLayout layout,
-                            const std::uint32_t* w3 = nullptr) {
+                            const std::uint32_t* w3 = nullptr, bool keep = true) {
     std::uint64_t fs_key = fnv1a(meta.spirv.data(), meta.spirv.size() * 4, module ? 1 : 2);
     fs_key = fnv1a(&ps_set, sizeof(ps_set), fs_key);
     if (w3) fs_key = fnv1a(w3, 32 * sizeof(std::uint32_t), fs_key ^ 0x3bec000000000000ull);
@@ -5386,21 +5718,24 @@ VkPipeline fragment_library(const gcn::TranslateResult& meta, VkShaderModule mod
             fragment_stage_wave_refused(p != VK_NULL_HANDLE);
         }
         return p;
-    });
+    }, keep);
 }
 
-// ---- per-shader compiles, step 4 (BBHOST_PIPELINE_LIBRARY; BBHOST_PRECOMPILE=0 turns it off) ----
+// ---- per-shader compiles, step 4 (BBHOST_PRECOMPILE=0 turns it off) ----
 // When GX creates a pixel shader, a worker translates it with what its binary
 // says (stage registers, flat inputs from its semantic table, image dimensions
 // predicted from the program, no-fallback, early fragment tests) and compiles
 // its fragment-shader library. A first draw whose stage inputs agree finds the
-// stage and the library ready and only links its pipeline.
+// stage and the library ready and only links its pipeline. Without pipeline
+// libraries (BBHOST_PIPELINE_LIBRARY=0, a driver without fast linking) the
+// stage is made all the same and the library left out: a draw then compiles
+// its whole pipeline, but translates nothing.
 bool precompile_enabled() {
     static const bool on = [] {
         const char* e = std::getenv("BBHOST_PRECOMPILE");
         return !(e && e[0] == '0');
     }();
-    return on && use_pipeline_library();
+    return on;
 }
 struct PrecompileJob {
     std::string name;
@@ -5408,6 +5743,10 @@ struct PrecompileJob {
     int type = 2;             // Shdr type: 1 vertex, 2 pixel, 4 compute (gpu.cpp precompile_compute); 0 an optimized relink
     std::uint64_t flip = 0;   // when GX created it
     std::shared_ptr<const ManifestStage> manifest;  // type 7: a stage from the manifest
+    std::shared_ptr<const PipelineRecipe> recipe;   // type 8: a pipeline from the pipeline manifest
+    // The shader sweep's (types 1, 2, 4 from the game's bundles): into the
+    // caches only, nothing kept in this run (precompile_ps, precompile_vs).
+    bool sweep = false;
     // An optimized relink (queue_library_relink): the pipeline, its libraries and layout.
     GfxPipeline* relink = nullptr;
     VkPipeline libraries[4] = {};
@@ -5461,7 +5800,7 @@ struct Precompiler {
     std::vector<std::string> vs_not_ready;                      // under mu: the same for vertex shaders
     std::atomic<std::uint64_t> queued{0}, done{0}, failed{0}, translate_us{0}, library_us{0}, stage_hits{0};
     std::uint64_t miss_not_ready = 0, miss_queued = 0, miss_compiling = 0, miss_failed = 0, miss_flat = 0, miss_input_map = 0, miss_eft_on = 0, miss_eft_off = 0, miss_dims = 0, miss_modes = 0, miss_ena = 0,
-                  miss_rsrc = 0, miss_other = 0, miss_lifted = 0;  // under mu
+                  miss_rsrc = 0, miss_other = 0, miss_lifted = 0, miss_clip = 0;  // under mu
     // The workers (precompiler()): `boot` of them until the first in-game
     // frame and while a loading screen is up, `steady` otherwise; those past
     // `limit` wait on park_cv.
@@ -5471,13 +5810,15 @@ struct Precompiler {
     // moment, for the "idle" line: how long the start's compiles took.
     bool busy = false;                                       // under mu
     std::chrono::steady_clock::time_point busy_since{};     // under mu
-    std::uint64_t burst_jobs = 0, burst_type[8] = {};        // under mu
+    std::uint64_t burst_jobs = 0, burst_type[9] = {};        // under mu
     int idle_logs = 0;                                       // under mu
 };
 void precompile_ps(Precompiler& w, const PrecompileJob& job);
 void precompile_vs(Precompiler& w, const PrecompileJob& job);
 void precompile_manifest(const ManifestStage& m);
 void relink_pipeline(Precompiler& w, const PrecompileJob& job);
+void replay_recipe(Precompiler& w, const std::shared_ptr<const PipelineRecipe>& recipe);
+void sweep_limit_update();
 // Parallel compiles at the start (Kyo's parallel preload, done natively): GX
 // creates its ~3,000 vertex and pixel shaders, and the manifest brings a few
 // hundred more, before the first in-game frame - while the game mostly loads -
@@ -5550,13 +5891,15 @@ Precompiler& precompiler() {
                         relink_pipeline(*w, job);
                     } else if (job.type == 7) {
                         precompile_manifest(*job.manifest);
+                    } else if (job.type == 8) {
+                        replay_recipe(*w, job.recipe);
                     } else {
                         precompile_ps(*w, job);
                     }
                     std::lock_guard<std::mutex> lk(w->mu);
                     if (--w->running[job.name] == 0) w->running.erase(job.name);
                     ++w->burst_jobs;
-                    ++w->burst_type[job.type & 7];
+                    ++w->burst_type[job.type >= 0 && job.type <= 8 ? job.type : 2];
                     if (w->busy && w->jobs.empty() && w->running.empty()) {
                         w->busy = false;
                         // How long a run of compiles took the workers, wall
@@ -5565,9 +5908,10 @@ Precompiler& precompiler() {
                         if (w->burst_jobs >= 32 && w->idle_logs < 16) {
                             ++w->idle_logs;
                             const auto now = std::chrono::steady_clock::now();
-                            host_log("render: precompile workers idle: %llu jobs (manifest %llu, pixel %llu, vertex %llu, compute %llu, relinks %llu) "
-                                     "in %.2f s on %d workers; %.1f s after start, flip %llu",
-                                     static_cast<unsigned long long>(w->burst_jobs), static_cast<unsigned long long>(w->burst_type[7]),
+                            host_log("render: precompile workers idle: %llu jobs (pipelines %llu, manifest %llu, pixel %llu, vertex %llu, compute %llu, "
+                                     "relinks %llu) in %.2f s on %d workers; %.1f s after start, flip %llu",
+                                     static_cast<unsigned long long>(w->burst_jobs), static_cast<unsigned long long>(w->burst_type[8]),
+                                     static_cast<unsigned long long>(w->burst_type[7]),
                                      static_cast<unsigned long long>(w->burst_type[2]), static_cast<unsigned long long>(w->burst_type[1]),
                                      static_cast<unsigned long long>(w->burst_type[4]), static_cast<unsigned long long>(w->burst_type[0]),
                                      std::chrono::duration<double>(now - w->busy_since).count(), w->limit,
@@ -5629,6 +5973,7 @@ void precompile_boost_update(const char* why) {
     }
     if (to > from) w->park_cv.notify_all();
     if (from != to) host_log("render: precompile workers %d -> %d (%s); %zu jobs waiting", from, to, why, waiting);
+    sweep_limit_update();
 }
 
 // BBHOST_LIBRARY_RELINK: after a fast link, a worker links the same libraries
@@ -5692,6 +6037,7 @@ void queue_library_relink(GfxPipeline& pl, const gcn::StageParams params[2]) {
         pl.spec_w3_mask[0] = job.w3_mask[0];
         pl.spec_w3_mask[1] = job.w3_mask[1];
     }
+    recipe_note_relink(pl);
     // BBHOST_RELINK_W3_LOG=1: what each relink's indexed loads had.
     static const bool w3_log = [] {
         const char* e = std::getenv("BBHOST_RELINK_W3_LOG");
@@ -5718,7 +6064,8 @@ void queue_library_relink(GfxPipeline& pl, const gcn::StageParams params[2]) {
     w.relinks_queued.fetch_add(1, std::memory_order_relaxed);
     w.cv.notify_one();
 }
-void relink_pipeline(Precompiler& w, const PrecompileJob& job) {
+// The optimized relink a job describes, built here; null when it failed.
+VkPipeline relink_build(Precompiler& w, const PrecompileJob& job) {
     const auto t0 = std::chrono::steady_clock::now();
     VkPipeline libraries[4];
     std::copy(job.libraries, job.libraries + 4, libraries);
@@ -5768,8 +6115,13 @@ void relink_pipeline(Precompiler& w, const PrecompileJob& job) {
     w.relink_us.fetch_add(pl_us_since(t0), std::memory_order_relaxed);
     if (!ok) {
         w.relinks_failed.fetch_add(1, std::memory_order_relaxed);
-        return;
+        return VK_NULL_HANDLE;
     }
+    return p;
+}
+void relink_pipeline(Precompiler& w, const PrecompileJob& job) {
+    const VkPipeline p = relink_build(w, job);
+    if (!p) return;
     {
         std::lock_guard<std::mutex> lk(w.mu);
         w.relinked.emplace_back(job.relink, p);
@@ -5806,12 +6158,137 @@ void apply_relinks_locked() {
         g_relinks_ready.store(true, std::memory_order_relaxed);
     }
 }
+// A recipe from the pipeline manifest (job type 8): its pipeline built as the
+// draw that recorded it built it - stages, libraries, the link or the whole
+// pipeline, then the optimized relink with the specialization that draw gave
+// it - and kept, by its content key, for the draw that needs it.
+void replay_recipe(Precompiler& w, const std::shared_ptr<const PipelineRecipe>& recipe) {
+    const PipelineRecipe& r = *recipe;
+    const auto t0 = std::chrono::steady_clock::now();
+    GfxPipeline* pl = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(g_pmanifest.mu);
+        if (g_pmanifest.built.count(r.key)) {
+            g_pmanifest.done.fetch_add(1, std::memory_order_relaxed);  // built already, under the key another recipe moved to
+            return;
+        }
+        pl = &g_pmanifest.pipelines.emplace_back();
+    }
+    RtImage formats[9];
+    const DrawState s = recipe_draw_state(r, formats);
+    const VertexInputPlan* vi = r.has_vertex_input ? &r.vertex_input : nullptr;
+    reflection_from_bundle(r.vs_name);
+    reflection_from_bundle(r.ps_name);
+    // Whether the pixel shader can discard, learnt as its compile at creation
+    // learns it (precompile_ps): its key's early fragment tests follow that
+    // (ps_early_tests_matter), and a draw later in the run asks with it known.
+    // Built before the shader's own compile, the pipeline took the other key.
+    if (!r.ps_words.empty() && ps_early_tests_matter(r.ps_words) < 0) {
+        const gcn::Program prog = gcn::decode(r.ps_words.data(), r.ps_words.size());
+        if (prog.errors.empty()) {
+            gcn::TranslateOptions o;
+            o.stage = gcn::Stage::Pixel;
+            o.rsrc1 = r.s.ps_rsrc1;
+            o.rsrc2 = r.s.ps_rsrc2;
+            note_ps_early_tests(r.ps_words, translate_cached(prog, o).spirv);
+        }
+    }
+    t_replaying = true;
+    t_replay_key = 0;
+    t_library_owner = r.vs_name.c_str();
+    build_gfx_pipeline(*pl, s, r.vs_words, r.fetch_words, r.ps_words, r.vs_name, r.ps_name, r.vs_dims, r.ps_dims, r.vs_modes, r.ps_modes,
+                       r.cb_no_fallback, vi, false, r.layout_only);
+    bool ok = !pl->failed && create_gfx_pipeline(*pl, s, vi, r.fetch_words.size());
+    const std::uint64_t key = t_replay_key;
+    t_library_owner = nullptr;
+    t_replaying = false;
+    ok = ok && key != 0 && pl->pipeline;
+    // Relinked here, with its first draw's specialization, so the draw takes
+    // the optimized pipeline at once.
+    if (ok && pl->library && pl->relink_pending && r.relink && g_library_relink) {
+        PrecompileJob job;
+        job.type = 0;
+        job.relink = pl;
+        std::copy(pl->relink_libs, pl->relink_libs + 4, job.libraries);
+        job.layout = pl->layout;
+        job.specialize_formats = pl->relink_formats;
+        std::copy(pl->relink_vertex_formats, pl->relink_vertex_formats + 16, job.vertex_formats);
+        job.polygon_mode = pl->relink_polygon;
+        job.depth_clamp = pl->relink_clamp;
+        std::memcpy(job.w3, r.spec_w3, sizeof(job.w3));
+        std::memcpy(job.stride, r.spec_stride, sizeof(job.stride));
+        std::memcpy(job.w3_mask, r.spec_w3_mask, sizeof(job.w3_mask));
+        std::memcpy(pl->spec_w3, r.spec_w3, sizeof(pl->spec_w3));
+        std::memcpy(pl->spec_stride, r.spec_stride, sizeof(pl->spec_stride));
+        std::memcpy(pl->spec_w3_mask, r.spec_w3_mask, sizeof(pl->spec_w3_mask));
+        w.relinks_queued.fetch_add(1, std::memory_order_relaxed);
+        if (const VkPipeline p = relink_build(w, job)) {
+            if (pl->spec_w3_mask[0] | pl->spec_w3_mask[1]) {
+                pl->generic = pl->pipeline;  // spec_w3_matches
+            } else {
+                vkDestroyPipeline(g.device, pl->pipeline, nullptr);  // the fast-linked one: no draw has recorded it, none will
+            }
+            pl->pipeline = p;
+            pl->relink_pending = false;
+            w.relinks_done.fetch_add(1, std::memory_order_relaxed);
+            w.relinks_adopted.fetch_add(1, std::memory_order_relaxed);
+            g_pmanifest.relinked.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    g_pmanifest.build_us.fetch_add(pl_us_since(t0), std::memory_order_relaxed);
+    std::size_t left = 0;
+    {
+        std::lock_guard<std::mutex> lk(g_pmanifest.mu);
+        if (ok) {
+            g_pmanifest.built.emplace(key, pl);
+            if (key != r.key) {
+                // The same inputs make another pipeline in this build (the
+                // draw path changed): kept under what it makes now.
+                auto it = g_pmanifest.by_key.find(r.key);
+                if (it != g_pmanifest.by_key.end()) {
+                    std::shared_ptr<PipelineRecipe> moved = it->second;
+                    g_pmanifest.by_key.erase(it);
+                    moved->key = key;
+                    g_pmanifest.by_key.emplace(key, std::move(moved));
+                    g_pmanifest.dirty = true;
+                }
+            }
+        } else {
+            g_pmanifest.by_key.erase(r.key);  // not kept: the running build cannot make it
+            g_pmanifest.dirty = true;
+        }
+        (ok ? g_pmanifest.done : g_pmanifest.failed).fetch_add(1, std::memory_order_relaxed);
+        left = g_pmanifest.queued.load() - g_pmanifest.done.load() - g_pmanifest.failed.load();
+    }
+    if (!ok) {
+        static std::atomic<int> logs{0};
+        if (logs.fetch_add(1) < 8) host_log("render: pipeline manifest: %s+%s no longer builds; dropped", r.vs_name.c_str(), r.ps_name.c_str());
+    }
+    if (left == 0 && !g_pmanifest.done_logged.exchange(true)) {
+        host_log("render: pipeline manifest: %llu pipelines built from it (%llu relinked) and %llu failed, %.1f s after it was read "
+                 "(%.1f s of worker time)",
+                 static_cast<unsigned long long>(g_pmanifest.done.load()), static_cast<unsigned long long>(g_pmanifest.relinked.load()),
+                 static_cast<unsigned long long>(g_pmanifest.failed.load()),
+                 std::chrono::duration<double>(std::chrono::steady_clock::now() - g_pmanifest.loaded_at).count(),
+                 g_pmanifest.build_us.load() / 1e6);
+    }
+}
+
 // A translation error without its offset and detail, as a failure reason.
 std::string translation_error_kind(const std::string& e) {
     std::string k = e.size() > 8 && e[6] == ':' ? e.substr(8) : e;
     if (const std::size_t p = k.find(" ("); p != std::string::npos) k.resize(p);
     return "translation: " + k;
 }
+// The shader sweep's results (shader_sweep_start).
+struct SweepStats {
+    std::atomic<std::uint64_t> queued{0}, done{0}, skipped{0}, failed{0}, us{0}, eboot{0}, bundles{0};
+    std::mutex mu;
+    std::map<std::string, std::uint64_t> fail_reasons;  // under mu
+    std::unordered_set<std::uint64_t> keys;              // under mu: the stage keys it compiled (and their twins)
+    std::atomic<std::uint64_t> draw_hits{0};             // stages a draw built that it had compiled into the caches
+};
+SweepStats g_sweep_stats;
 // BBHOST_EFT_TWINS: see precompile_ps.
 const bool g_eft_twins = [] {
     const char* e = std::getenv("BBHOST_EFT_TWINS");
@@ -5822,11 +6299,27 @@ std::atomic<std::uint64_t> g_eft_twins_built{0};
 void precompile_ps(Precompiler& w, const PrecompileJob& job) {
     const auto t0 = std::chrono::steady_clock::now();
     const auto give_up = [&](const std::string& why) {
+        if (job.sweep) {  // a sweep's failure is its own: GX's compile of the shader says the same
+            g_sweep_stats.failed.fetch_add(1, std::memory_order_relaxed);
+            std::lock_guard<std::mutex> lk(g_sweep_stats.mu);
+            g_sweep_stats.fail_reasons["PS " + why] += 1;
+            return;
+        }
         w.failed.fetch_add(1, std::memory_order_relaxed);
         std::lock_guard<std::mutex> lk(w.mu);
         w.records[job.name].failed = true;
         w.fail_reasons[why] += 1;
     };
+    if (job.sweep) {
+        {
+            std::lock_guard<std::mutex> lk(w.mu);
+            if (w.records.count(job.name)) {  // GX created it first: compiled as it was
+                g_sweep_stats.skipped.fetch_add(1, std::memory_order_relaxed);
+                return;
+            }
+        }
+        reflection_from_bundle(job.name);  // the names GX's creation would give its lift
+    }
     const std::vector<std::uint8_t>& c = job.container;
     gcn::ShaderCode code;
     std::size_t shdr = 0;
@@ -5848,7 +6341,7 @@ void precompile_ps(Precompiler& w, const PrecompileJob& job) {
     paths_options.rsrc2 = regs[5];
     // Its SPIR-V is read too: whether the program can discard (note_ps_early_tests).
     const gcn::TranslateResult paths = translate_cached(prog, paths_options);  // resource paths and the inputs read
-    offer_paths(code.words, paths);
+    if (!job.sweep) offer_paths(code.words, paths);
     PrecompileRecord rec;
     rec.rsrc1 = regs[4];
     rec.rsrc2 = regs[5];
@@ -5877,7 +6370,11 @@ void precompile_ps(Precompiler& w, const PrecompileJob& job) {
                            &rec.dims, &rec.modes, &rec.input_map};
     const bool lift = decomp_selects(job.name);
     const std::uint64_t key = lift_key(ps_stage_key(in), lift);
-    const bool cacheable = g_stage_cache_on;
+    if (job.sweep && g_stage_cache_on && cached_stage(key)) {  // built this run already
+        g_sweep_stats.skipped.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    const bool cacheable = g_stage_cache_on && !job.sweep;
     ShaderStage stage;
     if (const std::shared_ptr<const CachedStage> hit = cacheable ? cached_stage(key) : nullptr) {
         stage.take(hit);
@@ -5899,16 +6396,26 @@ void precompile_ps(Precompiler& w, const PrecompileJob& job) {
         if (!make_module(stage.meta().spirv, stage.module)) return give_up("shader module");
         if (cacheable) cache_stage(key, stage.meta(), stage.module, stage.lifted);
     }
-    w.translate_us.fetch_add(pl_us_since(t0), std::memory_order_relaxed);
+    if (!job.sweep) w.translate_us.fetch_add(pl_us_since(t0), std::memory_order_relaxed);
     const auto t1 = std::chrono::steady_clock::now();
+    const bool libraries = use_pipeline_library();  // without them the stage alone (precompile_enabled)
     const VkDescriptorSetLayout set = g.gfx_set_layout;  // both sets take the shared layout under libraries (build_gfx_pipeline)
-    const VkPipelineLayout layout = set ? stage_pipeline_layout(g.gfx_set_layout, set) : VK_NULL_HANDLE;
+    const VkPipelineLayout layout = set && libraries ? stage_pipeline_layout(g.gfx_set_layout, set) : VK_NULL_HANDLE;
     dump_spirv("precompile-" + job.name, stage.meta().spirv);
     t_library_owner = job.name.c_str();
-    const VkPipeline library = layout ? fragment_library(stage.meta(), stage.module, set, layout) : VK_NULL_HANDLE;
+    const VkPipeline library = !libraries ? kLibraryWarmed
+                               : layout   ? fragment_library(stage.meta(), stage.module, set, layout, nullptr, !job.sweep)
+                                          : VK_NULL_HANDLE;
     t_library_owner = nullptr;
-    w.library_us.fetch_add(pl_us_since(t1), std::memory_order_relaxed);
-    if (!library) return give_up("fragment-shader library");
+    if (!job.sweep) w.library_us.fetch_add(pl_us_since(t1), std::memory_order_relaxed);
+    // A sweep's module served its library build only.
+    const auto drop_module = [&] {
+        if (job.sweep && stage.module) vkDestroyShaderModule(g.device, stage.module, nullptr);
+    };
+    if (!library) {
+        drop_module();
+        return give_up("fragment-shader library");
+    }
     // BBHOST_EFT_TWINS (on unless 0): a program that discards is compiled for
     // early fragment tests, the variant the draws without depth writes (the
     // lights) ask for - and a draw of it with depth or stencil writes then
@@ -5934,12 +6441,23 @@ void precompile_ps(Precompiler& w, const PrecompileJob& job) {
             if (ok && cacheable) cache_stage(twin_key, twin, twin_module, stage.lifted);
         }
         t_library_owner = job.name.c_str();
-        ok = ok && fragment_library(twin, twin_module, set, layout) != VK_NULL_HANDLE;
+        ok = ok && (!libraries || fragment_library(twin, twin_module, set, layout, nullptr, !job.sweep) != VK_NULL_HANDLE);
         t_library_owner = nullptr;
         // Uncached, the module served the library build only.
         if (!have && !cacheable && twin_module) vkDestroyShaderModule(g.device, twin_module, nullptr);
-        if (ok) g_eft_twins_built.fetch_add(1, std::memory_order_relaxed);
-        else twin_key = 0;
+        if (ok && !job.sweep) g_eft_twins_built.fetch_add(1, std::memory_order_relaxed);
+        if (!ok) twin_key = 0;
+    }
+    if (job.sweep) {
+        drop_module();
+        {
+            std::lock_guard<std::mutex> lk(g_sweep_stats.mu);
+            g_sweep_stats.keys.insert(key);
+            if (twin_key) g_sweep_stats.keys.insert(twin_key);
+        }
+        g_sweep_stats.done.fetch_add(1, std::memory_order_relaxed);
+        g_sweep_stats.us.fetch_add(pl_us_since(t0), std::memory_order_relaxed);
+        return;
     }
     {
         std::lock_guard<std::mutex> lk(w.mu);
@@ -6007,11 +6525,13 @@ void precompile_manifest(const ManifestStage& m) {
         stage.take(hit);
         stage.module = hit->module;
     } else if (ok) {
+        if (m.lift) reflection_from_bundle(m.name);  // the names the draw's build gives the lift
         if (m.stage) {
             const gcn::TranslateOptions options = ps_translate_options(m.ps_inputs());
             stage.fresh() = translate_cached(prog, options);
             if (stage.meta().ok() && m.lift) {
                 gcn::LiftResult lifted = lift_cached(false, prog, options, stage.meta());
+                name_stage(lifted, stage.meta(), m.name);
                 if (lifted.ok()) {
                     stage.fresh().spirv = std::move(lifted.spirv);
                     stage.fresh().wave64_needs = 0;  // as build_gfx_pipeline's lift
@@ -6026,6 +6546,7 @@ void precompile_manifest(const ManifestStage& m) {
                 tl.attr_vec4s = m.tess_attr_vec4s;
                 gcn::LiftResult lifted = m.tess_hw ? lift_tess_cached(TranslationUse::kLiftDomain, prog, options, stage.meta(), tl)
                                                    : lift_cached(true, prog, options, stage.meta());
+                name_stage(lifted, stage.meta(), m.name);
                 if (lifted.ok()) {
                     stage.fresh().spirv = std::move(lifted.spirv);
                     stage.lifted = true;
@@ -6035,7 +6556,7 @@ void precompile_manifest(const ManifestStage& m) {
         ok = stage.meta().ok() && make_module(stage.meta().spirv, stage.module);
         if (ok && g_stage_cache_on) cache_stage(key, stage.meta(), stage.module, stage.lifted);
     }
-    if (ok && !m.tess_hw && !m.domain_level) {
+    if (ok && !m.tess_hw && !m.domain_level && use_pipeline_library()) {
         const VkDescriptorSetLayout set = g.gfx_set_layout;  // both sets take the shared layout under libraries
         const VkDescriptorSetLayout sets[2] = {set, set};
         const VkPipelineLayout layout = set ? stage_pipeline_layout(set, set) : VK_NULL_HANDLE;
@@ -6063,14 +6584,47 @@ void precompile_manifest(const ManifestStage& m) {
 // input, with elements from its input table (location = entry, VGPR =
 // register, components) and formats from the params block, and its
 // pre-rasterization library with fill mode, no depth clamp and no geometry shader.
+// BBHOST_PREDICT_VARIANTS (on unless 0): the vertex shaders compiled at
+// creation also cover the two kinds of draw a creation used to miss: one with
+// no vertex inputs (its draws read only the vertex and instance indices, with
+// no fetch shader and no vertex input), and the clip-varying twin of one that
+// writes clip distances. Such a shader (866 of the game's 1,663) is drawn with
+// its distances written to an output instead, for the pixel stage to discard
+// by (TranslateOptions::kVsOutCntlClipVarying), wherever the draw has a pixel
+// shader: the twin is compiled at the location the pair then uses, the first
+// past every param the vertex shader exports (a pixel shader reading past
+// those has the draw build its own). Draws without a pixel shader keep the
+// plain one.
+const bool g_predict_variants = [] {
+    const char* e = std::getenv("BBHOST_PREDICT_VARIANTS");
+    return !(e && e[0] == '0');
+}();
+std::atomic<std::uint64_t> g_vs_clip_twins{0}, g_vs_fetchless{0};
+
 void precompile_vs(Precompiler& w, const PrecompileJob& job) {
     const auto t0 = std::chrono::steady_clock::now();
     const auto give_up = [&](const std::string& why) {
+        if (job.sweep) {
+            g_sweep_stats.failed.fetch_add(1, std::memory_order_relaxed);
+            std::lock_guard<std::mutex> lk(g_sweep_stats.mu);
+            g_sweep_stats.fail_reasons["VS " + why] += 1;
+            return;
+        }
         w.vs_failed.fetch_add(1, std::memory_order_relaxed);
         std::lock_guard<std::mutex> lk(w.mu);
         w.vs_records[job.name].failed = true;
         w.fail_reasons["VS " + why] += 1;
     };
+    if (job.sweep) {
+        {
+            std::lock_guard<std::mutex> lk(w.mu);
+            if (w.vs_records.count(job.name)) {
+                g_sweep_stats.skipped.fetch_add(1, std::memory_order_relaxed);
+                return;
+            }
+        }
+        reflection_from_bundle(job.name);
+    }
     const std::vector<std::uint8_t>& c = job.container;
     gcn::ShaderCode code;
     std::size_t shdr = 0;
@@ -6081,7 +6635,13 @@ void precompile_vs(Precompiler& w, const PrecompileJob& job) {
     std::memcpy(regs, c.data() + shdr + 16, sizeof(regs));
     const std::size_t base = shdr + 16;
     const std::size_t inputs = c[base + 0x24], input_table = base + 0x28 + static_cast<std::size_t>(c[base + 3]) * 4;
-    if (inputs == 0) return give_up("no vertex inputs");
+    const bool fetchless = inputs == 0 && g_predict_variants;
+    if (inputs == 0 && !fetchless) return give_up("no vertex inputs");
+    // Without pipeline libraries a draw's vertex shader takes its elements'
+    // formats as constants (build_gfx_pipeline's vs_formats_from_params), which
+    // only the draw's vertex buffers give: nothing to make ahead but the ones
+    // with no vertex inputs.
+    if (!use_pipeline_library() && !fetchless) return give_up("formats are the draw's without pipeline libraries");
     if (inputs > 16 || input_table + inputs * 4 > c.size()) return give_up("an input table past 16 entries or the container");
     Precompiler::VsRecord rec;
     for (std::size_t k = 0; k < inputs; ++k) {
@@ -6106,53 +6666,337 @@ void precompile_vs(Precompiler& w, const PrecompileJob& job) {
     paths_options.rsrc1 = rec.rsrc1;
     paths_options.rsrc2 = rec.rsrc2;
     const gcn::TranslateResult paths = translate_cached(prog, paths_options, TranslationUse::kPaths);
-    offer_paths(code.words, paths);
+    if (!job.sweep) offer_paths(code.words, paths);
     for (const gcn::PredictedImage& p : gcn::predict_image_dims(prog, paths)) rec.dims.emplace_back(p.dim, p.arrayed);
     rec.modes.assign(paths.samplers.size(), false);
     static const std::vector<std::uint32_t> no_fetch;
-    const VsStageInputs in{&code.words, &no_fetch, rec.rsrc1, rec.rsrc2, rec.out_cntl, &rec.elements, true, true, &rec.dims, &rec.modes};
     const bool lift = !g_vs_dispatcher && decomp_selects(job.name);  // as build_gfx_pipeline's vs_decomp
-    const std::uint64_t key = lift_key(vs_stage_key(in), lift);
-    const bool cacheable = g_stage_cache_on;
-    ShaderStage stage;
-    if (const std::shared_ptr<const CachedStage> hit = cacheable ? cached_stage(key) : nullptr) {
-        stage.take(hit);
-        stage.module = hit->module;
-    } else {
-        const gcn::TranslateOptions options = vs_translate_options(in, nullptr);
-        stage.fresh() = translate_cached(prog, options);
-        if (!stage.meta().ok()) return give_up(translation_error_kind(stage.meta().errors[0]));
-        // The lift runs here as well, so a shader compiled at creation is the
-        // same stage the draw wants and is not thrown away for it.
-        if (lift) {
-            gcn::LiftResult lifted = lift_cached(true, prog, options, stage.meta());
-            name_stage(lifted, stage.meta(), job.name);
-            if (lifted.ok()) {
-                stage.fresh().spirv = std::move(lifted.spirv);
-                stage.lifted = true;
+    const bool cacheable = g_stage_cache_on && !job.sweep;
+    // One variant: its stage (translation, lift, module) and its
+    // pre-rasterization library. False when it could not be made (`why`).
+    const auto build = [&](std::uint32_t out_cntl, std::uint64_t& key, std::string& why) {
+        const VsStageInputs in{&code.words, &no_fetch, rec.rsrc1,  rec.rsrc2, out_cntl,   fetchless ? nullptr : &rec.elements,
+                               !fetchless,  true,      &rec.dims, &rec.modes};
+        key = lift_key(vs_stage_key(in), lift);
+        if (job.sweep && g_stage_cache_on && cached_stage(key)) return true;  // built this run already
+        const auto tb = std::chrono::steady_clock::now();
+        ShaderStage stage;
+        if (const std::shared_ptr<const CachedStage> hit = cacheable ? cached_stage(key) : nullptr) {
+            stage.take(hit);
+            stage.module = hit->module;
+        } else {
+            const gcn::TranslateOptions options = vs_translate_options(in, nullptr);
+            stage.fresh() = translate_cached(prog, options);
+            if (!stage.meta().ok()) {
+                why = translation_error_kind(stage.meta().errors[0]);
+                return false;
+            }
+            // The lift runs here as well, so a shader compiled at creation is the
+            // same stage the draw wants and is not thrown away for it.
+            if (lift) {
+                gcn::LiftResult lifted = lift_cached(true, prog, options, stage.meta());
+                name_stage(lifted, stage.meta(), job.name);
+                if (lifted.ok()) {
+                    stage.fresh().spirv = std::move(lifted.spirv);
+                    stage.lifted = true;
+                }
+            }
+            dump_spirv("precompile-" + job.name + "-vs", stage.meta().spirv);
+            if (!make_module(stage.meta().spirv, stage.module)) {
+                why = "shader module";
+                return false;
+            }
+            if (cacheable) cache_stage(key, stage.meta(), stage.module, stage.lifted);
+        }
+        if (!job.sweep) w.vs_translate_us.fetch_add(pl_us_since(tb), std::memory_order_relaxed);
+        const auto t1 = std::chrono::steady_clock::now();
+        const bool libraries = use_pipeline_library();  // without them the stage alone (precompile_enabled)
+        const VkDescriptorSetLayout sets[2] = {g.gfx_set_layout, g.gfx_set_layout};  // both sets take the shared layout under libraries
+        const VkPipelineLayout layout = libraries ? stage_pipeline_layout(g.gfx_set_layout, g.gfx_set_layout) : VK_NULL_HANDLE;
+        const ShaderStage no_gs;
+        t_library_owner = job.name.c_str();
+        const VkPipeline library =
+            !libraries ? kLibraryWarmed
+            : layout   ? pre_raster_library(stage, no_gs, VK_POLYGON_MODE_FILL, false, layout, sets, nullptr, nullptr, !job.sweep)
+                       : VK_NULL_HANDLE;
+        t_library_owner = nullptr;
+        if (job.sweep && stage.module) vkDestroyShaderModule(g.device, stage.module, nullptr);  // it served the library build only
+        if (!job.sweep) w.vs_library_us.fetch_add(pl_us_since(t1), std::memory_order_relaxed);
+        if (!library) {
+            why = "pre-rasterization library";
+            return false;
+        }
+        return true;
+    };
+    std::uint64_t key = 0, twin = 0;
+    std::string why;
+    if (!build(rec.out_cntl, key, why)) return give_up(why);
+    // The clip-varying twin (g_predict_variants), as build_gfx_pipeline's
+    // vs_out_cntl makes it for a draw with a pixel shader.
+    const std::uint32_t oc = rec.out_cntl;
+    if (g_predict_variants && g_clip_varying && (oc & (1u << 22)) && (oc & 0xf) && !(oc & 0xfff0) && !(oc & (1u << 23))) {
+        int used = -1;
+        for (const gcn::Inst& in : prog.insts) {
+            if (in.enc == gcn::Enc::EXP && in.tgt >= 32 && in.tgt < 64) used = std::max(used, static_cast<int>(in.tgt) - 32);
+        }
+        const std::uint32_t location = static_cast<std::uint32_t>(used + 1);
+        if (location <= 29) {
+            const std::uint32_t varying =
+                oc | gcn::TranslateOptions::kVsOutCntlClipVarying | location << gcn::TranslateOptions::kVsOutCntlClipLocationShift;
+            std::string twin_why;
+            if (build(varying, twin, twin_why)) {
+                if (!job.sweep) g_vs_clip_twins.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                twin = 0;
             }
         }
-        dump_spirv("precompile-" + job.name + "-vs", stage.meta().spirv);
-        if (!make_module(stage.meta().spirv, stage.module)) return give_up("shader module");
-        if (cacheable) cache_stage(key, stage.meta(), stage.module, stage.lifted);
     }
-    w.vs_translate_us.fetch_add(pl_us_since(t0), std::memory_order_relaxed);
-    const auto t1 = std::chrono::steady_clock::now();
-    const VkDescriptorSetLayout sets[2] = {g.gfx_set_layout, g.gfx_set_layout};  // both sets take the shared layout under libraries
-    const VkPipelineLayout layout = stage_pipeline_layout(g.gfx_set_layout, g.gfx_set_layout);
-    const ShaderStage no_gs;
-    t_library_owner = job.name.c_str();
-    const VkPipeline library = layout ? pre_raster_library(stage, no_gs, VK_POLYGON_MODE_FILL, false, layout, sets) : VK_NULL_HANDLE;
-    t_library_owner = nullptr;
-    w.vs_library_us.fetch_add(pl_us_since(t1), std::memory_order_relaxed);
-    if (!library) return give_up("pre-rasterization library");
+    if (fetchless && !job.sweep) g_vs_fetchless.fetch_add(1, std::memory_order_relaxed);
+    if (job.sweep) {
+        {
+            std::lock_guard<std::mutex> lk(g_sweep_stats.mu);
+            g_sweep_stats.keys.insert(key);
+            if (twin) g_sweep_stats.keys.insert(twin);
+        }
+        g_sweep_stats.done.fetch_add(1, std::memory_order_relaxed);
+        g_sweep_stats.us.fetch_add(pl_us_since(t0), std::memory_order_relaxed);
+        return;
+    }
     {
         std::lock_guard<std::mutex> lk(w.mu);
         w.vs_records[job.name] = std::move(rec);
         w.vs_stage_keys.insert(key);
+        if (twin) w.vs_stage_keys.insert(twin);
     }
     w.vs_done.fetch_add(1, std::memory_order_relaxed);
 }
+// ---- The shader sweep: every shader in the game's bundles, at the first start ----
+// GX creates a shader when the game loads what uses it, and the precompile
+// workers compile it then (precompile_ps, precompile_vs, precompile_compute):
+// some 3,000 at the start, then each area's at its first load - into the
+// translation cache and the driver's pipeline cache, so that a later start's
+// compile of the same shader is two cache lookups. The sweep compiles every
+// vertex, pixel and compute shader in the bundles the same way at the first
+// start (the first for this translator and device: shader-sweep.txt beside
+// the caches says which made it), so that an area's first load finds its
+// shaders in the caches too. On threads of its own (bb-sweep) at the lowest
+// priority, behind every job of the precompile workers: as many as those have
+// while the title or a loading screen is up, one in game. It keeps nothing in
+// the run - each module and library goes once the driver has made it - and its
+// translations join the translation cache only while that has room
+// (translation_cache_bounded). Only with pipeline libraries, whose shader
+// libraries are what it compiles. BBHOST_SHADER_SWEEP=1 runs it (once for a
+// translator and device), =2 at every start; off otherwise (shader_sweep_start).
+struct Sweeper {
+    std::mutex mu;
+    std::condition_variable cv;
+    std::deque<PrecompileJob> jobs;  // under mu
+    int limit = 1, threads = 0, running = 0;  // under mu
+    bool listed = false, finished = false;   // under mu
+    std::uint64_t total = 0;                 // under mu: shaders listed
+    std::chrono::steady_clock::time_point started{};
+    std::string stamp_path, stamp, eboot_path;
+};
+Sweeper g_sweeper;
+std::atomic<bool> g_sweep_on{false};
+int sweep_limit_now() {
+    Precompiler* w = g_precompiler.load();
+    const int boot = w ? w->boot : 1;
+    return g_precompile_boost.load() ? std::max(1, boot) : 1;
+}
+void sweep_limit_update() {
+    if (!g_sweep_on.load()) return;
+    {
+        std::lock_guard<std::mutex> lk(g_sweeper.mu);
+        g_sweeper.limit = std::min(g_sweeper.threads, sweep_limit_now());
+    }
+    g_sweeper.cv.notify_all();
+}
+// The stamp: what made the sweep and that it ran to its end.
+std::string sweep_stamp() {
+    VkPhysicalDeviceProperties props{};
+    vkGetPhysicalDeviceProperties(g.phys, &props);
+    char uuid[2 * VK_UUID_SIZE + 1] = {};
+    for (std::uint32_t k = 0; k < VK_UUID_SIZE; ++k) std::snprintf(uuid + 2 * k, 3, "%02x", props.pipelineCacheUUID[k]);
+    char buf[256];
+    std::snprintf(buf, sizeof(buf), "translator %s\ndevice %08x:%08x:%08x:%s\n", translator_fingerprint(), props.vendorID, props.deviceID,
+                  props.driverVersion, uuid);
+    return buf;
+}
+void sweep_thread(int index) {
+    host_thread_set_name("bb-sweep");
+    host_thread_background();
+    t_pipeline_worker = true;
+    translation_cache_bounded(true);
+    if (index == 0) {
+        // The list, made here rather than at the device's start: reading the
+        // bundles takes a moment.
+        // The eboot's own first - GX never creates them, so nothing else
+        // compiles them before a draw - then the bundles' (GX creates the
+        // game's at the start, and compiles them then: what is left of them
+        // is the debug bundle's).
+        const std::vector<BundleShader> own = eboot_shaders(g_sweeper.eboot_path);
+        const std::vector<BundleShader>& all = shader_bundles_list();
+        std::deque<PrecompileJob> jobs;
+        std::unordered_set<std::string> listed;
+        for (const std::vector<BundleShader>* set : {&own, &all}) {
+            for (const int type : {4, 2, 1}) {  // compute first (few, slow to compile), then pixel, then vertex
+                for (const BundleShader& b : *set) {
+                    if (b.type != type || !listed.insert(b.name).second) continue;
+                    PrecompileJob job;
+                    job.name = b.name;
+                    job.container = *b.container;
+                    job.type = type;
+                    job.sweep = true;
+                    jobs.push_back(std::move(job));
+                    (set == &own ? g_sweep_stats.eboot : g_sweep_stats.bundles).fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+        }
+        host_log("render: shader sweep: %zu of the eboot's own shaders, then the bundles' (%s): %zu vertex, pixel and compute shaders to "
+                 "compile into the caches", static_cast<std::size_t>(g_sweep_stats.eboot.load()), shader_bundles_summary().c_str(), jobs.size());
+        {
+            std::lock_guard<std::mutex> lk(g_sweeper.mu);
+            g_sweeper.total = jobs.size();
+            g_sweeper.jobs = std::move(jobs);
+            g_sweeper.listed = true;
+        }
+        g_sweep_stats.queued.store(g_sweeper.total);
+        g_sweeper.cv.notify_all();
+    }
+    for (;;) {
+        PrecompileJob job;
+        {
+            std::unique_lock<std::mutex> lk(g_sweeper.mu);
+            g_sweeper.cv.wait(lk, [index] { return g_sweeper.listed && (g_sweeper.jobs.empty() || index < g_sweeper.limit); });
+            if (g_sweeper.jobs.empty()) {
+                if (g_sweeper.running == 0 && !g_sweeper.finished) {
+                    g_sweeper.finished = true;
+                    std::ofstream(g_sweeper.stamp_path, std::ios::trunc)
+                        << g_sweeper.stamp << "shaders " << g_sweeper.total << " compiled " << g_sweep_stats.done.load() << " skipped "
+                        << g_sweep_stats.skipped.load() << " failed " << g_sweep_stats.failed.load() << "\n";
+                    host_log("render: shader sweep: done, %llu compiled into the caches, %llu compiled by the game first, %llu failed; %.1f s "
+                             "after it started (%.1f s of its threads' time)",
+                             static_cast<unsigned long long>(g_sweep_stats.done.load()), static_cast<unsigned long long>(g_sweep_stats.skipped.load()),
+                             static_cast<unsigned long long>(g_sweep_stats.failed.load()),
+                             std::chrono::duration<double>(std::chrono::steady_clock::now() - g_sweeper.started).count(),
+                             g_sweep_stats.us.load() / 1e6);
+                }
+                return;  // the thread's work is done
+            }
+            job = std::move(g_sweeper.jobs.front());
+            g_sweeper.jobs.pop_front();
+            ++g_sweeper.running;
+        }
+        // Behind the precompile workers: what the game created, the manifests,
+        // the relinks go first.
+        Precompiler& w = precompiler();
+        for (;;) {
+            bool idle;
+            {
+                std::lock_guard<std::mutex> lk(w.mu);
+                idle = w.jobs.empty();
+            }
+            if (idle && g.ok) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+        if (job.type == 4) {
+            if (compute_precompile_enabled() && note_compute_created(job.name, 0)) {
+                precompile_compute(job.name, job.container, 0);
+                g_sweep_stats.done.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                g_sweep_stats.skipped.fetch_add(1, std::memory_order_relaxed);
+            }
+        } else if (job.type == 1) {
+            precompile_vs(w, job);
+        } else {
+            precompile_ps(w, job);
+        }
+        std::lock_guard<std::mutex> lk(g_sweeper.mu);
+        --g_sweeper.running;
+        if (g_sweeper.jobs.empty() && g_sweeper.running == 0) g_sweeper.cv.notify_all();
+    }
+}
+}  // namespace
+
+// At the end of device init: the sweep, if this translator and device have
+// not run it to its end here yet.
+void shader_sweep_start(const std::string& stamp_path, const std::string& eboot_path) {
+    // Off unless asked for: GX creates every shader of the game's bundles at
+    // the start (the debug bundle's aside), and those are compiled then; what
+    // is left - the eboot's ~5,400 own, of which a twelve-place tour draws 83,
+    // and the debug bundle's - costs minutes of compiles and the caches'
+    // room for few draws. The pipeline and stage manifests cover what a draw
+    // needed, from the second start on.
+    const char* e = std::getenv("BBHOST_SHADER_SWEEP");
+    if (!(e && (e[0] == '1' || e[0] == '2'))) return;
+    const bool force = e[0] == '2';
+    if (!precompile_enabled() || !use_pipeline_library() || stamp_path.empty()) {
+        if (force) host_log("render: shader sweep: not without pipeline libraries and the shader caches");
+        return;
+    }
+    const std::string stamp = sweep_stamp();
+    {
+        std::ifstream in(stamp_path);
+        const std::string have((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        if (!force && have.compare(0, stamp.size(), stamp) == 0) return;  // done before, by this translator on this device
+    }
+    Precompiler& w = precompiler();
+    const int threads = std::max(1, w.boot);
+    {
+        std::lock_guard<std::mutex> lk(g_sweeper.mu);
+        g_sweeper.stamp_path = stamp_path;
+        g_sweeper.stamp = stamp;
+        g_sweeper.eboot_path = eboot_path;
+        g_sweeper.threads = threads;
+        g_sweeper.started = std::chrono::steady_clock::now();
+    }
+    g_sweep_on.store(true);
+    sweep_limit_update();
+    host_log("render: shader sweep: the eboot's own shaders and the bundles' into the caches, on %d bb-sweep threads at the lowest "
+             "priority (one in game), behind the precompile workers (BBHOST_SHADER_SWEEP)", threads);
+    for (int i = 0; i < threads; ++i) std::thread(sweep_thread, i).detach();
+}
+namespace {
+void note_sweep_hit(std::uint64_t key) {
+    if (!g_sweep_on.load(std::memory_order_relaxed)) return;
+    std::lock_guard<std::mutex> lk(g_sweep_stats.mu);
+    if (g_sweep_stats.keys.count(key)) g_sweep_stats.draw_hits.fetch_add(1, std::memory_order_relaxed);
+}
+}  // namespace
+
+// What the sweep has left, while the title or a loading screen is up (the
+// "Building shaders" line); 0 in game, where it goes on on one thread.
+std::size_t shader_sweep_left() {
+    if (!g_sweep_on.load() || !g_precompile_boost.load()) return 0;
+    std::lock_guard<std::mutex> lk(g_sweeper.mu);
+    return g_sweeper.listed ? g_sweeper.jobs.size() + static_cast<std::size_t>(g_sweeper.running) : 0;
+}
+
+namespace {
+
+void shader_sweep_report() {
+    if (!g_sweep_on.load()) return;
+    std::string reasons;
+    {
+        std::lock_guard<std::mutex> lk(g_sweep_stats.mu);
+        for (const auto& [why, n] : g_sweep_stats.fail_reasons) reasons += " " + why + " x" + std::to_string(n) + ";";
+    }
+    std::size_t left = 0;
+    {
+        std::lock_guard<std::mutex> lk(g_sweeper.mu);
+        left = g_sweeper.jobs.size() + static_cast<std::size_t>(g_sweeper.running);
+    }
+    host_log("render: shader sweep: %llu of %llu shaders (%llu the eboot's own, %llu the bundles') compiled into the caches (%.1f s of its "
+             "threads' time), %llu compiled by the game first, %llu failed, %zu left; stages a draw built that it had compiled %llu; "
+             "%llu translations left out of the full translation cache%s%s",
+             static_cast<unsigned long long>(g_sweep_stats.done.load()), static_cast<unsigned long long>(g_sweep_stats.queued.load()),
+             static_cast<unsigned long long>(g_sweep_stats.eboot.load()), static_cast<unsigned long long>(g_sweep_stats.bundles.load()),
+             g_sweep_stats.us.load() / 1e6, static_cast<unsigned long long>(g_sweep_stats.skipped.load()),
+             static_cast<unsigned long long>(g_sweep_stats.failed.load()), left, static_cast<unsigned long long>(g_sweep_stats.draw_hits.load()),
+             static_cast<unsigned long long>(translation_cache_bounded_left_out()), reasons.empty() ? "" : "; failed by reason:", reasons.c_str());
+}
+
 bool note_vs_precompile_hit(std::uint64_t vs_key) {  // true: a stage compiled at creation
     if (!precompile_enabled()) return false;
     Precompiler& w = precompiler();
@@ -6256,6 +7100,7 @@ void note_precompile_miss(const std::string& name, const PsStageInputs& in) {
     else if (r.modes != *in.modes) ++w.miss_modes;
     else if (r.ps_input_ena != in.ps_input_ena) ++w.miss_ena;
     else if (r.rsrc1 != in.rsrc1 || r.rsrc2 != in.rsrc2) ++w.miss_rsrc;
+    else if (in.clip_discard) ++w.miss_clip;  // the clip varying's discard, which only the pair decides
     else ++w.miss_other;
 }
 namespace manifest_file {
@@ -6360,11 +7205,274 @@ bool read(Reader& r, ManifestStage& m) {
 }
 }  // namespace manifest_file
 
+namespace recipe_file {
+constexpr std::uint32_t kMagic = 0x4d504242;  // "BBPM"
+constexpr std::uint32_t kVersion = 1;
+using manifest_file::Reader;
+using manifest_file::Writer;
+// What made the file: the translator and the device, for the report (the
+// recipes are the game's inputs, so neither invalidates them).
+struct Origin {
+    std::string translator;
+    std::uint32_t vendor = 0, device = 0, driver = 0;
+    std::uint8_t uuid[VK_UUID_SIZE] = {};
+    bool libraries = false;
+};
+void write_origin(Writer& w, const Origin& o) {
+    w.u32(static_cast<std::uint32_t>(o.translator.size()));
+    w.out.insert(w.out.end(), o.translator.begin(), o.translator.end());
+    w.u32(o.vendor);
+    w.u32(o.device);
+    w.u32(o.driver);
+    w.out.insert(w.out.end(), o.uuid, o.uuid + VK_UUID_SIZE);
+    w.u8(o.libraries ? 1 : 0);
+}
+bool read_origin(Reader& r, Origin& o) {
+    const std::uint32_t n = r.count(1);
+    if (!r.ok) return false;
+    o.translator.assign(reinterpret_cast<const char*>(r.p), n);
+    r.p += n;
+    o.vendor = r.u32();
+    o.device = r.u32();
+    o.driver = r.u32();
+    for (std::uint8_t& b : o.uuid) b = r.u8();
+    o.libraries = r.u8() != 0;
+    return r.ok;
+}
+void str(Writer& w, const std::string& v) {
+    w.u32(static_cast<std::uint32_t>(v.size()));
+    w.out.insert(w.out.end(), v.begin(), v.end());
+}
+bool str(Reader& r, std::string& v) {
+    const std::uint32_t n = r.count(1);
+    if (!r.ok) return false;
+    v.assign(reinterpret_cast<const char*>(r.p), n);
+    r.p += n;
+    return true;
+}
+template <typename T>
+void pod(Writer& w, const T& v) {
+    const auto* b = reinterpret_cast<const std::uint8_t*>(&v);
+    w.out.insert(w.out.end(), b, b + sizeof(T));
+}
+template <typename T>
+void pod(Reader& r, T& v) {
+    if (static_cast<std::size_t>(r.end - r.p) < sizeof(T)) {
+        r.ok = false;
+        return;
+    }
+    std::memcpy(&v, r.p, sizeof(T));
+    r.p += sizeof(T);
+}
+void words(Writer& w, const std::vector<std::uint32_t>& v) { w.u32s(v); }
+void words(Reader& r, std::vector<std::uint32_t>& v) {
+    v.resize(r.count(4));
+    for (std::uint32_t& x : v) x = r.u32();
+}
+void dims(Writer& w, const std::vector<std::pair<std::uint32_t, bool>>& v) {
+    w.u32(static_cast<std::uint32_t>(v.size()));
+    for (const auto& d : v) {
+        w.u32(d.first);
+        w.u8(d.second ? 1 : 0);
+    }
+}
+void dims(Reader& r, std::vector<std::pair<std::uint32_t, bool>>& v) {
+    v.resize(r.count(5));
+    for (auto& d : v) {
+        d.first = r.u32();
+        d.second = r.u8() != 0;
+    }
+}
+void modes(Writer& w, const std::vector<bool>& v) {
+    w.u32(static_cast<std::uint32_t>(v.size()));
+    for (bool b : v) w.u8(b ? 1 : 0);
+}
+void modes(Reader& r, std::vector<bool>& v) {
+    v.resize(r.count(1));
+    for (std::size_t k = 0; k < v.size(); ++k) v[k] = r.u8() != 0;
+}
+// One recipe, its byte length first (a reader skips what it cannot read).
+void write(Writer& out, const PipelineRecipe& rc) {
+    Writer w;
+    const DrawState& s = rc.s;
+    w.u32((rc.cb_no_fallback ? 1u : 0u) | (rc.layout_only ? 2u : 0u) | (rc.has_vertex_input ? 4u : 0u) | (rc.relink ? 8u : 0u) |
+          (s.gx_blend ? 16u : 0u) | (s.gx_depth ? 32u : 0u) | (s.gx_raster ? 64u : 0u) | (s.rect ? 128u : 0u));
+    pod(w, rc.key);
+    w.u32(rc.uses);
+    w.u32(rc.last_run);
+    for (std::uint32_t v : {s.vs_rsrc1, s.vs_rsrc2, s.ps_rsrc1, s.ps_rsrc2, s.prim, static_cast<std::uint32_t>(s.topo), s.depth_control,
+                            s.stencil_control, s.su_sc_mode, s.clip_cntl, s.vte_cntl, s.ps_input_ena, s.ps_in_control, s.vs_out_cntl,
+                            s.cb_shader_mask, s.ps_col_format, s.gx_ids[0], s.gx_ids[1], s.gx_ids[2]}) {
+        w.u32(v);
+    }
+    pod(w, s.program_fp);
+    for (std::uint32_t v : s.color_mask) w.u32(v);
+    for (std::uint32_t v : s.blend) w.u32(v);
+    for (std::uint32_t v : s.ps_input_cntl) w.u32(v);
+    for (std::uint32_t v : rc.color_format) w.u32(v);
+    w.u32(rc.depth_format);
+    pod(w, rc.blend);
+    pod(w, rc.depth);
+    pod(w, rc.raster);
+    words(w, rc.vs_words);
+    words(w, rc.fetch_words);
+    words(w, rc.ps_words);
+    str(w, rc.vs_name);
+    str(w, rc.ps_name);
+    dims(w, rc.vs_dims);
+    dims(w, rc.ps_dims);
+    modes(w, rc.vs_modes);
+    modes(w, rc.ps_modes);
+    const VertexInputPlan& vi = rc.vertex_input;
+    w.u32(static_cast<std::uint32_t>(vi.elements.size()));
+    for (const gcn::VertexElement& e : vi.elements) {
+        w.u32(e.location);
+        w.u32(e.vdata);
+        w.u32(e.count);
+        w.u32(e.w3);
+    }
+    w.u32(static_cast<std::uint32_t>(vi.bindings.size()));
+    for (const VkVertexInputBindingDescription& b : vi.bindings) {
+        w.u32(b.binding);
+        w.u32(b.stride);
+        w.u32(static_cast<std::uint32_t>(b.inputRate));
+    }
+    w.u32(static_cast<std::uint32_t>(vi.attributes.size()));
+    for (const VkVertexInputAttributeDescription& a : vi.attributes) {
+        w.u32(a.location);
+        w.u32(a.binding);
+        w.u32(static_cast<std::uint32_t>(a.format));
+        w.u32(a.offset);
+    }
+    pod(w, vi.hash);
+    pod(w, rc.spec_w3);
+    pod(w, rc.spec_stride);
+    pod(w, rc.spec_w3_mask);
+    out.u32(static_cast<std::uint32_t>(w.out.size()));
+    out.out.insert(out.out.end(), w.out.begin(), w.out.end());
+}
+bool read(Reader& in, PipelineRecipe& rc) {
+    const std::uint32_t n = in.count(1);
+    if (!in.ok) return false;
+    Reader r{in.p, in.p + n};
+    in.p += n;
+    DrawState& s = rc.s;
+    const std::uint32_t f = r.u32();
+    rc.cb_no_fallback = f & 1;
+    rc.layout_only = f & 2;
+    rc.has_vertex_input = f & 4;
+    rc.relink = f & 8;
+    s.rect = f & 128;
+    pod(r, rc.key);
+    rc.uses = r.u32();
+    rc.last_run = r.u32();
+    std::uint32_t topo = 0;
+    for (std::uint32_t* v : {&s.vs_rsrc1, &s.vs_rsrc2, &s.ps_rsrc1, &s.ps_rsrc2, &s.prim, &topo, &s.depth_control, &s.stencil_control,
+                             &s.su_sc_mode, &s.clip_cntl, &s.vte_cntl, &s.ps_input_ena, &s.ps_in_control, &s.vs_out_cntl, &s.cb_shader_mask,
+                             &s.ps_col_format, &s.gx_ids[0], &s.gx_ids[1], &s.gx_ids[2]}) {
+        *v = r.u32();
+    }
+    s.topo = static_cast<VkPrimitiveTopology>(topo);
+    pod(r, s.program_fp);
+    for (std::uint32_t& v : s.color_mask) v = r.u32();
+    for (std::uint32_t& v : s.blend) v = r.u32();
+    for (std::uint32_t& v : s.ps_input_cntl) v = r.u32();
+    for (std::uint32_t& v : rc.color_format) v = r.u32();
+    rc.depth_format = r.u32();
+    pod(r, rc.blend);
+    pod(r, rc.depth);
+    pod(r, rc.raster);
+    // Only whether they are set is read (recipe_draw_state aims them at the copies).
+    s.gx_blend = (f & 16) ? &rc.blend : nullptr;
+    s.gx_depth = (f & 32) ? &rc.depth : nullptr;
+    s.gx_raster = (f & 64) ? &rc.raster : nullptr;
+    // A list (tools/pipeline_list.py) gives a program by its name, word count
+    // and hash instead of its words: the words come from the game's own files
+    // (its bundles, or the eboot for the eboot's own), patched as the game's
+    // draws read them, and must hash the same.
+    const bool vs_ref = f & 256, ps_ref = f & 512;
+    std::uint32_t vs_count = 0, ps_count = 0;
+    std::uint64_t vs_hash = 0, ps_hash = 0;
+    if (vs_ref) {
+        vs_count = r.u32();
+        pod(r, vs_hash);
+    } else {
+        words(r, rc.vs_words);
+    }
+    words(r, rc.fetch_words);
+    if (ps_ref) {
+        ps_count = r.u32();
+        pod(r, ps_hash);
+    } else {
+        words(r, rc.ps_words);
+    }
+    if (!str(r, rc.vs_name) || !str(r, rc.ps_name)) return false;
+    const auto from_bundle = [](const std::string& name, std::uint32_t count, std::uint64_t hash, std::vector<std::uint32_t>& out) {
+        const std::shared_ptr<const std::vector<std::uint8_t>> c = shader_program_container(name);
+        gcn::ShaderCode code;
+        if (!c || !gcn::shader_code(*c, code)) return false;
+        shader_patch_apply(name, code.words);
+        if (code.words.size() != count || fnv1a(code.words.data(), code.words.size() * 4) != hash) return false;
+        out = std::move(code.words);
+        return true;
+    };
+    if (vs_ref && !from_bundle(rc.vs_name, vs_count, vs_hash, rc.vs_words)) return false;
+    if (ps_ref && !from_bundle(rc.ps_name, ps_count, ps_hash, rc.ps_words)) return false;
+    dims(r, rc.vs_dims);
+    dims(r, rc.ps_dims);
+    modes(r, rc.vs_modes);
+    modes(r, rc.ps_modes);
+    VertexInputPlan& vi = rc.vertex_input;
+    vi.elements.resize(r.count(16));
+    for (gcn::VertexElement& e : vi.elements) {
+        e.location = r.u32();
+        e.vdata = r.u32();
+        e.count = r.u32();
+        e.w3 = r.u32();
+    }
+    vi.bindings.resize(r.count(12));
+    for (VkVertexInputBindingDescription& b : vi.bindings) {
+        b.binding = r.u32();
+        b.stride = r.u32();
+        b.inputRate = static_cast<VkVertexInputRate>(r.u32());
+    }
+    vi.attributes.resize(r.count(16));
+    for (VkVertexInputAttributeDescription& a : vi.attributes) {
+        a.location = r.u32();
+        a.binding = r.u32();
+        a.format = static_cast<VkFormat>(r.u32());
+        a.offset = r.u32();
+    }
+    pod(r, vi.hash);
+    pod(r, rc.spec_w3);
+    pod(r, rc.spec_stride);
+    pod(r, rc.spec_w3_mask);
+    return r.ok && !rc.vs_words.empty() && rc.key != 0;
+}
+}  // namespace recipe_file
+
 void precompile_report() {
     compute_optimize_report();
     compute_precompile_report();
     translation_cache_report();
     if (const std::string r = ps_wave_census(false); !r.empty()) host_log("render: %s", r.c_str());
+    shader_sweep_report();
+    if (pipeline_manifest_on()) {
+        std::size_t kept = 0;
+        {
+            std::lock_guard<std::mutex> lk(g_pmanifest.mu);
+            kept = g_pmanifest.by_key.size();
+        }
+        host_log("render: pipeline manifest: %llu pipelines from earlier runs, %llu built at start (%.1f s of worker time, %llu relinked), "
+                 "%llu failed and dropped; pipeline builds that took one %llu (one recorded but not built yet %llu, another layout %llu); "
+                 "%llu recorded in this run, %zu kept, %llu left out for the size limit",
+                 static_cast<unsigned long long>(g_pmanifest.loaded.load()), static_cast<unsigned long long>(g_pmanifest.done.load()),
+                 g_pmanifest.build_us.load() / 1e6, static_cast<unsigned long long>(g_pmanifest.relinked.load()),
+                 static_cast<unsigned long long>(g_pmanifest.failed.load()), static_cast<unsigned long long>(g_pmanifest.taken.load()),
+                 static_cast<unsigned long long>(g_pmanifest.not_ready.load()), static_cast<unsigned long long>(g_pmanifest.layout_differs.load()),
+                 static_cast<unsigned long long>(g_pmanifest.recorded.load()), kept,
+                 static_cast<unsigned long long>(g_pmanifest.dropped.load()));
+    }
     if (!precompile_enabled()) return;
     Precompiler& w = precompiler();
     std::lock_guard<std::mutex> lk(w.mu);
@@ -6378,6 +7486,9 @@ void precompile_report() {
                  static_cast<unsigned long long>(w.relinks_w3.load()), static_cast<unsigned long long>(w.relink_spec_failed.load()),
                  static_cast<unsigned long long>(g_spec_w3_misses.load()), static_cast<unsigned long long>(g_spec_w3_draws.load()));
     }
+    host_log("render: vertex shaders compiled at creation: %llu clip-varying twins and %llu without vertex inputs among them "
+             "(BBHOST_PREDICT_VARIANTS)", static_cast<unsigned long long>(g_vs_clip_twins.load()),
+             static_cast<unsigned long long>(g_vs_fetchless.load()));
     host_log("render: vertex shaders compiled at creation: %llu queued, %llu done, %llu failed (translate %.1f s, libraries %.1f s); "
              "pipeline builds that found the stage ready %llu; no-fallback translations it did not serve: never queued %llu, still queued %llu, "
              "being compiled %llu, failed %llu, "
@@ -6418,7 +7529,8 @@ void precompile_report() {
     if (!reasons.empty()) host_log("render: pixel shaders not compiled at creation, by reason:%s", reasons.c_str());
     host_log("render: pixel shaders compiled at creation: %llu queued, %llu done (%llu early-fragment-tests twins beside them), %llu failed, %zu waiting (translate %.1f s, libraries %.1f s); "
              "draws that found the stage ready %llu; draw translations it did not serve: never queued %llu, still queued %llu, being compiled %llu, failed %llu, flat inputs %llu, input map %llu, "
-             "early fragment tests (draw with %llu, without %llu), image dims %llu, sampler modes %llu, input enable %llu, resource registers %llu, other %llu, "
+             "early fragment tests (draw with %llu, without %llu), image dims %llu, sampler modes %llu, input enable %llu, resource registers %llu, "
+             "clip discard %llu, other %llu, "
              "(of them lifted %llu); no record:%s",
              static_cast<unsigned long long>(w.queued.load()), static_cast<unsigned long long>(w.done.load()),
              static_cast<unsigned long long>(g_eft_twins_built.load()),
@@ -6427,7 +7539,8 @@ void precompile_report() {
              static_cast<unsigned long long>(w.miss_queued), static_cast<unsigned long long>(w.miss_compiling),
              static_cast<unsigned long long>(w.miss_failed), static_cast<unsigned long long>(w.miss_flat), static_cast<unsigned long long>(w.miss_input_map), static_cast<unsigned long long>(w.miss_eft_on), static_cast<unsigned long long>(w.miss_eft_off),
              static_cast<unsigned long long>(w.miss_dims), static_cast<unsigned long long>(w.miss_modes), static_cast<unsigned long long>(w.miss_ena),
-             static_cast<unsigned long long>(w.miss_rsrc), static_cast<unsigned long long>(w.miss_other), static_cast<unsigned long long>(w.miss_lifted),
+             static_cast<unsigned long long>(w.miss_rsrc), static_cast<unsigned long long>(w.miss_clip), static_cast<unsigned long long>(w.miss_other),
+             static_cast<unsigned long long>(w.miss_lifted),
              names.c_str());
 }
 
@@ -6664,6 +7777,17 @@ bool create_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const VertexInputP
     }
     VkPipelineInputAssemblyStateCreateInfo ia{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
     const GfxFixedState f = fixed_state(s);
+    // The pipeline manifest: a pipeline the start built from a recipe is
+    // taken as it is; one built here goes into the manifest for the next.
+    const std::uint64_t content_key = g_pmanifest.recording.load(std::memory_order_relaxed) && recipe_recordable(s) && !pl.tess_hw
+                                          ? pipeline_content_key(pl, f, vertex_input, linked)
+                                          : 0;
+    t_replay_key = t_replaying ? content_key : 0;
+    if (content_key && !t_replaying && take_prebuilt(pl, content_key)) {
+        t_library_owner = owner;
+        g.gfx_pipelines.fetch_add(1);
+        return true;
+    }
     ia.topology = pl.tess_hw ? VK_PRIMITIVE_TOPOLOGY_PATCH_LIST : f.topology;
     ia.primitiveRestartEnable = VK_FALSE;
     VkPipelineTessellationStateCreateInfo ts{VK_STRUCTURE_TYPE_PIPELINE_TESSELLATION_STATE_CREATE_INFO};
@@ -6774,6 +7898,7 @@ bool create_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const VertexInputP
         pl.failed = true;
         return false;
     }
+    if (content_key && !t_replaying) recipe_note_created(pl, content_key);
     const auto ms_ = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
     if (!t_pipeline_worker) g_pl_create_us.fetch_add(pl_us_since(t0), std::memory_order_relaxed);
     // Slow driver compiles, with what might make them slow: the stages'
@@ -13132,6 +14257,10 @@ bool tess_ls_pass_locked(const GpuDraw& d, TessDraw& t) {
     constexpr std::uint64_t kLsOptimizeTag = 0x15c0000000000000ull;  // its optimized build's key, apart from the dispatches'
     if (pl.standin) adopt_optimized_compute(key ^ kLsOptimizeTag, pl.pipeline, pl.standin, pl.opt_seen);
     if (!pl.pipeline && !pl.failed) {
+        struct BuildTime {  // the stall line's compute pipelines
+            std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+            ~BuildTime() { note_cp_compute_build(work_us_since(t0)); }
+        } build_time;
         pl.name = ls->name + "-ls";
         const gcn::Program prog = gcn::decode(ls->words.data(), ls->words.size());
         gcn::Program fprog;
@@ -18319,6 +19448,204 @@ void stage_manifest_save(const std::string& path) {
     }
     if (ok) std::filesystem::rename(tmp, path, ec);
     if (!ok || ec) host_log("render: saving the stage manifest to %s failed", path.c_str());
+}
+
+// The pipeline manifest (see PipelineRecipe), read at the end of device init
+// after the stage manifest: each recipe goes to the precompile workers, the
+// most recently used first, behind the stage manifest's stages and ahead of
+// what GX creates. Without pipeline libraries too: there the whole pipelines
+// it builds are what a draw would compile.
+// One recipe file: this player's manifest or a shipped list. False when it is
+// not one this build reads.
+bool read_recipe_file(const std::string& path, std::uint32_t& run, recipe_file::Origin& origin,
+                      std::vector<std::shared_ptr<PipelineRecipe>>& recipes, std::uint32_t& unread) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) return false;
+    const std::vector<std::uint8_t> data((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    manifest_file::Reader r{data.data(), data.data() + data.size()};
+    if (data.size() < 12 || r.u32() != recipe_file::kMagic || r.u32() != recipe_file::kVersion) {
+        if (!data.empty()) host_log("render: pipeline manifest: %s is not one this build reads", path.c_str());
+        return false;
+    }
+    run = r.u32();
+    if (!recipe_file::read_origin(r, origin)) return false;
+    const std::uint32_t n = r.u32();
+    for (std::uint32_t k = 0; k < n && k < kRecipeMax && r.ok; ++k) {
+        auto rc = std::make_shared<PipelineRecipe>();
+        if (recipe_file::read(r, *rc)) {
+            rc->loaded = true;
+            recipes.push_back(std::move(rc));
+        } else {
+            ++unread;
+        }
+    }
+    return true;
+}
+
+// The pipeline manifest (see PipelineRecipe), read at the end of device init
+// after the stage manifest: each recipe goes to the precompile workers, the
+// most recently used first, behind the stage manifest's stages and ahead of
+// what GX creates. Without pipeline libraries too: there the whole pipelines
+// it builds are what a draw would compile. A shipped list (`list_path`: one
+// tools/pipeline_list.py made, read where it exists) adds the recipes this
+// player's manifest lacks, behind those: a first start has them too.
+void pipeline_manifest_load(const std::string& path, const std::string& list_path) {
+    if (!pipeline_manifest_on() || path.empty()) return;
+    g_pmanifest.loaded_at = std::chrono::steady_clock::now();
+    g_pmanifest.recording.store(true);
+    VkPhysicalDeviceProperties props{};
+    vkGetPhysicalDeviceProperties(g.phys, &props);
+    recipe_file::Origin ours;
+    ours.translator = translator_fingerprint();
+    ours.vendor = props.vendorID;
+    ours.device = props.deviceID;
+    ours.driver = props.driverVersion;
+    std::memcpy(ours.uuid, props.pipelineCacheUUID, VK_UUID_SIZE);
+    ours.libraries = use_pipeline_library();
+    std::uint32_t run = 0, unread = 0;
+    recipe_file::Origin theirs = ours;
+    std::vector<std::shared_ptr<PipelineRecipe>> recipes;
+    const bool have_own = read_recipe_file(path, run, theirs, recipes, unread);
+    std::sort(recipes.begin(), recipes.end(), [](const auto& a, const auto& b) {
+        return a->last_run != b->last_run ? a->last_run > b->last_run : a->uses > b->uses;
+    });
+    std::size_t own = 0, listed = 0, list_unread = 0;
+    std::vector<std::shared_ptr<PipelineRecipe>> queue;
+    {
+        std::lock_guard<std::mutex> lk(g_pmanifest.mu);
+        g_pmanifest.run = run + 1;
+        for (const auto& rc : recipes) {
+            if (g_pmanifest.by_key.emplace(rc->key, rc).second) queue.push_back(rc);
+        }
+        if (unread) g_pmanifest.dirty = true;
+        own = queue.size();
+    }
+    if (!list_path.empty()) {
+        std::uint32_t list_run = 0, bad = 0;
+        recipe_file::Origin list_origin;
+        std::vector<std::shared_ptr<PipelineRecipe>> list;
+        if (read_recipe_file(list_path, list_run, list_origin, list, bad)) {
+            std::lock_guard<std::mutex> lk(g_pmanifest.mu);
+            for (auto& rc : list) {
+                rc->listed = true;
+                rc->uses = 0;
+                rc->last_run = 0;
+                if (g_pmanifest.by_key.emplace(rc->key, rc).second) queue.push_back(rc);
+            }
+            listed = queue.size() - own;
+            list_unread = bad;
+        }
+    }
+    g_pmanifest.loaded.store(queue.size());
+    g_pmanifest.queued.store(queue.size());
+    if (!queue.empty()) {
+        Precompiler& w = precompiler();
+        {
+            std::lock_guard<std::mutex> lk(w.mu);
+            for (const auto& rc : queue) {
+                PrecompileJob job;
+                job.name = rc->vs_name + "+" + rc->ps_name;
+                job.type = 8;
+                job.recipe = rc;
+                w.jobs.push_back(std::move(job));
+            }
+        }
+        w.cv.notify_all();
+    }
+    const bool same_translator = theirs.translator == ours.translator;
+    const bool same_device = theirs.vendor == ours.vendor && theirs.device == ours.device && theirs.driver == ours.driver &&
+                             !std::memcmp(theirs.uuid, ours.uuid, VK_UUID_SIZE);
+    std::string list_note;
+    if (listed || list_unread) {
+        list_note = "; " + std::to_string(listed) + " more from the list " + list_path +
+                    (list_unread ? " (" + std::to_string(list_unread) + " of its entries not in this game's bundles or unreadable)" : "");
+    }
+    host_log("render: pipeline manifest: %zu pipelines from earlier runs (run %u)%s queued for their build%s%s%s%s", own, g_pmanifest.run,
+             list_note.c_str(), unread ? (", " + std::to_string(unread) + " unreadable dropped").c_str() : "",
+             !have_own || same_translator ? "" : "; recorded with another translator: every stage is translated again",
+             !have_own || same_device ? "" : "; recorded on another device or driver: the driver compiles them all again",
+             !have_own || theirs.libraries == ours.libraries ? "" : ours.libraries ? "; recorded without pipeline libraries" : "; recorded with pipeline libraries");
+}
+
+// The whole manifest, when recipes were recorded or used since the last
+// write: the recipes no draw took for kRecipeIdleRuns starts left out, then
+// past kRecipeMax or kRecipeMaxBytes the least recently used.
+void pipeline_manifest_save(const std::string& path) {
+    if (!pipeline_manifest_on() || path.empty()) return;
+    static std::mutex writing;
+    std::lock_guard<std::mutex> wl(writing);
+    std::vector<std::shared_ptr<PipelineRecipe>> keep;
+    std::uint32_t run = 0;
+    {
+        std::lock_guard<std::mutex> lk(g_pmanifest.mu);
+        if (!g_pmanifest.dirty) return;
+        g_pmanifest.dirty = false;
+        run = g_pmanifest.run;
+        for (const auto& [key, rc] : g_pmanifest.by_key) {
+            if (rc->last_run + kRecipeIdleRuns < run) continue;
+            if (rc->listed && rc->last_run != run) continue;  // the list has it: the player's own file keeps only what was used
+            keep.push_back(rc);
+        }
+    }
+    std::sort(keep.begin(), keep.end(), [](const auto& a, const auto& b) {
+        return a->last_run != b->last_run ? a->last_run > b->last_run : a->uses > b->uses;
+    });
+    manifest_file::Writer body;
+    std::uint32_t count = 0;
+    {
+        std::lock_guard<std::mutex> lk(g_pmanifest.mu);  // the relink's specialization may change under a draw
+        for (const auto& rc : keep) {
+            const std::size_t before = body.out.size();
+            recipe_file::write(body, *rc);
+            if (count + 1 > kRecipeMax || body.out.size() > kRecipeMaxBytes) {
+                body.out.resize(before);
+                g_pmanifest.dropped.fetch_add(1, std::memory_order_relaxed);
+                continue;
+            }
+            ++count;
+        }
+    }
+    VkPhysicalDeviceProperties props{};
+    vkGetPhysicalDeviceProperties(g.phys, &props);
+    recipe_file::Origin ours;
+    ours.translator = translator_fingerprint();
+    ours.vendor = props.vendorID;
+    ours.device = props.deviceID;
+    ours.driver = props.driverVersion;
+    std::memcpy(ours.uuid, props.pipelineCacheUUID, VK_UUID_SIZE);
+    ours.libraries = use_pipeline_library();
+    manifest_file::Writer out;
+    out.u32(recipe_file::kMagic);
+    out.u32(recipe_file::kVersion);
+    out.u32(run);
+    recipe_file::write_origin(out, ours);
+    out.u32(count);
+    out.out.insert(out.out.end(), body.out.begin(), body.out.end());
+    std::error_code ec;
+    std::filesystem::create_directories(std::filesystem::path(path).parent_path(), ec);
+    const std::string tmp = path + ".tmp";
+    bool ok = false;
+    {
+        std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
+        f.write(reinterpret_cast<const char*>(out.out.data()), static_cast<std::streamsize>(out.out.size()));
+        ok = static_cast<bool>(f);
+    }
+    if (ok) std::filesystem::rename(tmp, path, ec);
+    if (!ok || ec) host_log("render: saving the pipeline manifest to %s failed", path.c_str());
+}
+
+void pipeline_manifest_save_async(const std::string& path) {
+    static std::atomic<bool> saving{false};
+    if (!pipeline_manifest_on() || path.empty()) return;
+    {
+        std::lock_guard<std::mutex> lk(g_pmanifest.mu);
+        if (!g_pmanifest.dirty) return;
+    }
+    if (saving.exchange(true)) return;
+    std::thread([path] {
+        pipeline_manifest_save(path);
+        saving.store(false);
+    }).detach();
 }
 
 // With every 300-flip report, on a thread of its own: a stage recorded is

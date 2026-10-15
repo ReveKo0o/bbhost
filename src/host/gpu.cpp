@@ -8,6 +8,7 @@
 #include "host/ring_budget.h"
 #include "host/shader_patch.h"
 #include "host/shaders/gpu_stall.spv.h"
+#include "host/shader_bundles.h"
 #include "host/translation_cache.h"
 
 #include "gcn/container.h"
@@ -1266,6 +1267,13 @@ std::string stage_manifest_path() {
     std::string path = pipeline_cache_path();
     if (path.empty()) return path;
     return path.substr(0, path.rfind('/') + 1) + "stage-manifest.bin";
+}
+
+// <data root>/bbhost/pipeline-manifest.bin, the same.
+std::string pipeline_manifest_path() {
+    std::string path = pipeline_cache_path();
+    if (path.empty()) return path;
+    return path.substr(0, path.rfind('/') + 1) + "pipeline-manifest.bin";
 }
 
 // <data root>/bbhost/translation-cache.bin (host/translation_cache.h), the same.
@@ -2818,6 +2826,18 @@ bool init_locked() {
     start_hang_watchdog();
     start_memory_reserve();
     stage_manifest_load(stage_manifest_path());
+    {
+        // A shipped pipeline list beside the executable (tools/pipeline_list.py),
+        // or BBHOST_PIPELINE_LIST's (empty: none).
+        const char* e = std::getenv("BBHOST_PIPELINE_LIST");
+        std::string list = e ? std::string(e) : config_exe_dir() + "/pipeline-list.bin";
+        if (!e && !std::filesystem::exists(list)) list.clear();
+        shader_programs_set_eboot(config().eboot);
+        pipeline_manifest_load(pipeline_manifest_path(), list);
+    }
+    if (const std::string cache = pipeline_cache_path(); !cache.empty()) {
+        shader_sweep_start(cache.substr(0, cache.rfind('/') + 1) + "shader-sweep.txt", config().eboot);
+    }
     return true;
 }
 
@@ -4047,6 +4067,11 @@ ComputePipeline& pipeline_for(const GpuDispatch& d, std::uint64_t key, const std
 }
 
 }  // namespace
+
+void note_cp_compute_build(std::uint64_t us) {
+    g_cp_compute_us.fetch_add(us, std::memory_order_relaxed);
+    g_cp_compute_n.fetch_add(1, std::memory_order_relaxed);
+}
 
 void compute_pipeline_work(std::uint64_t out[2]) {
     out[0] = g_cp_compute_us.load(std::memory_order_relaxed);
@@ -7268,6 +7293,7 @@ void host_gpu_save_pipeline_cache() {
     static std::chrono::steady_clock::time_point last{};
     if (!g.ok || g.cache == VK_NULL_HANDLE) return;
     stage_manifest_save_async(stage_manifest_path());
+    pipeline_manifest_save_async(pipeline_manifest_path());
     translation_cache_save_async(translation_cache_path());
     // Compute pipelines the optimizer built count: they join the cache at a save (merge_side_caches).
     const std::uint64_t pipelines = host_gpu_stats().pipelines + compute_optimized_built();
@@ -7321,6 +7347,7 @@ void host_gpu_save_pipeline_cache_at_exit() {
     }
     save_pipeline_cache_now(path, false);  // the flag stays set: no save after this one
     stage_manifest_save(stage_manifest_path());
+    pipeline_manifest_save(pipeline_manifest_path());
     translation_cache_save(translation_cache_path(), true);
 }
 
@@ -7636,7 +7663,9 @@ void host_gpu_set_loading(bool loading) {
 }
 
 void host_gpu_world_reached() { gpu::precompile_set_world_reached(); }
-std::size_t host_gpu_shader_backlog() { return gpu::translation_cache_cold() ? gpu::precompile_backlog() : 0; }
+std::size_t host_gpu_shader_backlog() {
+    return (gpu::translation_cache_cold() ? gpu::precompile_backlog() : 0) + gpu::shader_sweep_left();
+}
 
 std::string host_gpu_image_heap_report() {
     std::lock_guard<GpuMutex> lock(gpu::g.mu);
