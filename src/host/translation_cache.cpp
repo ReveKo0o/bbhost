@@ -837,8 +837,10 @@ gcn::LiftResult lift_cached(bool vertex, const gcn::Program& prog, const gcn::Tr
 
 gcn::LiftResult lift_compute_cached(const gcn::Program& prog, const gcn::TranslateOptions& o, const gcn::TranslateResult& reference) {
     const auto lift = [&] { return gcn::lift_compute_shader(prog, o, reference); };
-    if (!g_tc.ready.load(std::memory_order_acquire) || !g_tc.on) return lift();
-    return lift_through_cache(key_for(prog, o, TranslationUse::kLiftCompute), lift);
+    gcn::LiftResult l = !g_tc.ready.load(std::memory_order_acquire) || !g_tc.on ? lift()
+                                                                                : lift_through_cache(key_for(prog, o, TranslationUse::kLiftCompute), lift);
+    hlsl_stage(l);
+    return l;
 }
 
 gcn::LiftResult lift_tess_cached(TranslationUse use, const gcn::Program& prog, const gcn::TranslateOptions& o, const gcn::TranslateResult& reference,

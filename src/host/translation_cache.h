@@ -55,23 +55,23 @@ gcn::LiftResult lift_tess_cached(TranslationUse use, const gcn::Program& prog, c
                                  const gcn::TessLift& tess);
 
 // BBHOST_HLSL=1 (off by default, while the path is checked against the direct
-// one): every lift lift_cached and lift_tess_cached return is printed as HLSL
-// (gcn/hlsl.h) and compiled by DXC (host/dxc.h, libdxcompiler loaded at run
-// time), and the stage takes DXC's SPIR-V in place of the lifter's when it
-// declares the same interface and keeps the lift's operations
-// (gcn::hlsl_interface_diff, hlsl_operation_diff). Anything else - DXC not
-// found, a module the printer does not take, a compile error, a difference -
-// keeps the lifter's SPIR-V and is counted by reason in the exit report. The
-// result is kept in this cache under its own use (kHlsl), keyed on the lifted
-// module, DXC's version and its arguments: a later start compiles nothing
-// again. BBHOST_HLSL_O=0..3 sets DXC's optimization level (default 3),
+// one): every lift lift_cached, lift_compute_cached and lift_tess_cached return
+// is printed as HLSL (gcn/hlsl.h) and compiled by DXC (host/dxc.h,
+// libdxcompiler loaded at run time), and the stage takes DXC's SPIR-V in place
+// of the lifter's when it declares the same interface and keeps the lift's
+// operations (gcn::hlsl_interface_diff, hlsl_operation_diff). Anything else -
+// DXC not found, a module the printer does not take, a compile error, a
+// difference - keeps the lifter's SPIR-V and is counted by reason in the exit
+// report. The result is kept in this cache under its own use (kHlsl), keyed on
+// the lifted module, DXC's version and its arguments: a later start compiles
+// nothing again. BBHOST_HLSL_O=0..3 sets DXC's optimization level (default 3),
 // BBHOST_HLSL_DXC the library to load, BBHOST_HLSL_DUMP=<dir> writes each
 // compiled module's HLSL there (made from the game's shaders: it stays on this
 // machine). BBHOST_HLSL=2 compiles behind the game instead: a stage whose
-// module the cache does not have keeps the lifter's SPIR-V for this start,
-// and two bb-hlsl threads (BBHOST_HLSL_THREADS) compile it for the next - the
-// first start after switching costs nothing, the next takes every module it
-// met from the cache.
+// module the cache does not have keeps the lifter's SPIR-V for this start, and
+// two bb-hlsl threads (BBHOST_HLSL_THREADS) compile it for the next - the first
+// start after switching costs nothing, the next takes every module it met from
+// the cache.
 bool hlsl_on();
 
 // At device start, after the device's features are given to the translator
