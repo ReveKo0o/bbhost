@@ -709,6 +709,10 @@ void defer_destroy_private_view(VkImageView view);  // a pass's own view, never 
 void queue_drain();
 std::string submit_thread_report();  // for the hang report
 std::string submit_merge_report();   // the submission thread's jobs and queue submissions so far (recorder report)
+// Writes into write-combined memory the GPU reads (params blocks, constant-
+// buffer snapshots) run to the end of their last 64-byte line (gpu.cpp,
+// BBHOST_WC_LINES).
+extern const bool g_wc_whole_lines;
 struct QueueGuard {
     QueueGuard();
     ~QueueGuard();

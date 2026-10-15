@@ -9654,7 +9654,20 @@ void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t
             if (realign && bytes && bytes <= (1u << 20) && (snapshot || hle_kernel_va_mapped(base, bytes))) {
                 if (!scratch.buffer) create_upload_buffer(scratch, kScratch, "the constant-buffer copies' ring");
                 if (scratch.map) {
-                    if (scratch_next + bytes + 256 > kScratch) {
+                    // The ring is write-combined memory: a copy whose last line
+                    // is partly written leaves that line in a write-combining
+                    // buffer, flushed in pieces at the next store fence (the
+                    // draw's publish). So the copy runs on to the end of its
+                    // last 64-byte line, from the guest bytes after the buffer
+                    // when they lie in the same 4 KiB page (they are mapped);
+                    // what a draw binds and reads stays `bytes`.
+                    // BBHOST_WC_LINES=0: exactly the buffer's bytes.
+                    VkDeviceSize copy_bytes = bytes;
+                    if (g_wc_whole_lines) {
+                        const VkDeviceSize lines = (bytes + 63) & ~VkDeviceSize{63};
+                        if (((base + bytes - 1) >> 12) == ((base + lines - 1) >> 12)) copy_bytes = lines;
+                    }
+                    if (scratch_next + copy_bytes + 256 > kScratch) {
                         scratch_next = 0;
                         ++scratch_lap;
                     }
@@ -9662,7 +9675,7 @@ void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t
                     // A lap round the ring (~0.4 s of copies GPU-bound): the
                     // draws that read a segment's copies in the lap before have
                     // run before it is written again (at once, nearly always).
-                    for (VkDeviceSize s = at / kScratchSegment; s <= (at + bytes - 1) / kScratchSegment; ++s) {
+                    for (VkDeviceSize s = at / kScratchSegment; s <= (at + copy_bytes - 1) / kScratchSegment; ++s) {
                         if (segment_lap[s] != scratch_lap) {
                             if (segment_lap[s]) wait_submission_locked(segment_serial[s]);
                             segment_lap[s] = scratch_lap;
@@ -9670,10 +9683,10 @@ void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t
                         segment_serial[s] = g.flushes;
                     }
                     std::memcpy(static_cast<std::uint8_t*>(scratch.map) + at,
-                                reinterpret_cast<const void*>(static_cast<std::uintptr_t>(base)), bytes);
+                                reinterpret_cast<const void*>(static_cast<std::uintptr_t>(base)), copy_bytes);
                     // (A snapshot's range holds no copy-back: the lookup above said so.)
                     if (!snapshot) copy_versions_overlay_locked(base, bytes, static_cast<std::uint8_t*>(scratch.map) + at);
-                    scratch_next = at + bytes;
+                    scratch_next = at + copy_bytes;
                     // A snapshot binds the whole ring and is found by its
                     // dword bias: one descriptor for all of them. Bound at its
                     // own offset, every snapshot was a descriptor set never

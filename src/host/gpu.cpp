@@ -2877,16 +2877,40 @@ void begin_recording_locked() {
     }
 }
 
+// A params block into its slot in the ring, which is write-combined memory,
+// as whole 64-byte lines: a line written in part (352 bytes are five and a
+// half) stays in a write-combining buffer until the next store fence - the
+// draw's publish - which then flushes it in pieces. The slot (kParamsStride)
+// holds the rounded size; the binding's range stays sizeof(StageParams).
+// BBHOST_WC_LINES=0: the params blocks and the constant-buffer snapshots
+// (render.cpp) written at their exact sizes.
+const bool g_wc_whole_lines = [] {
+    const char* e = std::getenv("BBHOST_WC_LINES");
+    return !(e && e[0] == '0');
+}();
+constexpr std::size_t kParamsLines = (sizeof(gcn::StageParams) + 63) & ~std::size_t{63};
+static_assert(kParamsLines <= kParamsStride, "a params slot holds its block in whole lines");
+void put_params_lines(std::uint8_t* dst, const gcn::StageParams& params) {
+    if (!g_wc_whole_lines) {
+        std::memcpy(dst, &params, sizeof(params));
+        return;
+    }
+    alignas(64) std::uint8_t lines[kParamsLines];
+    std::memcpy(lines, &params, sizeof(params));
+    std::memset(lines + sizeof(params), 0, kParamsLines - sizeof(params));
+    std::memcpy(dst, lines, kParamsLines);
+}
+
 std::uint32_t alloc_params_slot_locked(const gcn::StageParams& params, VkDescriptorBufferInfo& out) {
     const std::uint32_t slot = g.queued++;
     const std::uint32_t index = static_cast<std::uint32_t>(g.slot) * kMaxQueued * kStageSlots + slot;
-    std::memcpy(static_cast<std::uint8_t*>(g.ubo_map) + static_cast<std::size_t>(index) * kParamsStride, &params, sizeof(params));
+    put_params_lines(static_cast<std::uint8_t*>(g.ubo_map) + static_cast<std::size_t>(index) * kParamsStride, params);
     out = {g.ubo, static_cast<VkDeviceSize>(index) * kParamsStride, sizeof(gcn::StageParams)};
     return slot;
 }
 
 void rewrite_params_slot_locked(const gcn::StageParams& params, const VkDescriptorBufferInfo& slot) {
-    std::memcpy(static_cast<std::uint8_t*>(g.ubo_map) + static_cast<std::size_t>(slot.offset), &params, sizeof(params));
+    put_params_lines(static_cast<std::uint8_t*>(g.ubo_map) + static_cast<std::size_t>(slot.offset), params);
 }
 
 // Sets come from the current slot's pool eight at a time: a draw takes two,
