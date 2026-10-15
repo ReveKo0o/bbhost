@@ -19,9 +19,9 @@ The 1.09 executable has about 169,000 functions. In a default run today:
 |---|---|
 | Rewritten as source, on the decomp list (`src/decomp/`) | 31 |
 | Replaced by bbhost code outside the list (written before the list existed) | 4, and the YEBIS resource builder bypassed |
-| Hooked at the entry or at call sites (GX methods, the resource registry, live resolution, settings, key prompts, menus) | 117 |
-| **Taken over in all** | **152** |
-| With any code byte changed (including byte patches and redirected calls) | 173; 255 at 60 fps |
+| Hooked at the entry or at call sites (GX methods, the resource registry, live resolution, settings, key prompts, menus) | 120 |
+| **Taken over in all** | **155** |
+| With any code byte changed (including byte patches and redirected calls) | 176; 258 at 60 fps |
 | The game's own code | everything else |
 
 The TLS rewrite also changes one instruction at each of 17,127 sites in about

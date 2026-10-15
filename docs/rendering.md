@@ -209,7 +209,18 @@ until the path is shown equal to the direct one in game.
   precompile ends 10-25 s later) and stalls up to ~0.7 s on arriving
   somewhere new; warm, nothing is compiled and starts and arrivals are the
   direct path's. With `BBHOST_HLSL=2` the first start is as fast as the
-  direct path's and the next takes what it compiled.
+  direct path's and the next takes what it compiled. Compute dispatches take
+  DXC's modules too.
+- **A driver that refuses DXC's module.** A pipeline the driver will not
+  build from DXC's modules is built again from the lifts' own: a graphics
+  pipeline whole or from its libraries, the native hulls' included, and a
+  compute pipeline from the lift's module and then from the translation. No
+  draw or dispatch is lost to the switch. A stage refused once takes its
+  lift's module at once in the pipelines after. The exit report's HLSL line
+  counts the refusals by what was being built; `BBHOST_TEST_HLSL_REFUSE=1`
+  makes every such pipeline a refusal, to run the path on a driver that
+  refuses none (the RTX 4070 here builds every module since the carries and
+  wide multiplies were spelled out).
 - **DXC.** bbhost loads libdxcompiler (`dxcompiler.dll` on Windows) at run
   time, from beside the executable or the library path, and needs nothing
   else of it (not `dxil.dll`); without it the switch keeps every lift. A
@@ -226,7 +237,9 @@ until the path is shown equal to the direct one in game.
   by guest address and write tracking.
 - Labels, fences and occlusion queries from GX's own calls, after which the PM4
   command processor only orders work.
-- HLSL from the lifted shaders (the table above).
+- The HLSL path checked on Windows and the Steam Deck with DXC in the kits,
+  before it can be the default; then shaders as editable source (the table
+  above).
 
 ## Tools
 
@@ -239,7 +252,7 @@ until the path is shown equal to the direct one in game.
 | `gcndis` | disassembles GCN programs |
 | F12 in game | dumps the frame, every render target and the draw list into a folder of its own (`tools/f12_check.py` reads it; `BBHOST_F12_PNG=1` for PNG) |
 | `BBHOST_CAPTURE_DRAW` + `drawreplay` | captures one draw with its inputs and replays it outside the game; `BBHOST_CAPTURE_DISPATCH` does the same for a compute dispatch |
-| `tools/area_check.py` | ten places in the game measured the same way every time - frame times, GPU time, draws by how their pixel shader ran, compiles, frames and lift checks - and two builds compared against their own noise ([area-check.md](area-check.md)) |
+| `tools/area_check.py` | twelve places in the game measured the same way every time - frame times, GPU time, draws by how their pixel shader ran, compiles, frames and lift checks - and two builds compared against their own noise ([area-check.md](area-check.md)) |
 | `BBHOST_VK_VALIDATE=1` | runs with the Vulkan validation layer |
 | `BBHOST_GPU_PROFILE=1` | per-pass GPU timings |
 | `bbhost --stream-selftest[=N]` | checks the command stream headless against a CPU model, N rounds (16 by default), and exits with 0 when it matched; run it with `BBHOST_VK_VALIDATE=1` too |
