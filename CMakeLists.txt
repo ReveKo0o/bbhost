@@ -340,6 +340,7 @@ set(BBHOST_DECOMP_SOURCES
   src/decomp/gx/flush_wait.cpp
   src/decomp/gx/block_reclaim.cpp
   src/decomp/gx/drain_token.cpp
+  src/decomp/gx/query_token.cpp
   src/decomp/memory/game_memcpy.cpp
   src/decomp/memory/ez_copy.cpp
   src/decomp/sfx/ribbons.cpp

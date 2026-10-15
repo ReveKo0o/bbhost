@@ -312,6 +312,11 @@ constexpr std::uint32_t kGxYebisMagic = 0x42595242u;  // "BRYB"
 // that wait: what it writes to memory itself after it goes behind the work
 // before it, on the GPU's timeline.
 constexpr std::uint32_t kGxBarrierMagic = 0x52424242u;  // "BBBR"
+// An occlusion query's begin or end as one token (decomp/gx/query_token.cpp):
+// {kGxQueryMagic, block | kind, block >> 32}, kind 0 a begin (the block reset,
+// the counters dumped at it), 1 an end (dumped at block + 8), 2 a dump at the
+// block alone.
+constexpr std::uint32_t kGxQueryMagic = 0x514f4242u;  // "BBOQ"
 struct GxYebisDraw {
     std::uint32_t index_count;
     std::uint64_t index_va;

@@ -1590,6 +1590,85 @@ void gds_dma(const std::uint32_t* b, unsigned src_sel, unsigned dst_sel, std::si
     gds_log_once(other_logs, "gnm exec: DMA_DATA from select %llu to select %llu through GDS is not a counter's move: dropped", src_sel, dst_sel);
 }
 
+// An occlusion query's begin: its 128-byte block zeroed on the GPU's timeline,
+// in stream order - after the dumps of the block's last query, before this
+// one's - as the DMA_DATA fill that did it went there behind the barrier
+// before it. The CP's own writes after it go there too (cp_write_after_waits).
+// Where the block is not in imported memory, on the CPU as the fill did.
+std::atomic<std::uint64_t> g_query_tokens[3] = {}, g_query_resets_cpu{0};
+void query_reset(std::uint64_t block) {
+    static const std::uint8_t kZeros[128] = {};
+    std::uint64_t serial = 0;
+    if (host_gpu_mem_write_ordered(block, kZeros, sizeof(kZeros), &serial)) {
+        record(block, kZeros, sizeof(kZeros), false);
+        t_cp_writes_need = std::max(t_cp_writes_need, serial + 1);
+        return;
+    }
+    if (!hle_kernel_va_mapped(block, sizeof(kZeros))) return;
+    g_query_resets_cpu.fetch_add(1, std::memory_order_relaxed);
+    store(block, kZeros, sizeof(kZeros));
+}
+
+// A pixel-pipe counter dump (an occlusion query's begin or end sample) to `va`:
+// the renderer's own occlusion query (host/occlusion.cpp), or, where it cannot
+// place one, the old rising count.
+void zpass_dump(std::uint64_t va, bool zpass_trace) {
+    // The real counters (host/occlusion.cpp): the draws after the
+    // dump are measured by Vulkan occlusion queries and the GPU
+    // writes the counts here once it has run them, before the
+    // labels that follow. Nothing is written now - the game zeroed
+    // the block and reads it as not ready until then.
+    if (host_gpu_zpass_dump(va)) return;
+    // Per pixel pipe: [this sample, the next one], 16 bytes apart.
+    constexpr int kPixelPipes = 8;  // 16 on a Neo; the game reads as many as it wrote
+    constexpr std::uint64_t kValid = 1ull << 63;
+    if (hle_kernel_va_mapped(va, kPixelPipes * 16)) {
+        // BBHOST_ZPASS_COUNT: how many pixels each sample claims
+        // passed, for working out what the game does with them.
+        static const std::uint64_t step = [] {
+            const char* e = std::getenv("BBHOST_ZPASS_COUNT");
+            return e ? std::strtoull(e, nullptr, 0) : 0x2ffffffull;
+        }();
+        static std::atomic<std::uint64_t> counter{0};
+        // Every pipe reports the same count, and a sample is
+        // ahead of the one before it. HLE fake: the pixels a draw
+        // covers are not counted, so a light behind a wall keeps
+        // its glare and the game culls nothing by its queries
+        // (the real counts are host_gpu_zpass_dump's, above).
+        const std::uint64_t now = counter.fetch_add(step, std::memory_order_relaxed) + step;
+        // Only the dump's own words, one per pipe, 16 bytes apart:
+        // the query's end dump lands at block+8 (Gnm's writer,
+        // 0x1477660), and writing a 128-byte image of value/zero
+        // pairs from there zeroed pipes 1-7's begin words and the
+        // 8 bytes after the block. Both readers (GX GetData
+        // 0x256a2f0, YEBIS 0x15db3c0) want bit 63 in all 16 words,
+        // so no query ever completed: GX culling entries stayed
+        // pending and YEBIS's luminance analysis took an
+        // uninitialised count.
+        const std::uint64_t word = now | kValid;
+        for (int i = 0; i < kPixelPipes; ++i) store(va + 16 * static_cast<std::uint64_t>(i), &word, sizeof(word));
+        // With BBHOST_ZPASS_TRACE an end dump (at block+8) prints the
+        // block: a query the game can finish has bit 63 in all 16.
+        if (zpass_trace && (va & 15) == 8) {
+            static std::atomic<int> blocks{0};
+            if (blocks.fetch_add(1) < 12) {
+                const auto* q = reinterpret_cast<const std::uint64_t*>(static_cast<std::uintptr_t>(va - 8));
+                int valid = 0;
+                for (int i = 0; i < kPixelPipes * 2; ++i) valid += (q[i] & kValid) != 0;
+                host_log("zpass: block 0x%llx: %d of 16 words valid, pipe 0 begin 0x%llx end 0x%llx",
+                         static_cast<unsigned long long>(va - 8), valid, static_cast<unsigned long long>(q[0]),
+                         static_cast<unsigned long long>(q[1]));
+            }
+        }
+        static std::atomic<int> logs{0};
+        if (logs.fetch_add(1) == 0) {
+            host_log("HLE fake: the pixel-pipe counters an occlusion query samples are a rising count, not the pixels drawn "
+                     "(first dump to 0x%llx; BBHOST_OCCLUSION=0, or the block is not in imported memory)",
+                     static_cast<unsigned long long>(va));
+        }
+    }
+}
+
 void execute_packet(std::uint32_t op, const std::uint32_t* b, std::size_t n, int depth) {
     t_packet_va = reinterpret_cast<std::uintptr_t>(b) - 4;
     t_packet_op = op;
@@ -1630,63 +1709,7 @@ void execute_packet(std::uint32_t op, const std::uint32_t* b, std::size_t n, int
                     host_log("zpass: event type %u at draw %llu", type, static_cast<unsigned long long>(g_draws.load()));
                 }
             }
-            if (type == kPixelPipeStatDump && index == kEventIndexZpassDone && n >= 3) {
-                const std::uint64_t va = gpu_va(b[1], b[2]);
-                // The real counters (host/occlusion.cpp): the draws after the
-                // dump are measured by Vulkan occlusion queries and the GPU
-                // writes the counts here once it has run them, before the
-                // labels that follow. Nothing is written now - the game zeroed
-                // the block and reads it as not ready until then.
-                if (host_gpu_zpass_dump(va)) break;
-                // Per pixel pipe: [this sample, the next one], 16 bytes apart.
-                constexpr int kPixelPipes = 8;  // 16 on a Neo; the game reads as many as it wrote
-                constexpr std::uint64_t kValid = 1ull << 63;
-                if (hle_kernel_va_mapped(va, kPixelPipes * 16)) {
-                    // BBHOST_ZPASS_COUNT: how many pixels each sample claims
-                    // passed, for working out what the game does with them.
-                    static const std::uint64_t step = [] {
-                        const char* e = std::getenv("BBHOST_ZPASS_COUNT");
-                        return e ? std::strtoull(e, nullptr, 0) : 0x2ffffffull;
-                    }();
-                    static std::atomic<std::uint64_t> counter{0};
-                    // Every pipe reports the same count, and a sample is
-                    // ahead of the one before it. HLE fake: the pixels a draw
-                    // covers are not counted, so a light behind a wall keeps
-                    // its glare and the game culls nothing by its queries
-                    // (the real counts are host_gpu_zpass_dump's, above).
-                    const std::uint64_t now = counter.fetch_add(step, std::memory_order_relaxed) + step;
-                    // Only the dump's own words, one per pipe, 16 bytes apart:
-                    // the query's end dump lands at block+8 (Gnm's writer,
-                    // 0x1477660), and writing a 128-byte image of value/zero
-                    // pairs from there zeroed pipes 1-7's begin words and the
-                    // 8 bytes after the block. Both readers (GX GetData
-                    // 0x256a2f0, YEBIS 0x15db3c0) want bit 63 in all 16 words,
-                    // so no query ever completed: GX culling entries stayed
-                    // pending and YEBIS's luminance analysis took an
-                    // uninitialised count.
-                    const std::uint64_t word = now | kValid;
-                    for (int i = 0; i < kPixelPipes; ++i) store(va + 16 * static_cast<std::uint64_t>(i), &word, sizeof(word));
-                    // With BBHOST_ZPASS_TRACE an end dump (at block+8) prints the
-                    // block: a query the game can finish has bit 63 in all 16.
-                    if (zpass_trace && (va & 15) == 8) {
-                        static std::atomic<int> blocks{0};
-                        if (blocks.fetch_add(1) < 12) {
-                            const auto* q = reinterpret_cast<const std::uint64_t*>(static_cast<std::uintptr_t>(va - 8));
-                            int valid = 0;
-                            for (int i = 0; i < kPixelPipes * 2; ++i) valid += (q[i] & kValid) != 0;
-                            host_log("zpass: block 0x%llx: %d of 16 words valid, pipe 0 begin 0x%llx end 0x%llx",
-                                     static_cast<unsigned long long>(va - 8), valid, static_cast<unsigned long long>(q[0]),
-                                     static_cast<unsigned long long>(q[1]));
-                        }
-                    }
-                    static std::atomic<int> logs{0};
-                    if (logs.fetch_add(1) == 0) {
-                        host_log("HLE fake: the pixel-pipe counters an occlusion query samples are a rising count, not the pixels drawn "
-                                 "(first dump to 0x%llx; BBHOST_OCCLUSION=0, or the block is not in imported memory)",
-                                 static_cast<unsigned long long>(va));
-                    }
-                }
-            }
+            if (type == kPixelPipeStatDump && index == kEventIndexZpassDone && n >= 3) zpass_dump(gpu_va(b[1], b[2]), zpass_trace);
             break;
         }
         case kSetPredication: {
@@ -2235,6 +2258,17 @@ void execute_packet(std::uint32_t op, const std::uint32_t* b, std::size_t n, int
             if (n >= 1 && b[0] == kGxBarrierMagic) {
                 t_barrier_pending = true;
                 g_barrier_tokens.fetch_add(1, std::memory_order_relaxed);
+                break;
+            }
+            // An occlusion query's begin or end (decomp/gx/query_token.cpp):
+            // a begin's block reset on the GPU's timeline, in stream order
+            // with the dumps around it, then the dump.
+            if (n >= 3 && b[0] == kGxQueryMagic) {
+                const std::uint64_t block = (b[1] & ~7u) | (static_cast<std::uint64_t>(b[2]) << 32);
+                const unsigned kind = b[1] & 3;
+                g_query_tokens[kind < 3 ? kind : 2].fetch_add(1, std::memory_order_relaxed);
+                if (kind == 0) query_reset(block);
+                zpass_dump(kind == 1 ? block + 8 : block, false);
                 break;
             }
             // BBHOST_GX_NATIVE: a GX draw's host-draw token.
@@ -3608,6 +3642,12 @@ void hle_gnm_cp_report() {
     host_log("cp: label values recorded for the GPU to write, by address: %zu addresses; %llu waits satisfied by one; %llu GX pipeline "
              "drains walked as barrier tokens", labels, static_cast<unsigned long long>(g_wait_pending.load()),
              static_cast<unsigned long long>(g_barrier_tokens.load()));
+    if (g_query_tokens[0].load() || g_query_tokens[1].load() || g_query_tokens[2].load()) {
+        host_log("cp: occlusion queries from their tokens: %llu begins (%llu blocks reset on the CPU: not in imported memory), %llu ends, "
+                 "%llu other dumps", static_cast<unsigned long long>(g_query_tokens[0].load()),
+                 static_cast<unsigned long long>(g_query_resets_cpu.load()), static_cast<unsigned long long>(g_query_tokens[1].load()),
+                 static_cast<unsigned long long>(g_query_tokens[2].load()));
+    }
 }
 
 void hle_gnm_label_report() {
