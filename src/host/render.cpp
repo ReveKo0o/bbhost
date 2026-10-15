@@ -1422,15 +1422,34 @@ struct PendingHtile {
     std::uint32_t word, stencil_clear;  // the HTILE word (htile_word_depth) and DB_STENCIL_CLEAR at the fill
 };
 std::unordered_map<std::uint64_t, PendingHtile> g_pending_htile;
+std::uint64_t g_pending_htile_gen = 1;  // bumped at every insert and erase of g_pending_htile (under g.mu)
 // The fill's clear values become the target's pending clear; true when one was waiting.
 bool take_pending_htile(std::uint64_t key, RtImage& r) {
+    // The keys that missed since the map last changed: every bound target of
+    // every draw asks again for the same few (its HTILE, its base, the draw's
+    // HTILE) while a fill that met no target stays waiting - a hash lookup
+    // each, 0.7% of the command processor at Mensis.
+    static std::uint64_t miss_key[4] = {}, miss_gen = 0;
+    static unsigned miss_next = 0;
+    if (miss_gen != g_pending_htile_gen) {
+        miss_gen = g_pending_htile_gen;
+        for (std::uint64_t& k : miss_key) k = ~0ull;
+    } else {
+        for (const std::uint64_t k : miss_key) {
+            if (k == key) return false;
+        }
+    }
     const auto it = g_pending_htile.find(key);
-    if (it == g_pending_htile.end()) return false;
+    if (it == g_pending_htile.end()) {
+        miss_key[miss_next++ & 3] = key;
+        return false;
+    }
     r.htile_clear_pending = true;
     const float depth = htile_word_depth(it->second.word);
     std::memcpy(&r.htile_clear_depth, &depth, 4);
     r.htile_clear_stencil = it->second.stencil_clear;
     g_pending_htile.erase(it);
+    ++g_pending_htile_gen;
     return true;
 }
 std::atomic<std::uint64_t> g_fill_pending{0}, g_fill_applied{0};
@@ -8124,6 +8143,7 @@ bool render_handle_fill_locked(std::uint64_t va, std::size_t bytes, const float 
     ++g_pending_gen;
     g_pending_clear_max = std::max(g_pending_clear_max, pc.bytes);
     g_pending_htile[va] = PendingHtile{word, stencil_clear};
+    ++g_pending_htile_gen;
     g_fill_pending.fetch_add(1);
     tex_event(va, bytes, "fill 0x%llx 0x%zx bytes with %g %g %g %g pending (no image yet)", static_cast<unsigned long long>(va), bytes,
               rgba[0], rgba[1], rgba[2], rgba[3]);
@@ -10976,6 +10996,7 @@ void host_gpu_depth_clear(std::uint64_t base, std::uint32_t word, std::uint32_t 
     if (!any) {
         ccheck_note(nullptr, false, 0, 0, nullptr, htile_word_depth(word), stencil);
         g_pending_htile[base] = PendingHtile{word, stencil};
+        ++g_pending_htile_gen;
     }
 }
 
@@ -11322,6 +11343,7 @@ bool host_gpu_clear_view(const GpuClearView& c, bool apply, GpuClearViewResult* 
             const DepthClearPlanes p = depth_clear_planes(c);
             const auto scaled = static_cast<std::uint32_t>(std::floor(p.depth_value * 16383.0f));
             g_pending_htile[static_cast<std::uint64_t>(c.z_read_base) << 8] = PendingHtile{scaled << 18, p.stencil_value};
+            ++g_pending_htile_gen;
         }
         return true;
     }
