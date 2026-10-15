@@ -897,7 +897,8 @@ bool install_jump_hook(ElfImage* image, std::uint64_t at, std::uint64_t target, 
 // is read each frame (0x26a5d22, 0x26b4cb7) and the bins are allocated per
 // frame, so a resize or a new render size takes effect on the next frame.
 // Never 0 - it is a divisor (0x26a5d43). BBHOST_LIGHT_GRID=0 keeps the
-// game's tiles and jobs; =WxH a fixed tile, for measuring.
+// game's tiles and jobs; =<N> N tiles a side (1: one tile, the frame); =WxH
+// a fixed tile, for measuring.
 constexpr std::uint64_t kGraphicsManagerSlot = 0x5940dd8;
 constexpr std::uint64_t kLightGridDiv = 0x553ae80;  // x, y
 constexpr std::size_t kLightTileW = 0x78a8, kLightTileH = 0x78ac;
@@ -920,7 +921,13 @@ std::uint32_t g_tile_fixed[2] = {0, 0};             // BBHOST_LIGHT_GRID=WxH: th
 // same picture (eight frames of each, twice: the pairs across configurations
 // differ no more than two runs of one); an RTX 3070 Ti laptop one tile
 // 83.0-83.5, 4 a side 90.7-91.5; an RTX 4070 (main-loop-bound) the same fps,
-// one tile +10% GPU time.
+// one tile +10% GPU time. 2026-10-14 (Kyo), the room NVIDIA players drop to
+// ~35 fps in (Kyo's save; 1080p, headless, the light pass's GPU ms a frame /
+// draws a frame / the command processor's ms a frame, two runs each in
+// A-B-C-C-B-A order): one tile 1.45-1.51 / 885, the game's tiles 0.87 / 1162,
+// 4 a side 0.83-0.86 / 918 / 6.8, 6 a side 0.74-0.76 / 961 / 6.5-6.7, 8 a side
+// 0.73-0.76 / 1020 / 7.3. BBHOST_LIGHT_GRID=<N> sets N tiles a side (=1 or
+// =window one tile, =quarter 4).
 std::uint32_t g_tiles_per_axis = 4;
 // The tile is the GraphicsManager's own, written once by its constructor
 // (sub_26958d0: mov dword [rbx+0x78a8], 128 at 0x2695cb6 and [rbx+0x78ac] at
@@ -1079,6 +1086,10 @@ void light_grid_install(ElfImage* image) {
         return;
     }
     if (const char* e = std::getenv("BBHOST_LIGHT_GRID"); e && std::strcmp(e, "window") == 0) g_tiles_per_axis = 1;
+    // =<N>: N tiles a side (1 is one tile the frame's size).
+    if (const char* e = std::getenv("BBHOST_LIGHT_GRID"); e && *e >= '1' && *e <= '9' && !std::strchr(e, 'x')) {
+        g_tiles_per_axis = static_cast<std::uint32_t>(std::clamp(std::atoi(e), 1, 32));
+    }
     if (const char* e = std::getenv("BBHOST_LIGHT_GRID"); e && std::strchr(e, 'x')) {
         g_tile_fixed[0] = static_cast<std::uint32_t>(std::atoi(e));
         g_tile_fixed[1] = static_cast<std::uint32_t>(std::atoi(std::strchr(e, 'x') + 1));
@@ -1122,8 +1133,8 @@ void light_grid_install(ElfImage* image) {
     }
     host_window_on_pixels(&light_grid_window);
     host_log("graphics: light grid - one job of %ux%u tiles sized to the larger of the window and the render size, set by the "
-             "manager's constructor and again only when either changes (was 3x3 jobs of 128x128 tiles%s; BBHOST_LIGHT_GRID=window: "
-             "one tile, =0: the game's)",
+             "manager's constructor and again only when either changes (was 3x3 jobs of 128x128 tiles%s; BBHOST_LIGHT_GRID=<N>: N "
+             "a side, =1 or =window one tile, =0 the game's)",
              g_tiles_per_axis, g_tiles_per_axis, patched ? "; the split was 1x1 already, a patch's" : "");
 }
 
