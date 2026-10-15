@@ -3013,7 +3013,7 @@ struct PipelineBuildScope {
                  "waiting for another thread's library %.2f ms; stage translations %llu; the rest %.2f ms",
                  pl.name.c_str(), pl.lean ? " (no-fallback)" : pl.layout_only ? " (fallback, laid out)" : "",
                  static_cast<unsigned long long>(hle_video_flip_count()), us / 1000.0, what,
-                 pl.failed ? "failed" : pl.library ? "linked" : pl.pipeline ? "whole" : "not created",
+                 pl.failed ? "failed" : pl.prebuilt ? "built at the start" : pl.library ? "linked" : pl.pipeline ? "whole" : "not created",
                  static_cast<unsigned long long>(dn[kWorkShaderLibrary]), du[kWorkShaderLibrary] / 1000.0,
                  static_cast<unsigned long long>(dn[kWorkInterfaceLibrary]), du[kWorkInterfaceLibrary] / 1000.0,
                  static_cast<unsigned long long>(dn[kWorkLink]), du[kWorkLink] / 1000.0, static_cast<unsigned long long>(dn[kWorkWhole]),
