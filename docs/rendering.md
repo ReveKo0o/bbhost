@@ -240,14 +240,30 @@ until the path is shown equal to the direct one in game.
   refuses none (the RTX 4070 here builds every module since the carries and
   wide multiplies were spelled out).
 - **DXC.** bbhost loads libdxcompiler (`dxcompiler.dll` on Windows) at run
-  time, from beside the executable or the library path, and needs nothing
-  else of it (not `dxil.dll`); without it the switch keeps every lift. A
+  time - the one `BBHOST_HLSL_DXC` names, else the one beside the executable,
+  which every package carries (DXC's v1.9.2602 release, pinned and checked by
+  `tools/fetch_dxc.sh`), else the system's - and needs nothing else of it (not
+  `dxil.dll`). A library that does not compile to SPIR-V is passed over;
+  without one the switch keeps every lift, counted as "DXC not found". A
   module costs DXC ~65 ms median (-O3, eight at a time on this machine), once:
   the result is kept in the translation cache. A sample's run-time offset,
   which Vulkan allows with maintenance8, is one thing DXC's own validator
   refuses with no option to allow it: such a module is compiled without that
-  validator and validated by bbhost, with the offset allowed (a build without
-  SPIRV-Tools keeps the lift).
+  validator and validated by bbhost with SPIRV-Tools, with the offset allowed
+  (the Windows build has SPIRV-Tools for it too; a build without keeps the
+  lift).
+- **Drivers.** `gcn2hlsl --sweep --app0 <game folder>` lifts every program as
+  bbhost does on the machine's GPU, compiles it through HLSL, and has that
+  GPU's driver build both the lift's module and DXC's into the pipelines the
+  renderer makes of the stage (its graphics pipeline libraries, then a fast
+  and an optimized link; a game hull's three stages as one native hull
+  pipeline), printing what it built and refused by stage and every DXC module
+  refused where the lift was built - the stages the in-game fallback would
+  give back the lift. The pipeline state the modules do not say (target and
+  vertex formats, the neighbouring stages) is made from their interfaces.
+  On lavapipe with the validation layer and on an RTX 4070 every one of the
+  13,858 lifts and its DXC module was built (171 hull sets among them).
+  `tools/package_hlsl_sweep.sh` makes a kit that runs it on another machine.
 
 ## What comes next
 
@@ -265,7 +281,7 @@ until the path is shown equal to the direct one in game.
 | Tool | What it does |
 |---|---|
 | `gcn2spv` | translates and validates every shader in the game's bundles |
-| `gcn2hlsl` | lifts every shader in the bundles, prints it as HLSL, compiles it with DXC and checks the module against the lift (`--tess` for the tessellation stages; `--spv` for one module) |
+| `gcn2hlsl` | lifts every shader in the bundles, prints it as HLSL, compiles it with DXC and checks the module against the lift (`--tess` for the tessellation stages; `--spv` for one module); `--sweep` has a GPU's driver build every lift and DXC module as the renderer would |
 | `hlsl_equiv` | each lift and its DXC module on the same random inputs (on lavapipe), outputs compared bit for bit: pixel, vertex, LS, hull and domain shaders; `--compile` has a device's compiler build each compute module |
 | `tools/hlsl_verify.py` | captured draws and dispatches replayed with DXC's stage against the lift's |
 | `gcndis` | disassembles GCN programs |

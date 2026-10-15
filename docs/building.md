@@ -41,14 +41,18 @@ sysroot (`x86_64-w64-mingw32`), and wine for running the tests and the smoke
 run.
 
 ```sh
-tools/win_deps.sh       # once: zlib, SDL3, libcurl (schannel) and ffmpeg for the target
+tools/win_deps.sh       # once: zlib, SDL3, libcurl (schannel), ffmpeg and SPIRV-Tools for the target
 cmake -S . -B build-win -G Ninja -DCMAKE_TOOLCHAIN_FILE=cmake/mingw-toolchain.cmake \
       -DCMAKE_PREFIX_PATH=$PWD/build/win-deps/prefix -DCMAKE_BUILD_TYPE=RelWithDebInfo
 cmake --build build-win
 ```
 
 The result is `build-win/bbhost.exe`, a single static executable that needs
-only the system DLLs and the GPU driver's `vulkan-1.dll`. It is linked at a
+only the system DLLs and the GPU driver's `vulkan-1.dll` (and, for the HLSL
+shader path, `dxcompiler.dll` beside it, which the package carries).
+SPIRV-Tools gives it the SPIR-V validator the HLSL path uses; shader liveness,
+which the Linux build also takes from SPIRV-Tools, is left out of the Windows
+build until it has been run there. It is linked at a
 fixed base (`0x600000000`) because the game's memory windows are reserved at
 fixed addresses before anything else runs.
 
@@ -85,6 +89,18 @@ every shader in the game's shader bundles.
 | `tools/package_steamdeck.sh` | the Linux package with the Steam Deck's settings |
 | `tools/package_plugins.sh` | the official plugins with their signatures |
 | `tools/package_playtest.sh` | tester kits for a playtest on a dev server, built by hand |
+| `tools/package_hlsl_sweep.sh` | a kit that runs the HLSL path's driver-acceptance sweep (`gcn2hlsl --sweep`) on another machine's GPU, built by hand ([rendering.md](rendering.md)) |
+
+Every package carries the DirectX Shader Compiler for the HLSL shader path
+beside the executable: `libdxcompiler.so` (Linux, Steam Deck) or the x64
+`dxcompiler.dll` (Windows) from DXC's own GitHub release, unmodified, with its
+licences in `licenses/dxc` (`third_party/dxc`). `tools/fetch_dxc.sh` pins the
+release by tag and checks both the archive and the library by SHA-256; the
+CI tests compile the HLSL printer's tests with the same library, and
+`tools/check_release_bundle.sh` fails a release without it or with DXC's
+DXIL validator (`dxil.dll`, which SPIR-V does not need and whose licence is
+not open). A new DXC version is a new pin and the HLSL path's checks run
+again with it.
 
 The release workflow (`.github/workflows/release.yml`) builds the Windows,
 Linux and Steam Deck packages from a `v*` tag, signs `SHA256SUMS` and the
