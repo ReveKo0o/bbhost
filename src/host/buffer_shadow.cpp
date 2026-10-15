@@ -343,11 +343,41 @@ std::vector<StageChunk> g_stage_held[kSlots];  // each slot's chunks, the last t
 VkDeviceSize g_stage_fill[kSlots] = {};        // bytes used in the slot's last chunk
 std::size_t g_stage_chunks = 0;                // chunks made
 std::atomic<std::uint64_t> g_staged{0}, g_staged_bytes{0}, g_stage_refused{0};
+// One copy of a range for every draw of a submission that reads it. The
+// uploads all run before the submission's first draw, so two copies of one
+// range made for two of its draws read the same bytes; the second draw reads
+// the first one's. An RTX 5080's log copied ~160,000 ranges, 2.7 GB, every
+// 300 flips standing still (9-37 MiB a frame) - on the 3D queue, ahead of the
+// draws, and outside the GPU busy meter's spans (Task Manager's 3D engine at
+// 100% where the meter said 64%). Keyed by the range's place in the import
+// (buffer, offset); a range of the same start no longer than one copied is
+// read from it. BBHOST_STAGE_DEDUP=0: a copy per draw, as before.
+struct StagedRange {
+    VkBuffer buffer = VK_NULL_HANDLE;  // the stage chunk holding it
+    VkDeviceSize offset = 0, bytes = 0;
+};
+struct StageKey {
+    VkBuffer src;
+    VkDeviceSize offset;
+    bool operator==(const StageKey& o) const { return src == o.src && offset == o.offset; }
+};
+struct StageKeyHash {
+    std::size_t operator()(const StageKey& k) const {
+        return std::hash<std::uint64_t>()(reinterpret_cast<std::uint64_t>(k.src) * 0x9e3779b97f4a7c15ull ^ k.offset);
+    }
+};
+std::unordered_map<StageKey, StagedRange, StageKeyHash> g_stage_seen[kSlots];
+std::atomic<std::uint64_t> g_stage_shared{0}, g_stage_shared_bytes{0};
+const bool g_stage_dedup = [] {
+    const char* e = std::getenv("BBHOST_STAGE_DEDUP");
+    return !(e && e[0] == '0');
+}();
 
 void stage_release_slot(int slot) {
     for (const StageChunk& c : g_stage_held[slot]) g_stage_free.push_back(c);
     g_stage_held[slot].clear();
     g_stage_fill[slot] = 0;
+    g_stage_seen[slot].clear();
 }
 
 bool new_stage_chunk(StageChunk& c) {
@@ -400,6 +430,7 @@ VkCommandBuffer upload_cmd_locked() {
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     vkBeginCommandBuffer(cmd, &bi);
     gpu_checkpoint_cmd(cmd, kGpuMarkSubmission, g.flushes * 4 + 0);
+    busy_upload_begin_locked(g.slots[g.slot], cmd);  // the busy meter counts the uploads too
     stage_release_slot(g.slot);  // the slot's last uploads have run: their staged copies are free
     // Earlier submissions' reads of the mirror finish before these writes.
     VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
@@ -712,6 +743,17 @@ bool shadow_stage_locked(std::uint64_t va, std::uint64_t bytes, Located& loc) {
     const VkCommandBuffer cmd = upload_cmd_locked();
     if (!cmd) return false;
     const int slot = g.slot;
+    if (g_stage_dedup) {
+        const auto it = g_stage_seen[slot].find(StageKey{loc.buffer, loc.offset});
+        if (it != g_stage_seen[slot].end() && it->second.bytes >= bytes) {
+            loc.buffer = it->second.buffer;
+            loc.offset = it->second.offset;
+            loc.avail = bytes;
+            bump(g_stage_shared);
+            g_stage_shared_bytes.fetch_add(bytes, std::memory_order_relaxed);
+            return true;
+        }
+    }
     const VkDeviceSize need = (bytes + 255) & ~VkDeviceSize{255};
     if (g_stage_held[slot].empty() || g_stage_fill[slot] + need > kStageChunkBytes) {
         StageChunk c;
@@ -728,6 +770,10 @@ bool shadow_stage_locked(std::uint64_t va, std::uint64_t bytes, Located& loc) {
     const StageChunk& c = g_stage_held[slot].back();
     const VkBufferCopy region{loc.offset, g_stage_fill[slot], bytes};
     vkCmdCopyBuffer(cmd, loc.buffer, c.buffer, 1, &region);
+    if (g_stage_dedup) {
+        StagedRange& seen = g_stage_seen[slot][StageKey{loc.buffer, loc.offset}];
+        if (bytes >= seen.bytes) seen = StagedRange{c.buffer, g_stage_fill[slot], bytes};
+    }
     loc.buffer = c.buffer;
     loc.offset = g_stage_fill[slot];
     loc.avail = bytes;
@@ -1271,9 +1317,12 @@ std::string shadow_report() {
                       static_cast<unsigned long long>(g_returns));
         out += gr;
     }
-    char st[200];
-    std::snprintf(st, sizeof(st), "; vertex ranges copied for their draw %llu (%.1f MiB), left in host memory %llu, staging chunks %zu (%zu MiB)",
+    char st[288];
+    std::snprintf(st, sizeof(st),
+                  "; vertex ranges copied for their draw %llu (%.1f MiB), read from another draw's copy %llu (%.1f MiB), left in host "
+                  "memory %llu, staging chunks %zu (%zu MiB)",
                   static_cast<unsigned long long>(g_staged.load()), static_cast<double>(g_staged_bytes.load()) / (1 << 20),
+                  static_cast<unsigned long long>(g_stage_shared.load()), static_cast<double>(g_stage_shared_bytes.load()) / (1 << 20),
                   static_cast<unsigned long long>(g_stage_refused.load()), g_stage_chunks,
                   static_cast<std::size_t>((g_stage_chunks * kStageChunkBytes) >> 20));
     return out + st;

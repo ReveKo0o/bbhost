@@ -348,6 +348,9 @@ struct Gpu {
         // once the slot retired. `busy_written`: this recording wrote both.
         VkQueryPool busy_pool = VK_NULL_HANDLE;
         bool busy_written = false;
+        // The buffer shadow's upload command buffer, which runs just ahead of
+        // this one in the same submission, wrote its start (query 2).
+        bool busy_upload = false;
         // Descriptor sets allocated ahead from this slot's pool, by layout
         // (alloc_set_locked); dropped with the pool's reset.
         std::vector<std::pair<VkDescriptorSetLayout, std::vector<VkDescriptorSet>>> spare_sets;
@@ -1023,6 +1026,7 @@ void compute_compiling_report();
 void busy_init_locked();                           // after the slots exist: the query pools, or off
 void busy_begin_locked(Gpu::Slot& sl);             // a recording's first command
 void busy_end_locked(Gpu::Slot& sl);               // its last, before vkEndCommandBuffer
+void busy_upload_begin_locked(Gpu::Slot& sl, VkCommandBuffer cmd);  // the uploads ahead of it: their start
 void busy_submitted_locked(Gpu::Slot& sl);         // it is on its way to the queue
 void busy_retired_locked(Gpu::Slot& sl, bool ok);  // its fence signalled (ok), or it never will
 std::string busy_exit_report();                    // the whole run's line, for host_gpu_report
