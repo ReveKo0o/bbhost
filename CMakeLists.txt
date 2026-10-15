@@ -419,6 +419,7 @@ if(UNIX)
     add_test(NAME world_baseline_test COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/world_baseline_test.py)
     add_test(NAME area_check_test COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/area_check_test.py)
     add_test(NAME lift_verify_test COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/lift_verify_test.py)
+    add_test(NAME pipeline_list_test COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/pipeline_list_test.py)
     # The Debug Menu plugin's English against the 1.09 eboot: skipped without
     # one (BBHOST_EBOOT, or eboot-109-decrypted.bin in the checkout).
     add_test(NAME debug_menu_strings_test COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/debug_menu_strings.py check)

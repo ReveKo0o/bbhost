@@ -67,9 +67,19 @@ Steam Deck, whose driver makes every import of the game's memory resident
 again at each one - the submissions queued behind each other go to the queue
 as one (`BBHOST_SUBMIT_MERGE=1` keeps them apart, to compare).
 
-**Shaders.** GCN shaders are converted to SPIR-V when the game creates them
-(the few that cannot be, at their first draw), so most pipelines are ready
-before they are needed. There are two compilers:
+**Shaders.** GCN shaders are converted to SPIR-V when the game creates them,
+and GX creates every shader of the game's bundles at the start (1,663 vertex
+and 1,346 pixel programs; only the debug bundle's wait), so their stages and
+pipeline libraries are compiled behind the title. What a draw still has to
+make itself is a variant creation does not know of - most of them the
+pixel shader of a pair that clips by a varying - and the eboot's own
+programs (YEBIS's, Scaleform's: the eboot carries some 5,400, a tour draws
+about 80). Every pipeline a draw creates is recorded in
+`pipeline-manifest.bin` with what built it, and the next start builds them
+all again on the precompile workers, its optimized link included, so an area
+an earlier run has seen compiles nothing when it comes into view
+(`tools/pipeline_list.py` makes a list of them that names the programs
+instead of holding them). There are two compilers:
 
 - the *translator* (`src/gcn/translate.cpp`) reproduces the GCN program's
   execution faithfully - one invocation per lane, with the execution mask as
