@@ -78,10 +78,10 @@ which are kept: `stage-manifest.bin`, the shaders the game's draws needed that
 it never creates itself, and `pipeline-manifest.bin`, every graphics pipeline
 a draw created. At each start bbhost builds every pipeline on that list again
 in the background, its shaders, its pipeline libraries and its optimized
-link, so an area an earlier run has seen compiles nothing when it comes into
-view. The lists hold what the game drew, not what bbhost made of it, so they
-outlast translator updates and driver changes: what they build is made again
-from them. A list `pipeline-list.bin` beside `bbhost` (or the one
+link, so what an earlier run has drawn is not compiled again when it comes
+into view. The lists hold what the game drew, not what bbhost made of it, so
+they outlast translator updates and driver changes: what they build is made
+again from them. A list `pipeline-list.bin` beside `bbhost` (or the one
 `BBHOST_PIPELINE_LIST` names) adds its pipelines to a player's own, so a first
 start has them too; such a list names the game's shaders, the player's own
 bundles supply them. `BBHOST_KEEP_SHADER_CACHE=1` keeps the caches anyway,

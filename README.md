@@ -95,7 +95,7 @@ Known issues:
 - The first time bbhost ever draws an area, some of its pipelines compile
   when they first come into view, which can cause short hitches. Every
   pipeline drawn is remembered, and later starts build them all again while
-  the title is up, so an area seen before compiles nothing.
+  the title is up, so what has been seen before does not compile again.
 - About one in four first summons fail and have to be repeated.
 - The cause of a GPU hang reported on an AMD RX 580 (Polaris) under Windows is
   not yet known.

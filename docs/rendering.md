@@ -76,8 +76,8 @@ pixel shader of a pair that clips by a varying - and the eboot's own
 programs (YEBIS's, Scaleform's: the eboot carries some 5,400, a tour draws
 about 80). Every pipeline a draw creates is recorded in
 `pipeline-manifest.bin` with what built it, and the next start builds them
-all again on the precompile workers, its optimized link included, so an area
-an earlier run has seen compiles nothing when it comes into view
+all again on the precompile workers, its optimized link included, so what
+an earlier run has drawn is not compiled again when it comes into view
 (`tools/pipeline_list.py` makes a list of them that names the programs
 instead of holding them). There are two compilers:
 
