@@ -1422,9 +1422,18 @@ std::uint64_t steady_ms() {
         std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
 }
 // A draw, a fill or a copy wrote the target (the reuse retire's age and order).
+// The time is read again once a flip and every 64 writes: every target of
+// every draw comes here, and the clock was 2.3% of the command processor in
+// Kyo's hall at 360p, for a retire that counts idle time in seconds.
 void rt_written(RtImage& r) {
-    r.written_flip = hle_video_flip_count();
-    r.written_ms = steady_ms();
+    static thread_local std::uint64_t flip = ~0ull, ms = 0, calls = 0;
+    const std::uint64_t f = hle_video_flip_count();
+    if (f != flip || ++calls % 64 == 0) {
+        flip = f;
+        ms = steady_ms();
+    }
+    r.written_flip = f;
+    r.written_ms = ms;
 }
 // The reuse retire's bases and when it retired them, to count a target made
 // again at a base it had retired within the idle time - the sign of retiring
