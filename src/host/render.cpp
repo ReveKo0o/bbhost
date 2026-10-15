@@ -4236,6 +4236,14 @@ struct PipelineManifest {
     std::atomic<bool> recording{false};  // a manifest file to keep: set when it is read (pipeline_manifest_load)
 };
 PipelineManifest g_pmanifest;
+// A field added to GfxFixedState reaches the Vulkan pipeline: it must join
+// pipeline_content_key below (or a pipeline the start built from a recipe
+// made before it would be taken for draws that differ in it), and what
+// build_gfx_pipeline and create_gfx_pipeline newly read of the draw state must
+// join PipelineRecipe, with recipe_file::kVersion raised.
+#if defined(__GLIBCXX__) && defined(__x86_64__)
+static_assert(sizeof(GfxFixedState) == 184, "a new GfxFixedState field: add it to pipeline_content_key");
+#endif
 // Everything a graphics pipeline's Vulkan creation is made from that is not
 // the run's own handles: its stages (by the stage cache's keys), whether it
 // links from libraries, the geometry shader of a rect list, the vertex input
