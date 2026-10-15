@@ -708,6 +708,7 @@ void defer_destroy_private_view(VkImageView view);  // a pass's own view, never 
 // given - so the work goes behind the game's - then holds g.queue_mu.
 void queue_drain();
 std::string submit_thread_report();  // for the hang report
+std::string submit_merge_report();   // the submission thread's jobs and queue submissions so far (recorder report)
 struct QueueGuard {
     QueueGuard();
     ~QueueGuard();

@@ -196,23 +196,120 @@ void submit_job_now(const SubmitJob& job) {
     if (job.foreign) g_foreign_submitted.store(job.foreign, std::memory_order_release);
 }
 
+// Game submissions queued behind each other go to the queue as one
+// (BBHOST_SUBMIT_MERGE=<n>, at most n of them, 8; 1 or 0: one by one). The
+// kernel's part of a submission is mostly the buffers it makes resident -
+// every one, since shaders reach memory by address - so on RADV each
+// submission pays for all ~70 dma-buf imports of direct memory again: a Steam
+// Deck's bb-submit was a whole core at the menus, 5 submissions a flip, and
+// the menus waited for it. Jobs queue up here only while the thread is behind,
+// so where submitting is cheap (NVIDIA) nothing changes. A merged submission
+// holds the jobs' command buffers in order (each job's shadow uploads before
+// its own commands, as before) and signals the timeline with the last one's
+// value; the earlier jobs' fences are signalled by fence-only submissions
+// after it (no buffers, so no residency), when everything before them has
+// run - their own work included. A job that waits on a semaphore (a sparse
+// bind) starts a submission; one that signals one (the presenter's) goes on
+// its own.
+const std::uint32_t g_submit_merge = [] {
+    const char* e = std::getenv("BBHOST_SUBMIT_MERGE");
+    const long n = e && *e ? std::strtol(e, nullptr, 10) : 8;
+    return static_cast<std::uint32_t>(std::clamp<long>(n, 1, 16));
+}();
+// BBHOST_TEST_SUBMIT_HOLD_US=<us> (tests): the thread waits this long before it
+// takes the jobs queued, so they queue up and the merged path runs where the
+// queue is otherwise kept empty.
+const std::uint32_t g_submit_hold_us = [] {
+    const char* e = std::getenv("BBHOST_TEST_SUBMIT_HOLD_US");
+    return e && *e ? static_cast<std::uint32_t>(std::strtoul(e, nullptr, 10)) : 0u;
+}();
+// Written by the submission thread only (relaxed stores), read by the report.
+std::atomic<std::uint64_t> g_sub_jobs_done{0}, g_sub_queue_submits{0}, g_sub_jobs_merged{0}, g_sub_fence_submits{0};
+
+bool merge_candidate(const SubmitJob& j) { return j.serial != ~0ull && !j.foreign && !j.signal && j.ncmds <= 2; }
+
+void add_relaxed_counter(std::atomic<std::uint64_t>& c, std::uint64_t n = 1) { c.store(c.load(std::memory_order_relaxed) + n, std::memory_order_relaxed); }
+
+// Jobs [0, n) of `jobs` (n >= 2, every one a merge candidate, only the first
+// waiting on a semaphore) as one queue submission.
+void submit_jobs_merged(const SubmitJob* jobs, std::uint32_t n) {
+    VkCommandBuffer cmds[2 * 16];
+    std::uint32_t ncmds = 0, items = 0;
+    for (std::uint32_t i = 0; i < n; ++i) {
+        for (std::uint32_t k = 0; k < jobs[i].ncmds; ++k) cmds[ncmds++] = jobs[i].cmds[k];
+        items += jobs[i].items;
+    }
+    const SubmitJob& first = jobs[0];
+    const SubmitJob& last = jobs[n - 1];
+    VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    si.commandBufferCount = ncmds;
+    si.pCommandBuffers = cmds;
+    if (first.wait) {
+        si.waitSemaphoreCount = 1;
+        si.pWaitSemaphores = &first.wait;
+        si.pWaitDstStageMask = &first.wait_stage;
+    }
+    TimelineSignal tl;
+    tl.add(si, last.serial);
+    VkResult r;
+    std::uint32_t fences = 0;
+    {
+        std::lock_guard<std::mutex> q(g.queue_mu);
+        r = vkQueueSubmit(g.queue, 1, &si, last.fence);
+        for (std::uint32_t i = 0; i + 1 < n && r == VK_SUCCESS; ++i) {
+            if (!jobs[i].fence) continue;
+            r = vkQueueSubmit(g.queue, 0, nullptr, jobs[i].fence);
+            ++fences;
+        }
+    }
+    if (r != VK_SUCCESS) {
+        int none = 0;
+        g_sub_failed.compare_exchange_strong(none, static_cast<int>(r));
+        g_sub_failed_items.fetch_add(items);
+    }
+    add_relaxed_counter(g_sub_jobs_merged, n - 1);
+    add_relaxed_counter(g_sub_fence_submits, fences);
+    // Published once every fence of the batch has gone to the queue: a waiter
+    // that sees its serial submitted may wait on its fence (which must not be
+    // used while vkQueueSubmit holds it).
+    g_stream_submitted.store(last.serial + 1, std::memory_order_release);
+}
+
 void submit_thread() {
     host_thread_set_name("bb-submit");
     host_thread_set_class(HostThreadClass::GpuFeed, "bb-submit");  // core/host_clock.h
+    SubmitJob jobs[16];
     for (;;) {
-        SubmitJob job;
+        std::uint32_t n = 0;
         {
             std::unique_lock<std::mutex> lk(g_sub_mu);
             g_sub_cv.wait(lk, [] { return !g_sub_jobs.empty(); });
-            job = g_sub_jobs.front();
+            if (g_submit_hold_us) {
+                lk.unlock();
+                std::this_thread::sleep_for(std::chrono::microseconds(g_submit_hold_us));
+                lk.lock();
+            }
+            jobs[n++] = g_sub_jobs.front();
             g_sub_jobs.pop_front();
+            if (merge_candidate(jobs[0])) {
+                while (n < g_submit_merge && !g_sub_jobs.empty() && merge_candidate(g_sub_jobs.front()) && !g_sub_jobs.front().wait) {
+                    jobs[n++] = g_sub_jobs.front();
+                    g_sub_jobs.pop_front();
+                }
+            }
             g_sub_busy = true;
         }
-        submit_job_now(job);
+        if (n == 1) {
+            submit_job_now(jobs[0]);
+        } else {
+            submit_jobs_merged(jobs, n);
+        }
+        add_relaxed_counter(g_sub_jobs_done, n);
+        add_relaxed_counter(g_sub_queue_submits);
         std::lock_guard<std::mutex> lk(g_sub_mu);
         g_sub_busy = false;
-        g_sub_submitted.store(job.ticket, std::memory_order_release);
-        g_sub_idle.notify_all();  // a drain, or a wait for this ticket
+        g_sub_submitted.store(jobs[n - 1].ticket, std::memory_order_release);
+        g_sub_idle.notify_all();  // a drain, or a wait for these tickets
     }
 }
 
@@ -583,6 +680,16 @@ QueueGuard::QueueGuard() {
 }
 QueueGuard::~QueueGuard() { g.queue_mu.unlock(); }
 std::string submit_thread_report() { return submit_thread_report_impl(); }
+std::string submit_merge_report() {
+    if (!g_sub_running) return {};
+    const std::uint64_t jobs = g_sub_jobs_done.load(std::memory_order_relaxed), subs = g_sub_queue_submits.load(std::memory_order_relaxed);
+    char buf[200];
+    std::snprintf(buf, sizeof(buf), "submissions: %llu jobs in %llu queue submissions, %llu merged into an earlier one (BBHOST_SUBMIT_MERGE=%u), "
+                  "%llu fence-only", static_cast<unsigned long long>(jobs), static_cast<unsigned long long>(subs),
+                  static_cast<unsigned long long>(g_sub_jobs_merged.load(std::memory_order_relaxed)), g_submit_merge,
+                  static_cast<unsigned long long>(g_sub_fence_submits.load(std::memory_order_relaxed)));
+    return buf;
+}
 
 const Chunk* dmem_import(std::uint32_t index, std::uint64_t in, std::uint64_t bytes) {
     if (index >= gcn::kDmemChunks) return nullptr;

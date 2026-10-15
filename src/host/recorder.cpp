@@ -1324,6 +1324,7 @@ std::string host_gpu_recorder_report() {
     if (gpu::set_cache_on()) r += "; " + gpu::set_cache_report();
     if (const std::string cv = gpu::copy_versions_report(); !cv.empty()) r += "; " + cv;
     if (const std::string pb = gpu::render_barriers_report(); !pb.empty()) r += "; " + pb;
+    if (const std::string sm = gpu::submit_merge_report(); !sm.empty()) r += "; " + sm;
     return r;
 }
 
