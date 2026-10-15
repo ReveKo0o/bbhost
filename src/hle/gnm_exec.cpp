@@ -621,8 +621,11 @@ void note_arena_write(std::uint64_t va, std::uint64_t value, std::size_t n) {
     }
 }
 
-void record(std::uint64_t va, const void* src, std::size_t n) {
-    host_gpu_shadow_cp_write(va, n);
+// shadow: tell the buffer shadow the CP wrote here; false when the write went
+// through host_gpu_mem_write_serial / _ordered, which told it already (under
+// the renderer's lock, which this would take a second time).
+void record(std::uint64_t va, const void* src, std::size_t n, bool shadow = true) {
+    if (shadow) host_gpu_shadow_cp_write(va, n);
     std::uint64_t v = 0;
     std::memcpy(&v, src, n > 8 ? 8 : n);  // bytes keeps the full extent
     if (g_arena_monitor) {
@@ -865,9 +868,30 @@ void warn_if_over_command_buffer(const char* what, std::uint64_t va, std::size_t
 
 // Which addresses the CP writes, and which ones a WAIT_REG_MEM gave up on.
 // A fence the game waits for and nobody writes is the shape of the world-load
-// hang, and the pair of these two maps names it.
+// hang, and the pair of these two names it. The writes are counted in a
+// direct-mapped table without a lock - every label goes through here, ~4.5M
+// over the 12-place tour, and a map under a mutex was a fifth of a label's
+// cost; an address another one evicted reads 0, which the hang report says.
+struct WrittenSlot {
+    std::atomic<std::uint64_t> va{0}, count{0};
+};
+constexpr unsigned kWrittenBits = 13;
+WrittenSlot g_written[1u << kWrittenBits];
+inline WrittenSlot& written_slot(std::uint64_t va) { return g_written[((va >> 2) * 0x9e3779b97f4a7c15ull) >> (64 - kWrittenBits)]; }
+inline void note_written_addr(std::uint64_t va) {
+    WrittenSlot& w = written_slot(va);
+    if (w.va.load(std::memory_order_relaxed) != va) {
+        w.va.store(va, std::memory_order_relaxed);
+        w.count.store(1, std::memory_order_relaxed);
+    } else {
+        w.count.store(w.count.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
+    }
+}
+std::uint64_t written_count(std::uint64_t va) {
+    const WrittenSlot& w = written_slot(va);
+    return w.va.load(std::memory_order_relaxed) == va ? w.count.load(std::memory_order_relaxed) : 0;
+}
 std::mutex g_addr_mu;
-std::map<std::uint64_t, std::uint64_t> g_written_addrs;   // address -> writes
 struct WaitInfo {
     std::uint64_t count = 0;
     std::uint32_t ref = 0, mask = 0, fn = 0;
@@ -885,10 +909,7 @@ void note_wait_timeout(std::uint64_t va, std::uint32_t ref, std::uint32_t mask, 
 }
 
 void note_label_write(std::uint64_t va, const void* src, std::size_t n) {
-    {
-        std::lock_guard<std::mutex> lk(g_addr_mu);
-        if (g_written_addrs.size() < 8192) g_written_addrs[va] += 1;
-    }
+    note_written_addr(va);
     if (n != 4 && n != 8) return;
     std::uint64_t v = 0;
     std::memcpy(&v, src, n);
@@ -975,8 +996,8 @@ void cp_write(std::uint64_t va, const void* src, std::size_t n) {
     }
     std::uint64_t serial = 0;
     if (host_gpu_mem_write_serial(va, src, n, &serial)) {
-        record(va, src, n);
-        g_exec_writes.fetch_add(1);
+        record(va, src, n, false);  // the shadow was told, under the lock the write took
+        g_exec_writes.fetch_add(1, std::memory_order_relaxed);
         if (g_arena_monitor) note_arena_queued(va, src, n, serial);
         if (n == 4 || n == 8) {
             std::lock_guard<std::mutex> lk(g_pending_mu);
@@ -1770,7 +1791,7 @@ void execute_packet(std::uint32_t op, const std::uint32_t* b, std::size_t n, int
                 }
                 const std::size_t bytes = (n - 3) * 4;
                 if (cp_write_after_waits(va, &b[3], bytes)) {
-                    record(va, &b[3], bytes);
+                    record(va, &b[3], bytes, false);  // host_gpu_mem_write_ordered told the shadow
                     g_exec_writes.fetch_add(1);
                     break;
                 }
@@ -3449,7 +3470,7 @@ void hle_gnm_wait_report() {
     std::vector<std::pair<std::uint64_t, WaitInfo>> v(g_timeout_addrs.begin(), g_timeout_addrs.end());
     std::sort(v.begin(), v.end(), [](const auto& a, const auto& b) { return a.second.count > b.second.count; });
     for (std::size_t i = 0; i < v.size() && i < 12; ++i) {
-        const auto it = g_written_addrs.find(v[i].first);
+        const std::uint64_t writes = written_count(v[i].first);
         std::uint32_t now = 0;
         if (hle_kernel_va_mapped(v[i].first, 4)) {
             std::memcpy(&now, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(v[i].first)), 4);
@@ -3457,7 +3478,7 @@ void hle_gnm_wait_report() {
         host_log("  wait 0x%llx gave up %llu time(s) (fn=%u ref=0x%08x mask=0x%08x, value now 0x%08x); CP writes to it: %llu",
                  static_cast<unsigned long long>(v[i].first), static_cast<unsigned long long>(v[i].second.count),
                  v[i].second.fn, v[i].second.ref, v[i].second.mask, now,
-                 static_cast<unsigned long long>(it == g_written_addrs.end() ? 0 : it->second));
+                 static_cast<unsigned long long>(writes));
     }
 }
 

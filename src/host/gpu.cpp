@@ -7270,25 +7270,65 @@ const bool g_replay_watch = [] {
 // every later write in the batch overwrites is dropped, and a write that
 // overlaps an earlier one still standing gets a barrier first: the last value
 // wins, as it did on the command processor.
+// The dwords the deferred writes of one command buffer touch: which write is
+// the last to each, and which were filled since the last barrier. Open
+// addressing over a table kept between calls and emptied by a generation
+// count - tens of writes a command buffer, each a label, where node-based
+// maps allocated at every insert (a fifth of this function's time).
+class DeferredDwords {
+public:
+    void reset(std::size_t writes) {
+        ++gen_;
+        std::size_t want = 64;
+        while (want < writes * 4) want <<= 1;  // two dwords a write, at most half full
+        if (want > slots_.size()) slots_.assign(want, Slot{});
+    }
+    void set_last(std::uint64_t va, std::uint32_t index) { slot(va).last = index; }
+    std::uint32_t last(std::uint64_t va) { return slot(va).last; }
+    void fill(std::uint64_t va) { slot(va).filled = gen_fill_; }
+    bool filled(std::uint64_t va) { return slot(va).filled == gen_fill_; }
+    void clear_filled() { ++gen_fill_; }
+
+private:
+    struct Slot {
+        std::uint64_t va = 0, gen = 0, filled = 0;
+        std::uint32_t last = 0;
+    };
+    Slot& slot(std::uint64_t va) {
+        const std::size_t mask = slots_.size() - 1;
+        std::size_t i = static_cast<std::size_t>(((va >> 2) * 0x9e3779b97f4a7c15ull) >> 40) & mask;
+        while (slots_[i].gen == gen_ && slots_[i].va != va) i = (i + 1) & mask;
+        Slot& s = slots_[i];
+        if (s.gen != gen_) {
+            s.gen = gen_;
+            s.va = va;
+            s.last = ~0u;
+            s.filled = 0;
+        }
+        return s;
+    }
+    std::vector<Slot> slots_;
+    std::uint64_t gen_ = 0, gen_fill_ = 1;  // 64 bits: never wrap
+};
+
 void flush_deferred_writes_locked() {
     if (g.deferred_writes.empty()) return;
     // Each ordinary run of transfers shares one barrier pair; this one starts
     // its own, so nothing recorded before it can land after it.
     transfer_flush_locked();
-    static std::unordered_map<std::uint64_t, std::size_t> last;  // dword -> index of the last write to it
-    static std::unordered_set<std::uint64_t> filled;             // dwords filled since the last barrier
-    last.clear();
-    filled.clear();
+    static DeferredDwords dwords;
     const auto& ws = g.deferred_writes;
+    dwords.reset(ws.size());
+    dwords.clear_filled();
     for (std::size_t i = 0; i < ws.size(); ++i) {
-        for (std::uint32_t k = 0; k < ws[i].bytes; k += 4) last[ws[i].va + k] = i;
+        for (std::uint32_t k = 0; k < ws[i].bytes; k += 4) dwords.set_last(ws[i].va + k, static_cast<std::uint32_t>(i));
     }
     for (std::size_t i = 0; i < ws.size(); ++i) {
         const Gpu::SmallWrite& w = ws[i];
         bool live = false, clash = false;
         for (std::uint32_t k = 0; k < w.bytes; k += 4) {
-            live |= last[w.va + k] == i;
-            clash |= filled.count(w.va + k) != 0;
+            live |= dwords.last(w.va + k) == i;
+            clash |= dwords.filled(w.va + k);
         }
         if (!live) continue;
         Located loc;
@@ -7306,7 +7346,7 @@ void flush_deferred_writes_locked() {
             mb.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
             rec().pipeline_barrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, nullptr, 0,
                                  nullptr);
-            filled.clear();
+            dwords.clear_filled();
         }
         std::uint32_t d[2] = {0, 0};
         std::memcpy(d, w.data, w.bytes);
@@ -7315,7 +7355,7 @@ void flush_deferred_writes_locked() {
         } else {
             for (std::uint32_t k = 0; k < w.bytes; k += 4) rec().fill_buffer(loc.buffer, loc.offset + k, 4, d[k / 4]);
         }
-        for (std::uint32_t k = 0; k < w.bytes; k += 4) filled.insert(w.va + k);
+        for (std::uint32_t k = 0; k < w.bytes; k += 4) dwords.fill(w.va + k);
     }
     g.deferred_writes.clear();
 }
