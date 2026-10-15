@@ -8205,6 +8205,16 @@ bool host_gpu_copy_back(std::uint64_t dst, std::uint64_t src, std::size_t bytes)
     return host_gpu_copy_guest(dst, src, bytes);
 }
 
+std::size_t host_gpu_copy_backs(const std::uint64_t* dst, const std::uint64_t* src, const std::uint64_t* bytes, std::size_t n) {
+    std::lock_guard<GpuMutex> lock(g.mu);
+    if (!g.ok) return 0;
+    std::size_t i = 0;
+    for (; i < n; ++i) {
+        if (bytes[i] && !copy_version_make_locked(dst[i], src[i], bytes[i])) break;
+    }
+    return i;
+}
+
 std::uint64_t host_gpu_work_needs() {
     std::lock_guard<GpuMutex> lock(g.mu);
     // Submissions are numbered from 0 in `flushes`; the recording under way

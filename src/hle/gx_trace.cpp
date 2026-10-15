@@ -6652,15 +6652,44 @@ void hle_gx_copy_token(std::uint64_t id) {
                      copies.empty() ? 0ull : static_cast<ull>(copies[0].bytes));
         }
     }
-    for (const GuestCopy& c : copies) {
-        g_copy_ranges.fetch_add(1, std::memory_order_relaxed);
-        g_copy_bytes.fetch_add(c.bytes, std::memory_order_relaxed);
-        if (!c.bytes || (c.back ? host_gpu_copy_back(c.dst, c.src, c.bytes) : host_gpu_copy_guest(c.dst, c.src, c.bytes))) continue;
+    // The copies in order. A run of copy-backs goes to the renderer under one
+    // hold of its lock while each becomes a copy version (host_gpu_copy_backs);
+    // the one a run stops at is copied on the GPU (host_gpu_copy_guest, what
+    // host_gpu_copy_back does with a copy it cannot make a version of), and
+    // every other copy goes one at a time as before. The counters are added
+    // once, after: a locked add between two copies waited for the first one's
+    // bytes to leave the write-combining buffers.
+    std::uint64_t ranges = 0, bytes = 0;
+    static thread_local std::vector<std::uint64_t> run_dst, run_src, run_bytes;
+    for (std::size_t i = 0; i < copies.size();) {
+        bool refused = false;
+        if (copies[i].back && copies[i].bytes) {
+            run_dst.clear();
+            run_src.clear();
+            run_bytes.clear();
+            for (std::size_t j = i; j < copies.size() && copies[j].back; ++j) {
+                run_dst.push_back(copies[j].dst);
+                run_src.push_back(copies[j].src);
+                run_bytes.push_back(copies[j].bytes);
+            }
+            const std::size_t took = host_gpu_copy_backs(run_dst.data(), run_src.data(), run_bytes.data(), run_dst.size());
+            for (std::size_t k = 0; k < took; ++k) bytes += copies[i + k].bytes;
+            ranges += took;
+            i += took;
+            if (i >= copies.size() || !copies[i].back) continue;
+            refused = true;  // copies[i]: no version (or no renderer); not asked twice
+        }
+        const GuestCopy& c = copies[i++];
+        ++ranges;
+        bytes += c.bytes;
+        if (!c.bytes || (c.back && !refused ? host_gpu_copy_back(c.dst, c.src, c.bytes) : host_gpu_copy_guest(c.dst, c.src, c.bytes))) continue;
         if (g_copy_failed.fetch_add(1, std::memory_order_relaxed) < 8) {
             host_log("gx-copy: buffer copy 0x%llx -> 0x%llx (%llu bytes) could not be recorded", static_cast<ull>(c.src),
                      static_cast<ull>(c.dst), static_cast<ull>(c.bytes));
         }
     }
+    g_copy_ranges.fetch_add(ranges, std::memory_order_relaxed);
+    g_copy_bytes.fetch_add(bytes, std::memory_order_relaxed);
     static std::atomic<std::uint64_t> walked{0};
     if (walked.fetch_add(1, std::memory_order_relaxed) % 50000 == 49999) {
         host_log("gx-copy: calls %llu, tokens written %llu, walked %llu, copies %llu (%.1f MiB; render-target images %llu), failed %llu, "

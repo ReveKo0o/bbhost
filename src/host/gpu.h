@@ -386,6 +386,13 @@ bool host_gpu_copy_guest(std::uint64_t dst, std::uint64_t src, std::size_t bytes
 // copy of the bytes taken now and the copy into place waits for the pass's
 // end (BBHOST_COPY_VERSIONS=0: as host_gpu_copy_guest, which it falls back to).
 bool host_gpu_copy_back(std::uint64_t dst, std::uint64_t src, std::size_t bytes);
+// Copy-backs [0, n) (dst[i] <- src[i], bytes[i]), in order, under one hold of
+// the renderer's lock, as long as each becomes a copy version (a zero-length
+// one is passed over); how many it took. The caller copies the one it stops at
+// on the GPU (host_gpu_copy_guest, as host_gpu_copy_back would). One lock for
+// a token's copies: each release waited for the copy just made to leave the
+// write-combining buffers of the staging memory.
+std::size_t host_gpu_copy_backs(const std::uint64_t* dst, const std::uint64_t* src, const std::uint64_t* bytes, std::size_t n);
 // A constant window a YEBIS draw reads, given at its token on the command
 // processor's thread (engine/yebis_bind.cpp): written into guest memory by
 // the CPU, and the next draw binds a copy of it taken as it records, so no

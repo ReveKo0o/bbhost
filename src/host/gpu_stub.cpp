@@ -38,6 +38,7 @@ bool host_gpu_counter_copy(std::uint64_t, std::uint64_t, std::size_t) { return f
 bool host_gpu_counter_fill(std::uint64_t, std::uint32_t, std::size_t) { return false; }
 bool host_gpu_copy_guest(std::uint64_t, std::uint64_t, std::size_t) { return false; }
 bool host_gpu_copy_back(std::uint64_t, std::uint64_t, std::size_t) { return false; }
+std::size_t host_gpu_copy_backs(const std::uint64_t*, const std::uint64_t*, const std::uint64_t*, std::size_t) { return 0; }
 bool host_gpu_draw_window(std::uint64_t, const void*, std::uint32_t) { return false; }
 std::uint64_t host_gpu_guest_copy_targets() { return 0; }
 bool host_gpu_clear_target(std::uint64_t, std::uint32_t, std::size_t) { return false; }
