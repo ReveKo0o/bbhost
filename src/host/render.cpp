@@ -584,6 +584,23 @@ const bool g_set_cache = [] {
 }();
 bool set_cache_on() { return g_set_cache; }
 bool cb_push_on() { return g_set_cache && g.has_push_descriptor; }
+// BBHOST_CB_EXACT=0: a draw's constant buffers bound over the V# base aligned
+// down, or a snapshot's over the whole ring, with each one's dword bias in the
+// params (StageParams::cb_bias_dw), as before. Otherwise, pushed and on a
+// device that binds a storage buffer at any dword (minStorageBufferOffsetAlignment
+// 4 or less: AMD's), every one is bound at its V# base and the vertex and pixel
+// shaders are translated to read it from dword 0 (TranslateOptions::cb_bias_zero):
+// a constant buffer's constant offsets then reach the driver as constants,
+// which it loads several dwords at a time. With the bias, AMD's compiler loaded
+// each dword with an address add of its own - 36 loads and 35 adds in the
+// G-buffer's main vertex shader, 63 and ~50 in its pixel shader.
+bool cb_exact_bindings() {
+    static const bool on = [] {
+        const char* e = std::getenv("BBHOST_CB_EXACT");
+        return !(e && e[0] == '0');
+    }();
+    return on && cb_push_on() && g.ssbo_align <= 4;
+}
 VkDescriptorType params_descriptor_type() {
     return g_set_cache ? VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC : VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
 }
@@ -3468,6 +3485,7 @@ gcn::TranslateOptions ps_translate_options(const PsStageInputs& in) {
     if (cb_push_on()) {
         po.cb_descriptor_set = 2;
         po.cb_binding_base = gcn::kBindingStorageBuffer0 + gcn::kMaxBuffers;
+        po.cb_bias_zero = cb_exact_bindings();  // pushed at their bases (resolve_stage_buffers)
     }
     po.image_dims = *in.dims;
     po.sampler_force_unnormalized = *in.modes;
@@ -3943,6 +3961,7 @@ gcn::TranslateOptions vs_translate_options(const VsStageInputs& in, const gcn::P
     vo.output_links = register_links();
     vo.descriptor_set = 0;
     if (cb_push_on()) vo.cb_descriptor_set = 2;  // bindings from 112, the default
+    vo.cb_bias_zero = cb_exact_bindings();          // pushed at their bases (resolve_stage_buffers)
     vo.image_dims = *in.dims;
     vo.sampler_force_unnormalized = *in.modes;
     vo.bindless = g.bindless;
@@ -4129,6 +4148,7 @@ bool build_tess_native_stages(GfxPipeline& pl, const DrawState& s, const VertexI
         o.descriptor_set = kTessNativeSet;
         o.cb_descriptor_set = static_cast<int>(kTessNativeSet);
         o.cb_binding_base = kTessNativeLsBuffers;
+        o.cb_bias_zero = false;  // a set of its own, not pushed: the biases stay
         const gcn::TranslateResult ref = translate_cached(prog, o);
         if (!ref.ok()) {
             why = "LS " + ls->name + ": " + ref.errors[0];
@@ -4186,6 +4206,7 @@ bool build_tess_native_stages(GfxPipeline& pl, const DrawState& s, const VertexI
         o.cb_no_fallback = true;
         o.cb_descriptor_set = static_cast<int>(kTessNativeSet);
         o.cb_binding_base = kTessNativeHsBuffers;
+        o.cb_bias_zero = false;  // a set of its own, not pushed: the biases stay
         const gcn::TranslateResult ref = translate_cached(prog, o);
         if (!ref.ok()) {
             why = "hull shader " + hs->name + ": " + ref.errors[0];
@@ -4629,6 +4650,7 @@ GfxPipeline& build_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const std::
                     gcn::TranslateOptions vo4 = vo;
                     vo4.cb_descriptor_set = static_cast<int>(kTessNativeSet);
                     vo4.cb_binding_base = kTessNativeLsBuffers;
+                    vo4.cb_bias_zero = false;  // a set of its own, not pushed: the biases stay
                     const gcn::TranslateResult ref4 = translate_cached(prog, vo4);
                     gcn::LiftResult lifted4 = ref4.ok() ? lift_tess_cached(TranslationUse::kLiftLs, prog, vo4, ref4, tl) : gcn::LiftResult{};
                     if (lifted4.ok() && ref4.images.empty() && ref4.samplers.empty()) {
@@ -9211,8 +9233,10 @@ bool draw_window_locked(std::uint64_t base, std::uint64_t bytes, Located& out) {
 // indexes it from cb_bias_dw. A V# outside imported memory, not on a dword
 // boundary, or too long for one binding stays on the page-table path
 // (cb_valid bit clear) and gets the dummy buffer.
+// `exact` (cb_exact_bindings, a pushed stage): every binding starts at its V#
+// base, its bias 0 - a shader translated with cb_bias_zero reads none.
 void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t* user, gcn::StageParams& params,
-                           std::vector<VkDescriptorBufferInfo>& infos, const GxStageRecords* gx = nullptr) {
+                           std::vector<VkDescriptorBufferInfo>& infos, const GxStageRecords* gx = nullptr, bool exact = false) {
     // Why V#s end up on the page-table path, logged every 200,000 resolves.
     enum { kBound, kNoBase, kUnaligned, kUnmapped, kTooLong, kOutcomes };
     static std::uint64_t outcomes[kOutcomes] = {};
@@ -9298,7 +9322,7 @@ void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t
             params.cb_bias_dw[i] = 0;
             outcome = kBound;
         } else if (loc.buffer) {
-            const VkDeviceSize start = loc.offset & ~(g.ssbo_align - 1);
+            const VkDeviceSize start = exact ? loc.offset : loc.offset & ~(g.ssbo_align - 1);
             const VkDeviceSize bias = loc.offset - start;
             outcome = kTooLong;
             // BBHOST_CB_ALIGN16=1: refuse a binding whose base is not a whole
@@ -9410,7 +9434,9 @@ void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t
                     // own offset, every snapshot was a descriptor set never
                     // seen before - written for each draw, 17% of the frame
                     // rate GPU-bound.
-                    const bool whole = snapshot && g.ssbo_max_range >= kScratch;
+                    // Pushed (`exact`), each draw's ranges go into the command
+                    // buffer anyway: the snapshot is bound where it is.
+                    const bool whole = !exact && snapshot && g.ssbo_max_range >= kScratch;
                     info = whole ? VkDescriptorBufferInfo{scratch.buffer, 0, kScratch} : VkDescriptorBufferInfo{scratch.buffer, at, bytes};
                     params.cb_valid |= 1u << i;
                     params.cb_bias_dw[i] = whole ? static_cast<std::uint32_t>(at / 4) : 0;
@@ -14290,7 +14316,7 @@ static bool draw_impl(const GpuDraw& d) {
             std::memcpy(params.vertex_formats, t_tess->hs_user, sizeof(params.vertex_formats));
             if (gx_stage[0]) put_tess_constants(*gx_stage[0], t_tess->tess_vsharp, params.user_sgpr);
         }
-        resolve_stage_buffers(meta, params.user_sgpr, params, buffer_infos, gx_stage[st]);
+        resolve_stage_buffers(meta, params.user_sgpr, params, buffer_infos, gx_stage[st], cb_exact_bindings());
         if (!meta.buffers.empty()) {
             any_buffers = true;
             all_bound = all_bound && params.cb_valid == (1u << meta.buffers.size()) - 1;
@@ -14701,7 +14727,7 @@ static bool draw_impl(const GpuDraw& d) {
             const gcn::TranslateResult& meta = st == 0 ? pl.vs.meta() : pl.ps.meta();
             std::vector<VkDescriptorBufferInfo> again;
             params.cb_valid = 0;
-            resolve_stage_buffers(meta, params.user_sgpr, params, again, gx_stage[st]);
+            resolve_stage_buffers(meta, params.user_sgpr, params, again, gx_stage[st], cb_exact_bindings());
             std::copy(again.begin(), again.end(), buffer_infos.begin() + static_cast<std::ptrdiff_t>(stage_first_buffer[st]));
             if (stage_reused[st] && !cb_push_on()) {
                 // This stage took the previous draw's set and params slot, and

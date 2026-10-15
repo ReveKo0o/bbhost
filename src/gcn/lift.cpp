@@ -2324,7 +2324,7 @@ private:
             ++constant_loads;
             return;
         }
-        const Id bias = params_load(bias_loads, 4, index);
+        const Id bias = cb_bias(index);
         Pending p{in.sdst, {}};
         for (int k = 0; k < count; ++k) {
             const Id at = m.emit(spv::OpIAdd, t_u32, {bias, cu(off_dw + static_cast<std::uint32_t>(k))});
@@ -2345,7 +2345,7 @@ private:
     std::size_t ranged_loads = 0;
     void ranged_load(const Inst& in, int count, std::uint32_t index) {
         const Id first = shift(spv::OpShiftRightLogical, as_u(read(static_cast<std::uint16_t>(in.imm), in)), cu(2));
-        const Id bias = params_load(bias_loads, 4, index);
+        const Id bias = cb_bias(index);
         const Id range_dw = params_load(stride_loads, 5, index);
         Pending p{in.sdst, {}};
         for (int k = 0; k < count; ++k) {
@@ -2378,6 +2378,8 @@ private:
         const Id v = m.emit(spv::OpSelect, t_u32, {m.emit(spv::OpINotEqual, t_bool, {spec, cu(0)}), spec, loaded});
         return values.emplace(index, v).first->second;
     }
+    // buffers[index]'s dword bias inside its binding, as translate.cpp cb_bias reads it.
+    Id cb_bias(std::uint32_t index) { return opt.cb_bias_zero ? cu(0) : params_load(bias_loads, 4, index); }
     Id params_load(std::map<std::uint32_t, Id>& cache, std::uint32_t member, std::uint32_t index) {
         auto it = cache.find(index);
         if (it == cache.end()) {
@@ -2454,7 +2456,7 @@ private:
         const std::uint32_t index = site->second;
         const Id stride_dw = shift(spv::OpShiftRightLogical, stride_value(index), cu(2));
         const Id first = ibin(spv::OpIAdd, cu(static_cast<std::uint32_t>(off / 4)), ibin(spv::OpIMul, as_u(value(256 + in.vaddr)), stride_dw));
-        const Id bias = params_load(bias_loads, 4, index);
+        const Id bias = cb_bias(index);
         int total = 0;
         for (int k = 0; k < count; ++k) total += bits[k];
         std::vector<Id> words;
@@ -2524,7 +2526,7 @@ private:
         const int n = in.op == 28 ? 1 : in.op == 29 ? 2 : in.op == 30 ? 4 : 3;
         const std::uint32_t index = site->second;
         const Id first = shift(spv::OpShiftRightLogical, ibin(spv::OpIAdd, cu(in.offset12), as_u(read(in.soffset, in))), cu(2));
-        const Id bias = params_load(bias_loads, 4, index);
+        const Id bias = cb_bias(index);
         const Id range_dw = params_load(stride_loads, 5, index);
         for (int k = 0; k < n; ++k) {
             const Id v = as_u(value(256 + in.vdata + k));

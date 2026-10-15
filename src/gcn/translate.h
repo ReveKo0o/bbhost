@@ -286,6 +286,12 @@ struct TranslateOptions {
     // and the pixel stage's from 128.
     int cb_descriptor_set = -1;
     std::uint32_t cb_binding_base = 112;  // kBindingStorageBuffer0
+    // The host binds every constant buffer at its V#'s base (StageParams::
+    // cb_bias_dw always 0): the shader indexes each from dword 0 rather than
+    // from a bias read from the params. Constant offsets stay constants, which
+    // the driver loads several dwords at a time; added to a bias, AMD's
+    // compiler loaded each dword with an address add of its own.
+    bool cb_bias_zero = false;
     // Image dimensions per T# use site, filled by the host from the resolved
     // T#s (spv::Dim, arrayed). Missing entries default to 2D. Bits 8-9 of the
     // dim are the texel kind (ImageBinding::kind), 0 when not given.

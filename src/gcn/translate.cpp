@@ -854,7 +854,7 @@ struct Translator {
         buffer_sites.push_back({reg, index, sym_key(sym_of(reg)), sym_key(sym_of(reg + 1)), def_seq++, cur_block});
         const Id first = shr(offset_bytes, cu(2));
         const auto bound_reads = [&] {
-            const Id bias = params_u32(4, index);
+            const Id bias = cb_bias(index);
             const Id range_dw = params_u32(5, index);
             std::vector<Id> vals;
             for (int k = 0; k < n; ++k) {
@@ -930,7 +930,7 @@ struct Translator {
         std::vector<Id> vals;
         for (int k = 0; k < n; ++k) vals.push_back(ld(vgpr_var(in.vdata + k)));
         exec_guard([&] {
-            const Id bias = params_u32(4, index);
+            const Id bias = cb_bias(index);
             const Id range_dw = params_u32(5, index);
             for (int k = 0; k < n; ++k) {
                 const Id at = iadd(first, cu(static_cast<std::uint32_t>(k)));
@@ -946,6 +946,9 @@ struct Translator {
         return m.load(t_u32, m.access_chain(p_uni_u32, ubo_var,
                                             {cu(member), cu(static_cast<std::uint32_t>(index / 4)), cu(static_cast<std::uint32_t>(index % 4))}));
     }
+    // buffers[index]'s dword bias inside its binding (StageParams::cb_bias_dw):
+    // 0 where the host binds every buffer at its base (TranslateOptions::cb_bias_zero).
+    Id cb_bias(std::size_t index) { return opt.cb_bias_zero ? c_zero_u : params_u32(4, index); }
     Id buffer_bound(std::size_t index) {
         const Id valid_bits = m.load(t_u32, params_head_v4 ? m.access_chain(p_uni_u32, ubo_var, {cu(3), c_zero_u})
                                                            : m.access_chain(p_uni_u32, ubo_var, {cu(3)}));
@@ -958,7 +961,7 @@ struct Translator {
         res.buffer_at[cur_offset] = static_cast<std::uint32_t>(index);
         buffer_sites.push_back({reg, index, sym_key(sym_of(reg)), sym_key(sym_of(reg + 1)), def_seq++, cur_block});
         if (opt.cb_no_fallback) {
-            const Id bias = params_u32(4, index);
+            const Id bias = cb_bias(index);
             std::vector<Id> vals;
             for (int k = 0; k < n; ++k) {
                 const Id at = iadd(bias, iadd(first_dw, cu(static_cast<std::uint32_t>(k))));
@@ -973,7 +976,7 @@ struct Translator {
         m.emit_void(spv::OpSelectionMerge, {l_merge, 0u});
         m.emit_void(spv::OpBranchConditional, {valid, l_bound, l_walk});
         m.label(l_bound);
-        const Id bias = params_u32(4, index);
+        const Id bias = cb_bias(index);
         for (int k = 0; k < n; ++k) {
             const Id at = iadd(bias, iadd(first_dw, cu(static_cast<std::uint32_t>(k))));
             m.store(vars[static_cast<std::size_t>(k)], m.load(t_u32, m.access_chain(p_ssbo_u32, buffer_vars[index], {c_zero_u, at})));
