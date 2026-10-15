@@ -2903,10 +2903,11 @@ void begin_recording_locked() {
 }
 
 // A params block into its slot in the ring, which is write-combined memory,
-// as whole 64-byte lines: a line written in part (352 bytes are five and a
-// half) stays in a write-combining buffer until the next store fence - the
-// draw's publish - which then flushes it in pieces. The slot (kParamsStride)
-// holds the rounded size; the binding's range stays sizeof(StageParams).
+// as whole 64-byte lines: a line written in part stays in a write-combining
+// buffer until the next store fence - the draw's publish - which then flushes
+// it in pieces. The slot (kParamsStride) holds the rounded size; the
+// binding's range stays sizeof(StageParams). (A block that is whole lines
+// already, as it is now at 512 bytes, is copied as it is.)
 // BBHOST_WC_LINES=0: the params blocks and the constant-buffer snapshots
 // (render.cpp) written at their exact sizes.
 const bool g_wc_whole_lines = [] {
@@ -2916,14 +2917,18 @@ const bool g_wc_whole_lines = [] {
 constexpr std::size_t kParamsLines = (sizeof(gcn::StageParams) + 63) & ~std::size_t{63};
 static_assert(kParamsLines <= kParamsStride, "a params slot holds its block in whole lines");
 void put_params_lines(std::uint8_t* dst, const gcn::StageParams& params) {
-    if (!g_wc_whole_lines) {
+    if constexpr (kParamsLines == sizeof(gcn::StageParams)) {
         std::memcpy(dst, &params, sizeof(params));
-        return;
+    } else {
+        if (!g_wc_whole_lines) {
+            std::memcpy(dst, &params, sizeof(params));
+            return;
+        }
+        alignas(64) std::uint8_t lines[kParamsLines];
+        std::memcpy(lines, &params, sizeof(params));
+        std::memset(lines + sizeof(params), 0, kParamsLines - sizeof(params));
+        std::memcpy(dst, lines, kParamsLines);
     }
-    alignas(64) std::uint8_t lines[kParamsLines];
-    std::memcpy(lines, &params, sizeof(params));
-    std::memset(lines + sizeof(params), 0, kParamsLines - sizeof(params));
-    std::memcpy(dst, lines, kParamsLines);
 }
 
 std::uint32_t alloc_params_slot_locked(const gcn::StageParams& params, VkDescriptorBufferInfo& out) {
