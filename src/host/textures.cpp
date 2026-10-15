@@ -54,7 +54,28 @@ struct FormatInfo {
 
 std::uint64_t tsharp_base(const std::uint32_t* w) {
     const std::uint64_t full = (static_cast<std::uint64_t>(w[0]) | (static_cast<std::uint64_t>(w[1] & 0xff) << 32)) << 8;
-    if (hle_kernel_va_mapped(full, 16)) return full;
+    // The mapped ranges the last few T#s were found in, while the map list
+    // stands (its generation): textures sit in a few heaps, and the general
+    // lookup's small cache is shared with every other kind of address the
+    // command processor checks - the recent-draw ring's T#s alone were 3.6%
+    // of it at Mensis, a search of the map list for most.
+    thread_local std::uint64_t lo[4] = {}, hi[4] = {}, gen = 0;
+    thread_local unsigned next = 0;
+    const std::uint64_t maps = hle_kernel_maps_generation();
+    if (maps == gen) {
+        for (int i = 0; i < 4; ++i) {
+            if (full >= lo[i] && full + 16 <= hi[i]) return full;
+        }
+    } else {
+        gen = maps;
+        for (int i = 0; i < 4; ++i) lo[i] = hi[i] = 0;
+    }
+    if (std::uint64_t a = 0, b = 0; hle_kernel_va_mapped_in(full, 16, &a, &b)) {
+        const unsigned k = next++ & 3;
+        lo[k] = a;
+        hi[k] = b;
+        return full;
+    }
     const std::uint64_t low = static_cast<std::uint64_t>(w[0]) << 8;
     if (hle_kernel_va_mapped(low, 16)) {
         static std::atomic<int> logs{0};
