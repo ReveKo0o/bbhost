@@ -7270,6 +7270,14 @@ const bool g_replay_watch = [] {
 // every later write in the batch overwrites is dropped, and a write that
 // overlaps an earlier one still standing gets a barrier first: the last value
 // wins, as it did on the command processor.
+// BBHOST_ARENA_RETIRE_ORDER (on unless 0): a command-arena chunk's retirement
+// waits for the labels written into its chunk before it in the same fills
+// (flush_deferred_writes_locked); counted at exit.
+const bool g_arena_retire_order = [] {
+    const char* e = std::getenv("BBHOST_ARENA_RETIRE_ORDER");
+    return !(e && e[0] == '0');
+}();
+std::atomic<std::uint64_t> g_arena_retires_ordered{0};
 // The dwords the deferred writes of one command buffer touch: which write is
 // the last to each, and which were filled since the last barrier. Open
 // addressing over a table kept between calls and emptied by a generation
@@ -7323,6 +7331,10 @@ void flush_deferred_writes_locked() {
     for (std::size_t i = 0; i < ws.size(); ++i) {
         for (std::uint32_t k = 0; k < ws[i].bytes; k += 4) dwords.set_last(ws[i].va + k, static_cast<std::uint32_t>(i));
     }
+    // The command-arena chunks filled into since the last barrier.
+    std::uint64_t filled_chunks[8];
+    int nfilled_chunks = 0;
+    bool filled_chunks_lost = false;
     for (std::size_t i = 0; i < ws.size(); ++i) {
         const Gpu::SmallWrite& w = ws[i];
         bool live = false, clash = false;
@@ -7333,6 +7345,24 @@ void flush_deferred_writes_locked() {
         if (!live) continue;
         Located loc;
         if (!locate_range(w.va, w.bytes, loc)) continue;
+        // A command-arena chunk's retirement (its marker's 0) hands the chunk
+        // back to the game, which writes new packets into it at once - a
+        // thread waiting for a chunk takes it the moment it reads 0. Fills
+        // with no barrier between them land in any order, so a label written
+        // into that chunk earlier in this batch (an embedded one: YEBIS's
+        // compute utilities wait on theirs) could land after the 0, on top of
+        // the new packets. The hardware's end-of-pipe events retire in order:
+        // the retirement waits for the fills into its chunk before it.
+        std::uint64_t chunk = 0;
+        const bool in_arena = hle_gx_arena_overlap(w.va, w.bytes, &chunk);
+        if (g_arena_retire_order && in_arena && !clash && w.bytes == 8 && hle_gx_arena_marker(w.va)) {
+            bool earlier = filled_chunks_lost;
+            for (int k = 0; k < nfilled_chunks && !earlier; ++k) earlier = filled_chunks[k] == chunk;
+            if (earlier) {
+                clash = true;
+                g_arena_retires_ordered.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
         if (g_replay_watch) {
             std::uint64_t v = 0;
             std::memcpy(&v, w.data, w.bytes < 8 ? w.bytes : 8);
@@ -7347,6 +7377,8 @@ void flush_deferred_writes_locked() {
             rec().pipeline_barrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, nullptr, 0,
                                  nullptr);
             dwords.clear_filled();
+            nfilled_chunks = 0;
+            filled_chunks_lost = false;
         }
         std::uint32_t d[2] = {0, 0};
         std::memcpy(d, w.data, w.bytes);
@@ -7356,6 +7388,17 @@ void flush_deferred_writes_locked() {
             for (std::uint32_t k = 0; k < w.bytes; k += 4) rec().fill_buffer(loc.buffer, loc.offset + k, 4, d[k / 4]);
         }
         for (std::uint32_t k = 0; k < w.bytes; k += 4) dwords.fill(w.va + k);
+        if (in_arena) {
+            bool known = false;
+            for (int k = 0; k < nfilled_chunks && !known; ++k) known = filled_chunks[k] == chunk;
+            if (!known) {
+                if (nfilled_chunks < 8) {
+                    filled_chunks[nfilled_chunks++] = chunk;
+                } else {
+                    filled_chunks_lost = true;  // more than eight: every retirement after them is ordered
+                }
+            }
+        }
     }
     g.deferred_writes.clear();
 }
@@ -8072,6 +8115,9 @@ void host_gpu_report() {
                  static_cast<unsigned long long>(g_dispatch_image_blits.load()),
                  static_cast<unsigned long long>(g_dispatch_buf_to_image.load()));
         host_log("gpu: %s", indirect_clamp_report().c_str());
+        host_log("gpu: command-arena chunk retirements that came after a label into their own chunk in the same unordered "
+                 "fills, given a barrier ahead of the marker's 0: %llu",
+                 static_cast<unsigned long long>(g_arena_retires_ordered.load()));
         host_log("gpu: %s", compute_lift_report().c_str());
         host_log("gpu: dispatch census: %llu reached a shader over %zu programs, %llu were a fill and %llu a copy (no shader runs "
                  "for those)",
