@@ -26,6 +26,13 @@
 # window nothing keeps in front, no scripted presses, the player's own options
 # (%APPDATA%/bbhost/bbhost-options.toml: its Frame rate, not the bench's 60 or
 # BBHOST_UNCAP), an hour unless PERF_SECONDS says otherwise.
+# PERF_MENUTAP=1: through the title by asking for the menus' confirm every
+# 2 s for the first PERF_MENUTAP_SECONDS (70), carried out only while one of
+# the game's menus has the input (the test request menutap), in place of the
+# timed Cross presses - which the world takes too once it is up (a lamp next
+# to the save opened and travelled: a run measured another area). PERF_DUMP_AT
+# ="s[,s...]": the displayed frame at those seconds into the run, as
+# build/perf/NAME-<s>.ppm (with BBHOST_DUMP_DRAWS=<n> its draw list in the log).
 # Runs play on build/perf/data (a copy of the saves; the pipeline cache stays
 # between runs so compiles do not land in the measured seconds) and write
 # build/perf/NAME.log, NAME.perfmon.
@@ -89,6 +96,29 @@ TOML
 rm -f "$out/data/bbhost/gpu-device-lost.txt" "$out/$NAME.perfmon"
 # Title: Cross through the "press any button", Continue and any notice.
 taps=${PERF_TAPS-"20:cross,25:cross,30:cross,35:cross,40:cross,45:cross,50:cross"}
+reqs=()
+if [ "${PERF_MENUTAP:-0}" = 1 ] || [ -n "${PERF_DUMP_AT:-}" ]; then
+    reqdir="$root/$out/req"
+    rm -rf "$out/req"
+    mkdir -p "$out/req"
+    reqs=(BBHOST_TEST_REQUESTS="$reqdir")
+    [ "${PERF_MENUTAP:-0}" = 1 ] && taps=""
+    (
+        t=0
+        dumps=",${PERF_DUMP_AT:-},"
+        while [ $t -lt "$secs" ]; do
+            sleep 1
+            t=$((t + 1))
+            if [ "${PERF_MENUTAP:-0}" = 1 ] && [ $t -le "${PERF_MENUTAP_SECONDS:-70}" ] && [ $((t % 2)) = 0 ]; then
+                echo "menutap confirm 1500" > "$out/req/tap-$t.tmp" && mv "$out/req/tap-$t.tmp" "$out/req/tap-$(printf %04d $t).req"
+            fi
+            case "$dumps" in *",$t,"*)
+                echo "dump $root/$out/$NAME-$t.ppm" > "$out/req/dump-$t.tmp" && mv "$out/req/dump-$t.tmp" "$out/req/dump-$(printf %04d $t).req" ;;
+            esac
+        done
+    ) &
+    reqloop=$!
+fi
 if [ "${PERF_DEBUG_MENU:-1}" = 1 ] && [ ! -f "$(dirname "$exe")/plugins/debug_menu.dll" ]; then
     echo "note: no $(dirname "$exe")/plugins/debug_menu.dll - the debug menu needs the plugin (tools/win_build_msys2.sh builds it)"
 fi
@@ -109,9 +139,10 @@ uncap=()
 [ "${PERF_UNCAPPED:-1}" = 1 ] && uncap=(BBHOST_UNCAP=1 BBHOST_BENCH_UNCAPPED=1)
 env BBHOST_CONFIG_DIR="$root/$out/cfg" BBHOST_SETUP_WINDOW=0 BBHOST_NO_GAMEPAD=$nogamepad BBHOST_SKIP_INTRO=1 \
     BBHOST_HEADLESS=${PERF_HEADLESS:-1} BBHOST_FRAME_STATS=1 $([ "${PERF_PLAY:-0}" = 1 ] || echo BBHOST_GAME_FPS=60) \
-    BBHOST_EXIT_SECONDS=$secs BBHOST_AUTOPRESS="$taps" "${uncap[@]}" "${play[@]}" "$@" \
+    BBHOST_EXIT_SECONDS=$secs BBHOST_AUTOPRESS="$taps" "${uncap[@]}" "${play[@]}" "${reqs[@]}" "$@" \
     timeout $((secs + 120)) "$exe" --config "$root/$out/cfg/bbhost.toml" > "$out/$NAME.log" 2>&1
 echo "exit $?" >> "$out/$NAME.log"
+[ -n "${reqloop:-}" ] && kill "$reqloop" 2>/dev/null
 wait $mon 2>/dev/null
 python tools/perf_pass_summary.py "$out/$NAME.log" "$out/$NAME.perfmon"
 if [ -n "$etw" ]; then

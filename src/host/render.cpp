@@ -6707,7 +6707,12 @@ void begin_pass(const DrawState& s, std::uint64_t key, bool hazard = false) {
         if (s.depth->format != VK_FORMAT_D32_SFLOAT && s.depth->format != VK_FORMAT_D16_UNORM) ri.pStencilAttachment = &stencil;
     }
     if (g.profile_passes && g_pass_profile_name) {
-        profile_begin_locked(g_pass_profile_name);
+        // The pass's size and attachments beside its first draw's pipeline:
+        // which passes are the render size's, and how many targets they write.
+        static std::unordered_set<std::string> names;
+        char tail[48];
+        std::snprintf(tail, sizeof(tail), "@%ux%u:%zu%s", extent.width, extent.height, colors.size(), s.depth ? "d" : "");
+        profile_begin_locked(&*names.insert(*g_pass_profile_name + tail).first);
         g_pass.profiled = true;
     }
     if (DrawCmds* c = DrawCmds::open(); !c || !c->begin_rendering(ri)) vkCmdBeginRendering(g_cmd(), &ri);
