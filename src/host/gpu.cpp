@@ -7382,6 +7382,14 @@ const bool g_replay_watch = [] {
     const char* e = std::getenv("BBHOST_ARENA_WATCH");
     return e && e[0] == '1';
 }();
+// BBHOST_ARENA_RETIRE_ORDER (on unless 0): a command-arena chunk's retirement
+// waits for the labels written into its chunk before it in the same fills
+// (flush_deferred_writes_locked); counted at exit.
+const bool g_arena_retire_order = [] {
+    const char* e = std::getenv("BBHOST_ARENA_RETIRE_ORDER");
+    return !(e && e[0] == '0');
+}();
+std::atomic<std::uint64_t> g_arena_retires_ordered{0};
 
 // Replays the fence writes held back by host_gpu_mem_write at the end of the
 // command buffer, in the order the command processor made them.
@@ -7401,67 +7409,36 @@ const bool g_replay_watch = [] {
 // every later write in the batch overwrites is dropped, and a write that
 // overlaps an earlier one still standing gets a barrier first: the last value
 // wins, as it did on the command processor.
-// BBHOST_ARENA_RETIRE_ORDER (on unless 0): a command-arena chunk's retirement
-// waits for the labels written into its chunk before it in the same fills
-// (flush_deferred_writes_locked); counted at exit.
-const bool g_arena_retire_order = [] {
-    const char* e = std::getenv("BBHOST_ARENA_RETIRE_ORDER");
-    return !(e && e[0] == '0');
-}();
-std::atomic<std::uint64_t> g_arena_retires_ordered{0};
-// The dwords the deferred writes of one command buffer touch: which write is
-// the last to each, and which were filled since the last barrier. Open
-// addressing over a table kept between calls and emptied by a generation
-// count - tens of writes a command buffer, each a label, where node-based
-// maps allocated at every insert (a fifth of this function's time).
-class DeferredDwords {
-public:
-    void reset(std::size_t writes) {
-        ++gen_;
-        std::size_t want = 64;
-        while (want < writes * 4) want <<= 1;  // two dwords a write, at most half full
-        if (want > slots_.size()) slots_.assign(want, Slot{});
-    }
-    void set_last(std::uint64_t va, std::uint32_t index) { slot(va).last = index; }
-    std::uint32_t last(std::uint64_t va) { return slot(va).last; }
-    void fill(std::uint64_t va) { slot(va).filled = gen_fill_; }
-    bool filled(std::uint64_t va) { return slot(va).filled == gen_fill_; }
-    void clear_filled() { ++gen_fill_; }
-
-private:
-    struct Slot {
-        std::uint64_t va = 0, gen = 0, filled = 0;
-        std::uint32_t last = 0;
-    };
-    Slot& slot(std::uint64_t va) {
-        const std::size_t mask = slots_.size() - 1;
-        std::size_t i = static_cast<std::size_t>(((va >> 2) * 0x9e3779b97f4a7c15ull) >> 40) & mask;
-        while (slots_[i].gen == gen_ && slots_[i].va != va) i = (i + 1) & mask;
-        Slot& s = slots_[i];
-        if (s.gen != gen_) {
-            s.gen = gen_;
-            s.va = va;
-            s.last = ~0u;
-            s.filled = 0;
-        }
-        return s;
-    }
-    std::vector<Slot> slots_;
-    std::uint64_t gen_ = 0, gen_fill_ = 1;  // 64 bits: never wrap
-};
-
 void flush_deferred_writes_locked() {
     if (g.deferred_writes.empty()) return;
     // Each ordinary run of transfers shares one barrier pair; this one starts
     // its own, so nothing recorded before it can land after it.
     transfer_flush_locked();
-    static DeferredDwords dwords;
+    static std::unordered_map<std::uint64_t, std::size_t> last;  // dword -> index of the last write to it
+    static std::unordered_set<std::uint64_t> filled;             // dwords filled since the last barrier
     const auto& ws = g.deferred_writes;
-    dwords.reset(ws.size());
-    dwords.clear_filled();
-    for (std::size_t i = 0; i < ws.size(); ++i) {
-        for (std::uint32_t k = 0; k < ws[i].bytes; k += 4) dwords.set_last(ws[i].va + k, static_cast<std::uint32_t>(i));
+    // A submission's few writes (a label or two, at most 8 bytes each) are
+    // compared with each other directly: the maps' node per dword was an
+    // allocation and a free, at every submission (~1.8% of the command
+    // processor at Mensis). Past kSmall the maps, as before.
+    constexpr std::size_t kSmall = 32;
+    const bool small = ws.size() <= kSmall;
+    std::uint64_t filled_small[2 * kSmall];
+    std::size_t nfilled = 0;
+    if (!small) {
+        last.clear();
+        filled.clear();
+        for (std::size_t i = 0; i < ws.size(); ++i) {
+            for (std::uint32_t k = 0; k < ws[i].bytes; k += 4) last[ws[i].va + k] = i;
+        }
     }
+    // Whether a write after the i-th puts a dword at `at`, as `last` keys them.
+    const auto written_later = [&](std::size_t i, std::uint64_t at) {
+        for (std::size_t j = i + 1; j < ws.size(); ++j) {
+            if (at >= ws[j].va && at < ws[j].va + ws[j].bytes && (at - ws[j].va) % 4 == 0) return true;
+        }
+        return false;
+    };
     // The command-arena chunks filled into since the last barrier.
     std::uint64_t filled_chunks[8];
     int nfilled_chunks = 0;
@@ -7470,8 +7447,13 @@ void flush_deferred_writes_locked() {
         const Gpu::SmallWrite& w = ws[i];
         bool live = false, clash = false;
         for (std::uint32_t k = 0; k < w.bytes; k += 4) {
-            live |= dwords.last(w.va + k) == i;
-            clash |= dwords.filled(w.va + k);
+            if (small) {
+                live |= !written_later(i, w.va + k);
+                for (std::size_t f = 0; f < nfilled && !clash; ++f) clash = filled_small[f] == w.va + k;
+            } else {
+                live |= last[w.va + k] == i;
+                clash |= filled.count(w.va + k) != 0;
+            }
         }
         if (!live) continue;
         Located loc;
@@ -7507,7 +7489,8 @@ void flush_deferred_writes_locked() {
             mb.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
             rec().pipeline_barrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, nullptr, 0,
                                  nullptr);
-            dwords.clear_filled();
+            filled.clear();
+            nfilled = 0;
             nfilled_chunks = 0;
             filled_chunks_lost = false;
         }
@@ -7518,7 +7501,13 @@ void flush_deferred_writes_locked() {
         } else {
             for (std::uint32_t k = 0; k < w.bytes; k += 4) rec().fill_buffer(loc.buffer, loc.offset + k, 4, d[k / 4]);
         }
-        for (std::uint32_t k = 0; k < w.bytes; k += 4) dwords.fill(w.va + k);
+        for (std::uint32_t k = 0; k < w.bytes; k += 4) {
+            if (small) {
+                filled_small[nfilled++] = w.va + k;  // at most two dwords a write, kSmall writes
+            } else {
+                filled.insert(w.va + k);
+            }
+        }
         if (in_arena) {
             bool known = false;
             for (int k = 0; k < nfilled_chunks && !known; ++k) known = filled_chunks[k] == chunk;
