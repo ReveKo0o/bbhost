@@ -1652,23 +1652,50 @@ GxRecordsPtr snapshot_records(const GxRec& r) {
     // after another they cost a miss each: ask for all of them first, both
     // stages', so the misses overlap. A prefetch of a bad pointer is harmless.
     const auto prefetch = [](std::uint64_t va) { __builtin_prefetch(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(va))); };
+    // The record set is pooled and comes back cold (the command processor
+    // read it last): the lines the copies below write are asked for with the
+    // intent to write too, a line once, so their reads for ownership overlap
+    // the objects' misses instead of following them one store at a time.
+    // BBHOST_GX_RECORDS_PREFETCHW=0: not asked for.
+    static const bool prefetch_records_w = [] {
+        const char* e = std::getenv("BBHOST_GX_RECORDS_PREFETCHW");
+        return !(e && e[0] == '0');
+    }();
+    const char* last_line = nullptr;
+    const auto prefetch_w = [&](const void* p) {
+        const char* line = reinterpret_cast<const char*>(reinterpret_cast<std::uintptr_t>(p) & ~std::uintptr_t{63});
+        if (line == last_line) return;
+        last_line = line;
+        prefetch_for_write(line);
+    };
     for (int k = 0; k < nrec; ++k) {
+        GxStageRecords& s = out->stage[k];
         for (std::uint64_t m = tex_needed[k]; m; m &= m - 1) {
-            if (const std::uint64_t view = rd64(groups[k] + 0x80 + 8 * static_cast<std::uint64_t>(__builtin_ctzll(m)))) {
+            const int j = __builtin_ctzll(m);
+            if (const std::uint64_t view = rd64(groups[k] + 0x80 + 8 * static_cast<std::uint64_t>(j))) {
                 prefetch(view + 0x10);
                 prefetch(view + 0x2f);
+                if (prefetch_records_w) prefetch_w(s.obj_tex + j * 32);
             }
         }
+        if (prefetch_records_w && tex_needed[k]) {
+            last_line = nullptr;
+            for (std::uint64_t m = tex_needed[k]; m; m &= m - 1) prefetch_w(&s.obj_tex_id[__builtin_ctzll(m)]);
+        }
         for (std::uint32_t m = smp_needed[k]; m; m &= m - 1) {
-            if (const std::uint64_t smp = rd64(groups[k] + 8 * static_cast<std::uint64_t>(__builtin_ctz(m)))) {
+            const int j = __builtin_ctz(m);
+            if (const std::uint64_t smp = rd64(groups[k] + 8 * static_cast<std::uint64_t>(j))) {
                 prefetch(smp);
                 prefetch(smp + 0x1f);
             }
+            if (prefetch_records_w) prefetch_w(s.obj_smp + j * 32);  // an empty slot gets the default record
         }
         for (std::uint32_t m = cb_needed[k]; m; m &= m - 1) {
-            if (const std::uint64_t cb = rd64(groups[k] + 0x480 + 8 * static_cast<std::uint64_t>(__builtin_ctz(m)))) {
+            const int j = __builtin_ctz(m);
+            if (const std::uint64_t cb = rd64(groups[k] + 0x480 + 8 * static_cast<std::uint64_t>(j))) {
                 prefetch(cb + 0x18);
                 prefetch(cb + 0x57);
+                if (prefetch_records_w) prefetch_w(s.obj_cb + j * 16);
             }
         }
     }
