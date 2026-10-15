@@ -10164,16 +10164,27 @@ bool plan_vertex_input(const std::vector<std::uint32_t>& fetch_words, std::uint6
             ns.whole = {};
             // The bytes the draw reads of the record: up to its last vertex's
             // furthest element (the record's whole extent when not known).
-            std::uint64_t read_bytes = record_bytes;
-            if (std::int64_t last = 0; draw_last_vertex(last)) {
-                std::uint64_t elem_end = 0;
-                for (std::size_t k = 0; k < n; ++k) {
-                    const std::uint32_t* wk = o.vtx_rec[els[k].slot];
-                    if (((o.vtx_valid >> els[k].slot) & 1) && std::memcmp(wk, w, 12) == 0)
-                        elem_end = std::max<std::uint64_t>(elem_end, els[k].offset + vertex_format_bytes((wk[3] >> 15) & 0xf));
+            // Worked out only where they are used - a snapshot of a record
+            // on a page the game rewrites, BBHOST_VB_RACE - since an indexed
+            // draw's last vertex is its largest index, which reads every
+            // index: done for every record it was 20.5% of the command
+            // processor in Kyo's hall.
+            bool read_known = false;
+            std::uint64_t read_bytes_memo = record_bytes;
+            const auto read_bytes = [&]() -> std::uint64_t {
+                if (read_known) return read_bytes_memo;
+                read_known = true;
+                if (std::int64_t last = 0; draw_last_vertex(last)) {
+                    std::uint64_t elem_end = 0;
+                    for (std::size_t k = 0; k < n; ++k) {
+                        const std::uint32_t* wk = o.vtx_rec[els[k].slot];
+                        if (((o.vtx_valid >> els[k].slot) & 1) && std::memcmp(wk, w, 12) == 0)
+                            elem_end = std::max<std::uint64_t>(elem_end, els[k].offset + vertex_format_bytes((wk[3] >> 15) & 0xf));
+                    }
+                    read_bytes_memo = std::min(record_bytes, static_cast<std::uint64_t>(last) * stride + elem_end);
                 }
-                read_bytes = std::min(record_bytes, static_cast<std::uint64_t>(last) * stride + elem_end);
-            }
+                return read_bytes_memo;
+            };
             bool in_place = false;
             if (windowed) {
                 bump(g_vertex_window_records);
@@ -10184,15 +10195,16 @@ bool plan_vertex_input(const std::vector<std::uint32_t>& fetch_words, std::uint6
                     // A ring the game rewrites: the bytes as the draw records
                     // (shadow_snapshot_locked); otherwise staged as the GPU
                     // reaches the submission, or read in place.
-                    if (version == kCopyVersionNone && shadow_snapshot_locked(record_va, read_bytes, ns.whole)) {
+                    if (version == kCopyVersionNone && shadow_snapshot_maybe_locked(record_va, record_bytes) &&
+                        shadow_snapshot_locked(record_va, read_bytes(), ns.whole)) {
                         bump(g_vertex_snapshot_records);
-                    } else if (vb_race_on() && read_bytes > (1u << 20)) {
+                    } else if (vb_race_on() && read_bytes() > (1u << 20)) {
                         static int logs = 0;
                         if (logs++ < 12) {
                             const DrawVertexSpan& v = t_vertex_span;
                             host_log("vb race: a %llu-byte vertex record at 0x%llx left in place, its draw's vertices unknown: known %d, "
                                      "count %u, indices 0x%llx (%s), base %lld, worked out %d last %lld",
-                                     static_cast<unsigned long long>(read_bytes), static_cast<unsigned long long>(record_va), v.known ? 1 : 0,
+                                     static_cast<unsigned long long>(read_bytes()), static_cast<unsigned long long>(record_va), v.known ? 1 : 0,
                                      v.count, static_cast<unsigned long long>(v.index_va), v.index_type ? "32-bit" : "16-bit",
                                      static_cast<long long>(v.base), v.worked_out ? 1 : 0, static_cast<long long>(v.last));
                         }
@@ -10213,8 +10225,8 @@ bool plan_vertex_input(const std::vector<std::uint32_t>& fetch_words, std::uint6
             // copy, nor memory a GPU write is still to land on (the draw's own
             // order covers that).
             if (vb_race_on() && in_place && version == kCopyVersionNone && t_vb_race_n < 8 &&
-                !gpu_writes_pending_locked(record_va, read_bytes))
-                t_vb_race_ranges[t_vb_race_n++] = {record_va, read_bytes};
+                !gpu_writes_pending_locked(record_va, read_bytes()))
+                t_vb_race_ranges[t_vb_race_n++] = {record_va, read_bytes()};
             rs = &ns;
         }
         if (rs->whole.buffer) {

@@ -881,6 +881,15 @@ bool snap_ring_make() {
 }
 }  // namespace
 
+bool shadow_snapshot_maybe_locked(std::uint64_t va, std::uint64_t bytes) {
+    if (!g_snapshot_on || !buffer_shadow_on() || !bytes) return false;
+    std::uint32_t chunk = 0;
+    std::uint64_t off = 0;
+    if (!phys_of(va, bytes, chunk, off) || off + bytes > kChunkBytes) return true;  // not told this cheaply
+    const Mirror& m = g_mirrors[chunk];
+    return !m.pages.empty() && any_set(m.dyn, static_cast<std::uint32_t>(off >> kPageShift), static_cast<std::uint32_t>((off + bytes - 1) >> kPageShift));
+}
+
 bool shadow_snapshot_locked(std::uint64_t va, std::uint64_t bytes, Located& loc) {
     if (!g_snapshot_on || !buffer_shadow_on() || !bytes || bytes > kSnapMaxBytes) return false;
     // Only a range on a page the game keeps rewriting: a static page the

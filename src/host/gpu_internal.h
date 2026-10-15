@@ -795,6 +795,10 @@ bool shadow_stage_locked(std::uint64_t va, std::uint64_t bytes, Located& loc);
 // False, `loc` unchanged, for a range on no dynamic page, past 1 MiB, or one a
 // GPU write is still to land on (BBHOST_VERTEX_SNAPSHOT).
 bool shadow_snapshot_locked(std::uint64_t va, std::uint64_t bytes, Located& loc);
+// Whether shadow_snapshot_locked may copy any of [va, va+bytes) - a page of it
+// the game rewrites, or a range this cannot tell cheaply - before the caller
+// works out how much of it a draw reads.
+bool shadow_snapshot_maybe_locked(std::uint64_t va, std::uint64_t bytes);
 void shadow_written_locked(std::uint64_t va, std::uint64_t bytes, bool by_gpu);
 // BBHOST_INDIRECT_STATS=1: an indirect dispatch (kind 0) or draw (1, 2
 // indexed) recorded now, whose arguments are read once its submission is
