@@ -2087,6 +2087,24 @@ void execute_packet(std::uint32_t op, const std::uint32_t* b, std::size_t n, int
                                      static_cast<unsigned long long>(va), fn, ref, mask, v);
                             host_log("  packet: %08x %08x %08x %08x %08x %08x depth=%d", b[0], b[1], b[2], b[3], b[4],
                                      n > 5 ? b[5] : 0u, depth);
+                            // Where it sits, and what came before it in its
+                            // buffer: the packets that set up what it waits on
+                            // (a label, the event that writes it) name its writer.
+                            {
+                                const std::uint64_t at = reinterpret_cast<std::uintptr_t>(b - 1);
+                                const bool inside = at >= t_cb_lo && at < t_cb_hi;  // not a constant-engine packet's
+                                const std::uint64_t from = inside ? std::max(t_cb_lo, at >= 64 ? at - 64 : 0) : at;
+                                char before[16 * 9 + 1] = {};
+                                int len = 0;
+                                for (std::uint64_t p2 = from; p2 < at && len < static_cast<int>(sizeof(before)) - 9; p2 += 4) {
+                                    len += std::snprintf(before + len, sizeof(before) - len, " %08x",
+                                                         *reinterpret_cast<const std::uint32_t*>(static_cast<std::uintptr_t>(p2)));
+                                }
+                                host_log("  at 0x%llx, +0x%llx into the buffer at 0x%llx (0x%llx bytes); the dwords before it:%s",
+                                         static_cast<unsigned long long>(at), static_cast<unsigned long long>(at - t_cb_lo),
+                                         static_cast<unsigned long long>(t_cb_lo),
+                                         static_cast<unsigned long long>(t_cb_hi - t_cb_lo), len ? before : " none");
+                            }
                             // Only what is mapped: a wait at the first bytes of
                             // a mapping (0x100000001 during a load, a malformed
                             // address) has nothing below it to show.
