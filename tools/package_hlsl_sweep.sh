@@ -11,7 +11,8 @@
 # On the machine:
 #   run-sweep.bat <game folder>      (Windows)     ./run-sweep.sh <game folder>      (Linux, Steam Deck)
 # where <game folder> holds dvdroot_ps4 (CUSA00900); sweep-summary.txt and
-# sweep-list.txt are written beside the script.
+# sweep-list.txt are written beside the script (SWEEP_NAME=<name>: <name>-summary.txt
+# and <name>-list.txt, to keep one run's beside another's).
 set -eu
 cd "$(dirname "$0")/.."
 target=${1:-}; bin=${2:-}; out=${3:-}
@@ -37,20 +38,22 @@ rem every shader of the game lifted as bbhost lifts it here, compiled by DXC,
 rem and both modules built into the pipelines bbhost makes, by the driver.
 rem   run-sweep.bat <game folder>      the folder that holds dvdroot_ps4
 rem   run-sweep.bat <game folder> --gpu 1    another GPU (bbhost's log numbers them)
-rem It takes 5 to 15 minutes. Send sweep-summary.txt and sweep-list.txt.
+rem It takes 5 to 15 minutes. Send sweep-summary.txt and sweep-list.txt
+rem (set SWEEP_NAME=other first: other-summary.txt and other-list.txt).
 setlocal
 cd /d "%~dp0"
 if "%~1"=="" (
   echo usage: run-sweep.bat ^<game folder^>
   exit /b 2
 )
+if "%SWEEP_NAME%"=="" set SWEEP_NAME=sweep
 set game=%~1
 shift
-gcn2hlsl.exe --sweep --app0 "%game%" --list sweep-list.txt %1 %2 %3 %4 > sweep-summary.txt 2>&1
+gcn2hlsl.exe --sweep --app0 "%game%" --list %SWEEP_NAME%-list.txt %1 %2 %3 %4 > %SWEEP_NAME%-summary.txt 2>&1
 set rc=%errorlevel%
-type sweep-summary.txt
+type %SWEEP_NAME%-summary.txt
 echo.
-echo exit %rc%: the summary is %~dp0sweep-summary.txt, every program in %~dp0sweep-list.txt
+echo exit %rc%: the summary is %~dp0%SWEEP_NAME%-summary.txt, every program in %~dp0%SWEEP_NAME%-list.txt
 exit /b %rc%
 EOF
     (cd "$out" && rm -f "$name.zip" && zip -qr "$name.zip" "$name")
@@ -66,7 +69,8 @@ linux)
 # and both modules built into the pipelines bbhost makes, by the driver.
 #   ./run-sweep.sh <game folder>             the folder that holds dvdroot_ps4
 #   ./run-sweep.sh <game folder> --gpu 1     another GPU (bbhost's log numbers them)
-# It takes 5 to 15 minutes. Send sweep-summary.txt and sweep-list.txt.
+# It takes 5 to 15 minutes. Send sweep-summary.txt and sweep-list.txt
+# (SWEEP_NAME=other ./run-sweep.sh ...: other-summary.txt and other-list.txt).
 cd "$(dirname "$0")" || exit 1
 if [ -z "${1:-}" ]; then
     echo "usage: ./run-sweep.sh <game folder>"
@@ -74,11 +78,12 @@ if [ -z "${1:-}" ]; then
 fi
 game=$1
 shift
-./gcn2hlsl --sweep --app0 "$game" --list sweep-list.txt "$@" > sweep-summary.txt 2>&1
+name=${SWEEP_NAME:-sweep}
+./gcn2hlsl --sweep --app0 "$game" --list "$name-list.txt" "$@" > "$name-summary.txt" 2>&1
 rc=$?
-cat sweep-summary.txt
+cat "$name-summary.txt"
 echo
-echo "exit $rc: the summary is $(pwd)/sweep-summary.txt, every program in $(pwd)/sweep-list.txt"
+echo "exit $rc: the summary is $(pwd)/$name-summary.txt, every program in $(pwd)/$name-list.txt"
 exit $rc
 EOF
     stage=$(mktemp -d); trap 'rm -rf "$stage"' EXIT
