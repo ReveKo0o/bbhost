@@ -117,6 +117,7 @@ class Recipe:
         self.key = r.u64()
         self.uses = r.u32()
         self.last_run = r.u32()
+        self.order = r.u32()
         state_at = r.p
         r.take(19 * 4 + 8 + (8 + 8 + 32 + 8 + 1) * 4 + GX_BLEND + GX_DEPTH + GX_RASTER)
         self.state = body[state_at:r.p]
@@ -150,7 +151,7 @@ class Recipe:
         return self
 
     def body(self):
-        out = [w32(self.flags), struct.pack("<Q", self.key), w32(self.uses), w32(self.last_run), self.state,
+        out = [w32(self.flags), struct.pack("<Q", self.key), w32(self.uses), w32(self.last_run), w32(self.order), self.state,
                program_bytes(self.vs, self.vs_ref), w32(len(self.fetch) // 4) + self.fetch, program_bytes(self.ps, self.ps_ref),
                wstr(self.vs_name), wstr(self.ps_name), self.mid, self.tess]
         if self.tess_flags & TESS_HAS_LS:

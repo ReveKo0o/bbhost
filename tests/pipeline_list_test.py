@@ -22,7 +22,7 @@ def recipe(key, last_run, vs, ps, vs_name="0000aaaa", ps_name="0000bbbb", vertex
     tail = struct.pack("<I", 0) * 4 + struct.pack("<I", 1) + struct.pack("<4I", 0, 1, 4, 0x8C) + struct.pack("<I", 0) * 2 + \
         struct.pack("<Q", 0x1234) + bytes(128 + 128 + 4)
     tail += struct.pack("<I", 0) + bytes(9 * 4 + 16 + 8 + 48 + 8)  # no tessellation
-    body = b"".join([struct.pack("<IQII", flags, key, 1, last_run), state, struct.pack("<I", len(vs) // 4), vs,
+    body = b"".join([struct.pack("<IQIII", flags, key, 1, last_run, key), state, struct.pack("<I", len(vs) // 4), vs,
                      struct.pack("<I", 0), struct.pack("<I", len(ps) // 4), ps, pl.wstr(vs_name), pl.wstr(ps_name), tail])
     return pl.Recipe().parse(body)
 

@@ -4204,6 +4204,10 @@ struct PipelineRecipe {
     // draws took it, and the last start that did (or recorded it).
     std::uint64_t key = 0;
     std::uint32_t uses = 0, last_run = 0;
+    // Its place in the order the run that recorded it first created them: a
+    // start builds them in that order - the title's first, then the place
+    // the game starts in - so what is drawn first is built first.
+    std::uint32_t order = 0;
     bool listed = false;  // from a shipped list (pipeline_manifest_load), not this player's own record
     bool loaded = false;  // read at the start (else recorded in this run)
 };
@@ -4265,6 +4269,7 @@ struct PipelineManifest {
     std::atomic<std::uint64_t> loaded{0}, queued{0}, done{0}, failed{0}, relinked{0}, build_us{0}, recorded{0};
     std::atomic<std::uint64_t> taken{0}, not_ready{0}, layout_differs{0}, unrecordable{0}, dropped{0};
     std::atomic<std::uint64_t> wait_us{0};
+    std::atomic<std::uint32_t> next_order{0};
     std::chrono::steady_clock::time_point loaded_at{};
     std::atomic<bool> done_logged{false};
     std::atomic<bool> recording{false};  // a manifest file to keep: set when it is read (pipeline_manifest_load)
@@ -4434,6 +4439,7 @@ void recipe_note_created(GfxPipeline& pl, std::uint64_t key) {
         pl.recipe->key = key;
         pl.recipe->uses = 1;
         pl.recipe->last_run = g_pmanifest.run;
+        pl.recipe->order = g_pmanifest.next_order.fetch_add(1, std::memory_order_relaxed);
         g_pmanifest.recorded.fetch_add(1, std::memory_order_relaxed);
         g_pmanifest.dirty = true;
     } else {
@@ -7414,6 +7420,7 @@ void write(Writer& out, const PipelineRecipe& rc) {
     pod(w, rc.key);
     w.u32(rc.uses);
     w.u32(rc.last_run);
+    w.u32(rc.order);
     for (std::uint32_t v : {s.vs_rsrc1, s.vs_rsrc2, s.ps_rsrc1, s.ps_rsrc2, s.prim, static_cast<std::uint32_t>(s.topo), s.depth_control,
                             s.stencil_control, s.su_sc_mode, s.clip_cntl, s.vte_cntl, s.ps_input_ena, s.ps_in_control, s.vs_out_cntl,
                             s.cb_shader_mask, s.ps_col_format, s.gx_ids[0], s.gx_ids[1], s.gx_ids[2]}) {
@@ -7499,6 +7506,7 @@ bool read(Reader& in, PipelineRecipe& rc) {
     pod(r, rc.key);
     rc.uses = r.u32();
     rc.last_run = r.u32();
+    rc.order = r.u32();
     std::uint32_t topo = 0;
     for (std::uint32_t* v : {&s.vs_rsrc1, &s.vs_rsrc2, &s.ps_rsrc1, &s.ps_rsrc2, &s.prim, &topo, &s.depth_control, &s.stencil_control,
                              &s.su_sc_mode, &s.clip_cntl, &s.vte_cntl, &s.ps_input_ena, &s.ps_in_control, &s.vs_out_cntl, &s.cb_shader_mask,
@@ -19694,14 +19702,16 @@ void pipeline_manifest_load(const std::string& path, const std::string& list_pat
     recipe_file::Origin theirs = ours;
     std::vector<std::shared_ptr<PipelineRecipe>> recipes;
     const bool have_own = read_recipe_file(path, run, theirs, recipes, unread);
-    std::sort(recipes.begin(), recipes.end(), [](const auto& a, const auto& b) {
-        return a->last_run != b->last_run ? a->last_run > b->last_run : a->uses > b->uses;
-    });
+    // In the order they were first drawn, which a start draws them in too.
+    std::stable_sort(recipes.begin(), recipes.end(), [](const auto& a, const auto& b) { return a->order < b->order; });
     std::size_t own = 0, listed = 0, list_unread = 0;
     std::vector<std::shared_ptr<PipelineRecipe>> queue;
     {
         std::lock_guard<std::mutex> lk(g_pmanifest.mu);
         g_pmanifest.run = run + 1;
+        std::uint32_t last = 0;
+        for (const auto& rc : recipes) last = std::max(last, rc->order + 1);
+        g_pmanifest.next_order.store(last);
         for (const auto& rc : recipes) {
             if (g_pmanifest.by_key.emplace(rc->key, rc).second) queue.push_back(rc);
         }
@@ -19714,6 +19724,7 @@ void pipeline_manifest_load(const std::string& path, const std::string& list_pat
         std::vector<std::shared_ptr<PipelineRecipe>> list;
         if (read_recipe_file(list_path, list_run, list_origin, list, bad)) {
             std::lock_guard<std::mutex> lk(g_pmanifest.mu);
+            std::stable_sort(list.begin(), list.end(), [](const auto& a, const auto& b) { return a->order < b->order; });
             for (auto& rc : list) {
                 rc->listed = true;
                 rc->uses = 0;
