@@ -1171,6 +1171,9 @@ struct LinkInfo {
     std::uint32_t vs_pgm[4], ps_pgm[4];
     std::uint32_t vs_out_cntl, ps_input_ena, ps_in_control, cb_shader_mask, ps_col_format, ps_input_count;
     std::uint32_t ps_input_cntl[32];
+    // program_fingerprint of the inputs these give (and the constant
+    // vte_cntl): 0 until the first draw that made the entry has worked it out.
+    std::uint64_t program_fp = 0;
 };
 constexpr std::size_t kLinkInfos = 256;
 thread_local LinkInfo* t_link_infos = nullptr;
@@ -1223,6 +1226,7 @@ bool build_inputs(const GxRec& r, GpuDrawInputs& in, bool allow_tess = false) {
             in.ps_col_format = link->ps_col_format;
             in.ps_input_count = link->ps_input_count;
             std::memcpy(in.ps_input_cntl, link->ps_input_cntl, sizeof(in.ps_input_cntl));
+            in.program_fp = link->program_fp;  // 0 until worked out: gx_hook does it then
             goto shaders_done;
         }
         if (!check_cached) g_link_info.add(1, 1);
@@ -1309,6 +1313,7 @@ bool build_inputs(const GxRec& r, GpuDrawInputs& in, bool allow_tess = false) {
         link->ps_col_format = in.ps_col_format;
         link->ps_input_count = in.ps_input_count;
         std::memcpy(link->ps_input_cntl, in.ps_input_cntl, sizeof(in.ps_input_cntl));
+        link->program_fp = 0;  // worked out once the draw's inputs are whole (below)
     }
     }
     if (check_cached) {
@@ -1399,6 +1404,12 @@ shaders_done:
         case kDrawInstanced: in.base_vertex = static_cast<std::int32_t>(r.arg[2]); break;
         case kDrawIndexedInstanced: in.base_vertex = static_cast<std::int32_t>(r.arg[3]); break;
         default: break;
+    }
+    // The program fingerprint reads only what the link entry gives (and the
+    // constant vte_cntl): worked out once an entry, not at every draw.
+    if (link) {
+        if (!link->program_fp) link->program_fp = program_fingerprint(in);
+        in.program_fp = link->program_fp;
     }
     return true;
 }
@@ -5568,7 +5579,7 @@ GUEST_ABI std::uint64_t gx_hook(std::uint64_t id, const std::uint64_t* f) {
                 return !(e && e[0] == '0');
             }();
             r.in_ok = g_backend && build_inputs(r, r.in, tess_native);
-            if (r.in_ok) r.in.program_fp = program_fingerprint(r.in);
+            if (r.in_ok && !r.in.program_fp) r.in.program_fp = program_fingerprint(r.in);  // build_inputs' link entry may have it
             if (g_native && g_backend == 1) {
                 if (r.kind > kDrawIndexedIndirect) g_native_skipped.add(1, kSkipKind);
                 else if (!tess_native && (r.st[1].shader || r.st[2].shader)) g_native_skipped.add(1, kSkipTess);
