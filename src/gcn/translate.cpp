@@ -2679,8 +2679,11 @@ struct Translator {
         const Id kind = iand(d, cu(7));
         const Id count = iand(shr(d, cu(4)), cu(7));
         const Id one = sel(bor(ieq(kind, cu(2)), ieq(kind, cu(4))), c_one_u, u(cf(1.0f)));
+        const Id packing = iand(shr(d, cu(12)), cu(3));  // VertexElement::packed: 1 bytes, 2 halves in the input's dwords
         for (std::uint32_t k = 0; k < el.count && k < 4; ++k) {
-            const Id c = extract(t_u32, raw, k);
+            const Id byte = ubfe(extract(t_u32, raw, 0), 8 * k, 8);
+            const Id half = ubfe(extract(t_u32, raw, k / 2), 16 * (k % 2), 16);
+            const Id c = sel(ieq(packing, c_one_u), byte, sel(ieq(packing, cu(2)), half, extract(t_u32, raw, k)));
             const Id unorm8 = u(fdiv(u2f(c), cf(255.0f)));
             const Id sint16 = ui(m.emit(spv::OpBitFieldSExtract, t_i32, {i(c), c_zero_u, cu(16)}));
             const Id converted = sel(ieq(kind, cu(3)), unorm8, sel(ieq(kind, cu(4)), sint16, c));  // kinds 1 and 2: the raw bits
@@ -2712,12 +2715,13 @@ struct Translator {
                 error("vertex input: unsupported buffer data format " + std::to_string(dfmt));
                 return;
             }
-            const bool packed = dfmt >= 6 && dfmt <= 9;
+            // A packed format, or components the host packed (VertexElement::packed): taken from the input's dwords.
+            const bool packed = (dfmt >= 6 && dfmt <= 9) || (el.packed && el.packed == vertex_packed_bits(dfmt));
             const Id one = nfmt == 4 || nfmt == 5 ? c_one_u : u(cf(1.0f));
             std::vector<Id> comps(4, c_zero_u);
             int bit = 0;
             for (int k = 0; k < count; ++k) {
-                const Id c = packed ? ubfe(extract(t_u32, raw, 0), bit, bits[k]) : extract(t_u32, raw, k);
+                const Id c = packed ? ubfe(extract(t_u32, raw, static_cast<std::uint32_t>(bit / 32)), bit % 32, bits[k]) : extract(t_u32, raw, k);
                 comps[k] = convert_component(c, bits[k], nfmt);
                 bit += bits[k];
             }

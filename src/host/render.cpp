@@ -2701,6 +2701,12 @@ struct VertexInputPlan {
     std::uint64_t va[16] = {};  // guest address of each binding's first byte (draw captures copy from there)
     std::uint64_t hash = 0;     // pipeline identity: elements, bindings and attributes
 };
+std::uint64_t vertex_plan_hash(const VertexInputPlan& p) {
+    std::uint64_t h = fnv1a("vertex input", 12);
+    h = fnv1a(p.elements.data(), p.elements.size() * sizeof(gcn::VertexElement), h);
+    h = fnv1a(p.bindings.data(), p.bindings.size() * sizeof(VkVertexInputBindingDescription), h);
+    return fnv1a(p.attributes.data(), p.attributes.size() * sizeof(VkVertexInputAttributeDescription), h);
+}
 
 // Read masks (table_slots_read) run the SPIRV-Tools optimizer, tens of
 // milliseconds a module. On the command processor's thread that doubled the
@@ -6299,7 +6305,7 @@ bool link_gfx_pipeline(GfxPipeline& pl, const GfxFixedState& f, const VertexInpu
         if (g_relink_formats && pl.vs_formats_from_params && vertex_input && !pl.tess_hw && !vertex_input->elements.empty()) {
             pl.relink_formats = true;
             for (const gcn::VertexElement& el : vertex_input->elements) {
-                if (el.location < 16) pl.relink_vertex_formats[el.location] = gcn::vertex_format_descriptor(el.w3);
+                if (el.location < 16) pl.relink_vertex_formats[el.location] = gcn::vertex_format_descriptor(el.w3, el.packed);
             }
         }
         pl.relink_polygon = f.polygon_mode;
@@ -10230,12 +10236,40 @@ bool plan_vertex_input(const std::vector<std::uint32_t>& fetch_words, std::uint6
         return true;
     };
     if (!bind(g_vertex_input == 2)) bind(true);
-    std::uint64_t h = fnv1a("vertex input", 12);
-    h = fnv1a(p.elements.data(), p.elements.size() * sizeof(gcn::VertexElement), h);
-    h = fnv1a(p.bindings.data(), p.bindings.size() * sizeof(VkVertexInputBindingDescription), h);
-    h = fnv1a(p.attributes.data(), p.attributes.size() * sizeof(VkVertexInputAttributeDescription), h);
-    p.hash = h;
+    p.hash = vertex_plan_hash(p);
     return true;
+}
+
+// BBHOST_VERTEX_PACK=0: every element one component a channel, as before.
+// Otherwise an element of 8- or 16-bit components whose address and stride
+// allow it arrives packed, as the record holds it, in an R16_UINT, R32_UINT or
+// R32G32_UINT attribute (gcn::VertexElement::packed) that the vertex shader
+// takes apart. AMD's compiler fetches an R8G8B8A8 or R16G16B16A16 attribute
+// one component a load, since Vulkan promises an attribute's address only its
+// component's alignment: the G-buffer's main vertex shader made 15 typed loads
+// a vertex where its record needs 5. Only for a vertex shader that reads its
+// formats from its params (vertex_formats_from_params), whose descriptor says
+// how each element arrives - whichever translation of it serves the draw.
+const bool g_vertex_pack = [] {
+    const char* e = std::getenv("BBHOST_VERTEX_PACK");
+    return !(e && e[0] == '0');
+}();
+void pack_vertex_input(VertexInputPlan& p) {
+    bool any = false;
+    for (VkVertexInputAttributeDescription& a : p.attributes) {
+        if (a.location >= p.elements.size() || a.binding >= p.bindings.size()) continue;
+        gcn::VertexElement& el = p.elements[a.location];
+        const std::uint32_t dfmt = (el.w3 >> 15) & 0xf, bits = gcn::vertex_packed_bits(dfmt);
+        if (!bits) continue;
+        const std::uint32_t bytes = vertex_format_bytes(dfmt);  // 2, 4 or 8
+        const VkFormat f = bytes == 2 ? VK_FORMAT_R16_UINT : bytes == 4 ? VK_FORMAT_R32_UINT : VK_FORMAT_R32G32_UINT;
+        const VkDeviceSize align = bytes == 2 ? 2 : 4;  // the packed format's component
+        if ((p.offset[a.binding] + a.offset) % align || p.bindings[a.binding].stride % align || !vertex_format_usable(f)) continue;
+        a.format = f;
+        el.packed = bits;
+        any = true;
+    }
+    if (any) p.hash = vertex_plan_hash(p);
 }
 
 // The record a resource slot's pending-state object gives for a descriptor
@@ -13207,6 +13241,11 @@ static bool draw_impl(const GpuDraw& d) {
         }
     }
     if (t_tess && t_tess->native && !use_vertex_input) return tess_native_refuse("no vertex input for its LS");
+    // Elements a vertex shader reading its formats from its params can take
+    // packed (build_gfx_pipeline decides vs_formats_from_params the same way).
+    if (use_vertex_input && g_vertex_pack && !(t_tess && t_tess->native) && g_vertex_format_params && use_pipeline_library() &&
+        gcn::vertex_formats_from_params_supported(vertex_input.elements))
+        pack_vertex_input(vertex_input);
     const std::vector<std::uint32_t>& fetch_words = fetch ? fetch->words : no_words;
     draw_stamp.to(kRenderCostPrograms);
     const std::uint64_t ps_hash = ps_cp ? ps_cp->hash : 0;
@@ -14259,7 +14298,7 @@ static bool draw_impl(const GpuDraw& d) {
         if (st == 0 && use_vertex_input) {
             // Step 6c: the conversions a vertex shader built with vertex_formats_from_params reads.
             for (const gcn::VertexElement& el : vertex_input.elements) {
-                if (el.location < 16) params.vertex_formats[el.location] = gcn::vertex_format_descriptor(el.w3);
+                if (el.location < 16) params.vertex_formats[el.location] = gcn::vertex_format_descriptor(el.w3, el.packed);
             }
         }
         if (st == 0 && pl.tess_attrs) {

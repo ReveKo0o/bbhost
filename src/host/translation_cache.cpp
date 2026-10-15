@@ -36,7 +36,7 @@ static_assert(sizeof(gcn::TranslateResult) == 424, "a new TranslateResult field:
 static_assert(sizeof(gcn::ResourcePath) == 40 && sizeof(gcn::ResourceStep) == 8, "a new ResourcePath field: add it to the entry");
 static_assert(sizeof(gcn::ImageBinding) == 64 && sizeof(gcn::SamplerBinding) == 56 && sizeof(gcn::BufferBinding) == 56,
               "a new binding field: add it to the entry");
-static_assert(sizeof(gcn::VertexElement) == 16, "a new VertexElement field: add it to hash_options");
+static_assert(sizeof(gcn::VertexElement) == 20, "a new VertexElement field: add it to hash_options");
 // (A lift's proof, listing, wave-operation counts and engine names are not
 // kept: the names are put on after the cache (render.cpp name_stage), the rest
 // is diagnostics.)
@@ -135,6 +135,7 @@ void hash_options(KeyHasher& h, const gcn::TranslateOptions& o) {
         h.u32(e.vdata);
         h.u32(e.count);
         h.u32(e.w3);
+        h.u32(e.packed);
     }
     h.flag(o.vertex_formats_from_params);
     h.flag(o.force_dispatcher);

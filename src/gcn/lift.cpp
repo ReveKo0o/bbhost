@@ -2569,8 +2569,11 @@ private:
             const Id count = ibin(spv::OpBitwiseAnd, ibin(spv::OpShiftRightLogical, d, cu(4)), cu(7));
             const Id integer = m.emit(spv::OpLogicalOr, t_bool, {ieq(kind, cu(2)), ieq(kind, cu(4))});
             const Id one = m.emit(spv::OpSelect, t_u32, {integer, cu(1), cu(std::bit_cast<std::uint32_t>(1.0f))});
+            const Id packing = ibin(spv::OpBitwiseAnd, ibin(spv::OpShiftRightLogical, d, cu(12)), cu(3));  // VertexElement::packed
             for (std::uint32_t k = 0; k < el.count && k < 4; ++k) {
-                const Id c = extract(t_u32, raw, k);
+                const Id byte = m.emit(spv::OpBitFieldUExtract, t_u32, {extract(t_u32, raw, 0), cu(8 * k), cu(8)});
+                const Id half = m.emit(spv::OpBitFieldUExtract, t_u32, {extract(t_u32, raw, k / 2), cu(16 * (k % 2)), cu(16)});
+                const Id c = m.emit(spv::OpSelect, t_u32, {ieq(packing, cu(1)), byte, m.emit(spv::OpSelect, t_u32, {ieq(packing, cu(2)), half, extract(t_u32, raw, k)})});
                 const Id unorm8 = m.emit(spv::OpBitcast, t_u32, {fdiv(m.emit(spv::OpConvertUToF, t_f32, {c}), cf(255.0f))});
                 const Id sint16 = from_i(m.emit(spv::OpBitFieldSExtract, t_i32, {to_i(c), cu(0), cu(16)}));
                 // kinds 1 and 2: the raw bits
@@ -2609,15 +2612,16 @@ private:
                 reject("vertex input: unsupported buffer data format " + std::to_string(dfmt));
                 return;
             }
-            const bool packed = dfmt >= 6 && dfmt <= 9;
+            // A packed format, or components the host packed (VertexElement::packed): taken from the input's dwords.
+            const bool packed = (dfmt >= 6 && dfmt <= 9) || (el.packed && el.packed == vertex_packed_bits(dfmt));
             const Id one = nfmt == 4 || nfmt == 5 ? cu(1) : as_u(float_const(1.0f));
             std::vector<Id> comps(4, cu(0));
             {
                 EntryScope entry(m);  // inputs and their conversions dominate every block
                 const Id raw = m.load(t_v4u, var);
                 for (int k = 0, bit = 0; k < count; bit += bits[k], ++k) {
-                    const Id c = packed ? m.emit(spv::OpBitFieldUExtract, t_u32, {extract(t_u32, raw, 0), cu(static_cast<std::uint32_t>(bit)),
-                                                                                  cu(static_cast<std::uint32_t>(bits[k]))})
+                    const Id c = packed ? m.emit(spv::OpBitFieldUExtract, t_u32, {extract(t_u32, raw, static_cast<std::uint32_t>(bit / 32)),
+                                                                                  cu(static_cast<std::uint32_t>(bit % 32)), cu(static_cast<std::uint32_t>(bits[k]))})
                                         : extract(t_u32, raw, static_cast<std::uint32_t>(k));
                     comps[static_cast<std::size_t>(k)] = convert_component(c, bits[k], nfmt);
                 }
