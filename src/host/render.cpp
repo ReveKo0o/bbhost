@@ -5866,6 +5866,9 @@ struct PrecompileJob {
     // The shader sweep's (types 1, 2, 4 from the game's bundles): into the
     // caches only, nothing kept in this run (precompile_ps, precompile_vs).
     bool sweep = false;
+    // Type 1: the vertex shader's clip-varying twin alone, queued behind every
+    // other job by its own compile (Precompiler::later).
+    bool twin = false;
     // An optimized relink (queue_library_relink): the pipeline, its libraries and layout.
     GfxPipeline* relink = nullptr;
     VkPipeline libraries[4] = {};
@@ -5894,6 +5897,11 @@ struct Precompiler {
     std::mutex mu;
     std::condition_variable cv;
     std::deque<PrecompileJob> jobs;                             // under mu
+    // Under mu: what is likely needed rather than certainly - the clip-varying
+    // twins precompile_vs predicts - taken only when `jobs` is empty, so a
+    // start's shaders are ready as soon as they were without them.
+    std::deque<PrecompileJob> later;
+    bool later_logged = false;  // under mu
     std::unordered_map<std::string, int> running;               // under mu: the names a worker is compiling now
     std::unordered_map<std::string, PrecompileRecord> records;  // by pixel-shader name, under mu
     std::unordered_set<std::uint64_t> stage_keys;               // under mu
@@ -5984,15 +5992,27 @@ Precompiler& precompiler() {
                             if (i >= w->limit) {
                                 // A wake-up meant for a worker under the limit
                                 // goes on to one.
-                                if (!w->jobs.empty()) w->cv.notify_one();
+                                if (!w->jobs.empty() || !w->later.empty()) w->cv.notify_one();
                                 w->park_cv.wait(lk, [w, i] { return i < w->limit; });
                                 continue;
                             }
-                            if (!w->jobs.empty()) break;
+                            if (!w->jobs.empty() || !w->later.empty()) break;
                             w->cv.wait(lk);
                         }
-                        job = std::move(w->jobs.front());
-                        w->jobs.pop_front();
+                        if (!w->jobs.empty()) {
+                            job = std::move(w->jobs.front());
+                            w->jobs.pop_front();
+                        } else {
+                            job = std::move(w->later.front());
+                            w->later.pop_front();
+                            if (!w->later_logged) {
+                                w->later_logged = true;
+                                host_log("render: precompile workers: every shader queued so far taken, %.1f s after start (flip %llu); "
+                                         "%zu predicted variants behind them (BBHOST_PREDICT_VARIANTS)",
+                                         std::chrono::duration<double>(std::chrono::steady_clock::now() - g_process_start).count(),
+                                         static_cast<unsigned long long>(hle_video_flip_count()), w->later.size() + 1);
+                            }
+                        }
                         ++w->running[job.name];
                         if (!w->busy) {
                             w->busy = true;
@@ -6019,7 +6039,7 @@ Precompiler& precompiler() {
                     if (--w->running[job.name] == 0) w->running.erase(job.name);
                     ++w->burst_jobs;
                     ++w->burst_type[job.type >= 0 && job.type <= 8 ? job.type : 2];
-                    if (w->busy && w->jobs.empty() && w->running.empty()) {
+                    if (w->busy && w->jobs.empty() && w->later.empty() && w->running.empty()) {
                         w->busy = false;
                         // How long a run of compiles took the workers, wall
                         // time: the start's is what parallel compiles and the
@@ -6720,7 +6740,9 @@ void precompile_manifest(const ManifestStage& m) {
 // shader: the twin is compiled at the location the pair then uses, the first
 // past every param the vertex shader exports (a pixel shader reading past
 // those has the draw build its own). Draws without a pixel shader keep the
-// plain one.
+// plain one. The twins (719 on a cold start, 40 s of compiles on a desktop
+// NVIDIA driver) wait behind every other job (Precompiler::later), so the
+// start's own shaders are not later for them on a CPU with few cores.
 const bool g_predict_variants = [] {
     const char* e = std::getenv("BBHOST_PREDICT_VARIANTS");
     return !(e && e[0] == '0');
@@ -6792,7 +6814,7 @@ void precompile_vs(Precompiler& w, const PrecompileJob& job) {
     paths_options.rsrc1 = rec.rsrc1;
     paths_options.rsrc2 = rec.rsrc2;
     const gcn::TranslateResult paths = translate_cached(prog, paths_options, TranslationUse::kPaths);
-    if (!job.sweep) offer_paths(code.words, paths);
+    if (!job.sweep && !job.twin) offer_paths(code.words, paths);
     for (const gcn::PredictedImage& p : gcn::predict_image_dims(prog, paths)) rec.dims.emplace_back(p.dim, p.arrayed);
     rec.modes.assign(paths.samplers.size(), false);
     static const std::vector<std::uint32_t> no_fetch;
@@ -6856,9 +6878,12 @@ void precompile_vs(Precompiler& w, const PrecompileJob& job) {
     };
     std::uint64_t key = 0, twin = 0;
     std::string why;
-    if (!build(rec.out_cntl, key, why)) return give_up(why);
+    if (!job.twin && !build(rec.out_cntl, key, why)) return give_up(why);
     // The clip-varying twin (g_predict_variants), as build_gfx_pipeline's
-    // vs_out_cntl makes it for a draw with a pixel shader.
+    // vs_out_cntl makes it for a draw with a pixel shader. A draw needs the
+    // shader as it is first, if ever the twin, so the twin is a job of its own
+    // behind every other (Precompiler::later): a start's shaders are ready as
+    // soon as they were without it. The sweep's, already behind them, here.
     const std::uint32_t oc = rec.out_cntl;
     if (g_predict_variants && g_clip_varying && (oc & (1u << 22)) && (oc & 0xf) && !(oc & 0xfff0) && !(oc & (1u << 23))) {
         int used = -1;
@@ -6866,7 +6891,19 @@ void precompile_vs(Precompiler& w, const PrecompileJob& job) {
             if (in.enc == gcn::Enc::EXP && in.tgt >= 32 && in.tgt < 64) used = std::max(used, static_cast<int>(in.tgt) - 32);
         }
         const std::uint32_t location = static_cast<std::uint32_t>(used + 1);
-        if (location <= 29) {
+        if (location <= 29 && !job.twin && !job.sweep) {
+            PrecompileJob later;
+            later.name = job.name;
+            later.container = job.container;
+            later.type = 1;
+            later.flip = job.flip;
+            later.twin = true;
+            {
+                std::lock_guard<std::mutex> lk(w.mu);
+                w.later.push_back(std::move(later));
+            }
+            w.cv.notify_one();
+        } else if (location <= 29) {
             const std::uint32_t varying =
                 oc | gcn::TranslateOptions::kVsOutCntlClipVarying | location << gcn::TranslateOptions::kVsOutCntlClipLocationShift;
             std::string twin_why;
@@ -6876,6 +6913,13 @@ void precompile_vs(Precompiler& w, const PrecompileJob& job) {
                 twin = 0;
             }
         }
+    }
+    if (job.twin) {
+        if (twin) {
+            std::lock_guard<std::mutex> lk(w.mu);
+            w.vs_stage_keys.insert(twin);
+        }
+        return;
     }
     if (fetchless && !job.sweep) g_vs_fetchless.fetch_add(1, std::memory_order_relaxed);
     if (job.sweep) {
@@ -7021,7 +7065,7 @@ void sweep_thread(int index) {
             bool idle;
             {
                 std::lock_guard<std::mutex> lk(w.mu);
-                idle = w.jobs.empty();
+                idle = w.jobs.empty() && w.later.empty();
             }
             if (idle && g.ok) break;
             std::this_thread::sleep_for(std::chrono::milliseconds(20));
