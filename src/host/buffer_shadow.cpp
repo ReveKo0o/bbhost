@@ -926,7 +926,7 @@ bool shadow_snapshot_locked(std::uint64_t va, std::uint64_t bytes, Located& loc)
     std::memcpy(g_snap.map + at, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(va)), bytes);
     g_snap.next = at + bytes;
     bump(g_snapshots);
-    g_snapshot_bytes.fetch_add(bytes, std::memory_order_relaxed);
+    bump(g_snapshot_bytes, bytes);  // not a locked add: it would wait for the copy to drain
     loc.buffer = g_snap.buffer;
     loc.offset = at;
     loc.avail = bytes;

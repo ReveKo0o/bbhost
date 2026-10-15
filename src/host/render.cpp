@@ -9356,7 +9356,7 @@ void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t
             bool realign = realign_mode == 1 ? (bias % 16) != 0 : realign_mode == 2 ? (bias % 16) == 0 : realign_mode == 3;
             if (t_snapshot_cbs && !realign) {
                 realign = true;  // BBHOST_SF_SNAPSHOT: the bytes as recorded
-                g_sf_cb_snapshots.fetch_add(1, std::memory_order_relaxed);
+                bump(g_sf_cb_snapshots);
             }
             // The bytes as the draw is recorded, for memory the game writes on
             // the CPU (BBHOST_CB_SNAPSHOT, on unless 0). Read in place, a
@@ -9385,7 +9385,7 @@ void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t
             if (!realign && snapshot_cpu && version == kCopyVersionNone && !in_window && !b.written &&
                 !gpu_writes_pending_locked(base, bytes)) {
                 realign = snapshot = true;
-                if (host_tooling()) g_cb_snapshots.fetch_add(1, std::memory_order_relaxed);
+                if (host_tooling()) bump(g_cb_snapshots);
             }
             if (glitch_watching_draw()) {
                 glitch_watch_read_locked(base, bytes);
@@ -9444,9 +9444,12 @@ void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t
                     // The guest bytes, unless a copy-back's copy laid over them.
                     if (!whole && version == kCopyVersionNone && copy_version_lookup_locked(base, bytes, nullptr) == kCopyVersionNone)
                         note_copy_binding_locked(info, base);
+                    // Not locked adds (bump): one right after the copy waited for
+                    // its writes to the ring - write-combined memory - to drain,
+                    // 8.6% of the command processor in Kyo's hall.
                     if (host_tooling()) {
-                        g_cb_realigned.fetch_add(1, std::memory_order_relaxed);
-                        g_cb_realigned_bytes.fetch_add(bytes, std::memory_order_relaxed);
+                        bump(g_cb_realigned);
+                        bump(g_cb_realigned_bytes, bytes);
                     }
                 }
             }
