@@ -3,7 +3,9 @@
 # among the assets, no config in a bundle that names a server, the example
 # config showing the live server's settings, launchers that pass no config,
 # and the binaries' own first-start template naming the live server over
-# https. The publish job runs it on what it is about to sign.
+# https. Each bundle carries the pinned DXC library beside its executable
+# with DXC's licences, and no DXIL validator (tools/fetch_dxc.sh). The
+# publish job runs it on what it is about to sign.
 #   tools/check_release_bundle.sh DIR     (dist/release)
 set -eu
 d=${1:?usage: tools/check_release_bundle.sh DIR}
@@ -26,6 +28,19 @@ done < <(find "$work" -name bbhost.example.toml)
 while IFS= read -r f; do
     if tr -d '\r' < "$f" | grep -E '^[^r#].*--config|^bbhost\.exe .*--config'; then fail "${f#"$work"/} passes a config"; fi
 done < <(find "$work" -name 'run-bbhost.bat')
+# DXC: the pinned library beside each executable, its licences, never dxil.
+fetch_dxc=$(dirname "$0")/fetch_dxc.sh
+win_dxc=$("$fetch_dxc" --sha256 windows); lin_dxc=$("$fetch_dxc" --sha256 linux)
+while IFS= read -r exe; do
+    b=$(dirname "$exe")
+    case "$exe" in *.exe) lib=$b/dxcompiler.dll want=$win_dxc ;; *) lib=$b/libdxcompiler.so want=$lin_dxc ;; esac
+    [ -f "$lib" ] || fail "${b#"$work"/}: no $(basename "$lib") beside the executable"
+    [ "$(sha256sum "$lib" | cut -d' ' -f1)" = "$want" ] || fail "${lib#"$work"/}: not the pinned DXC (tools/fetch_dxc.sh)"
+    for l in LICENSE.TXT LICENSE-Apache-2.0-LLVM.txt ThirdPartyNotices.txt LICENSE-SPIRV-Tools.txt; do
+        [ -f "$b/licenses/dxc/$l" ] || fail "${b#"$work"/}: no licenses/dxc/$l"
+    done
+done < <(find "$work" -mindepth 3 -maxdepth 3 -type f \( -name bbhost.exe -o -name bbhost \))
+if find "$work" -iname 'dxil.dll' -o -iname 'libdxil.so*' | grep .; then fail "a bundle carries DXC's DXIL validator"; fi
 # What a first start writes (core/config.cpp's template), in each executable.
 for b in "$d"/bbhost "$d"/bbhost.exe; do
     [ -f "$b" ] || continue
@@ -35,4 +50,4 @@ for b in "$d"/bbhost "$d"/bbhost.exe; do
         grep -qxF "$want" <<<"$s" || fail "$(basename "$b"): its first-start config lacks $want"
     done
 done
-echo "release bundles: $n checked, the live server over https by default, no playtest kit"
+echo "release bundles: $n checked, the live server over https by default, no playtest kit, DXC $(cat "$(dirname "$0")/../third_party/dxc/VERSION") beside each executable"
