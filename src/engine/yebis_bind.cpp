@@ -5,6 +5,7 @@
 #include "hle/modules.h"
 #include "log.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
@@ -401,6 +402,33 @@ bool build_stage(std::uint64_t state, int stage, std::uint64_t table, std::uint3
     return true;
 }
 
+std::uint16_t user_data(std::uint64_t state, int stage, std::uint64_t table, std::uint32_t count, const std::uint64_t* block,
+                        std::uint32_t* user) {
+    const std::uint64_t res = rd64(state + 8);
+    if (!res || count > 64) return 0;
+    const std::uint32_t stage_dw = static_cast<std::uint32_t>(stage) * kStageDwords;
+    std::uint16_t written = 0;
+    for (std::uint32_t i = 0; i < count; ++i) {
+        const std::uint32_t d = rd32(table + 4ull * i);
+        const std::uint32_t type = d & 0xff, slot = (d >> 8) & 0xff, ud = (d >> 16) & 0xff;
+        const bool wide = ((d >> 24) & 1) != 0;
+        if (ud > 0xf || type > 0x1b) continue;
+        Plain p{};
+        if (plain_of(type, &p)) {
+            const std::uint32_t dwords = std::min<std::uint32_t>(wide && p.wide ? p.wide : p.dwords, 16 - ud);
+            std::memcpy(user + ud, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(res + 4ull * (stage_dw + p.base + slot * p.stride))),
+                        4ull * dwords);
+            written = static_cast<std::uint16_t>(written | (((1u << dwords) - 1) << ud));
+            continue;
+        }
+        if (type == 0x12 || type < 0x13 || ud + 1 > 0xf || !block[i]) continue;  // 0x12: the builder skips it
+        user[ud] = static_cast<std::uint32_t>(block[i]);
+        user[ud + 1] = static_cast<std::uint32_t>(block[i] >> 32);
+        written = static_cast<std::uint16_t>(written | (3u << ud));
+    }
+    return written;
+}
+
 bool add_copy(Work& work, std::uint64_t dst, const void* src, std::uint32_t bytes) {
     if (work.n >= kMaxCopies || bytes > kMaxWindow) return false;
     std::uint64_t seq = 0;
@@ -421,6 +449,29 @@ void run(const Work& work) {
             hle_gnm_cp_write(work.copies[i].dst, g_arena + work.copies[i].at, work.copies[i].bytes);
         }
         g_copy_bytes.fetch_add(work.copies[i].bytes, std::memory_order_relaxed);
+    }
+    g_copies.fetch_add(static_cast<std::uint64_t>(work.n), std::memory_order_relaxed);
+}
+
+std::atomic<std::uint64_t> g_ordered{0}, g_ordered_cpu{0};
+void run_ordered(const Work& work) {
+    const std::uint64_t now = g_arena_seq.load(std::memory_order_relaxed);
+    for (int i = 0; i < work.n; ++i) {
+        if (!g_arena || now - work.copies[i].seq >= kArenaBytes) {
+            g_arena_lapped.fetch_add(1, std::memory_order_relaxed);
+            continue;
+        }
+        const Copy& c = work.copies[i];
+        if (host_gpu_mem_write_ordered(c.dst, g_arena + c.at, c.bytes, nullptr)) {
+            g_ordered.fetch_add(1, std::memory_order_relaxed);
+        } else if (hle_kernel_va_mapped(c.dst, c.bytes)) {
+            // Not on the GPU's timeline (not imported memory): everything
+            // recorded before has run, then the CPU writes it.
+            host_gpu_flush();
+            std::memcpy(reinterpret_cast<void*>(static_cast<std::uintptr_t>(c.dst)), g_arena + c.at, c.bytes);
+            g_ordered_cpu.fetch_add(1, std::memory_order_relaxed);
+        }
+        g_copy_bytes.fetch_add(c.bytes, std::memory_order_relaxed);
     }
     g_copies.fetch_add(static_cast<std::uint64_t>(work.n), std::memory_order_relaxed);
 }
@@ -493,6 +544,10 @@ void report() {
     if (g_other_thread.load()) {
         host_log("yebis-bind: %llu stages were built from a second thread - the mirror needs to be per queue",
                  static_cast<ull>(g_other_thread.load()));
+    }
+    if (g_ordered.load() || g_ordered_cpu.load()) {
+        host_log("yebis-bind: dispatch windows on the GPU's timeline %llu, on the CPU after a flush %llu",
+                 static_cast<ull>(g_ordered.load()), static_cast<ull>(g_ordered_cpu.load()));
     }
     if (g_arena_lapped.load()) {
         host_log("yebis-bind: %llu windows were lapped in the arena before the token reached them",

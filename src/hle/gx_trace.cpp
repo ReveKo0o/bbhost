@@ -159,6 +159,9 @@ enum Kind : std::uint8_t {
     // GX's CopyStructureCount (0x2568be0: ctx, -, destination holder, offset,
     // UAV view): a count copy token (BBHOST_GX_COUNT_COPIES).
     kCopyStructureCount,
+    // YEBIS's compute pass (yebis_gnm_dispatch 0x15fbd10: ctx, x, y, z): a
+    // dispatch token from YEBIS's own state (BBHOST_GX_YEBIS_DISPATCH).
+    kYebisDispatch,
     kKinds
 };
 const char* const kKindName[kKinds] = {
@@ -175,7 +178,7 @@ const char* const kKindName[kKinds] = {
     "set viewport scissor", "set index offset", "set CS", "set base", "set CS user data (n)", "set CS user data (8)", "set CS user data (4)",
     "set CS user data (1)", "set CS user data pointer", "set CS user data (8, compute ring)", "set CS (compute ring)", "depth decompress pass", "depth-stencil clear pass",
     "create shader (types 1, 5, 6)", "create shader (types 1, 5)", "create pixel shader", "create compute shader", "emit DMA_DATA",
-    "CopyStructureCount"};
+    "CopyStructureCount", "YEBIS dispatch"};
 const char* const kStageName[6] = {"VS", "HS", "DS", "GS", "PS", "CS"};
 bool is_dispatch(int k) { return k == kDispatch || k == kDispatchIndirect; }
 
@@ -276,6 +279,7 @@ const Hook kHooks[kKinds] = {
     {0x25673e0, 16, {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x53, 0x48, 0x81, 0xec, 0x28, 0x01, 0x00, 0x00}},
     {0x1473e60, 14, {BB_PUSH6, 0x50}},  // the DMA_DATA writer
     {0x2568be0, 17, {BB_PUSH6, 0x48, 0x83, 0xec, 0x18}},  // CopyStructureCount (sub rsp, 0x18)
+    {0x15fbd10, 14, {BB_PUSH4_ECX}},                      // yebis_gnm_dispatch (..., mov r14d, ecx)
 };
 #undef BB_PUSH6
 #undef BB_PUSH4_ECX
@@ -707,6 +711,8 @@ std::uint32_t rd32(std::uint64_t va) {
     std::memcpy(&v, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(va)), 4);
     return v;
 }
+std::uint8_t rd8(std::uint64_t va) { return *reinterpret_cast<const std::uint8_t*>(static_cast<std::uintptr_t>(va)); }
+void wr8(std::uint64_t va, std::uint8_t v) { *reinterpret_cast<std::uint8_t*>(static_cast<std::uintptr_t>(va)) = v; }
 // Reads of objects we only have a pointer to: a bad pointer fails the call
 // instead of faulting the game.
 // The audit: how often the fallback below is taken, and what it costs. A guest
@@ -4752,6 +4758,10 @@ struct DispatchRecord {
     // A dispatch through GX's compute commit: its compute stage's records
     // (snapshot_cs_records), which its user data is built from.
     std::shared_ptr<GxStageRecords> cs;
+    // YEBIS's compute pass from YEBIS's own state (native_yebis_dispatch): the
+    // windows its stage-0 build stashed, written on the GPU's timeline before
+    // the dispatch, as the constant engine's dumps were.
+    std::shared_ptr<yebis_bind::Work> yebis;
     // Shadow diagnostics: the buffer the dispatch is emitted on, its write
     // pointer at the token, the recording thread's image's set slots and their
     // writers (ComputeUserData), and the per-buffer image's.
@@ -4826,6 +4836,8 @@ void refuse_dispatch(DsRefusal why, std::uint64_t caller) {
     std::lock_guard<std::mutex> lk(g_ds_mu);
     if (g_ds_refused_callers.size() < 64 || g_ds_refused_callers.count(caller)) ++g_ds_refused_callers[caller];
 }
+constexpr std::uint64_t kYebisDispatchSite = 0x15fbd4a;  // yebis_gnm_dispatch's call of the dispatch emitter returns here
+void check_yebis_dispatch(const std::uint32_t* user, std::uint32_t loaded);
 int wrapper_dispatch(Kind kind, const std::uint64_t* f, std::uint64_t caller) {
     if (!g_native_dispatch || g_backend != 1) return 0;
     if (kind != kEmitDispatch && kind != kEmitDispatchQueue && kind != kEmitDispatchIndirect) return 0;
@@ -4863,6 +4875,7 @@ int wrapper_dispatch(Kind kind, const std::uint64_t* f, std::uint64_t caller) {
     const unsigned loaded = (r.d.rsrc2 >> 1) & 0x1f;
     std::memcpy(r.d.user_data, t_cs_user.user, sizeof(r.d.user_data));
     for (unsigned k = loaded; k < 16; ++k) r.d.user_data[k] = 0;
+    if (caller == kYebisDispatchSite) check_yebis_dispatch(r.d.user_data, loaded);
     if (kind == kEmitDispatchIndirect) {
         r.d.indirect_va = w->indirect_base + (f[4] & 0xffffffff);
         r.d.dim[0] = r.d.dim[1] = r.d.dim[2] = 1;
@@ -4945,6 +4958,9 @@ const GpuDispatch* dispatch_token_impl(std::uint64_t id) {
         t_ds_pending = true;
         return nullptr;
     }
+    // YEBIS's windows, into their ring slots in stream order, before the
+    // dispatch that reads them.
+    if (r.yebis) yebis_bind::run_ordered(*r.yebis);
     // The records stay alive until the next token on this thread: the
     // command processor runs the dispatch before it walks another.
     static thread_local GpuDispatch t_ds;
@@ -4956,6 +4972,125 @@ const GpuDispatch* dispatch_token_impl(std::uint64_t id) {
     return &t_ds;
 }
 bool dispatch_pending_impl() { return t_ds_pending; }
+
+// YEBIS's compute pass (yebis_gnm_dispatch 0x15fbd10: ctx, x, y, z) as a
+// dispatch token from YEBIS's own state, as its draws are (native_yebis). The
+// method's pre (sub_15f9d20) builds stage 0's resources through the constant
+// engine - WRITE_CONST_RAM of the changed records, DUMP_CONST_RAM of each
+// window into its ring slot, the CE/DE counters that keep the ring from lapping
+// the GPU - writes the user data with the graphics writers on stage 0, binds
+// the program and, when its 0x30 dwords are dirty, writes them with a
+// WRITE_DATA; then the dispatch packet and the post's INCREMENT_DE_COUNTER.
+// The last thing in the stream that used the constant engine. Here stage 0 is
+// built with yebis_bind as the draws' stages are, the user data comes from
+// what it resolved, the windows and the 0x30 dwords go on the GPU's timeline
+// at the token (dispatch_token_impl), and the method does not run.
+//   2 (default with the YEBIS flip and dispatch tokens): as above;
+//   1 (checks) ours predicts (yebis_bind's dry build), the game's method runs,
+//     and the user data its writers set is compared slot by slot with ours;
+//   0 the game's method.
+const int g_yebis_dispatch = [] {
+    const char* e = std::getenv("BBHOST_GX_YEBIS_DISPATCH");
+    return e && e[0] ? std::atoi(e) : 2;
+}();
+std::atomic<std::uint64_t> g_yd_native{0}, g_yd_game{0}, g_yd_refused{0}, g_yd_checked{0}, g_yd_slots{0}, g_yd_slots_differ{0};
+thread_local bool t_yd_predicted = false;
+thread_local std::uint32_t t_yd_user[16] = {};
+thread_local std::uint16_t t_yd_written = 0;
+
+std::uint64_t native_yebis_dispatch(const std::uint64_t* f) {
+    const int mode = (g_native_yebis == 5 && g_native_dispatch == 2 && g_native == 2 && g_backend == 1) ? g_yebis_dispatch : 0;
+    if (!mode) return 0;
+    const std::uint64_t ctx = f[5];
+    const std::uint64_t state = ctx ? rd64(ctx + 0x28) : 0, cb = ctx ? rd64(ctx + 8) : 0;
+    const std::uint64_t cs = state ? rd64(state + 0x158) : 0;
+    const std::uint32_t count = cs ? (rd32(cs) >> 24) & 0xff : 0;
+    if (!cb || !cs || !count || count > 64 || !yebis_bind::table_known(cs + 0x28, count) || yebis_bind::mode() == 0) {
+        g_yd_refused.fetch_add(1, std::memory_order_relaxed);
+        return 0;
+    }
+    std::uint64_t block[64] = {};
+    auto work = std::make_shared<yebis_bind::Work>();
+    if (mode == 1) {
+        // Predict, without moving YEBIS's rings or marks: the game's build follows.
+        yebis_bind::build_stage(state, 0, cs + 0x28, count, block, *work, true);
+        std::memset(t_yd_user, 0, sizeof(t_yd_user));
+        t_yd_written = yebis_bind::user_data(state, 0, cs + 0x28, count, block, t_yd_user);
+        t_yd_predicted = true;
+        g_yd_game.fetch_add(1, std::memory_order_relaxed);
+        return 0;
+    }
+    if (!yebis_bind::build_stage(state, 0, cs + 0x28, count, block, *work, false)) {
+        // Refused part way (no room for the windows): the stage is half built,
+        // which the game's builder cannot finish either - count it; the
+        // game's method runs on whatever it finds.
+        g_yd_refused.fetch_add(1, std::memory_order_relaxed);
+        return 0;
+    }
+    DispatchRecord r;
+    const std::uint64_t regs = cs + 8;  // gnm_set_cs_shader's argument: the Gnm CS shader's registers
+    r.d.code_va = (static_cast<std::uint64_t>(rd32(regs + 4) & 0xff) << 40) | (static_cast<std::uint64_t>(rd32(regs)) << 8);
+    r.d.rsrc1 = rd32(regs + 8);
+    r.d.rsrc2 = rd32(regs + 12);
+    r.d.threads[0] = rd32(regs + 16);
+    r.d.threads[1] = rd32(regs + 20);
+    r.d.threads[2] = rd32(regs + 24);
+    yebis_bind::user_data(state, 0, cs + 0x28, count, block, r.d.user_data);
+    const unsigned loaded = (r.d.rsrc2 >> 1) & 0x1f;
+    for (unsigned k = loaded; k < 16; ++k) r.d.user_data[k] = 0;
+    r.d.dim[0] = static_cast<std::uint32_t>(f[4]);
+    r.d.dim[1] = static_cast<std::uint32_t>(f[3]);
+    r.d.dim[2] = static_cast<std::uint32_t>(f[2]);
+    // The pre's WRITE_DATA of the pass's 0x30 dwords, when they are dirty.
+    if (rd8(state + 0x260)) {
+        yebis_bind::add_copy(*work, rd64(state + 0x198), reinterpret_cast<const void*>(static_cast<std::uintptr_t>(state + 0x1a0)), 0x30 * 4);
+        wr8(state + 0x260, 0);
+    }
+    // What the pre and post leave in YEBIS's state: the program bound, no
+    // ring lapped since, the pass over.
+    wr8(state + 0x180, 0);
+    wr8(state + 0x187, 0);
+    wr8(state + 0xa14, 0);
+    r.caller = kYebisDispatchSite;
+    r.yebis = std::move(work);
+    const std::uint64_t id = next_native_id();
+    {
+        std::lock_guard<std::mutex> lk(g_ds_mu);
+        if (g_ds_records.size() > 65536) g_ds_records.clear();
+        g_ds_records[id] = std::move(r);
+    }
+    if (!write_native_token(cb - 0x10, kGxDispatchMagic, id)) {
+        std::lock_guard<std::mutex> lk(g_ds_mu);
+        g_ds_records.erase(id);
+        // The stage is built and the rings moved: the dispatch is lost, as a
+        // dispatch whose token could not be written is (counted).
+        refuse_dispatch(kDsRefNotWritten, kYebisDispatchSite);
+        return 1;
+    }
+    {
+        std::lock_guard<std::mutex> lk(g_ds_mu);
+        if (g_ds_callers.size() < 64 || g_ds_callers.count(kYebisDispatchSite)) ++g_ds_callers[kYebisDispatchSite];
+    }
+    g_ds_tokens.fetch_add(1, std::memory_order_relaxed);
+    g_yd_native.fetch_add(1, std::memory_order_relaxed);
+    return 1;
+}
+
+// BBHOST_GX_YEBIS_DISPATCH=1: the user data the game's writers set for the
+// YEBIS dispatch about to be tokenized, against what ours predicted.
+void check_yebis_dispatch(const std::uint32_t* user, std::uint32_t loaded) {
+    if (!t_yd_predicted) return;
+    t_yd_predicted = false;
+    g_yd_checked.fetch_add(1, std::memory_order_relaxed);
+    for (std::uint32_t k = 0; k < loaded && k < 16; ++k) {
+        if (!((t_yd_written >> k) & 1)) continue;
+        g_yd_slots.fetch_add(1, std::memory_order_relaxed);
+        if (user[k] == t_yd_user[k]) continue;
+        if (g_yd_slots_differ.fetch_add(1, std::memory_order_relaxed) < 8) {
+            host_log("gx-dispatch: YEBIS's dispatch user data s[%u]: the game's writers 0x%08x, ours 0x%08x", k, user[k], t_yd_user[k]);
+        }
+    }
+}
 // Which packet the register file's value of a loaded slot came from, against
 // the one the token's image took it from (DsWhy).
 DsWhy classify_slot(const DispatchRecord& rec, int k, const GpuDispatchWriters& w) {
@@ -5187,6 +5322,14 @@ void report_dispatch_tokens() {
         }
         host_log("gx-dispatch: compute records taken at %llu dispatches through GX's compute commit; not taken:%s",
                  static_cast<ull>(g_cs_records_taken.load()), missed.empty() ? " none" : missed.c_str());
+        if (g_yd_native.load() || g_yd_game.load() || g_yd_refused.load()) {
+            host_log("gx-dispatch: YEBIS's compute passes from YEBIS's state (BBHOST_GX_YEBIS_DISPATCH=%d): %llu as tokens with stage 0 "
+                     "built by ours, %llu left to the game's method and its constant engine (%llu checked against ours: %llu user-data "
+                     "slots, %llu differing), %llu refused (a table ours does not know, or no room for its windows)",
+                     g_yebis_dispatch, static_cast<ull>(g_yd_native.load()), static_cast<ull>(g_yd_game.load()),
+                     static_cast<ull>(g_yd_checked.load()), static_cast<ull>(g_yd_slots.load()), static_cast<ull>(g_yd_slots_differ.load()),
+                     static_cast<ull>(g_yd_refused.load()));
+        }
         if (g_tc_dispatches.load()) {
             host_log("gx-dispatch: GPU particle counters taken with the token from the UAVs (BBHOST_GX_TOKEN_COUNTERS=%d): %llu counting "
                      "dispatches, %llu counters (%llu set to an initial count, %llu kept), %llu UAV slots with no view; the moves through "
@@ -5383,6 +5526,7 @@ GUEST_ABI std::uint64_t gx_hook(std::uint64_t id, const std::uint64_t* f) {
         return 0;
     }
     if (id == kCopyStructureCount) return native_count_copy(f);
+    if (id == kYebisDispatch) return native_yebis_dispatch(f);
     if (id == kEmitDma) {
         // Where the packet goes and who asked for it (hle_gx_emitter_caller).
         const std::uint64_t cmd = rd64(f[5] + 0x10);
@@ -6079,6 +6223,7 @@ void hle_gx_trace_arm(GuestMemory* mem) {
         if (id == kUpdateSubresource && !g_trace && !g_gx_cost_enabled && !g_watch_update && !g_upload_census) continue;
         if (id == kEmitDma && !g_cp_census_hooks) continue;
         if (id == kCopyStructureCount && !g_count_copies) continue;
+        if (id == kYebisDispatch && !g_yebis_dispatch) continue;
         const Hook& h = kHooks[id];
         const std::uint64_t va = g_slide + (h.va - kPreferredGuestSlide);
         if (va < mem->slide || va + h.n > mem->slide + mem->size) continue;
