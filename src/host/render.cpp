@@ -4206,9 +4206,11 @@ struct PipelineRecipe {
     // draws took it, and the last start that did (or recorded it).
     std::uint64_t key = 0;
     std::uint32_t uses = 0, last_run = 0;
-    // Its place in the order the run that recorded it first created them: a
-    // start builds them in that order - the title's first, then the place
-    // the game starts in - so what is drawn first is built first.
+    // Its place in the order its last start's draws first took them (created
+    // or found built): a start builds the last start's in that order - the
+    // title's first, then the place the game starts in, then where it went -
+    // and the older ones after, the most recent first, so what is likely
+    // drawn first is built first after many starts too.
     std::uint32_t order = 0;
     bool listed = false;  // from a shipped list (pipeline_manifest_load), not this player's own record
     bool loaded = false;  // read at the start (else recorded in this run)
@@ -4448,6 +4450,7 @@ void recipe_note_created(GfxPipeline& pl, std::uint64_t key) {
         pl.recipe = it->second;  // a later relink's specialization goes to the kept one
         if (it->second->last_run != g_pmanifest.run) {
             it->second->last_run = g_pmanifest.run;
+            it->second->order = g_pmanifest.next_order.fetch_add(1, std::memory_order_relaxed);
             ++it->second->uses;
             g_pmanifest.dirty = true;
         }
@@ -4517,6 +4520,7 @@ bool take_prebuilt(GfxPipeline& pl, std::uint64_t key) {
         pl.recipe = recipe;
         if (recipe->last_run != g_pmanifest.run) {
             recipe->last_run = g_pmanifest.run;
+            recipe->order = g_pmanifest.next_order.fetch_add(1, std::memory_order_relaxed);
             ++recipe->uses;
             g_pmanifest.dirty = true;
         }
@@ -19704,16 +19708,17 @@ void pipeline_manifest_load(const std::string& path, const std::string& list_pat
     recipe_file::Origin theirs = ours;
     std::vector<std::shared_ptr<PipelineRecipe>> recipes;
     const bool have_own = read_recipe_file(path, run, theirs, recipes, unread);
-    // In the order they were first drawn, which a start draws them in too.
-    std::stable_sort(recipes.begin(), recipes.end(), [](const auto& a, const auto& b) { return a->order < b->order; });
+    // The last start's in the order its draws first took them, which this
+    // start's draws likely follow, then the older ones, the most recent first.
+    std::stable_sort(recipes.begin(), recipes.end(), [](const auto& a, const auto& b) {
+        return a->last_run != b->last_run ? a->last_run > b->last_run : a->order < b->order;
+    });
     std::size_t own = 0, listed = 0, list_unread = 0;
     std::vector<std::shared_ptr<PipelineRecipe>> queue;
     {
         std::lock_guard<std::mutex> lk(g_pmanifest.mu);
         g_pmanifest.run = run + 1;
-        std::uint32_t last = 0;
-        for (const auto& rc : recipes) last = std::max(last, rc->order + 1);
-        g_pmanifest.next_order.store(last);
+        g_pmanifest.next_order.store(0);  // this start's order of first use (recipe_note_created, take_prebuilt)
         for (const auto& rc : recipes) {
             if (g_pmanifest.by_key.emplace(rc->key, rc).second) queue.push_back(rc);
         }
@@ -19775,7 +19780,13 @@ void pipeline_manifest_save(const std::string& path) {
     if (!pipeline_manifest_on() || path.empty()) return;
     static std::mutex writing;
     std::lock_guard<std::mutex> wl(writing);
-    std::vector<std::shared_ptr<PipelineRecipe>> keep;
+    // With their use as it stood under the lock: a draw may take one while
+    // they are sorted, and the sort needs values that hold still.
+    struct Kept {
+        std::shared_ptr<PipelineRecipe> rc;
+        std::uint32_t last_run, uses;
+    };
+    std::vector<Kept> keep;
     std::uint32_t run = 0;
     {
         std::lock_guard<std::mutex> lk(g_pmanifest.mu);
@@ -19785,19 +19796,19 @@ void pipeline_manifest_save(const std::string& path) {
         for (const auto& [key, rc] : g_pmanifest.by_key) {
             if (rc->last_run + kRecipeIdleRuns < run) continue;
             if (rc->listed && rc->last_run != run) continue;  // the list has it: the player's own file keeps only what was used
-            keep.push_back(rc);
+            keep.push_back({rc, rc->last_run, rc->uses});
         }
     }
-    std::sort(keep.begin(), keep.end(), [](const auto& a, const auto& b) {
-        return a->last_run != b->last_run ? a->last_run > b->last_run : a->uses > b->uses;
+    std::sort(keep.begin(), keep.end(), [](const Kept& a, const Kept& b) {
+        return a.last_run != b.last_run ? a.last_run > b.last_run : a.uses > b.uses;
     });
     manifest_file::Writer body;
     std::uint32_t count = 0;
     {
         std::lock_guard<std::mutex> lk(g_pmanifest.mu);  // the relink's specialization may change under a draw
-        for (const auto& rc : keep) {
+        for (const Kept& k : keep) {
             const std::size_t before = body.out.size();
-            recipe_file::write(body, *rc);
+            recipe_file::write(body, *k.rc);
             if (count + 1 > kRecipeMax || body.out.size() > kRecipeMaxBytes) {
                 body.out.resize(before);
                 g_pmanifest.dropped.fetch_add(1, std::memory_order_relaxed);
