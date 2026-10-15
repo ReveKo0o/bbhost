@@ -51,5 +51,6 @@ bool program_allows_native_half_rtz(const struct Program& prog);
 // Whether the legacy multiply's zero rule is written as DXVK writes D3D9's,
 // min(|a|, |b|) == 0 (BBHOST_LEGACY_MUL=select: a == 0 || b == 0, as before).
 bool legacy_mul_min_form();
+bool legacy_mul_plain();  // BBHOST_LEGACY_MUL=plain: a plain multiply (a measurement)
 
 }  // namespace gcn

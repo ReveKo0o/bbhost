@@ -36,9 +36,9 @@ std::string translation_switches() {
         return std::string(name) + "=" + (e ? e : "") + ";";
     };
     std::string s = std::string("offsets=") + (runtime_sample_offsets() ? "1" : "0") + ";half_rtz=" + (native_half_rtz() ? "1" : "0") +
-                    ";export_rtz=" + (export_rtz_on() ? "1" : "0") + ";legacy_mul=" + (legacy_mul_min_form() ? "min" : "select") + ";";
+                    ";export_rtz=" + (export_rtz_on() ? "1" : "0") + ";legacy_mul=" + (legacy_mul_plain() ? "plain" : legacy_mul_min_form() ? "min" : "select") + ";";
     for (const char* name : {"BBHOST_DST_SEL_BRANCH", "BBHOST_LOOP_BLOCKS", "BBHOST_LOOP_REACH", "BBHOST_SPILL_CELLS", "BBHOST_COPY_DEFS", "BBHOST_CB_RANGED", "BBHOST_BOUND_STORES",
-                             "BBHOST_TBUFFER_DST_SEL"}) {
+                             "BBHOST_TBUFFER_DST_SEL", "BBHOST_LIFT_BRANCH"}) {
         s += env(name);
     }
     return s;
@@ -1320,6 +1320,9 @@ struct Translator {
         // and a select before. NMin, so a NaN beside a zero still gives zero
         // (FMin may answer the NaN, as NVIDIA's did). BBHOST_LEGACY_MUL=select:
         // the old form.
+        // x * x: one operand is zero only when both are, so the zero rule never
+        // decides; the plain multiply is the same value (lift.cpp mul_legacy).
+        if (legacy_mul_plain() || a == b) return fmul(a, b);
         if (legacy_mul_min_form()) return fsel(feq(fmin_(fabs_(a), fabs_(b)), cf(0.0f)), cf(0.0f), fmul(a, b));
         const Id zero = bor(feq(a, cf(0.0f)), feq(b, cf(0.0f)));
         return fsel(zero, cf(0.0f), fmul(a, b));

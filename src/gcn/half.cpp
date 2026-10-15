@@ -56,6 +56,17 @@ bool program_allows_native_half_rtz(const Program& prog) {
     return true;
 }
 
+// BBHOST_LEGACY_MUL=plain (a measurement, not a mode to play with): an
+// ordinary multiply, which gives NaN for 0 x inf where GCN gives 0 - what the
+// zero rule's two or three extra instructions cost, as an upper bound.
+bool legacy_mul_plain() {
+    static const bool on = [] {
+        const char* e = std::getenv("BBHOST_LEGACY_MUL");
+        return e && std::strcmp(e, "plain") == 0;
+    }();
+    return on;
+}
+
 bool legacy_mul_min_form() {
     static const bool on = [] {
         const char* e = std::getenv("BBHOST_LEGACY_MUL");
