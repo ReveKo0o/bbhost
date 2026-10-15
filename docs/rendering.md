@@ -29,18 +29,29 @@ draw.
 commit - the GPU particles, the tone-map and depth-of-field look-up tables -
 takes its compute stage from the engine's objects at the call, as a draw does:
 the compute shader, its views, UAVs, samplers and constant buffers, from which
-the command processor builds the shader's user data, tables included. YEBIS's
-passes and GX's own resource passes take the user data their writers set. A
-dispatch the hooks did not take would still run from its packet and the
-register file (`BBHOST_GX_NATIVE_DISPATCH=0` runs them all that way), and the
-exit report counts those by reason.
+the command processor builds the shader's user data, tables included - and,
+for the particles, each UAV's hidden counter: its word and the initial count
+the game set, as D3D11's `pUAVInitialCounts` (`BBHOST_GX_TOKEN_COUNTERS`). YEBIS's
+passes are built from YEBIS's own state, as its draws are, and need no constant
+engine (`BBHOST_GX_YEBIS_DISPATCH`); GX's own resource passes take the user data
+their writers set. A dispatch the hooks did not take would still run from its
+packet and the register file (`BBHOST_GX_NATIVE_DISPATCH=0` runs them all that
+way), and the exit report counts those by reason.
 
-**The command processor.** bbhost still walks the game's command buffers, for
-what has not moved to tokens: labels and fences the game waits on, the
-counters the GPU particles keep in GDS, occlusion queries and the constant
-engine's tables. Clears and copies come as tokens from GX's own calls: a clear
-names its view, and is made as the next pass's load op, or as a transfer clear
-when something reads the image first.
+**The command processor.** bbhost still walks the game's command buffers,
+and mostly to take the tokens in their order. What else it does is the
+completions the game waits on - the labels GX's block pools, its command arena,
+Map and its queries' results, YEBIS's flush counter and Scaleform's fences are
+written with, which it records on the GPU's timeline - and a few waits and
+constant-engine writes outside GX (YEBIS's own drains, the flip's, Gnmx's
+constant update engine). GX's pipeline drains are barrier tokens: the CP's own
+writes after one go behind the work before it, with no label and no wait.
+Occlusion queries are tokens from GX's Begin and End, measured by the
+renderer's own queries. The packets nothing on the host reads - the cache
+flushes, the context registers, the shader prefetches - are not written at
+all (`BBHOST_CP_DEAD_PACKETS`). Clears and copies come as tokens from GX's own
+calls: a clear names its view, and is made as the next pass's load op, or as a
+transfer clear when something reads the image first.
 
 **Recording.** The command processor leaves the Vulkan calls to a thread of
 its own, `bb-record`. Each draw goes into a packet, and most of its other
@@ -117,9 +128,11 @@ path at all:
 | Post-processing (YEBIS) | native resource building; the game's shaders |
 | Menus (Scaleform) | native draw building from the HAL |
 | Fills and copies without a shader | recognised and performed directly |
-| Other compute dispatches | native: built at a token from the engine's objects (GX's compute stage) or the user data its writers set (YEBIS, GX's own passes); the game's shaders |
+| Other compute dispatches | native: built at a token from the engine's objects (GX's compute stage, the particles' counters with it; YEBIS's state) or the user data its writers set (GX's own passes); the game's shaders |
 | Clears and target copies | native: tokens from GX's calls, in the view's terms |
-| Labels and fences | emulated, on the command processor |
+| Occlusion queries | native: tokens from GX's calls, measured by the renderer's own queries |
+| Pipeline drains | native: barrier tokens from GX's calls |
+| Labels and fences the game waits on | emulated: written by the command processor on the GPU's timeline |
 | Shaders | decompiled (lifted) to SPIR-V; a few refused programs translated (see below) |
 | Resource identity | the game's memory addresses, plus write tracking |
 
@@ -235,8 +248,9 @@ until the path is shown equal to the direct one in game.
 
 - Resources identified by the engine's own objects and generations rather than
   by guest address and write tracking.
-- Labels, fences and occlusion queries from GX's own calls, after which the PM4
-  command processor only orders work.
+- The completions the game waits on (GX's block pools and command arena, Map,
+  query results) from the host's own submission timeline rather than labels,
+  after which the PM4 command processor only orders work.
 - The HLSL path checked on Windows and the Steam Deck with DXC in the kits,
   before it can be the default; then shaders as editable source (the table
   above).

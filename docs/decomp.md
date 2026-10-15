@@ -17,11 +17,11 @@ The 1.09 executable has about 169,000 functions. In a default run today:
 
 | | Functions |
 |---|---|
-| Rewritten as source, on the decomp list (`src/decomp/`) | 31 |
+| Rewritten as source, on the decomp list (`src/decomp/`) | 33 |
 | Replaced by bbhost code outside the list (written before the list existed) | 4, and the YEBIS resource builder bypassed |
-| Hooked at the entry or at call sites (GX methods, the resource registry, live resolution, settings, key prompts, menus) | 120 |
-| **Taken over in all** | **155** |
-| With any code byte changed (including byte patches and redirected calls) | 176; 258 at 60 fps |
+| Hooked at the entry or at call sites (GX methods, the resource registry, live resolution, settings, key prompts, menus) | 121 |
+| **Taken over in all** | **158** |
+| With any code byte changed (including byte patches and redirected calls) | 201; 283 at 60 fps (20 of them Gnm packet writers that write nothing: the packets nothing on the host reads) |
 | The game's own code | everything else |
 
 The TLS rewrite also changes one instruction at each of 17,127 sites in about
@@ -177,6 +177,8 @@ the game's code turning it by the same counts as ours.
 |---|---|---|---|
 | flush wait (`sub_15d7030`) | `0x15d7030` | the render thread's wait for the GPU to finish a flush | the same condition, yielding the core instead of spinning on it |
 | GX table reclaim (`sub_2aaa860`) | `0x2aaa860` | frees the GX layer's blocks of draw resource tables once the GPU is done with them | the same walk as the game's, plus a wait when a pool runs empty (which used to fail an allocation and black out a frame) |
+| pipeline drain (`gx_command_buffer_wait_for_eop`) | `0x2ab09e0` | makes the GPU wait for the work before (a label, an end-of-pipe event and a wait) | written as a barrier token for the command processor instead, which orders its own writes behind it; the same command buffer read and refilled the same way as the game's version, beside it on test buffers (`decomp_gx_drain_token`) |
+| occlusion query (`gnm_write_occlusion_query`) | `0x1477660` | an occlusion query's begin or end: the block reset, a wait, the counter dumps | written as one query token instead, taken as the renderer's own query; checked in the game by the queries it makes |
 
 ### Memory (`src/decomp/memory/`)
 
