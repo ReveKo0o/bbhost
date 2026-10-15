@@ -339,6 +339,7 @@ set(BBHOST_DECOMP_SOURCES
   src/decomp/camera/follow_camera.cpp
   src/decomp/gx/flush_wait.cpp
   src/decomp/gx/block_reclaim.cpp
+  src/decomp/gx/drain_token.cpp
   src/decomp/memory/game_memcpy.cpp
   src/decomp/memory/ez_copy.cpp
   src/decomp/sfx/ribbons.cpp
@@ -521,6 +522,7 @@ if(UNIX)
   bbhost_decomp_test(follow_camera SOURCES src/decomp/camera/follow_camera.cpp src/engine/mouse_camera_stubs.cpp ARGS 2000)
   bbhost_decomp_test(sfx_ribbons SOURCES src/core/write_watch.cpp)
   bbhost_decomp_test(adaptive_mutex)
+  bbhost_decomp_test(gx_drain_token)
   # The engine's classes by the names they register (tools/class_catalog.cpp).
   add_executable(class_catalog tools/class_catalog.cpp src/decomp/insn.cpp)
   target_link_libraries(class_catalog PRIVATE eboot_kit)

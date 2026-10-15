@@ -185,6 +185,14 @@ std::atomic<std::uint64_t> g_resyncs{0};       // PM4 walk re-locks
 // reach (its bytes are not on the CPU yet). BBHOST_CP_DMA_ORDER=0: as walked.
 thread_local std::uint64_t t_cp_writes_need = 0;  // submissions that must have run before the CP writes memory on the CPU (0: none)
 std::atomic<std::uint64_t> g_cp_writes{0}, g_cp_writes_waited{0}, g_cp_writes_wait_us{0}, g_cp_writes_timeline{0};
+// A GX pipeline drain's barrier token (decomp/gx/drain_token.cpp) was walked:
+// the wait it stands for - the drain's label, end-of-pipe event and
+// WAIT_REG_MEM, which the wait passed on the recorded label - so what the
+// CP writes itself after it goes behind the work recorded before it, as after
+// any passed wait. The submissions that covers are asked for only when such a
+// write comes (cp_writes_need_gpu): the token itself costs one store.
+thread_local bool t_barrier_pending = false;
+std::atomic<std::uint64_t> g_barrier_tokens{0};
 
 bool cp_dma_order_on() {
     static const bool on = [] {
@@ -196,6 +204,10 @@ bool cp_dma_order_on() {
 
 // Whether a CP write here has to come after recorded GPU work still to run.
 bool cp_writes_need_gpu() {
+    if (t_barrier_pending) {
+        t_barrier_pending = false;
+        if (cp_dma_order_on()) t_cp_writes_need = std::max(t_cp_writes_need, host_gpu_work_needs());
+    }
     if (!cp_dma_order_on() || !t_cp_writes_need) return false;
     if (host_gpu_submissions_completed() >= t_cp_writes_need) {
         t_cp_writes_need = 0;
@@ -2198,6 +2210,12 @@ void execute_packet(std::uint32_t op, const std::uint32_t* b, std::size_t n, int
             break;
         }
         case kNop:
+            // A GX pipeline drain, as a barrier token: the wait it was.
+            if (n >= 1 && b[0] == kGxBarrierMagic) {
+                t_barrier_pending = true;
+                g_barrier_tokens.fetch_add(1, std::memory_order_relaxed);
+                break;
+            }
             // BBHOST_GX_NATIVE: a GX draw's host-draw token.
             if (n >= 3 && b[0] == kGxNativeMagic) {
                 g_token_nops.fetch_add(1, std::memory_order_relaxed);
@@ -3566,8 +3584,9 @@ void hle_gnm_cp_report() {
         std::lock_guard<std::mutex> lk(g_pending_mu);
         labels = g_pending_labels.size();
     }
-    host_log("cp: label values recorded for the GPU to write, by address: %zu addresses; %llu waits satisfied by one", labels,
-             static_cast<unsigned long long>(g_wait_pending.load()));
+    host_log("cp: label values recorded for the GPU to write, by address: %zu addresses; %llu waits satisfied by one; %llu GX pipeline "
+             "drains walked as barrier tokens", labels, static_cast<unsigned long long>(g_wait_pending.load()),
+             static_cast<unsigned long long>(g_barrier_tokens.load()));
 }
 
 void hle_gnm_label_report() {

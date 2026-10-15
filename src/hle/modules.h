@@ -306,6 +306,12 @@ void hle_gx_copy_token(std::uint64_t id);
 // draw packets begin. Shadow first: the method still runs, and the CP checks
 // that the draw packet after the token is the one the call asked for.
 constexpr std::uint32_t kGxYebisMagic = 0x42595242u;  // "BRYB"
+// GX's pipeline drain as a barrier token (decomp/gx/drain_token.cpp): a
+// two-dword NOP {kGxBarrierMagic} where gx_command_buffer_wait_for_eop wrote
+// its label, end-of-pipe event and wait. The command processor takes it as
+// that wait: what it writes to memory itself after it goes behind the work
+// before it, on the GPU's timeline.
+constexpr std::uint32_t kGxBarrierMagic = 0x52424242u;  // "BBBR"
 struct GxYebisDraw {
     std::uint32_t index_count;
     std::uint64_t index_va;
