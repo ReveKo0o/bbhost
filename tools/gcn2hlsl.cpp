@@ -1,7 +1,7 @@
 // gcn2hlsl: every lifted shader in the game's bundles printed as HLSL, compiled
 // with DXC to SPIR-V for Vulkan and checked against the lift.
 //
-//   gcn2hlsl [--ps] [--vs] [--tess] [--clip] [--runtime-offsets] [--native-half-rtz] [--invariant] [--O0] [--jobs N] [--only NAME[,NAME]]
+//   gcn2hlsl [--ps] [--vs] [--tess] [--cs] [--clip] [--runtime-offsets] [--native-half-rtz] [--invariant] [--O0] [--jobs N] [--only NAME[,NAME]]
 //            [--out DIR] [--list FILE] [--no-dxc] [--sample N] [--oconfig PASSES] <bundle.dcx>...
 //   gcn2hlsl --spv <lifted.spv> --out <prefix> [--O0]
 //            one lifted module (a draw capture's bound one, tools/hlsl_verify.py):
@@ -14,7 +14,8 @@
 // container's reflection, printed as HLSL (gcn/hlsl.h) and compiled by DXC
 // (host/dxc.h, libdxcompiler loaded at run time). The DXC module must pass
 // spirv-val and declare the lift's interface (gcn::hlsl_interface_diff).
-// --clip lifts the pixel shaders with the clip-distance discard and the
+// --cs lifts the compute shaders as the renderer does when GX creates them
+// (gpu.cpp precompile_compute). --clip lifts the pixel shaders with the clip-distance discard and the
 // vertex shaders with the clip varying, as the draws that use them do.
 // --invariant declares the vertex shaders' position Invariant, as
 // BBHOST_VS_INVARIANT=1 does.
@@ -32,8 +33,8 @@
 // Exit 0: every lift compiled to a valid module with the lift's interface.
 //
 //   gcn2hlsl --sweep --app0 <game folder> [--gpu N|NAME] [--list FILE] [--validate] [--monolithic]
-//            the driver-acceptance sweep: every vertex, pixel and tessellation
-//            program lifted as the renderer lifts it on this machine's GPU (its
+//            the driver-acceptance sweep: every vertex, pixel, tessellation and
+//            compute program lifted as the renderer lifts it on this machine's GPU (its
 //            run-time sample offsets and half rounding), printed, compiled by
 //            DXC and checked as the HLSL path checks it, and then the lift's
 //            module and DXC's each built into the pipelines the renderer makes
@@ -132,7 +133,7 @@ std::string reason_key(const std::string& r) {
     return k;
 }
 
-enum class Kind { Pixel, Vertex, Ls, Hull, Domain };
+enum class Kind { Pixel, Vertex, Ls, Hull, Domain, Compute };
 const char* kind_name(Kind k) {
     switch (k) {
     case Kind::Pixel: return "ps";
@@ -140,6 +141,7 @@ const char* kind_name(Kind k) {
     case Kind::Ls: return "ls";
     case Kind::Hull: return "hs";
     case Kind::Domain: return "ds";
+    case Kind::Compute: return "cs";
     }
     return "?";
 }
@@ -555,7 +557,7 @@ int main(int argc, char** argv) {
     if (argc >= 5 && std::string(argv[1]) == "--spv" && std::string(argv[3]) == "--out") {
         return one_module(argv[2], argv[4], argc >= 6 && std::string(argv[5]) == "--O0" ? 0 : 3);
     }
-    bool ps = false, vs = false, clip = false, use_dxc = true, tess = false, invariant = false;
+    bool ps = false, vs = false, clip = false, use_dxc = true, tess = false, invariant = false, cs = false;
     int opt_level = 3;
     int sample = 1;  // every n-th program
     std::string passes;
@@ -579,6 +581,7 @@ int main(int argc, char** argv) {
         else if (arg == "--vs") vs = true;
         else if (arg == "--clip") clip = true;
         else if (arg == "--tess") tess = true;
+        else if (arg == "--cs") cs = true;
         else if (arg == "--runtime-offsets") gcn::set_runtime_sample_offsets(true);
         else if (arg == "--native-half-rtz") gcn::set_native_half_rtz(true);
         else if (arg == "--invariant") invariant = true;
@@ -616,9 +619,9 @@ int main(int argc, char** argv) {
                              "       gcn2hlsl --sweep --app0 <game folder> [--gpu N|NAME] [--list FILE] [--validate] [--monolithic] [--driver-cache]\n");
         return 2;
     }
-    if (sweep) ps = vs = tess = true;
+    if (sweep) ps = vs = tess = cs = true;
     if (!jobs) jobs = std::max(1u, std::thread::hardware_concurrency() / (sweep ? 1 : 2));
-    if (!ps && !vs && !tess) ps = vs = true;
+    if (!ps && !vs && !tess && !cs) ps = vs = true;
     if (out_dir) fs::create_directories(out_dir);
     if (device && !use_dxc) {
         std::fprintf(stderr, "--device and --sweep need DXC\n");
@@ -681,8 +684,8 @@ int main(int argc, char** argv) {
             std::size_t shdr = 0;
             while (shdr + 0x60 <= e.data.size() && shdr < 0x100 && std::memcmp(e.data.data() + shdr, "Shdr", 4) != 0) ++shdr;
             if (shdr + 0x60 > e.data.size() || shdr >= 0x100) continue;
-            const bool is_ps = code.type == 2, is_vs = code.type == 1;
-            if (!(is_ps && ps) && !(is_vs && vs)) continue;
+            const bool is_ps = code.type == 2, is_vs = code.type == 1, is_cs = code.type == 4;
+            if (!(is_ps && ps) && !(is_vs && vs) && !(is_cs && cs)) continue;
             std::string base = e.name;
             if (const std::size_t slash = base.find_last_of("\\/"); slash != std::string::npos) base = base.substr(slash + 1);
             if (!only.empty() && !only.count(base) && !only.count(e.name)) continue;
@@ -697,10 +700,29 @@ int main(int argc, char** argv) {
             j.bundle = fs::path(path).filename().string();
             j.bundle = j.bundle.substr(0, j.bundle.find('.'));
             j.name = full;
-            j.kind = is_vs ? Kind::Vertex : Kind::Pixel;
+            j.kind = is_cs ? Kind::Compute : is_vs ? Kind::Vertex : Kind::Pixel;
             j.program = gcn::decode(code.words.data(), code.words.size());
             const std::size_t gnm = shdr + 16;
-            if (is_ps) {
+            if (is_cs) {
+                // gpu.cpp precompile_compute: the dispatch's options from what the container gives.
+                gcn::TranslateOptions paths_options;
+                paths_options.stage = gcn::Stage::Compute;
+                paths_options.rsrc1 = regs[4];
+                paths_options.rsrc2 = regs[5];
+                const gcn::TranslateResult paths = gcn::translate(j.program, paths_options);
+                gcn::TranslateOptions& o = j.options;
+                o.stage = gcn::Stage::Compute;
+                o.gds_counters = true;
+                o.rsrc1 = regs[4];
+                o.rsrc2 = regs[5];
+                for (const gcn::PredictedImage& pi : gcn::predict_image_dims(j.program, paths)) o.image_dims.emplace_back(pi.dim, pi.arrayed);
+                o.sampler_force_unnormalized.assign(paths.samplers.size(), false);
+                o.max_lds_bytes = 32768;
+                o.cs_threads[0] = regs[6];
+                o.cs_threads[1] = regs[7];
+                o.cs_threads[2] = regs[8];
+                o.exec_known = true;
+            } else if (is_ps) {
                 // render.cpp precompile_ps
                 gcn::TranslateOptions paths_options;
                 paths_options.stage = gcn::Stage::Pixel;
@@ -832,6 +854,7 @@ int main(int argc, char** argv) {
         case Kind::Vertex:
         case Kind::Ls: v = prober->vertex(m); break;
         case Kind::Domain: v = prober->domain(m, lift); break;
+        case Kind::Compute: v = prober->compute(m); break;
         case Kind::Hull:
             v.ok = false;
             v.skipped = true;
@@ -895,6 +918,7 @@ int main(int argc, char** argv) {
             case Kind::Ls: l = gcn::lift_ls_shader(j.program, j.options, ref, j.tess); break;
             case Kind::Hull: l = gcn::lift_hull_shader(j.program, j.options, ref, j.tess); break;
             case Kind::Domain: l = gcn::lift_domain_shader(j.program, j.options, ref, j.tess); break;
+            case Kind::Compute: l = gcn::lift_compute_shader(j.program, j.options, ref); break;
             }
             if (!l.ok()) {
                 result = "not-lifted", reason = l.rejections.empty() ? "no module" : l.rejections[0];
@@ -930,7 +954,7 @@ int main(int argc, char** argv) {
             const auto e0 = std::chrono::steady_clock::now();
             gcn::HlslOptions hopt;
             static const char* const what[] = {"pixel shader", "vertex shader", "LS as the vertex stage", "hull shader as the control stage",
-                                               "domain shader as the evaluation stage"};
+                                               "domain shader as the evaluation stage", "compute shader"};
             hopt.title = j.name + " (" + what[static_cast<int>(j.kind)] + ")";
             hopt.names = l.names.buffers.empty() && l.names.images.empty() ? nullptr : &l.names;
             hopt.tess_quads = j.options.tess_quads;
@@ -1165,7 +1189,7 @@ int main(int argc, char** argv) {
                         what, k.lifts, k.lift_built, k.lift_refused, k.lift_untried, k.dxc, k.dxc_built, k.dxc_refused, k.dxc_only, k.dxc_untried, k.us / 1e6);
         };
         static const char* const kinds[][2] = {{"ps", "pixel shaders"}, {"vs", "vertex shaders"}, {"ls", "LS (particles', alone)"},
-                                               {"ds", "domain shaders (particles')"}};
+                                               {"ds", "domain shaders (particles')"}, {"cs", "compute shaders"}};
         DriverTally total = set_tally;
         for (const auto& k : kinds) {
             const auto it = by_kind.find(k[0]);
