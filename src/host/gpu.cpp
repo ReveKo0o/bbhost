@@ -2257,6 +2257,15 @@ bool init_locked() {
         if (supported.shaderInt16) f2.features.shaderInt16 = VK_TRUE;
         g.has_f16_math = q12.shaderFloat16 && supported.shaderInt16;
         gcn::set_native_half_rtz(native);
+        // The legacy multiply's zero rule as a select on AMD's own drivers,
+        // whose compiler matches neither form to v_mul_legacy_f32 (gcn/half.h).
+        VkPhysicalDeviceDriverProperties drv{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
+        VkPhysicalDeviceProperties2 dp{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+        dp.pNext = &drv;
+        vkGetPhysicalDeviceProperties2(g.phys, &dp);
+        gcn::set_legacy_mul_select(drv.driverID == VK_DRIVER_ID_AMD_PROPRIETARY || drv.driverID == VK_DRIVER_ID_AMD_OPEN_SOURCE);
+        host_log("gpu: legacy multiplies' zero rule as %s", gcn::legacy_mul_plain() ? "nothing (BBHOST_LEGACY_MUL=plain)"
+                                                             : gcn::legacy_mul_min_form() ? "min(|a|, |b|) == 0" : "a == 0 || b == 0");
         host_log("gpu: f16 rounding toward zero by the device: %s (shaderFloat16 %d, RTZ %d, denorm preserve %d)", native ? "yes" : "no",
                  static_cast<int>(q12.shaderFloat16), static_cast<int>(p12.shaderRoundingModeRTZFloat16),
                  static_cast<int>(p12.shaderDenormPreserveFloat16));

@@ -1274,9 +1274,10 @@ private:
         const Id zero = m.emit(spv::OpLogicalOr, t_bool, {feq(a, cf(0.0f)), feq(b, cf(0.0f))});
         return fsel(zero, cf(0.0f), fmul(a, b));
     }
-    Id clamp_inf(Id v) {
+    Id clamp_inf(Id v) {  // as the translator writes it (translate.cpp clamp_inf): the sign onto FLT_MAX's bits
         const Id inf = m.emit(spv::OpIsInf, t_bool, {v});
-        return fsel(inf, fmul(ext(spv::GlslFSign, {v}), cf(3.4028235e38f)), v);
+        const Id sign = ibin(spv::OpBitwiseAnd, m.emit(spv::OpBitcast, t_u32, {v}), cu(0x80000000u));
+        return fsel(inf, m.emit(spv::OpBitcast, t_f32, {ibin(spv::OpBitwiseOr, sign, cu(0x7f7fffffu))}), v);
     }
 
     // `mask`: v_cndmask's select or the carry in, from src2 (VOP3); VCC otherwise.

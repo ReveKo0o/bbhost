@@ -1509,10 +1509,13 @@ struct Translator {
     Id rcp(Id x) { return fdiv(cf(1.0f), x); }
     Id rsq(Id x) { return m.ext_inst(t_f32, spv::GlslInverseSqrt, {x}); }
     Id clamp_inf(Id v) {
-        // v_rsq_clamp / v_rcp_clamp: +-inf -> +-FLT_MAX
+        // v_rsq_clamp / v_rcp_clamp: +-inf -> +-FLT_MAX, the sign moved onto
+        // FLT_MAX's bits (one v_and_or_b32; FSign(v) * FLT_MAX was two
+        // compares and two selects on AMD's compiler).
         const Id inf = m.emit(spv::OpIsInf, t_bool, {v});
-        const Id big = m.ext_inst(t_f32, spv::GlslFSign, {v});
-        return fsel(inf, fmul(big, cf(3.4028235e38f)), v);
+        const Id sign = m.emit(spv::OpBitwiseAnd, t_u32, {m.emit(spv::OpBitcast, t_u32, {v}), cu(0x80000000u)});
+        const Id big = m.emit(spv::OpBitcast, t_f32, {m.emit(spv::OpBitwiseOr, t_u32, {sign, cu(0x7f7fffffu)})});
+        return fsel(inf, big, v);
     }
 
     bool vop1(std::uint32_t op, const Inst& in, Id s0, const Mods& md) {

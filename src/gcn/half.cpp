@@ -67,12 +67,17 @@ bool legacy_mul_plain() {
     return on;
 }
 
+namespace {
+std::atomic<bool> g_legacy_mul_select{false};
+}
+void set_legacy_mul_select(bool on) { g_legacy_mul_select.store(on, std::memory_order_relaxed); }
 bool legacy_mul_min_form() {
-    static const bool on = [] {
+    // BBHOST_LEGACY_MUL=min or =select decides; otherwise the device's form.
+    static const int forced = [] {
         const char* e = std::getenv("BBHOST_LEGACY_MUL");
-        return !(e && std::strcmp(e, "select") == 0);
+        return e && std::strcmp(e, "select") == 0 ? 0 : e && std::strcmp(e, "min") == 0 ? 1 : -1;
     }();
-    return on;
+    return forced >= 0 ? forced == 1 : !g_legacy_mul_select.load(std::memory_order_relaxed);
 }
 
 spv::Id emit_rtz_half(spv::Module& m, const SpvScalarTypes& t, spv::Id x) {
