@@ -138,10 +138,24 @@ struct DevBuffer {
     bool in_host = false;
 };
 
+// A compute shader translated with its constant buffers, tables and typed
+// loads read through storage buffers the dispatch pushes (set 1 of
+// Gpu::cs_buffers_layout) and no page-table fallback for them
+// (BBHOST_CS_BUFFERS, gpu.cpp): a dispatch every one of whose buffers binds
+// runs it, any other the pipeline beside it.
+struct ComputeLean {
+    gcn::TranslateResult meta;
+    VkShaderModule module = VK_NULL_HANDLE;
+    VkPipeline pipeline = VK_NULL_HANDLE;
+    bool standin = false;  // unoptimized, the optimized one queued (ComputePipeline::standin)
+    std::uint64_t opt_seen = 0;
+};
+
 struct ComputePipeline {
     VkShaderModule module = VK_NULL_HANDLE;
     VkPipeline pipeline = VK_NULL_HANDLE;
     gcn::TranslateResult meta;
+    std::shared_ptr<ComputeLean> lean;  // null: none (off, nothing to bind, or it failed)
     std::string name;
     bool failed = false;
     // Its pipeline is still in the driver's compiler on a worker, and was not
@@ -375,6 +389,9 @@ struct Gpu {
     std::map<VkBuffer, std::uint32_t> scratch_users;
     VkDescriptorSetLayout set_layout = VK_NULL_HANDLE;
     VkPipelineLayout pipe_layout = VK_NULL_HANDLE;         // compute: one set
+    // Compute with its buffers pushed (ComputeLean): set 0 as pipe_layout's,
+    // set 1 cb_push_layout. Null without push descriptors.
+    VkPipelineLayout cs_buffers_layout = VK_NULL_HANDLE;
     VkPipelineLayout gfx_pipe_layout = VK_NULL_HANDLE;     // graphics: set 0 VS, set 1 PS
     VkDescriptorPool desc_pool = VK_NULL_HANDLE;
     VkPipelineCache cache = VK_NULL_HANDLE;
@@ -1008,9 +1025,11 @@ extern std::uint64_t g_draw_rec_next;
 // optimizer as BBHOST_CS_OPTIMIZE says (gpu.cpp). `standin`: it is the
 // unoptimized one, and the optimized one is being built on a bb-cs-optimize
 // thread under `opt_key`; adopt_optimized_compute swaps it in. `watch`: the
-// name the watchdog lists it under while it compiles.
+// name the watchdog lists it under while it compiles. `layout`: null for
+// Gpu::pipe_layout.
 VkPipeline first_compute_pipeline(VkShaderModule module, std::uint64_t opt_key, const std::string& name,
-                                  const std::vector<std::uint32_t>& spirv, bool& standin, const std::string& watch);
+                                  const std::vector<std::uint32_t>& spirv, bool& standin, const std::string& watch,
+                                  VkPipelineLayout layout = VK_NULL_HANDLE);
 // A stand-in's optimized pipeline, when it is built: true when `pipeline` now
 // is it (and `standin` false). Cheap when nothing new was built since `seen`.
 bool adopt_optimized_compute(std::uint64_t opt_key, VkPipeline& pipeline, bool& standin, std::uint64_t& seen);
@@ -1477,6 +1496,10 @@ public:
     void bind_sets(VkPipelineBindPoint bind_point, VkPipelineLayout layout, std::uint32_t first, std::uint32_t n, const VkDescriptorSet* sets,
                    std::uint32_t ndynamic = 0, const std::uint32_t* dynamic = nullptr);
     void push_constants(VkPipelineLayout layout, VkShaderStageFlags stages, std::uint32_t offset, std::uint32_t size, const void* data);
+    // vkCmdPushDescriptorSetKHR of n storage buffers into set `set` (a
+    // dispatch's, ComputeLean).
+    void push_buffers(VkPipelineBindPoint bind_point, VkPipelineLayout layout, std::uint32_t set, std::uint32_t n, const std::uint32_t* bindings,
+                      const VkDescriptorBufferInfo* infos);
     // vkUpdateDescriptorSets at this point of the stream (a set the op
     // stream's earlier commands may still bind in this command buffer).
     void update_sets(std::uint32_t n, const VkWriteDescriptorSet* writes);
@@ -1623,6 +1646,17 @@ bool set_cache_on();
 // than in the stage's set, which the cache then keys without them: with the
 // cache, whenever the device has push descriptors.
 bool cb_push_on();
+// Pushed constant buffers bound at their V# bases, shaders translated with
+// TranslateOptions::cb_bias_zero (render.cpp, BBHOST_CB_EXACT).
+bool cb_exact_bindings();
+// A dispatch's storage buffers (ComputeLean::meta's), resolved as a draw's
+// are - bound where they are, or copied as recorded for memory the game
+// writes on the CPU - into params (cb_valid, biases, strides) and `infos`,
+// one a buffer. The dispatch's own stores must be noted as GPU writes first
+// (gpu_writes_note_locked), so nothing it writes is read from a copy.
+// render.cpp; under g.mu, with the dispatch's recording begun.
+void resolve_dispatch_buffers(const gcn::TranslateResult& meta, const char* name, const std::uint32_t* user, gcn::StageParams& params,
+                              std::vector<VkDescriptorBufferInfo>& infos);
 // BBHOST_PIPELINE_STATS=<name>: whether a compute shader is named, and its
 // pipeline's statistics and disassembly to build/pipeline-stats (render.cpp).
 bool compute_pipeline_stats_wanted(const std::string& name);

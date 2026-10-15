@@ -10691,6 +10691,20 @@ void probe_gx_vertex_table(const std::vector<std::uint32_t>& fetch_words, const 
 
 }  // namespace
 
+// gpu_internal.h. The windows are the draw before's (a YEBIS slot is never a
+// dispatch's to read), and the name goes where a draw's pipeline would, for
+// BBHOST_INPLACE_STATS and BBHOST_VB_RACE.
+void gpu::resolve_dispatch_buffers(const gcn::TranslateResult& meta, const char* name, const std::uint32_t* user, gcn::StageParams& params,
+                                   std::vector<VkDescriptorBufferInfo>& infos) {
+    std::vector<DrawWindow> windows;
+    windows.swap(t_draw_windows);
+    const char* const was = t_draw_pipeline;
+    t_draw_pipeline = name;
+    resolve_stage_buffers(meta, user, params, infos, nullptr, cb_exact_bindings());
+    t_draw_pipeline = was;
+    windows.swap(t_draw_windows);
+}
+
 void host_gpu_depth_clear(std::uint64_t base, std::uint32_t word, std::uint32_t stencil) {
     std::lock_guard<GpuMutex> lk(g.mu);
     bool any = false;
