@@ -16718,6 +16718,25 @@ static bool draw_impl(const GpuDraw& d) {
             }
         }
         r.tex0 = r.tex[0];
+        // The next draw's entry, asked for with the intent to write: the ring
+        // (16,384 entries, 8 MiB) is far larger than the caches, so each of an
+        // entry's lines was a read for ownership from memory as the fields
+        // were written. BBHOST_PACKET_PREFETCH=0: not asked for.
+        static const bool prefetch_next = [] {
+            const char* e = std::getenv("BBHOST_PACKET_PREFETCH");
+            return !(e && e[0] == '0');
+        }();
+        if (prefetch_next) {
+            const auto* next = reinterpret_cast<const char*>(&g_draw_recs[g_draw_rec_next % kDrawRecs]);
+            const auto* line = reinterpret_cast<const char*>(reinterpret_cast<std::uintptr_t>(next) & ~std::uintptr_t{63});
+            for (; line < next + sizeof(DrawRec); line += 64) {
+#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
+                asm volatile("prefetchw %0" : : "m"(*line));
+#else
+                __builtin_prefetch(line, 1);
+#endif
+            }
+        }
     }
     if (g_trace) {
         static std::atomic<int> logs{0};
