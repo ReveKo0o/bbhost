@@ -556,7 +556,7 @@ int main(int argc, char** argv) {
     int opt_level = 3;
     int sample = 1;  // every n-th program
     std::string passes;
-    unsigned jobs = std::max(1u, std::thread::hardware_concurrency() / 2);
+    unsigned jobs = 0;  // --jobs; else half the machine's threads, or all of them for --sweep (the machine is the sweep's)
     std::set<std::string> only;
     const char* out_dir = nullptr;
     const char* list_path = nullptr;
@@ -613,6 +613,7 @@ int main(int argc, char** argv) {
         return 2;
     }
     if (sweep) ps = vs = tess = true;
+    if (!jobs) jobs = std::max(1u, std::thread::hardware_concurrency() / (sweep ? 1 : 2));
     if (!ps && !vs && !tess) ps = vs = true;
     if (out_dir) fs::create_directories(out_dir);
     if (device && !use_dxc) {
