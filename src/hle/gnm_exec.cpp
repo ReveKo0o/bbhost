@@ -1285,6 +1285,10 @@ void cp_count_copy(std::uint64_t dst, std::uint64_t src) {
     if (host_gpu_gds_counters() && covers_counter_word(src, 4) && host_gpu_counter_copy(dst, src, 4)) {
         g_cc_gpu.fetch_add(1, std::memory_order_relaxed);
         g_counter_reads.fetch_add(1, std::memory_order_relaxed);
+        // Its destination (a draw's arguments) now holds a GPU value, as the
+        // packet's did (note_gpu_args): a DMA over it later in the stream
+        // goes on the GPU's timeline too.
+        note_gpu_args(dst, 4);
         return;
     }
     if (!hle_kernel_va_mapped(src, 4) || !hle_kernel_va_mapped(dst, 4)) {
