@@ -1,7 +1,7 @@
 // gcn2hlsl: every lifted shader in the game's bundles printed as HLSL, compiled
 // with DXC to SPIR-V for Vulkan and checked against the lift.
 //
-//   gcn2hlsl [--ps] [--vs] [--tess] [--clip] [--runtime-offsets] [--invariant] [--O0] [--jobs N] [--only NAME[,NAME]]
+//   gcn2hlsl [--ps] [--vs] [--tess] [--clip] [--runtime-offsets] [--native-half-rtz] [--invariant] [--O0] [--jobs N] [--only NAME[,NAME]]
 //            [--out DIR] [--list FILE] [--no-dxc] [--sample N] [--oconfig PASSES] <bundle.dcx>...
 //   gcn2hlsl --spv <lifted.spv> --out <prefix> [--O0]
 //            one lifted module (a draw capture's bound one, tools/hlsl_verify.py):
@@ -20,7 +20,9 @@
 // BBHOST_VS_INVARIANT=1 does.
 // --runtime-offsets lifts a sample's offset as the run-time operand, as on a
 // device with VK_KHR_maintenance8 (gcn::set_runtime_sample_offsets); without
-// it the offset moves the coordinates, as elsewhere.
+// it the offset moves the coordinates, as elsewhere. --native-half-rtz lifts
+// as on a device that rounds f16 toward zero itself (gcn::set_native_half_rtz:
+// RADV, the Steam Deck's driver). --device and --sweep set both from the GPU.
 //
 // --out writes, per program, <name>.<stage>.lift.spv, .hlsl and .dxc.spv.
 // They are made from the game's own shaders: they stay on this machine.
@@ -48,6 +50,7 @@
 //            --driver-cache keeps it. Exit 0: as above, and no DXC module
 //            refused where its lift was built.
 #include "gcn/container.h"
+#include "gcn/half.h"
 #include "gcn/hlsl.h"
 #include "gcn/isa.h"
 #include "gcn/lift.h"
@@ -577,6 +580,7 @@ int main(int argc, char** argv) {
         else if (arg == "--clip") clip = true;
         else if (arg == "--tess") tess = true;
         else if (arg == "--runtime-offsets") gcn::set_runtime_sample_offsets(true);
+        else if (arg == "--native-half-rtz") gcn::set_native_half_rtz(true);
         else if (arg == "--invariant") invariant = true;
         else if (arg == "--O0") opt_level = 0;
         else if (arg == "--oconfig" && a + 1 < argc) passes = argv[++a];
@@ -608,7 +612,7 @@ int main(int argc, char** argv) {
         bundles.insert(bundles.end(), found.begin(), found.end());
     }
     if (bundles.empty()) {
-        std::fprintf(stderr, "usage: gcn2hlsl [--ps] [--vs] [--tess] [--clip] [--runtime-offsets] [--invariant] [--O0] [--jobs N] [--only NAME,..] [--out DIR] [--list FILE] [--no-dxc] <bundle.dcx>...\n"
+        std::fprintf(stderr, "usage: gcn2hlsl [--ps] [--vs] [--tess] [--clip] [--runtime-offsets] [--native-half-rtz] [--invariant] [--O0] [--jobs N] [--only NAME,..] [--out DIR] [--list FILE] [--no-dxc] <bundle.dcx>...\n"
                              "       gcn2hlsl --sweep --app0 <game folder> [--gpu N|NAME] [--list FILE] [--validate] [--monolithic] [--driver-cache]\n");
         return 2;
     }
