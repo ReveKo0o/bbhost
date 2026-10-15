@@ -3756,47 +3756,101 @@ const int g_skip_state_packets = [] {
 std::atomic<std::uint64_t> g_state_packets_skipped[kKinds] = {};
 // Leaf packet writers whose packet nothing reads any more - the
 // command processor's census found them: multi-sample configuration, the
-// guard band, clip rectangles, blend constants, the alpha-to-mask and SPI
-// words, the instance step rate, a DB_DEPTH_CONTROL clear, and the
-// ACQUIRE_MEM cache flushes the host's own barriers replace. Hooking them to
-// suppress the packet is **off by default and not worth turning on**: they are
-// called 7.9M times a soak for 49.5M dwords (189 MiB), which is about 0.1% of
-// a frame's work, while a prologue hook on each costs several times that (two
-// soaks with them on were no better than two without, and their p95 was worse:
-// 16.4 and 16.7 ms against 14.0 and 15.8). The table stays as the record of
-// which writers are dead, for whoever wants to patch them out instead.
-// BBHOST_GX_DEAD_WRITERS=1 installs them.
+// guard band, clip rectangles, blend constants, the alpha-to-mask word, the
+// scratch ring size, the instance step rate, a DB_DEPTH_CONTROL clear (context
+// registers, which nothing reads while the register file is not kept), the
+// ACQUIRE_MEM cache flushes the host's own barriers replace (the command
+// processor has no case for them at all) and Gnm's shader prefetch, a DMA_DATA
+// into a register. Each reserves room, writes its packet and moves the write
+// pointer; nothing else. 13.8M ACQUIRE_MEM (96.9M dwords), 21.4M
+// SET_CONTEXT_REG (95.3M dwords, 31% of everything walked between them) and
+// 248k prefetches over the 12-place tour.
+//
+// BBHOST_CP_DEAD_PACKETS (default 1): their first bytes become `mov rax,
+// [rdi + 0x10]; ret` - the write pointer as the packet's address, which no
+// caller reads (tools: every call site's use of rax) - so the packet is never
+// written, copied, walked or skipped. The context-register writers only while
+// the register file is not kept (skip_state_packets): a shadow or packet-path
+// mode reads them. 0 writes them all as before; 2 (checks) returns an address
+// no caller can follow (0xdead000000000000, non-canonical): a caller that used
+// it would fault on the spot.
+//
+// BBHOST_GX_DEAD_WRITERS=1 hooks them instead (the 8.3(g) measurement: a
+// prologue hook costs several times what the packet does - two soaks with them
+// on were no better than two without, their p95 16.4 and 16.7 ms against 14.0
+// and 15.8).
 const bool g_dead_writers = [] {
     const char* e = std::getenv("BBHOST_GX_DEAD_WRITERS");
     return e && e[0] == '1';
+}();
+const int g_dead_packets = [] {
+    const char* e = std::getenv("BBHOST_CP_DEAD_PACKETS");
+    return e && e[0] ? std::atoi(e) : 1;
 }();
 struct DeadWriter {
     std::uint64_t va;
     std::uint8_t n;
     std::uint8_t bytes[20];
     std::uint8_t dwords;  // what the packet would have cost, for the report
+    bool context;         // context registers: dead only while the register file is not kept
     const char* what;
 };
 const DeadWriter kDeadWriters[] = {
-    {0x1475e10, 14, {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x55, 0x41, 0x54, 0x53, 0x50}, 7, "ACQUIRE_MEM"},
-    {0x1477f40, 14, {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x54, 0x53, 0x41, 0x89, 0xce}, 7, "ACQUIRE_MEM (b)"},
-    {0x148b550, 14, {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x55, 0x41, 0x54, 0x53, 0x50}, 7, "ACQUIRE_MEM (queue)"},
-    {0x148b610, 15, {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x53, 0x50, 0x89, 0xd3, 0x41, 0x89, 0xf7}, 7, "ACQUIRE_MEM (queue b)"},
-    {0x14772c0, 17, {0x55, 0x48, 0x89, 0xe5, 0x41, 0x56, 0x53, 0x48, 0x89, 0xf3, 0x49, 0x89, 0xfe, 0x49, 0x8b, 0x4e, 0x08}, 18, "sample locations"},
-    {0x14773b0, 17, {0x55, 0x48, 0x89, 0xe5, 0x41, 0x56, 0x53, 0x48, 0x89, 0xf3, 0x49, 0x89, 0xfe, 0x49, 0x8b, 0x4e, 0x08}, 18, "sample locations (b)"},
-    {0x1477350, 17, {0x55, 0x48, 0x89, 0xe5, 0x41, 0x56, 0x53, 0x49, 0x89, 0xf6, 0x48, 0x89, 0xfb, 0x48, 0x8b, 0x4b, 0x08}, 4, "PA_SC_AA_MASK"},
-    {0x14771c0, 17, {0x55, 0x48, 0x89, 0xe5, 0x41, 0x56, 0x53, 0x41, 0x89, 0xf6, 0x48, 0x89, 0xfb, 0x48, 0x8b, 0x4b, 0x08}, 3, "PA_SC_AA_CONFIG"},
-    {0x14734c0, 17, {0x55, 0x48, 0x89, 0xe5, 0x53, 0x50, 0x48, 0x89, 0xfb, 0x48, 0x8b, 0x4b, 0x08, 0x48, 0x8b, 0x43, 0x10}, 3, "DB_DEPTH_CONTROL 0"},
-    {0x1473100, 16, {0x55, 0x48, 0x89, 0xe5, 0x53, 0x48, 0x83, 0xec, 0x18, 0x48, 0x89, 0xfb, 0x48, 0x8b, 0x4b, 0x08}, 6, "the blend constants"},
-    {0x1473030, 17, {0x55, 0x48, 0x89, 0xe5, 0x41, 0x56, 0x53, 0x41, 0x89, 0xf6, 0x48, 0x89, 0xfb, 0x48, 0x8b, 0x4b, 0x08}, 3, "DB_ALPHA_TO_MASK"},
-    {0x1472ed0, 15, {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x53, 0x50, 0x89, 0xd3, 0x41, 0x89, 0xf7}, 3, "SPI_BARYC_CNTL"},
-    {0x1473650, 15, {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x53, 0x50, 0x89, 0xd3, 0x41, 0x89, 0xf7}, 3, "the clip rectangle"},
-    {0x14736d0, 17, {0x55, 0x48, 0x89, 0xe5, 0x53, 0x50, 0x48, 0x89, 0xfb, 0x48, 0x8b, 0x4b, 0x08, 0x48, 0x8b, 0x43, 0x10}, 6, "the guard band"},
-    {0x1473750, 17, {0x55, 0x48, 0x89, 0xe5, 0x53, 0x50, 0x48, 0x89, 0xfb, 0x48, 0x8b, 0x4b, 0x08, 0x48, 0x8b, 0x43, 0x10}, 6, "the guard band (b)"},
-    {0x1474f90, 16, {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x53, 0x50, 0x41, 0x89, 0xd6, 0x41, 0x89, 0xf7}, 4, "the instance step rate"},
+    {0x1475e10, 14, {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x55, 0x41, 0x54, 0x53, 0x50}, 7, false, "ACQUIRE_MEM"},
+    {0x1477f40, 14, {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x54, 0x53, 0x41, 0x89, 0xce}, 7, false, "ACQUIRE_MEM (b)"},
+    {0x148b550, 14, {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x55, 0x41, 0x54, 0x53, 0x50}, 7, false, "ACQUIRE_MEM (queue)"},
+    {0x148b610, 15, {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x53, 0x50, 0x89, 0xd3, 0x41, 0x89, 0xf7}, 7, false, "ACQUIRE_MEM (queue b)"},
+    {0x14772c0, 17, {0x55, 0x48, 0x89, 0xe5, 0x41, 0x56, 0x53, 0x48, 0x89, 0xf3, 0x49, 0x89, 0xfe, 0x49, 0x8b, 0x4e, 0x08}, 18, true, "sample locations"},
+    {0x14773b0, 17, {0x55, 0x48, 0x89, 0xe5, 0x41, 0x56, 0x53, 0x48, 0x89, 0xf3, 0x49, 0x89, 0xfe, 0x49, 0x8b, 0x4e, 0x08}, 18, true, "sample locations (b)"},
+    {0x1477350, 17, {0x55, 0x48, 0x89, 0xe5, 0x41, 0x56, 0x53, 0x49, 0x89, 0xf6, 0x48, 0x89, 0xfb, 0x48, 0x8b, 0x4b, 0x08}, 4, true, "PA_SC_AA_MASK"},
+    {0x14771c0, 17, {0x55, 0x48, 0x89, 0xe5, 0x41, 0x56, 0x53, 0x41, 0x89, 0xf6, 0x48, 0x89, 0xfb, 0x48, 0x8b, 0x4b, 0x08}, 3, true, "PA_SC_AA_CONFIG"},
+    {0x14734c0, 17, {0x55, 0x48, 0x89, 0xe5, 0x53, 0x50, 0x48, 0x89, 0xfb, 0x48, 0x8b, 0x4b, 0x08, 0x48, 0x8b, 0x43, 0x10}, 3, true, "DB_DEPTH_CONTROL 0"},
+    {0x1473100, 16, {0x55, 0x48, 0x89, 0xe5, 0x53, 0x48, 0x83, 0xec, 0x18, 0x48, 0x89, 0xfb, 0x48, 0x8b, 0x4b, 0x08}, 6, true, "the blend constants"},
+    {0x1473030, 17, {0x55, 0x48, 0x89, 0xe5, 0x41, 0x56, 0x53, 0x41, 0x89, 0xf6, 0x48, 0x89, 0xfb, 0x48, 0x8b, 0x4b, 0x08}, 3, true, "DB_ALPHA_TO_MASK"},
+    {0x1472ed0, 15, {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x53, 0x50, 0x89, 0xd3, 0x41, 0x89, 0xf7}, 3, true, "SPI_TMPRING_SIZE"},
+    {0x1473650, 15, {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x53, 0x50, 0x89, 0xd3, 0x41, 0x89, 0xf7}, 3, true, "the clip rectangle"},
+    {0x14736d0, 17, {0x55, 0x48, 0x89, 0xe5, 0x53, 0x50, 0x48, 0x89, 0xfb, 0x48, 0x8b, 0x4b, 0x08, 0x48, 0x8b, 0x43, 0x10}, 6, true, "the guard band"},
+    {0x1473750, 17, {0x55, 0x48, 0x89, 0xe5, 0x53, 0x50, 0x48, 0x89, 0xfb, 0x48, 0x8b, 0x4b, 0x08, 0x48, 0x8b, 0x43, 0x10}, 6, true, "the guard band (b)"},
+    {0x1474f90, 16, {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x53, 0x50, 0x41, 0x89, 0xd6, 0x41, 0x89, 0xf7}, 4, true, "the instance step rate"},
+    {0x1473f50, 16, {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x53, 0x50, 0x41, 0x89, 0xd6, 0x49, 0x89, 0xf7}, 7, false, "the shader prefetch (DMA_DATA into a register)"},
 };
 constexpr std::size_t kDeadWriterCount = sizeof(kDeadWriters) / sizeof(kDeadWriters[0]);
 std::atomic<std::uint64_t> g_dead_calls[kDeadWriterCount] = {};
+// Which of them were patched at load (BBHOST_CP_DEAD_PACKETS), for the report.
+bool g_dead_patched[kDeadWriterCount] = {};
+
+// BBHOST_CP_WRITERS=1 (census, off by default): who calls the Gnm writers of
+// the packets the command processor walks without drawing from them - the
+// labels and waits, the cache actions, the embedded data, the occlusion
+// queries, the shader prefetch and the dead context-register writers above -
+// by return address. A prologue hook on each, so only for the census (tens of
+// millions of calls a tour); with it the dead writers are not patched, so the
+// census sees what the game writes.
+struct CensusWriter {
+    std::uint64_t va;
+    std::uint8_t n;
+    std::uint8_t bytes[20];
+    const char* what;
+};
+const CensusWriter kCensusWriters[] = {
+    {0x14778f0, 14, {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x55, 0x41, 0x54, 0x53, 0x50}, "EVENT_WRITE_EOP"},
+    {0x1477b30, 14, {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x55, 0x41, 0x54, 0x53, 0x50}, "WAIT_REG_MEM"},
+    {0x1478320, 14, {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x54, 0x53, 0x41, 0x89, 0xce}, "EVENT_WRITE_EOS"},
+    {0x14760c0, 14, {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x54, 0x53, 0x41, 0x89, 0xd7}, "embedded data"},
+    {0x1477660, 16, {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x53, 0x50, 0x49, 0x89, 0xd6, 0x41, 0x89, 0xf7}, "occlusion query"},
+    {0x2ab9850, 15, {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x54, 0x53, 0x48, 0x83, 0xec, 0x10}, "gx_context_apply_pending_flags"},
+};
+constexpr std::size_t kCensusWriterCount = sizeof(kCensusWriters) / sizeof(kCensusWriters[0]);
+const bool g_cp_writers = [] {
+    const char* e = std::getenv("BBHOST_CP_WRITERS");
+    return e && e[0] == '1';
+}();
+// [writer] -> caller -> calls; the dead writers follow the census writers.
+std::mutex g_cp_writers_mu;
+std::map<std::uint64_t, std::uint64_t> g_cp_writer_callers[kCensusWriterCount + kDeadWriterCount];
+std::atomic<std::uint64_t> g_cp_writer_calls[kCensusWriterCount + kDeadWriterCount] = {};
+constexpr std::uint64_t kCensusIdBase = kKinds + kDeadWriterCount;  // hook ids past the dead writers'
+const char* cp_writer_name(std::size_t i) { return i < kCensusWriterCount ? kCensusWriters[i].what : kDeadWriters[i - kCensusWriterCount].what; }
 // The dwords each setter writes, for the report (the packet plus its marker).
 std::uint8_t state_packet_dwords(Kind id) {
     switch (id) {
@@ -5040,6 +5094,28 @@ void report_state_packets() {
     }
 }
 
+// The dead writers patched at load, and (BBHOST_CP_WRITERS) the packet
+// writers' callers.
+void report_cp_writers() {
+    std::string patched;
+    for (std::size_t i = 0; i < kDeadWriterCount; ++i) {
+        if (g_dead_patched[i]) appendf(patched, " %s;", kDeadWriters[i].what);
+    }
+    if (!patched.empty()) host_log("gx-state: writers that write nothing (BBHOST_CP_DEAD_PACKETS):%s", patched.c_str());
+    if (!g_cp_writers) return;
+    std::lock_guard<std::mutex> lk(g_cp_writers_mu);
+    for (std::size_t i = 0; i < kCensusWriterCount + kDeadWriterCount; ++i) {
+        const std::uint64_t n = g_cp_writer_calls[i].load();
+        if (!n) continue;
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> rows;
+        for (const auto& [caller, k] : g_cp_writer_callers[i]) rows.push_back({k, caller});
+        std::sort(rows.rbegin(), rows.rend());
+        std::string by;
+        for (std::size_t r = 0; r < rows.size() && r < 40; ++r) appendf(by, " 0x%llx %llu;", static_cast<ull>(rows[r].second), static_cast<ull>(rows[r].first));
+        host_log("cp-writers: %s: %llu calls from %zu callers:%s", cp_writer_name(i), static_cast<ull>(n), rows.size(), by.c_str());
+    }
+}
+
 void report_dispatch_tokens() {
     if (!g_ds_tokens.load() && !g_ds_refused.load()) return;
     std::string callers, refused, fields;
@@ -5220,11 +5296,21 @@ void note_shader_created(int creator, std::uint64_t va, std::uint32_t size) {
 // to the method's caller without running it.
 GUEST_ABI std::uint64_t gx_hook(std::uint64_t id, const std::uint64_t* f) {
     if (id >= kKinds) {
-        // A dead packet writer.
         const std::size_t i = static_cast<std::size_t>(id - kKinds);
-        if (i >= kDeadWriterCount) return 0;
-        g_dead_calls[i].fetch_add(1, std::memory_order_relaxed);
-        return 1;
+        if (i < kDeadWriterCount) {
+            // A dead packet writer (BBHOST_GX_DEAD_WRITERS=1).
+            g_dead_calls[i].fetch_add(1, std::memory_order_relaxed);
+            return 1;
+        }
+        // A census writer (BBHOST_CP_WRITERS): who called it; it runs.
+        const std::size_t w = i - kDeadWriterCount;
+        if (w >= kCensusWriterCount + kDeadWriterCount) return 0;
+        g_cp_writer_calls[w].fetch_add(1, std::memory_order_relaxed);
+        const std::uint64_t caller = bn(f[6]);
+        std::lock_guard<std::mutex> lk(g_cp_writers_mu);
+        std::map<std::uint64_t, std::uint64_t>& m = g_cp_writer_callers[w];
+        if (m.size() < 1024 || m.count(caller)) ++m[caller];
+        return 0;
     }
     if (id >= kCreateShader156 && id <= kCreateComputeShader) {
         note_shader_created(static_cast<int>(id - kCreateShader156), f[3], static_cast<std::uint32_t>(f[2]));
@@ -5921,7 +6007,7 @@ void hle_gx_trace_arm(GuestMemory* mem) {
     g_slide = mem->slide;
     g_image_size = mem->size;
     void* host = thunk_wrap(reinterpret_cast<void*>(&gx_hook));
-    void* page = host_page_alloc(0x8000, true);  // a stub of up to ~230 bytes per hook (with the xmm save)
+    void* page = host_page_alloc(0x10000, true);  // a stub of up to ~230 bytes per hook (with the xmm save)
     if (!page) {
         host_log("gx: stub page allocation failed; trace off");
         return;
@@ -5957,25 +6043,24 @@ void hle_gx_trace_arm(GuestMemory* mem) {
         guest_protect_rx(mem, lo, hi - lo);
         ++hooked;
     }
-    int dead = 0;
-    for (std::size_t i = 0; g_dead_writers && i < kDeadWriterCount; ++i) {
-        const DeadWriter& w = kDeadWriters[i];
+    // A prologue hook on one of the writers below (the dead writers, the
+    // census writers): its stub, then a jump to it over the prologue.
+    const auto hook_writer = [&](std::uint64_t bn_va, std::uint8_t n, const std::uint8_t* bytes, std::uint64_t id, const char* what) {
         Hook h{};
-        h.va = w.va;
-        h.n = w.n;
-        std::memcpy(h.bytes, w.bytes, sizeof(h.bytes));
+        h.va = bn_va;
+        h.n = n;
+        std::memcpy(h.bytes, bytes, sizeof(h.bytes));
         const std::uint64_t va = g_slide + (h.va - kPreferredGuestSlide);
-        if (va < mem->slide || va + h.n > mem->slide + mem->size) continue;
+        if (va < mem->slide || va + h.n > mem->slide + mem->size) return false;
         auto* p = static_cast<std::uint8_t*>(guest_ptr(*mem, va));
         if (std::memcmp(p, h.bytes, h.n) != 0) {
-            host_log("gx: the writer of %s at 0x%llx does not start with the expected prologue; not hooked", w.what,
-                     static_cast<ull>(w.va));
-            continue;
+            host_log("gx: the writer of %s at 0x%llx does not start with the expected prologue; not hooked", what, static_cast<ull>(h.va));
+            return false;
         }
         const std::uint8_t* stub = c;
-        c = emit_stub(c, kKinds + i, host, va + h.n, h);
+        c = emit_stub(c, id, host, va + h.n, h);
         const std::uint64_t lo = va & ~0xfffull, hi = (va + h.n + 0xfff) & ~0xfffull;
-        if (!guest_protect_rwx(mem, lo, hi - lo)) continue;
+        if (!guest_protect_rwx(mem, lo, hi - lo)) return false;
         const std::uint64_t dest = reinterpret_cast<std::uint64_t>(stub);
         p[0] = 0xff;
         p[1] = 0x25;
@@ -5983,9 +6068,73 @@ void hle_gx_trace_arm(GuestMemory* mem) {
         std::memcpy(p + 6, &dest, 8);
         std::memset(p + 14, 0xcc, h.n - 14u);
         guest_protect_rx(mem, lo, hi - lo);
-        ++dead;
+        return true;
+    };
+    int dead = 0;
+    for (std::size_t i = 0; g_dead_writers && i < kDeadWriterCount; ++i) {
+        const DeadWriter& w = kDeadWriters[i];
+        if (hook_writer(w.va, w.n, w.bytes, kKinds + i, w.what)) ++dead;
     }
     if (g_dead_writers) host_log("gx: %d of %zu dead packet writers hooked; their packets are not written", dead, kDeadWriterCount);
+    // BBHOST_CP_WRITERS: the census writers, and the dead writers unless hooked above.
+    int census = 0;
+    for (std::size_t i = 0; g_cp_writers && i < kCensusWriterCount + kDeadWriterCount; ++i) {
+        const bool is_dead = i >= kCensusWriterCount;
+        if (is_dead && g_dead_writers) continue;
+        const std::uint8_t* bytes = is_dead ? kDeadWriters[i - kCensusWriterCount].bytes : kCensusWriters[i].bytes;
+        const std::uint64_t bn_va = is_dead ? kDeadWriters[i - kCensusWriterCount].va : kCensusWriters[i].va;
+        const std::uint8_t n = is_dead ? kDeadWriters[i - kCensusWriterCount].n : kCensusWriters[i].n;
+        if (hook_writer(bn_va, n, bytes, kCensusIdBase + i, cp_writer_name(i))) ++census;
+    }
+    if (g_cp_writers) {
+        host_log("gx: BBHOST_CP_WRITERS: %d of %zu packet writers hooked for the census (callers in the exit report)", census,
+                 kCensusWriterCount + kDeadWriterCount);
+    }
+    // BBHOST_CP_DEAD_PACKETS: the dead writers write nothing (their table).
+    // Not with the census or the hooks, which need the writers as they are.
+    int patched = 0, kept = 0;
+    if (g_dead_packets && !g_dead_writers && !g_cp_writers && g_backend == 1) {
+        const bool context_dead = skip_state_packets();
+        for (std::size_t i = 0; i < kDeadWriterCount; ++i) {
+            const DeadWriter& w = kDeadWriters[i];
+            if (w.context && !context_dead) {
+                ++kept;
+                continue;
+            }
+            const std::uint64_t va = g_slide + (w.va - kPreferredGuestSlide);
+            if (va < mem->slide || va + w.n > mem->slide + mem->size) continue;
+            auto* p = static_cast<std::uint8_t*>(guest_ptr(*mem, va));
+            if (std::memcmp(p, w.bytes, w.n) != 0) {
+                host_log("gx: the writer of %s at 0x%llx does not start with the expected prologue; its packets are written",
+                         w.what, static_cast<ull>(w.va));
+                continue;
+            }
+            const std::uint64_t lo = va & ~0xfffull, hi = (va + w.n + 0xfff) & ~0xfffull;
+            if (!guest_protect_rwx(mem, lo, hi - lo)) continue;
+            if (g_dead_packets == 2) {
+                // movabs rax, 0xdead000000000000; ret - an address no caller can follow
+                constexpr std::uint64_t kPoison = 0xdead000000000000ull;
+                p[0] = 0x48;
+                p[1] = 0xb8;
+                std::memcpy(p + 2, &kPoison, 8);
+                p[10] = 0xc3;
+            } else {
+                // mov rax, [rdi + 0x10]; ret - the command buffer's write pointer
+                p[0] = 0x48;
+                p[1] = 0x8b;
+                p[2] = 0x47;
+                p[3] = 0x10;
+                p[4] = 0xc3;
+            }
+            guest_protect_rx(mem, lo, hi - lo);
+            g_dead_patched[i] = true;
+            ++patched;
+        }
+        host_log("gx: dead packets suppressed where they are written: %d of %zu writers write nothing%s (BBHOST_CP_DEAD_PACKETS=0 writes "
+                 "them)%s",
+                 patched, kDeadWriterCount, g_dead_packets == 2 ? " and return an address no caller can follow" : "",
+                 kept ? "; the context-register writers are kept: the register file is kept" : "");
+    }
     g_active = hooked > 0;
     host_log("gx: %d of %d hooks armed; trace %s (flips %llu-%llu), backend mode %d", hooked, static_cast<int>(kKinds),
              g_trace ? "on" : "off", static_cast<ull>(g_first), static_cast<ull>(g_last), g_backend);
@@ -6707,6 +6856,7 @@ void hle_gx_scaleform_report() {
     report_wrapper_draws();
     report_dispatch_tokens();
     report_state_packets();
+    report_cp_writers();
     report_clears_and_copies();
 }
 // Whether dispatches are made into tokens at all: native dispatch tokens need
