@@ -73,6 +73,20 @@ gcn::LiftResult lift_tess_cached(TranslationUse use, const gcn::Program& prog, c
 // start after switching costs nothing, the next takes every module it met from
 // the cache.
 bool hlsl_on();
+// BBHOST_HLSL: whether `module` is DXC's module of a lift - one the switch gave
+// a stage in the lift's place; the engine's names put on it afterwards leave
+// it the same module - and if so, the lift's own SPIR-V in `lift`. A driver
+// that refuses a pipeline of DXC's modules gets it built from the lifts'
+// instead (render.cpp create_gfx_pipeline, gpu.cpp's compute pipelines): the
+// draw or dispatch is never skipped for it.
+bool hlsl_lift_of(const std::vector<std::uint32_t>& module, std::vector<std::uint32_t>& lift);
+// Such a refusal (`what` was being built), with the number of stages built
+// from their lifts instead and whether the driver took that; counted by
+// `what` in the exit report's HLSL line.
+void hlsl_note_refused(const char* what, int stages, bool rebuilt);
+// Stages a later pipeline gave their lift's module before its first attempt,
+// their DXC module refused in an earlier one; counted in the same line.
+void hlsl_note_lift_again(int stages);
 
 // At device start, after the device's features are given to the translator
 // (they are part of every key).

@@ -238,6 +238,10 @@ struct GfxPipeline {
     // the evaluation stage's).
     bool tess_native = false;
     gcn::TranslateResult tess_hs;
+    // BBHOST_HLSL: the words of the native hull's control-stage module, which
+    // a pipeline the driver refuses finds the hull's lift by (DXC's module
+    // then, hlsl_stages_from_lifts); empty with the switch off.
+    std::vector<std::uint32_t> tess_hull_spirv;
     VkDescriptorSetLayout tess_set_layout = VK_NULL_HANDLE;
     // The VS and PS sets' layouts and the pipeline layout (stage_set_layout);
     // null with BBHOST_SET_LAYOUTS=0, which keeps the shared layout.
@@ -4278,6 +4282,7 @@ bool build_tess_native_stages(GfxPipeline& pl, const DrawState& s, const VertexI
             why = "hull module";
             return false;
         }
+        if (hlsl_on()) pl.tess_hull_spirv = lifted.spirv;
         pl.tess_hs = ref;
         pl.tess_hs.spirv.clear();  // the bindings are what the draws read
         pl.tess_hs.spirv.shrink_to_fit();
@@ -6380,6 +6385,90 @@ bool link_gfx_pipeline(GfxPipeline& pl, const GfxFixedState& f, const VertexInpu
     return ok;
 }
 
+// ---- BBHOST_HLSL: a pipeline the driver refuses with DXC's modules ----
+// is built again with its stages' lifts' own modules (translation_cache.h
+// hlsl_lift_of): the draw is never lost to the switch. Each such stage is made
+// once, from the lift DXC's module was compiled from, and shared by every
+// pipeline that needs it - kept for good, as the stage cache's are, since the
+// pipelines and their relinks go on using it. A stage whose DXC module a
+// driver refused once takes its lift's at once in the pipelines after.
+std::mutex g_hlsl_lift_stages_mu;
+std::unordered_map<std::uint64_t, std::shared_ptr<const CachedStage>> g_hlsl_lift_stages;  // by the words of DXC's module
+// The lift's stage for `meta`, a stage whose module is DXC's; null when it is
+// not DXC's (or its lift is not to be had). `make`: build it when it is not
+// made yet; without, only one an earlier refusal made.
+std::shared_ptr<const CachedStage> hlsl_lift_stage(const gcn::TranslateResult& meta, bool make) {
+    const std::uint64_t key = fnv1a(meta.spirv.data(), meta.spirv.size() * 4);
+    {
+        std::lock_guard<std::mutex> lk(g_hlsl_lift_stages_mu);
+        if (const auto it = g_hlsl_lift_stages.find(key); it != g_hlsl_lift_stages.end()) return it->second;
+        if (!make) return nullptr;
+    }
+    std::vector<std::uint32_t> lift;
+    if (!hlsl_lift_of(meta.spirv, lift)) return nullptr;
+    auto entry = std::make_shared<CachedStage>();
+    entry->meta = meta;  // DXC's module declares the lift's bindings and interface: the same translation
+    entry->meta.spirv = std::move(lift);
+    entry->lifted = true;
+    if (!make_module(entry->meta.spirv, entry->module)) return nullptr;
+    std::lock_guard<std::mutex> lk(g_hlsl_lift_stages_mu);
+    const auto [it, fresh] = g_hlsl_lift_stages.emplace(key, entry);
+    if (!fresh) vkDestroyShaderModule(g.device, entry->module, nullptr);  // another thread made it first
+    return it->second;
+}
+// Swaps the stages of `pl` that hold DXC's modules for their lifts': every
+// such stage with `make`, else those an earlier refusal already rebuilt. How
+// many it swapped (0: none, so a refusal is the pipeline's own).
+int hlsl_stages_from_lifts(GfxPipeline& pl, bool make) {
+    if (!hlsl_on()) return 0;
+    if (!make) {
+        std::lock_guard<std::mutex> lk(g_hlsl_lift_stages_mu);
+        if (g_hlsl_lift_stages.empty()) return 0;
+    }
+    int swapped = 0;
+    for (ShaderStage* st : {&pl.vs, &pl.ps, &pl.tess_ls}) {
+        if (!st->module || !st->lifted) continue;  // a translation's module is never DXC's
+        if (const std::shared_ptr<const CachedStage> lift = hlsl_lift_stage(st->meta(), make)) {
+            st->take(lift);
+            st->module = lift->module;
+            ++swapped;
+        }
+    }
+    // A native hull's control stage, a module of its own with its words beside it.
+    if (pl.tess_tcs && !pl.tess_hull_spirv.empty()) {
+        gcn::TranslateResult hull;
+        hull.spirv = pl.tess_hull_spirv;
+        if (const std::shared_ptr<const CachedStage> lift = hlsl_lift_stage(hull, make)) {
+            pl.tess_tcs = lift->module;
+            pl.tess_hull_spirv.clear();
+            ++swapped;
+        }
+    }
+    if (!make && swapped) hlsl_note_lift_again(swapped);
+    return swapped;
+}
+// BBHOST_TEST_HLSL_REFUSE=<n> (checks): every n-th pipeline created while a
+// stage held DXC's module is taken as refused (1: every one), so the rebuild
+// from the lifts' modules runs on a driver that refuses none of them.
+bool hlsl_test_refused(const GfxPipeline& pl) {
+    static const int every = [] {
+        const char* e = std::getenv("BBHOST_TEST_HLSL_REFUSE");
+        return e ? std::max(0, std::atoi(e)) : 0;
+    }();
+    if (!every || !hlsl_on()) return false;
+    bool dxc = false;
+    for (const ShaderStage* st : {&pl.vs, &pl.ps, &pl.tess_ls}) {
+        std::vector<std::uint32_t> lift;
+        if (st->module && st->lifted && hlsl_lift_of(st->meta().spirv, lift)) dxc = true;
+    }
+    if (pl.tess_tcs && !pl.tess_hull_spirv.empty()) {
+        std::vector<std::uint32_t> lift;
+        if (hlsl_lift_of(pl.tess_hull_spirv, lift)) dxc = true;
+    }
+    static std::atomic<std::uint64_t> seen{0};
+    return dxc && seen.fetch_add(1, std::memory_order_relaxed) % static_cast<std::uint64_t>(every) == 0;
+}
+
 // The Vulkan pipeline of a translated and laid-out GfxPipeline, from any draw
 // state with its key (the key covers the fixed state and vertex input).
 bool create_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const VertexInputPlan* vertex_input, std::size_t fetch_dwords) {
@@ -6399,20 +6488,27 @@ bool create_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const VertexInputP
         pl.failed = true;
         return false;
     }
-    if (pl.tess_hw) {
-        // The host's own tessellator. The control points are
-        // already in the buffer the LS compute pass wrote, so the vertex stage
-        // carries nothing and the control stage only the hull shader's
-        // factors; `pl.vs` holds the domain shader, which is the evaluation
-        // stage.
-        stage(VK_SHADER_STAGE_VERTEX_BIT, pl.tess_attrs || pl.tess_native ? pl.tess_ls.module : pl.tess_vs);
-        stage(VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT, pl.tess_tcs);
-        stage(VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT, pl.vs.module);
-    } else {
-        stage(VK_SHADER_STAGE_VERTEX_BIT, pl.vs.module);
-    }
-    if (pl.gs.module) stage(VK_SHADER_STAGE_GEOMETRY_BIT, pl.gs.module);
-    if (pl.ps.module) stage(VK_SHADER_STAGE_FRAGMENT_BIT, pl.ps.module);
+    // BBHOST_HLSL: stages whose DXC module a driver refused before take their
+    // lift's module now, not after another refusal.
+    hlsl_stages_from_lifts(pl, false);
+    const auto collect_stages = [&] {
+        stages.clear();
+        if (pl.tess_hw) {
+            // The host's own tessellator. The control points are
+            // already in the buffer the LS compute pass wrote, so the vertex stage
+            // carries nothing and the control stage only the hull shader's
+            // factors; `pl.vs` holds the domain shader, which is the evaluation
+            // stage.
+            stage(VK_SHADER_STAGE_VERTEX_BIT, pl.tess_attrs || pl.tess_native ? pl.tess_ls.module : pl.tess_vs);
+            stage(VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT, pl.tess_tcs);
+            stage(VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT, pl.vs.module);
+        } else {
+            stage(VK_SHADER_STAGE_VERTEX_BIT, pl.vs.module);
+        }
+        if (pl.gs.module) stage(VK_SHADER_STAGE_GEOMETRY_BIT, pl.gs.module);
+        if (pl.ps.module) stage(VK_SHADER_STAGE_FRAGMENT_BIT, pl.ps.module);
+    };
+    collect_stages();
     // Pixel shaders at wave32: built whole, the fragment stage is given its
     // subgroup size here (linked, in its library: fragment_library).
     // A pipeline with set 4 (a native hull pipeline, a particle LS's constant
@@ -6500,6 +6596,35 @@ bool create_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const VertexInputP
         fragment_stage_unsized(stages.back());
         created = vkCreateGraphicsPipelines(g.device, PipelineCacheUse().cache, 1, &gpci, nullptr, &pl.pipeline) == VK_SUCCESS;
         fragment_stage_wave_refused(created);
+    }
+    if (created && hlsl_test_refused(pl)) {
+        vkDestroyPipeline(g.device, pl.pipeline, nullptr);
+        pl.pipeline = VK_NULL_HANDLE;
+        pl.relink_pending = false;
+        created = false;
+    }
+    // BBHOST_HLSL: refused while stages held DXC's modules - built again with
+    // their lifts' own, and counted by what was being built.
+    if (!created) {
+        if (const int swapped = hlsl_stages_from_lifts(pl, true)) {
+            if (linked) {
+                created = link_gfx_pipeline(pl, f, vertex_input);
+            } else {
+                collect_stages();
+                gpci.stageCount = static_cast<std::uint32_t>(stages.size());
+                gpci.pStages = stages.data();
+                ps_wave = {};
+                const bool sized = pl.ps.module && fragment_stage_wave(pl.ps.meta(), stages.back(), ps_wave);
+                created = vkCreateGraphicsPipelines(g.device, PipelineCacheUse().cache, 1, &gpci, nullptr, &pl.pipeline) == VK_SUCCESS;
+                if (!created && sized) {
+                    fragment_stage_unsized(stages.back());
+                    created = vkCreateGraphicsPipelines(g.device, PipelineCacheUse().cache, 1, &gpci, nullptr, &pl.pipeline) == VK_SUCCESS;
+                    fragment_stage_wave_refused(created);
+                }
+            }
+            hlsl_note_refused(linked ? "a graphics pipeline from libraries" : pl.tess_hw ? "a tessellated graphics pipeline" : "a graphics pipeline",
+                              swapped, created);
+        }
     }
     t_library_owner = owner;
     if (!created) {

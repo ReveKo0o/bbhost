@@ -687,10 +687,100 @@ void hlsl_keep(const std::string& why) {
     g_hlsl.reasons[hlsl_reason_key(why)]++;
 }
 // BBHOST_HLSL: `l`'s module through HLSL and DXC, cached; unchanged where that
-// fails. `o`: a tessellation stage's options (a hull's domain, partitioning
-// and winding are HLSL's to declare).
-void hlsl_stage(gcn::LiftResult& l, const gcn::TranslateOptions* o = nullptr);
+// fails. `lift_key`: the lift's own entry in this cache (null when it was made
+// without the cache), which hlsl_lift_of finds it by. `o`: a tessellation
+// stage's options (a hull's domain, partitioning and winding are HLSL's to
+// declare).
+void hlsl_stage(gcn::LiftResult& l, const Key* lift_key, const gcn::TranslateOptions* o = nullptr);
+
+// ---- BBHOST_HLSL: the lift behind each of DXC's modules ----
+// A driver may refuse a pipeline of DXC's modules that it builds from the
+// lifts' (NVIDIA's compiler did, for eight compute modules, until df928d5);
+// the stage is then built from the lift's own module (hlsl_lift_of), never
+// skipped. A module is known by its words without the debug instructions -
+// OpSource*, OpName, OpMemberName, OpString, OpLine, OpNoLine,
+// OpModuleProcessed - since the engine's names go on the module after this
+// cache gives it out (render.cpp name_stage), DXC's included.
+Key module_identity(const std::vector<std::uint32_t>& spirv) {
+    KeyHasher h;
+    const std::size_t n = spirv.size();
+    h.u32(static_cast<std::uint32_t>(n >= 5 ? 5 : n));
+    for (std::size_t i = 0; i < n && i < 5; ++i) h.u32(spirv[i]);
+    for (std::size_t i = 5; i < n;) {
+        const std::uint32_t len = spirv[i] >> 16, op = spirv[i] & 0xffff;
+        if (!len || i + len > n) {  // malformed: every word counts
+            for (; i < n; ++i) h.u32(spirv[i]);
+            break;
+        }
+        const bool debug = (op >= 2 && op <= 8) || op == 317 || op == 330;
+        if (!debug) {
+            for (std::uint32_t k = 0; k < len; ++k) h.u32(spirv[i + k]);
+        }
+        i += len;
+    }
+    return {h.a, h.b};
+}
+struct HlslLiftOf {
+    struct From {
+        Key lift_key{};  // the lift's entry in this cache
+        bool cached = false;
+        std::vector<std::uint32_t> words;  // the lift itself, when it was made without the cache
+    };
+    std::mutex mu;
+    std::unordered_map<Key, From, KeyHash> by_module;  // under mu: DXC's module (module_identity) -> its lift
+    std::map<std::string, std::uint64_t> refused;      // under mu: pipelines the driver refused with DXC's modules, by what was built
+    std::atomic<std::uint64_t> refusals{0}, stages{0}, rebuilt{0}, refused_again{0}, lift_again{0};
+} g_hlsl_lift_of;
+void hlsl_remember_lift(const std::vector<std::uint32_t>& dxc_module, const Key* lift_key, const std::vector<std::uint32_t>& lift) {
+    HlslLiftOf::From from;
+    if (lift_key) {
+        from.lift_key = *lift_key;
+        from.cached = true;
+    } else {
+        from.words = lift;
+    }
+    const Key id = module_identity(dxc_module);
+    std::lock_guard<std::mutex> lk(g_hlsl_lift_of.mu);
+    g_hlsl_lift_of.by_module.insert_or_assign(id, std::move(from));
+}
 }  // namespace
+
+bool hlsl_lift_of(const std::vector<std::uint32_t>& module, std::vector<std::uint32_t>& lift) {
+    if (!hlsl_on() || module.empty()) return false;
+    HlslLiftOf::From from;
+    {
+        const Key id = module_identity(module);
+        std::lock_guard<std::mutex> lk(g_hlsl_lift_of.mu);
+        const auto it = g_hlsl_lift_of.by_module.find(id);
+        if (it == g_hlsl_lift_of.by_module.end()) return false;
+        from = it->second;
+    }
+    if (!from.cached) {
+        lift = std::move(from.words);
+        return !lift.empty();
+    }
+    gcn::LiftResult l;
+    if (!lookup(from.lift_key, [&](Reader& r) { return read_lift(r, l); }) || !l.ok()) return false;
+    lift = std::move(l.spirv);
+    return true;
+}
+
+void hlsl_note_refused(const char* what, int stages, bool rebuilt) {
+    g_hlsl_lift_of.refusals.fetch_add(1, std::memory_order_relaxed);
+    g_hlsl_lift_of.stages.fetch_add(static_cast<std::uint64_t>(stages), std::memory_order_relaxed);
+    (rebuilt ? g_hlsl_lift_of.rebuilt : g_hlsl_lift_of.refused_again).fetch_add(1, std::memory_order_relaxed);
+    {
+        std::lock_guard<std::mutex> lk(g_hlsl_lift_of.mu);
+        g_hlsl_lift_of.refused[what]++;
+    }
+    static std::atomic<int> logs{0};
+    if (logs.fetch_add(1) < 8) {
+        host_log("render: HLSL: the driver refused %s holding DXC's modules; %s from the lifts' own (%d stage%s)", what,
+                 rebuilt ? "built" : "refused again when built", stages, stages == 1 ? "" : "s");
+    }
+}
+
+void hlsl_note_lift_again(int stages) { g_hlsl_lift_of.lift_again.fetch_add(static_cast<std::uint64_t>(stages), std::memory_order_relaxed); }
 
 int hlsl_mode() {
     static const int mode = [] {
@@ -758,7 +848,7 @@ void hlsl_defer(const Key& key, const std::vector<std::uint32_t>& lifted, const 
     g_hlsl_behind.cv.notify_one();
 }
 
-void hlsl_stage(gcn::LiftResult& l, const gcn::TranslateOptions* to) {
+void hlsl_stage(gcn::LiftResult& l, const Key* lift_key, const gcn::TranslateOptions* to) {
     if (!hlsl_on() || !l.ok()) return;
     gcn::HlslOptions hopt;
     if (to) {
@@ -820,6 +910,7 @@ void hlsl_stage(gcn::LiftResult& l, const gcn::TranslateOptions* to) {
         return;
     }
     g_hlsl.taken.fetch_add(1, std::memory_order_relaxed);
+    hlsl_remember_lift(spirv, lift_key, l.spirv);
     l.spirv = std::move(spirv);
 }
 }  // namespace
@@ -828,18 +919,27 @@ gcn::LiftResult lift_cached(bool vertex, const gcn::Program& prog, const gcn::Tr
     const auto lift = [&] {
         return vertex ? gcn::lift_vertex_shader(prog, o, reference) : gcn::lift_pixel_shader(prog, o, reference);
     };
-    gcn::LiftResult l = !g_tc.ready.load(std::memory_order_acquire) || !g_tc.on
-                            ? lift()
-                            : lift_through_cache(key_for(prog, o, vertex ? TranslationUse::kLiftVertex : TranslationUse::kLiftPixel), lift);
-    hlsl_stage(l);
+    if (!g_tc.ready.load(std::memory_order_acquire) || !g_tc.on) {
+        gcn::LiftResult l = lift();
+        hlsl_stage(l, nullptr);
+        return l;
+    }
+    const Key key = key_for(prog, o, vertex ? TranslationUse::kLiftVertex : TranslationUse::kLiftPixel);
+    gcn::LiftResult l = lift_through_cache(key, lift);
+    hlsl_stage(l, &key);
     return l;
 }
 
 gcn::LiftResult lift_compute_cached(const gcn::Program& prog, const gcn::TranslateOptions& o, const gcn::TranslateResult& reference) {
     const auto lift = [&] { return gcn::lift_compute_shader(prog, o, reference); };
-    gcn::LiftResult l = !g_tc.ready.load(std::memory_order_acquire) || !g_tc.on ? lift()
-                                                                                : lift_through_cache(key_for(prog, o, TranslationUse::kLiftCompute), lift);
-    hlsl_stage(l);
+    if (!g_tc.ready.load(std::memory_order_acquire) || !g_tc.on) {
+        gcn::LiftResult l = lift();
+        hlsl_stage(l, nullptr);
+        return l;
+    }
+    const Key key = key_for(prog, o, TranslationUse::kLiftCompute);
+    gcn::LiftResult l = lift_through_cache(key, lift);
+    hlsl_stage(l, &key);
     return l;
 }
 
@@ -852,7 +952,7 @@ gcn::LiftResult lift_tess_cached(TranslationUse use, const gcn::Program& prog, c
     };
     if (!g_tc.ready.load(std::memory_order_acquire) || !g_tc.on) {
         gcn::LiftResult l = lift();
-        hlsl_stage(l, &o);
+        hlsl_stage(l, nullptr, &o);
         return l;
     }
     KeyHasher h;
@@ -867,8 +967,9 @@ gcn::LiftResult lift_tess_cached(TranslationUse use, const gcn::Program& prog, c
     for (const std::uint32_t v : {tess.control_points, tess.ls_stride, tess.cp_stride, tess.patch_constants, tess.params_binding}) h.u32(v);
     h.str(tess.constants_path);
     for (const std::uint32_t v : tess.constants) h.u32(v);
-    gcn::LiftResult l = lift_through_cache(Key{h.a, h.b}, lift);
-    hlsl_stage(l, &o);
+    const Key key{h.a, h.b};
+    gcn::LiftResult l = lift_through_cache(key, lift);
+    hlsl_stage(l, &key, &o);
     return l;
 }
 
@@ -1060,11 +1161,24 @@ void translation_cache_report() {
                           g_hlsl_behind.done_us.load() / 1e6, static_cast<unsigned long long>(g_hlsl_behind.failed.load()), waiting);
             behind = b;
         }
+        // The pipelines a driver refused while they held DXC's modules, which
+        // were built from the lifts' instead (hlsl_lift_of), by what was built.
+        std::string refused;
+        {
+            std::lock_guard<std::mutex> lk(g_hlsl_lift_of.mu);
+            for (const auto& [what, n] : g_hlsl_lift_of.refused) refused += (refused.empty() ? " (" : ", ") + what + " x" + std::to_string(n);
+        }
+        if (!refused.empty()) refused += ")";
         host_log("render: HLSL: %llu lifted stages took DXC's module (%llu compiled at this start in %.1f s of worker time, %llu from the "
-                 "translation cache)%s; %llu kept the lifter's SPIR-V%s",
+                 "translation cache)%s; %llu kept the lifter's SPIR-V%s; the driver refused %llu pipelines holding DXC's modules%s: %llu built "
+                 "from the lifts' own (%llu stages), %llu refused again; %llu stages of later pipelines took their lift's at once",
                  static_cast<unsigned long long>(g_hlsl.taken.load()), static_cast<unsigned long long>(g_hlsl.compiled.load()),
                  g_hlsl.compile_us.load() / 1e6, static_cast<unsigned long long>(g_hlsl.cached.load()), behind.c_str(),
-                 static_cast<unsigned long long>(g_hlsl.kept.load()), reasons.c_str());
+                 static_cast<unsigned long long>(g_hlsl.kept.load()), reasons.c_str(),
+                 static_cast<unsigned long long>(g_hlsl_lift_of.refusals.load()), refused.c_str(),
+                 static_cast<unsigned long long>(g_hlsl_lift_of.rebuilt.load()), static_cast<unsigned long long>(g_hlsl_lift_of.stages.load()),
+                 static_cast<unsigned long long>(g_hlsl_lift_of.refused_again.load()),
+                 static_cast<unsigned long long>(g_hlsl_lift_of.lift_again.load()));
     }
     if (!g_tc_enabled) return;
     std::size_t entries = 0;

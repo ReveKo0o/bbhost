@@ -3140,6 +3140,22 @@ bool compute_lift_selects(const std::string& name) {
     }();
     return on && (selection.first || selection.second.count(name) != 0);
 }
+// BBHOST_TEST_HLSL_REFUSE=<n> (checks): every n-th compute pipeline to be made
+// from DXC's module is taken as refused before it is asked for (1: every
+// one), so the rebuild from the lift's own module runs on a driver that
+// refuses none (render.cpp has the same for graphics pipelines).
+bool hlsl_test_refused_compute(const std::vector<std::uint32_t>& spirv) {
+    static const int every = [] {
+        const char* e = std::getenv("BBHOST_TEST_HLSL_REFUSE");
+        return e ? std::max(0, std::atoi(e)) : 0;
+    }();
+    if (!every || !hlsl_on()) return false;
+    std::vector<std::uint32_t> lift;
+    if (!hlsl_lift_of(spirv, lift)) return false;
+    static std::atomic<std::uint64_t> seen{0};
+    return seen.fetch_add(1, std::memory_order_relaxed) % static_cast<std::uint64_t>(every) == 0;
+}
+
 // The program's lift in place of its translation's SPIR-V, when selected and
 // accepted; `lifted` and `why` (the first rejection, or empty) say which.
 // Every compute program a pipeline was made for, at GX's creation or at a
@@ -3778,6 +3794,7 @@ ComputePipeline& pipeline_for(const GpuDispatch& d, std::uint64_t key, const std
         host_log("gpu: creating compute pipeline %s", name.c_str());
     }
     const auto t0 = std::chrono::steady_clock::now();
+    bool from_lift = false;  // BBHOST_HLSL: DXC's module was refused, this is the lift's own
     for (;;) {
         const char* failed = nullptr;
         VkShaderModuleCreateInfo smci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
@@ -3786,15 +3803,29 @@ ComputePipeline& pipeline_for(const GpuDispatch& d, std::uint64_t key, const std
         if (vkCreateShaderModule(g.device, &smci, nullptr, &pl.module) != VK_SUCCESS) {
             pl.module = VK_NULL_HANDLE;
             failed = "module creation";
+        } else if (hlsl_test_refused_compute(pl.meta.spirv)) {
+            failed = "pipeline creation";
         } else {
             pl.pipeline = first_compute_pipeline(pl.module, key, name, pl.meta.spirv, pl.standin, name + " (at its dispatch)");
             if (!pl.pipeline) failed = "pipeline creation";
+        }
+        if (from_lift) {
+            hlsl_note_refused("a compute pipeline", 1, !failed);
+            from_lift = false;
         }
         if (!failed) break;
         if (!pl.lifted) {
             host_log("gpu: shader %s: %s failed", name.c_str(), failed);
             pl.failed = true;
             return pl;
+        }
+        // BBHOST_HLSL: the driver refused DXC's module - the lift's own next.
+        if (std::vector<std::uint32_t> lift; hlsl_lift_of(pl.meta.spirv, lift)) {
+            if (pl.module) vkDestroyShaderModule(g.device, pl.module, nullptr);
+            pl.module = VK_NULL_HANDLE;
+            pl.meta.spirv = std::move(lift);
+            from_lift = true;
+            continue;
         }
         // The driver refused what the lift built: the translation instead.
         host_log("gpu: shader %s: the lift's %s failed; it runs translated", name.c_str(), failed);
@@ -3939,6 +3970,7 @@ void precompile_compute(const std::string& name, const std::vector<std::uint8_t>
         }();
         if (delay_ms > 0) std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
         t_compute_worker = true;
+        bool from_lift = false;  // BBHOST_HLSL: DXC's module was refused, this is the lift's own
         for (;;) {
             VkShaderModuleCreateInfo smci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
             smci.codeSize = e.meta.spirv.size() * 4;
@@ -3946,11 +3978,26 @@ void precompile_compute(const std::string& name, const std::vector<std::uint8_t>
             if (vkCreateShaderModule(g.device, &smci, nullptr, &e.module) != VK_SUCCESS) {
                 e.module = VK_NULL_HANDLE;
                 why = "shader module";
+            } else if (hlsl_test_refused_compute(e.meta.spirv)) {
+                why = "pipeline";
             } else {
                 e.pipeline = first_compute_pipeline(e.module, key, name, e.meta.spirv, e.standin, name);
                 if (!e.pipeline) why = "pipeline";
             }
+            if (from_lift) {
+                hlsl_note_refused("a compute pipeline", 1, why.empty());
+                from_lift = false;
+            }
             if (why.empty() || !e.lifted) break;
+            // BBHOST_HLSL: the driver refused DXC's module - the lift's own next.
+            if (std::vector<std::uint32_t> lift; hlsl_lift_of(e.meta.spirv, lift)) {
+                if (e.module) vkDestroyShaderModule(g.device, e.module, nullptr);
+                e.module = VK_NULL_HANDLE;
+                e.meta.spirv = std::move(lift);
+                from_lift = true;
+                why.clear();
+                continue;
+            }
             // The driver refused what the lift built: the translation instead.
             host_log("gpu: shader %s: the lift's %s failed; it runs translated", name.c_str(), why.c_str());
             if (e.module) vkDestroyShaderModule(g.device, e.module, nullptr);
