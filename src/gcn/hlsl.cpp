@@ -340,6 +340,7 @@ private:
             t.k = TK::Float;
             t.width = in.a.at(0);
             if (t.width != 32 && t.width != 16) fail("a float of " + std::to_string(t.width) + " bits");
+            if (t.width == 16) has_half = true;
             break;
         }
         case spv::OpTypeVector: {
@@ -512,6 +513,18 @@ private:
         const Type& ty = type(t);
         return ty.k == TK::Vector ? ty.count : 1;
     }
+    // The bits of a scalar or vector of numbers.
+    std::uint32_t bits_of(std::uint32_t t) const {
+        const Type& s = type(scalar_of(t));
+        if (s.k != TK::Int && s.k != TK::Float) fail("a bitcast of a value that is no number");
+        return s.width * lanes_of(t);
+    }
+    // Whether the module declares a 16-bit float (a lift for a device that rounds halves itself).
+    bool has_half = false;
+    bool is_half(std::uint32_t value) const {
+        const Type& s = type(scalar_of(type_of(value)));
+        return s.k == TK::Float && s.width == 16;
+    }
     // 'u' 'i' 'f' 'b' (and 'h' half, 'U' uint64, 'I' int64) of a scalar or vector type.
     char kind_of(std::uint32_t t) const {
         const Type& s = type(scalar_of(t));
@@ -606,7 +619,9 @@ private:
         switch (k) {
         case 'b': return bits ? "true" : "false";
         case 'f': return float_literal(static_cast<std::uint32_t>(bits));
-        case 'h': return "asfloat16(uint16_t(" + hex(bits & 0xffff) + "))";
+        // A half constant would need 16-bit integers (asfloat16(uint16_t(...))),
+        // which the lift does not declare; the lifter writes none.
+        case 'h': fail("a half-precision constant");
         case 'u': return uint_literal(static_cast<std::uint32_t>(bits));
         case 'i': return int_literal(static_cast<std::uint32_t>(bits));
         case 'U': return hex(bits) + "ull";
@@ -671,6 +686,7 @@ private:
     std::uint32_t output_vertices = 0;      // a hull's OutputVertices
     std::uint32_t local_size[3] = {0, 0, 0};  // a compute shader's [numthreads]
     bool hv202x = false;                      // vk::BufferPointer (an atomic on a raw address) needs -HV 202x
+    std::vector<std::uint32_t> float_modes;   // DenormPreserve, RoundingModeRTZ for 16-bit floats, in the lift's order
     // The hull: its per-control-point output and the barrier its body crosses.
     std::uint32_t cp_out_var = 0, invocation_var = 0;
     bool past_barrier = false;
@@ -717,8 +733,11 @@ private:
             case spv::CapSampledCubeArray: case spv::CapImageCubeArray: case spv::CapStorageImageReadWithoutFormat:
             case spv::CapStorageImageWriteWithoutFormat: case spv::CapImageGatherExtended: case spv::CapPhysicalStorageBufferAddresses:
                 break;
-            case spv::CapFloat16: case spv::CapDenormPreserve: case spv::CapRoundingModeRTZ:
-                fail("half precision with the device's rounding mode (native RTZ)");
+            // A lift for a device that rounds halves itself (gcn/half.h
+            // native_half_rtz): Float16 comes with the half types DXC is given
+            // (-enable-16bit-types), DenormPreserve and RoundingModeRTZ with
+            // the execution modes that need them (float_modes).
+            case spv::CapFloat16: case spv::CapDenormPreserve: case spv::CapRoundingModeRTZ: break;
             default: fail("capability " + std::to_string(c));
             }
         }
@@ -744,6 +763,18 @@ private:
             case spv::ExLocalSize:
                 if (m.size() < 5) fail("LocalSize without three sizes");
                 local_size[0] = m[2], local_size[1] = m[3], local_size[2] = m[4];
+                break;
+            // The device's own half rounding: f16 conversions round toward
+            // zero and keep denormals. HLSL has no spelling for either; the
+            // entry point declares them as inline SPIR-V, with their
+            // capabilities (float_mode_attributes). For 16-bit floats only:
+            // the printer writes no arithmetic on halves, only the lift's
+            // conversions and bitcasts as its own instructions, which DXC
+            // passes to the driver whatever their operands - an operation in
+            // HLSL's own spelling DXC may evaluate itself, rounding to nearest.
+            case spv::ExDenormPreserve: case spv::ExRoundingModeRTZ:
+                if (m.size() != 3 || m[2] != 16) fail("a float-controls execution mode for floats other than 16-bit");
+                if (std::find(float_modes.begin(), float_modes.end(), m[1]) == float_modes.end()) float_modes.push_back(m[1]);
                 break;
             default: fail("execution mode " + std::to_string(m[1]));
             }
@@ -1534,6 +1565,25 @@ private:
             fail("a result kind");
         };
         const auto operand_kind = [&](std::size_t k) { return kind_of(type_of(in.a.at(k))); };
+        if (has_half) {
+            // Halves are converted and moved, nothing else (the lifter writes
+            // nothing else of them): an operation on halves in HLSL's spelling
+            // DXC could evaluate itself, rounding to nearest where the module
+            // says toward zero.
+            std::size_t ids = in.a.size();  // the operands that are values; the rest are literals
+            if (in.op == spv::OpCompositeExtract) ids = 1;
+            if (in.op == spv::OpCompositeInsert || in.op == spv::OpVectorShuffle) ids = 2;
+            bool half = rk == 'h';
+            for (std::size_t k = 0; k < ids && k < in.a.size() && !half; ++k) half = is_half(in.a[k]);
+            if (half) {
+                switch (in.op) {
+                case spv::OpFConvert: case spv::OpBitcast: case spv::OpCompositeConstruct: case spv::OpCompositeExtract:
+                case spv::OpCompositeInsert: case spv::OpVectorShuffle: case spv::OpSelect:
+                    break;
+                default: fail("an operation on halves other than a conversion, a bitcast or a move (opcode " + std::to_string(in.op) + ")");
+                }
+            }
+        }
         switch (in.op) {
         case spv::OpIAdd: return define(in, bin("+", rk));
         case spv::OpISub: return define(in, bin("-", rk));
@@ -1595,6 +1645,13 @@ private:
         case spv::OpBitcast: {
             const std::uint32_t from = type_of(in.a.at(0));
             const char fk = kind_of(from);
+            if (fk == 'h' || rk == 'h') {
+                // A pair of halves and the 32-bit word that holds them (a
+                // packed export's): the lift's own instruction, which HLSL
+                // writes only through 16-bit integers.
+                if (bits_of(from) != bits_of(in.type)) fail("a bitcast between widths");
+                return define(in, inline_op("spv_bitcast", spv::OpBitcast, false, in.type, {in.a.at(0)}));
+            }
             if (lanes_of(from) != lanes_of(in.type)) fail("a bitcast between vectors of different sizes");
             if ((fk == 'U' || fk == 'I') != (rk == 'U' || rk == 'I')) fail("a bitcast between widths");
             return define(in, as(in.a.at(0), rk));
@@ -1607,7 +1664,22 @@ private:
             return define(in, back(with_kind(in.type, unsigned_of(rk)) + "(" + as(in.a.at(0), unsigned_of(operand_kind(0))) + ")", unsigned_of(rk)));
         case spv::OpSConvert:
             return define(in, back(with_kind(in.type, signed_of(rk)) + "(" + as(in.a.at(0), signed_of(operand_kind(0))) + ")", signed_of(rk)));
-        case spv::OpFConvert: fail("a float conversion (half precision)");
+        case spv::OpFConvert: {
+            // Between f32 and f16 (a lift for a device that rounds halves
+            // itself): the lift's own instruction. To half it rounds as the
+            // module's execution mode says - toward zero, denormals kept - by
+            // the device, at run time; float16_t(x) of a constant DXC would
+            // evaluate itself, rounding to nearest. From half it is exact.
+            // Undecorated, as the lifter writes it: a Mesa driver (lavapipe;
+            // RADV shares its compiler) removes an undecorated f32 -> f16 ->
+            // f32 round trip, one decorated NoContraction it keeps - and DXC
+            // has no way to decorate a conversion.
+            const char fk = operand_kind(0);
+            if (!((fk == 'f' && rk == 'h') || (fk == 'h' && rk == 'f'))) fail("a float conversion other than between 32 and 16 bits");
+            if (lanes_of(type_of(in.a.at(0))) != lanes_of(in.type)) fail("a float conversion between vectors of different sizes");
+            if (decorated(in.id, spv::DecNoContraction)) fail("a half conversion decorated NoContraction, which DXC cannot write");
+            return define(in, inline_op(rk == 'h' ? "spv_to_half" : "spv_from_half", spv::OpFConvert, false, in.type, {in.a.at(0)}));
+        }
         case spv::OpCompositeConstruct: {
             const Type& t = type(in.type);
             if (t.k != TK::Vector) fail("a constructed aggregate");
@@ -1714,6 +1786,11 @@ private:
         const std::vector<std::uint32_t> args(in.a.begin() + 2, in.a.end());
         const char rk = kind_of(in.type);
         const bool wide = rk == 'U' || rk == 'I';
+        if (has_half) {  // as arithmetic(): no operation on halves but conversions and moves
+            bool half = rk == 'h';
+            for (const std::uint32_t a : args) half = half || is_half(a);
+            if (half) fail("an operation on halves other than a conversion, a bitcast or a move (GLSL.std.450 " + std::to_string(op) + ")");
+        }
         const auto call = [&](const char* fn, char k) {
             std::string s = std::string(fn) + "(";
             for (std::size_t i = 0; i < args.size(); ++i) s += (i ? ", " : "") + as(args[i], k);
@@ -2120,6 +2197,26 @@ private:
     }
 
     // ---- the whole source -----------------------------------------------------------------
+    // The device's half rounding as the lift declares it (float_modes): each
+    // mode's capability on the entry point, ahead of HLSL's own attributes
+    // (DXC takes them there), and the mode itself in the entry point's body.
+    std::string float_mode_attributes() const {
+        std::string s;
+        for (const std::uint32_t m : float_modes) {
+            s += m == spv::ExDenormPreserve ? "[[vk::ext_capability(" + std::to_string(spv::CapDenormPreserve) + " /* DenormPreserve */)]]\n"
+                                            : "[[vk::ext_capability(" + std::to_string(spv::CapRoundingModeRTZ) + " /* RoundingModeRTZ */)]]\n";
+        }
+        return s;
+    }
+    std::string float_mode_calls() const {
+        std::string s;
+        for (const std::uint32_t m : float_modes) {
+            s += "    vk::ext_execution_mode(" + std::to_string(m) + ", 16);  // " +
+                 (m == spv::ExDenormPreserve ? "DenormPreserve: f16 denormals kept" : "RoundingModeRTZ: f32 to f16 rounds toward zero") + "\n";
+        }
+        return s;
+    }
+
     // The hull shader's two phases from the one body (hlsl.h).
     std::string assemble_hull() {
         if (!output_vertices) fail("a hull shader without OutputVertices");
@@ -2204,11 +2301,13 @@ private:
         s += copy_in + copy_pc;
         s += "    " + invocation + " = 0u;\n    hull_phase_cp = false;\n    lifted_main();\n    PatchConstants pc;\n" + factor_copy + "    return pc;\n}\n\n";
         static const char* const partitioning[] = {"integer", "fractional_odd", "fractional_even"};
+        s += float_mode_attributes();
         s += std::string("[domain(\"") + (quads ? "quad" : "tri") + "\")]\n";
         s += std::string("[partitioning(\"") + partitioning[std::clamp(opt.tess_spacing, 0, 2)] + "\")]\n";
         s += std::string("[outputtopology(\"") + (opt.tess_cw ? "triangle_cw" : "triangle_ccw") + "\")]\n";
         s += "[outputcontrolpoints(" + n + ")]\n[patchconstantfunc(\"patch_main\")]\n";
         s += "ControlPointOut main(InputPatch<ControlPointIn, " + n + "> ip, uint id : SV_OutputControlPointID" + params + ") {\n";
+        s += float_mode_calls();
         s += copy_in + "    " + invocation + " = id;\n    hull_phase_cp = true;\n    lifted_main();\n    ControlPointOut o;\n" + copy_out_cp + "    return o;\n}\n";
         if (uses_half) arguments.push_back("-enable-16bit-types");
         return s;
@@ -2267,8 +2366,9 @@ private:
             copy += "    " + v.name + " = si_" + v.name + ";\n";
         }
         s += "\n" + helper_functions() + "void lifted_main() {\n" + body_text + "}\n\n";
+        s += float_mode_attributes();
         s += "[numthreads(" + std::to_string(local_size[0]) + ", " + std::to_string(local_size[1]) + ", " + std::to_string(local_size[2]) + ")]\n";
-        s += "void main(" + params + ") {\n" + copy + "    lifted_main();\n}\n";
+        s += "void main(" + params + ") {\n" + float_mode_calls() + copy + "    lifted_main();\n}\n";
         if (uses_half) arguments.push_back("-enable-16bit-types");
         return s;
     }
@@ -2387,6 +2487,7 @@ private:
         }
         if (!out_struct.empty()) s += "struct StageOutput {\n" + out_struct + "};\n";
         s += "\n" + helper_functions() + "void lifted_main() {\n" + body_text + "}\n\n";
+        s += float_mode_attributes();
         if (early_tests) s += "[earlydepthstencil]\n";
         std::string args = in_struct.empty() ? "" : "StageInput si";
         if (tes) {
@@ -2396,6 +2497,7 @@ private:
             args += params;
         }
         s += std::string(out_struct.empty() ? "void" : "StageOutput") + " main(" + args + ") {\n";
+        s += float_mode_calls();
         for (const std::uint32_t m : tess_modes) {
             static const std::map<std::uint32_t, const char*> mode_names = {
                 {spv::ExSpacingEqual, "SpacingEqual"}, {spv::ExSpacingFractionalEven, "SpacingFractionalEven"},
@@ -2418,7 +2520,7 @@ private:
 
 struct Iface {
     std::uint32_t model = 0;
-    std::set<std::uint32_t> modes;
+    std::set<std::vector<std::uint32_t>> modes;  // each execution mode with its literals (RoundingModeRTZ 16, LocalSize 64 1 1)
     std::map<std::pair<std::uint32_t, std::uint32_t>, std::string> bindings;  // (set, binding) -> description
     std::map<std::string, std::string> io;                                  // "in loc 3" / "out builtin 0" -> description
     std::set<std::uint32_t> spec_ids;
@@ -2450,7 +2552,9 @@ Iface interface_of(const std::vector<std::uint32_t>& w) {
             for (; k < n - 1; ++k) iface_ids.insert(a[k]);
             break;
         }
-        case spv::OpExecutionMode: f.modes.insert(a[1]); break;
+        case spv::OpExecutionMode:
+            if (n >= 3) f.modes.insert(std::vector<std::uint32_t>(a + 1, a + n - 1));
+            break;
         case spv::OpDecorate: dec[a[0]][a[1]] = std::vector<std::uint32_t>(a + 2, a + n - 1); break;
         case spv::OpMemberDecorate:
             if (n >= 5 && a[2] == spv::DecOffset) member_offset[{a[0], a[1]}] = a[3];
@@ -2549,6 +2653,11 @@ struct OpCensus {
     std::map<std::string, std::size_t> ops;  // "op 129" / "glsl 79" -> count
     std::size_t contractible = 0;              // float arithmetic without NoContraction
     std::size_t fused_fma = 0;                 // Fma decorated NoContraction (a driver must fuse it)
+    // Constants of 16-bit floats (scalars, vectors, composites of them): a
+    // conversion to half that DXC evaluated itself - rounding to nearest,
+    // where a lift for a device that rounds halves itself says toward zero -
+    // leaves one where the lift has none.
+    std::size_t half_constants = 0;
 };
 
 OpCensus op_census(const std::vector<std::uint32_t>& w) {
@@ -2562,7 +2671,7 @@ OpCensus op_census(const std::vector<std::uint32_t>& w) {
     std::map<std::uint32_t, Fn> fns;
     std::uint32_t entry = 0, current = 0;
     OpCensus c;
-    std::set<std::uint32_t> nocontract, consts, quad_results;
+    std::set<std::uint32_t> nocontract, consts, quad_results, half_types;
     std::vector<std::uint32_t> float_arith, fma_ids;
     std::uint32_t glsl_set = 0;
     for (std::size_t i = 5; i < w.size();) {
@@ -2570,6 +2679,13 @@ OpCensus op_census(const std::vector<std::uint32_t>& w) {
         if (!n || i + n > w.size()) break;
         const std::uint32_t* a = &w[i + 1];
         if (op == spv::OpEntryPoint) entry = a[1];
+        if (op == spv::OpTypeFloat && n >= 3 && a[1] == 16) half_types.insert(a[0]);
+        if ((op == spv::OpTypeVector || op == spv::OpTypeArray) && n >= 3 && half_types.count(a[1])) half_types.insert(a[0]);
+        if ((op == spv::OpConstant || op == spv::OpConstantComposite || op == spv::OpConstantNull || op == spv::OpSpecConstant ||
+             op == kOpSpecConstantComposite || op == kOpSpecConstantOp) &&
+            n >= 3 && half_types.count(a[0])) {
+            ++c.half_constants;
+        }
         if (op == spv::OpFunction) current = a[1];
         if (op == spv::OpFunctionCall && current) fns[current].calls.push_back(a[2]);
         auto& ops = fns[current].ops;
@@ -2639,6 +2755,8 @@ std::string hlsl_operation_diff(const std::vector<std::uint32_t>& lifted, const 
         if (k == "op " + std::to_string(spv::OpImageQueryLod) && n <= 2 * have) continue;
         return k + ": " + std::to_string(n) + " where the lift has " + std::to_string(have);
     }
+    if (b.half_constants > a.half_constants)
+        return std::to_string(b.half_constants) + " half-precision constants where the lift has " + std::to_string(a.half_constants) + " (a conversion DXC evaluated)";
     if (b.contractible) return std::to_string(b.contractible) + " float operations without NoContraction";
     // Fma the lift leaves to the driver (fused or not) must not be one DXC's module requires fused.
     if (b.fused_fma > a.fused_fma) return std::to_string(b.fused_fma) + " Fma decorated NoContraction where the lift has " + std::to_string(a.fused_fma);
@@ -2650,17 +2768,23 @@ HlslResult emit_hlsl(const std::vector<std::uint32_t>& spirv, const HlslOptions&
 std::string hlsl_interface_diff(const std::vector<std::uint32_t>& lifted, const std::vector<std::uint32_t>& compiled) {
     const Iface a = interface_of(lifted), b = interface_of(compiled);
     if (a.model != b.model) return "execution model " + std::to_string(a.model) + " against " + std::to_string(b.model);
-    for (const std::uint32_t m : a.modes) {
-        if (!b.modes.count(m)) return "execution mode " + std::to_string(m) + " missing";
+    const auto mode_text = [](const std::vector<std::uint32_t>& m) {
+        std::string s = "execution mode";
+        for (const std::uint32_t x : m) s += " " + std::to_string(x);
+        return s;
+    };
+    for (const std::vector<std::uint32_t>& m : a.modes) {
+        if (!b.modes.count(m)) return mode_text(m) + " missing";
     }
-    for (const std::uint32_t m : b.modes) {
+    for (const std::vector<std::uint32_t>& m : b.modes) {
         // HLSL declares a hull's domain, partitioning and winding (the
         // evaluation stage declares the same; HlslOptions passes them).
-        const bool hull_tess_mode = b.model == spv::EmTessellationControl &&
-                                    (m == spv::ExTriangles || m == spv::ExQuads || m == spv::ExIsolines || m == spv::ExSpacingEqual ||
-                                     m == spv::ExSpacingFractionalEven || m == spv::ExSpacingFractionalOdd || m == spv::ExVertexOrderCw ||
-                                     m == spv::ExVertexOrderCcw);
-        if (!a.modes.count(m) && !hull_tess_mode) return "execution mode " + std::to_string(m) + " added";
+        const std::uint32_t k = m.at(0);
+        const bool hull_tess_mode = b.model == spv::EmTessellationControl && m.size() == 1 &&
+                                    (k == spv::ExTriangles || k == spv::ExQuads || k == spv::ExIsolines || k == spv::ExSpacingEqual ||
+                                     k == spv::ExSpacingFractionalEven || k == spv::ExSpacingFractionalOdd || k == spv::ExVertexOrderCw ||
+                                     k == spv::ExVertexOrderCcw);
+        if (!a.modes.count(m) && !hull_tess_mode) return mode_text(m) + " added";
     }
     for (const auto& [k, v] : a.bindings) {
         const auto it = b.bindings.find(k);

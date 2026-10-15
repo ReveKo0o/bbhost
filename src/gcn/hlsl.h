@@ -23,7 +23,15 @@
 //   * quad operations are QuadReadLaneAt / QuadReadAcross*, which DXC lowers
 //     to the lift's OpGroupNonUniformQuadBroadcast / QuadSwap;
 //   * an Invariant output (the position, with BBHOST_VS_INVARIANT) keeps the
-//     decoration as [[vk::ext_decorate(18)]] on its member.
+//     decoration as [[vk::ext_decorate(18)]] on its member;
+//   * a lift for a device that rounds halves itself (gcn/half.h
+//     native_half_rtz: RADV) declares DenormPreserve 16 and RoundingModeRTZ
+//     16, which HLSL cannot spell: the entry point declares them as
+//     vk::ext_execution_mode with their [[vk::ext_capability]], and the lift's
+//     conversions between f32 and f16 and bitcasts between half pairs and
+//     words are its own instructions (inline OpFConvert, OpBitcast): DXC
+//     would evaluate float16_t(constant) itself, rounding to nearest. Halves
+//     are only converted and moved; arithmetic on them is not printed.
 //
 // Tessellation: the LS is a vertex shader whose control point is an array
 // output; the domain shader takes its control points as an OutputPatch and
@@ -97,11 +105,11 @@ struct HlslResult {
 // caller keeps the lifted SPIR-V.
 HlslResult emit_hlsl(const std::vector<std::uint32_t>& spirv, const HlslOptions& options = {});
 
-// Whether two modules declare the same interface: execution model and modes,
-// descriptor bindings (set, binding, kind, image shape and texel type,
-// buffer layout), stage inputs and outputs (location or built-in, type,
-// interpolation), and specialization constant ids. Empty when they do, else
-// the first difference.
+// Whether two modules declare the same interface: execution model and modes
+// (with their literals: RoundingModeRTZ 16), descriptor bindings (set,
+// binding, kind, image shape and texel type, buffer layout), stage inputs and
+// outputs (location or built-in, type, interpolation), and specialization
+// constant ids. Empty when they do, else the first difference.
 std::string hlsl_interface_diff(const std::vector<std::uint32_t>& lifted, const std::vector<std::uint32_t>& compiled);
 
 // Whether DXC kept the lift's operations where their results' bits depend on
@@ -109,9 +117,10 @@ std::string hlsl_interface_diff(const std::vector<std::uint32_t>& lifted, const 
 // discard operation (by opcode, and by GLSL.std.450 number) that the lift
 // does not use, none more often than the lift uses it (DXC may merge and drop
 // them, not add them; GetDimensions' size and level queries and
-// CalculateLevelOfDetail excepted), and every float add, subtract, multiply,
-// divide and negate (of something other than a literal) NoContraction. Empty
-// when it did, else the first difference.
+// CalculateLevelOfDetail excepted), no constant of 16-bit floats the lift does
+// not have (a conversion to half DXC evaluated itself), and every float add,
+// subtract, multiply, divide and negate (of something other than a literal)
+// NoContraction. Empty when it did, else the first difference.
 std::string hlsl_operation_diff(const std::vector<std::uint32_t>& lifted, const std::vector<std::uint32_t>& compiled);
 
 }  // namespace gcn
