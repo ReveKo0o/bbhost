@@ -42,6 +42,10 @@ struct GpuDispatch {
     static constexpr std::uint32_t kGdsCounters = 8;  // gcn::kGdsCounters
     std::uint32_t gds_base = 0;
     GdsCounter gds[kGdsCounters] = {};
+    // The counters came with the dispatch token, from the engine's objects
+    // (gx_trace.cpp take_cs_counters: each UAV's word and initial count), not
+    // from the DMA_DATA moves through GDS around the dispatch packet.
+    bool gds_from_token = false;
     // A dispatch token from GX's compute commit: the compute stage's records,
     // taken at the call from the context's pending state (gx_trace.cpp
     // snapshot_cs_records). The user data the descriptors name is built from

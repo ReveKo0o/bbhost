@@ -4693,6 +4693,58 @@ bool snapshot_cs_records(std::uint64_t ctx, GxStageRecords& s, CsRecordsMiss* wh
     return true;
 }
 
+// BBHOST_GX_TOKEN_COUNTERS: the GPU particles' append/consume counters in
+// the dispatch token, from the engine's objects. A shader that counts (bit 56
+// of its misc mask: ds_append / ds_consume in GDS) has each bound UAV's
+// hidden counter moved into GDS dword 8 + slot by GX's compute commit and
+// back by gx_dispatch_post (0x2accf20), with DMA_DATA - D3D11's UAV counter
+// with its initial count. The counter is the word past the buffer's records
+// (sub_256e1c0: the holder's memory + its size - 8); the initial count is the
+// one CSSetUnorderedAccessViews left at ctx + 0x1fd0 + 4 * slot (sub_2569560;
+// -1 keeps the count the word holds), read by the commit at the call. So the
+// token carries {word, set to N or kept} for each, and the command processor
+// needs neither the moves nor its model of GDS.
+//   2 (default) the token's counters; the moves are not written (their two
+//     call sites, in the commit and the post, are patched out);
+//   1 (checks) the moves are written and walked, the counters bound from them
+//     as before, and the token's compared with them dispatch by dispatch;
+//   0 the moves alone, as before.
+const int g_token_counters = [] {
+    const char* e = std::getenv("BBHOST_GX_TOKEN_COUNTERS");
+    return e && e[0] ? std::atoi(e) : 2;
+}();
+std::atomic<std::uint64_t> g_tc_dispatches{0}, g_tc_counters{0}, g_tc_set{0}, g_tc_kept{0}, g_tc_no_view{0};
+bool g_gds_moves_nopped = false;  // the two moves are not written (hle_gx_trace_arm)
+// The UAV counters of a dispatch through GX's compute commit, into d (true
+// when its shader counts). ctx: the GX context (the command buffer - 0x10).
+bool take_cs_counters(std::uint64_t ctx, const GxStageRecords& s, GpuDispatch& d) {
+    const std::uint64_t misc = s.mask[2];
+    if (!((misc >> 56) & 1)) return false;
+    const std::uint32_t uavs = static_cast<std::uint32_t>((misc >> 36) & 0xff);
+    if (!uavs) return false;
+    const std::uint64_t st = ctx + 0xb730;
+    d.gds_base = 8;  // GDS byte 0x20: the commit's 0x20 + 4 * slot
+    for (std::uint32_t m = uavs; m; m &= m - 1) {
+        const int j = __builtin_ctz(m);
+        const std::uint64_t view = rd64(st + 0x2368 + 8 * static_cast<std::uint64_t>(j));
+        const std::uint64_t holder = view ? rd64(view + 8) : 0;
+        if (!holder) {
+            g_tc_no_view.fetch_add(1, std::memory_order_relaxed);
+            continue;
+        }
+        GpuDispatch::GdsCounter& c = d.gds[j];
+        c.word = rd64(holder + 0x20) + rd32(holder + 0x30) - 8;
+        const std::uint32_t init = rd32(ctx + 0x1fd0 + 4 * static_cast<std::uint64_t>(j));
+        c.start = init == 0xffffffffu ? GpuDispatch::kGdsKeep : GpuDispatch::kGdsSet;
+        c.value = init == 0xffffffffu ? 0 : init;
+        (c.start == GpuDispatch::kGdsSet ? g_tc_set : g_tc_kept).fetch_add(1, std::memory_order_relaxed);
+        g_tc_counters.fetch_add(1, std::memory_order_relaxed);
+    }
+    d.gds_from_token = g_token_counters == 2;
+    g_tc_dispatches.fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+
 struct DispatchRecord {
     GpuDispatch d;
     std::uint64_t caller = 0;
@@ -4838,6 +4890,7 @@ int wrapper_dispatch(Kind kind, const std::uint64_t* f, std::uint64_t caller) {
         auto rec = std::make_shared<GxStageRecords>();
         CsRecordsMiss why = kCsMissShader;
         if (snapshot_cs_records(cb - 0x10, *rec, &why)) {
+            if (g_token_counters) take_cs_counters(cb - 0x10, *rec, r.d);
             r.cs = std::move(rec);
             g_cs_records_taken.fetch_add(1, std::memory_order_relaxed);
         } else {
@@ -5134,6 +5187,14 @@ void report_dispatch_tokens() {
         }
         host_log("gx-dispatch: compute records taken at %llu dispatches through GX's compute commit; not taken:%s",
                  static_cast<ull>(g_cs_records_taken.load()), missed.empty() ? " none" : missed.c_str());
+        if (g_tc_dispatches.load()) {
+            host_log("gx-dispatch: GPU particle counters taken with the token from the UAVs (BBHOST_GX_TOKEN_COUNTERS=%d): %llu counting "
+                     "dispatches, %llu counters (%llu set to an initial count, %llu kept), %llu UAV slots with no view; the moves through "
+                     "GDS %s",
+                     g_token_counters, static_cast<ull>(g_tc_dispatches.load()), static_cast<ull>(g_tc_counters.load()),
+                     static_cast<ull>(g_tc_set.load()), static_cast<ull>(g_tc_kept.load()), static_cast<ull>(g_tc_no_view.load()),
+                     g_gds_moves_nopped ? "not written" : "written");
+        }
     }
     if (g_gx_cost_enabled) {
         const auto per = [](int k) {
@@ -6134,6 +6195,35 @@ void hle_gx_trace_arm(GuestMemory* mem) {
                  "them)%s",
                  patched, kDeadWriterCount, g_dead_packets == 2 ? " and return an address no caller can follow" : "",
                  kept ? "; the context-register writers are kept: the register file is kept" : "");
+    }
+    // BBHOST_GX_TOKEN_COUNTERS=2: the counters ride in the dispatch tokens, so
+    // the DMA_DATA moves through GDS around a counting dispatch are not
+    // written - the commit's load (0x2acc30f) and the post's store (0x2acd08c)
+    // are each one call of the DMA writer 0x1473e60 whose result nothing reads,
+    // and become a five-byte NOP. Only with every compute-commit dispatch a
+    // token with its records (the defaults), which is what carries them.
+    if (g_token_counters == 2 && g_native_dispatch == 2 && g_native == 2 && g_backend == 1 && g_ds_records_mode && !g_cp_writers) {
+        struct CallSite {
+            std::uint64_t va;
+            std::uint8_t call[5];
+        };
+        static constexpr CallSite kGdsMoves[] = {{0x2acc30f, {0xe8, 0x4c, 0x7b, 0x9a, 0xfe}}, {0x2acd08c, {0xe8, 0xcf, 0x6d, 0x9a, 0xfe}}};
+        int nopped = 0;
+        for (const CallSite& s : kGdsMoves) {
+            const std::uint64_t va = g_slide + (s.va - kPreferredGuestSlide);
+            if (va < mem->slide || va + 5 > mem->slide + mem->size) continue;
+            auto* p = static_cast<std::uint8_t*>(guest_ptr(*mem, va));
+            if (std::memcmp(p, s.call, 5) != 0) continue;
+            const std::uint64_t lo = va & ~0xfffull, hi = (va + 5 + 0xfff) & ~0xfffull;
+            if (!guest_protect_rwx(mem, lo, hi - lo)) continue;
+            static constexpr std::uint8_t kNop5[5] = {0x0f, 0x1f, 0x44, 0x00, 0x00};
+            std::memcpy(p, kNop5, 5);
+            guest_protect_rx(mem, lo, hi - lo);
+            ++nopped;
+        }
+        host_log("gx: GPU particle counters in the dispatch tokens: %d of 2 moves through GDS not written (BBHOST_GX_TOKEN_COUNTERS=1 "
+                 "writes them and checks the tokens against them)", nopped);
+        g_gds_moves_nopped = nopped == 2;
     }
     g_active = hooked > 0;
     host_log("gx: %d of %d hooks armed; trace %s (flips %llu-%llu), backend mode %d", hooked, static_cast<int>(kKinds),

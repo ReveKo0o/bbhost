@@ -235,6 +235,7 @@ void indirect_log(const char* kind, std::uint64_t args, const std::uint32_t* a, 
 }
 
 void bind_gds_counters(GpuDispatch& d);
+void note_counter_given(std::uint64_t word);
 void note_gpu_args(std::uint64_t va, std::size_t bytes);
 // BBHOST_CP_CENSUS=1: the clears and copies still reaching the command
 // processor as packets - each dispatch by what it was and who emitted it, and
@@ -1383,6 +1384,7 @@ void bind_gds_counters(GpuDispatch& d) {
         if (h.kind == GdsHeld::kValue) {
             c.start = GpuDispatch::kGdsSet;
             c.value = h.value;
+            note_counter_given(c.word);
         } else if (h.kind == GdsHeld::kWord && h.word != c.word) {
             c.start = GpuDispatch::kGdsCopy;
             c.from = h.word;
@@ -1396,6 +1398,93 @@ void bind_gds_counters(GpuDispatch& d) {
         any = true;
     }
     if (any) g_gds_dispatches.fetch_add(1, std::memory_order_relaxed);
+}
+
+// BBHOST_GX_TOKEN_COUNTERS: the counters a dispatch token carries from the
+// engine's objects (gx_trace.cpp take_cs_counters): each UAV's word, set to its
+// initial count first or counted on from what it holds. Each GDS dword they
+// take holds that word's count from here, as bind_gds_counters leaves it, so a
+// move through GDS that still arrives folds; the words are counter words.
+//
+// A counter kept from memory (initial count -1) that nothing ever gave a
+// count - no set count at a token, no CP write into the word - counts on from
+// whatever the buffer's memory held: what the Forbidden Woods dispatch of
+// 2da7fe60 copied into its arguments before the moves through GDS were
+// followed (3,176,062,614 workgroups). Counted, and the first few logged with
+// the buffer they belong to.
+std::mutex g_counters_given_mu;
+std::set<std::uint64_t> g_counters_given, g_counters_unset_logged;  // under g_counters_given_mu
+std::atomic<std::uint64_t> g_tc_adopted{0}, g_tc_kept_unset{0}, g_tc_check_dispatches{0}, g_tc_check_same{0}, g_tc_check_differ{0};
+
+void note_counter_given(std::uint64_t word) {
+    std::lock_guard<std::mutex> lk(g_counters_given_mu);
+    if (g_counters_given.size() < 65536) g_counters_given.insert(word);
+}
+
+void adopt_token_counters(const GpuDispatch& d) {
+    bool any = false;
+    for (std::uint32_t k = 0; k < GpuDispatch::kGdsCounters; ++k) {
+        const GpuDispatch::GdsCounter& c = d.gds[k];
+        if (!c.word) continue;
+        any = true;
+        note_counter_word(c.word);
+        if (d.gds_base + k < kGdsDwords) {
+            GdsHeld& h = t_gds[d.gds_base + k];
+            h.kind = GdsHeld::kWord;
+            h.word = c.word;
+        }
+        if (c.start == GpuDispatch::kGdsSet) {
+            note_counter_given(c.word);
+            continue;
+        }
+        bool given = false, logged = false;
+        {
+            std::lock_guard<std::mutex> lk(g_counters_given_mu);
+            given = g_counters_given.count(c.word) != 0;
+            // The first 16 such words are logged, each once.
+            if (!given) logged = g_counters_unset_logged.size() >= 16 || !g_counters_unset_logged.insert(c.word).second;
+        }
+        if (given) continue;
+        g_tc_kept_unset.fetch_add(1, std::memory_order_relaxed);
+        if (logged) continue;
+        std::uint32_t now = 0;
+        if (hle_kernel_va_mapped(c.word, 4)) std::memcpy(&now, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(c.word)), 4);
+        GxResourceInfo info;
+        const bool known = gx_resource_at(c.word, 4, &info);
+        host_log("gnm exec: a dispatch of program 0x%llx (%ux%ux%u%s) keeps the counter at 0x%llx (UAV %u) that nothing gave a count: "
+                 "memory holds %u (0x%08x) there%s; buffer %s id %u at 0x%llx, %u bytes, made at flip %llu %s initial data; flip %llu",
+                 static_cast<unsigned long long>(d.code_va), d.dim[0], d.dim[1], d.dim[2], d.indirect_va ? ", indirect" : "",
+                 static_cast<unsigned long long>(c.word), k, now, now, now > 0xffff ? " - garbage for a count" : "", known ? "" : "(none known)",
+                 known ? info.id : 0u, static_cast<unsigned long long>(known ? info.memory : 0), known ? info.bytes : 0u,
+                 static_cast<unsigned long long>(known ? info.created_flip : 0), known && info.initial_data ? "with" : "without",
+                 static_cast<unsigned long long>(hle_video_flip_count()));
+    }
+    if (any) g_tc_adopted.fetch_add(1, std::memory_order_relaxed);
+}
+
+// BBHOST_GX_TOKEN_COUNTERS=1: the counters bound from the moves through GDS,
+// as before, and the token's compared with them.
+void check_token_counters(GpuDispatch& d) {
+    const GpuDispatch tok = d;
+    for (GpuDispatch::GdsCounter& c : d.gds) c = GpuDispatch::GdsCounter{};
+    d.gds_base = 0;
+    bind_gds_counters(d);
+    g_tc_check_dispatches.fetch_add(1, std::memory_order_relaxed);
+    for (std::uint32_t k = 0; k < GpuDispatch::kGdsCounters; ++k) {
+        const GpuDispatch::GdsCounter& t = tok.gds[k];
+        if (!t.word) continue;
+        const std::uint32_t g = tok.gds_base + k;
+        const GpuDispatch::GdsCounter* p = g >= d.gds_base && g - d.gds_base < GpuDispatch::kGdsCounters ? &d.gds[g - d.gds_base] : nullptr;
+        const bool same = p && p->word == t.word && p->start == t.start && (t.start != GpuDispatch::kGdsSet || p->value == t.value);
+        (same ? g_tc_check_same : g_tc_check_differ).fetch_add(1, std::memory_order_relaxed);
+        if (!same && g_tc_check_differ.load(std::memory_order_relaxed) <= 8) {
+            host_log("gnm exec: program 0x%llx's counter in GDS dword %u: the token's 0x%llx %s %u, the moves' 0x%llx %s %u",
+                     static_cast<unsigned long long>(tok.code_va), g, static_cast<unsigned long long>(t.word),
+                     t.start == GpuDispatch::kGdsSet ? "set to" : "kept", t.value, static_cast<unsigned long long>(p ? p->word : 0),
+                     !p ? "-" : p->start == GpuDispatch::kGdsSet ? "set to" : p->start == GpuDispatch::kGdsCopy ? "copied" : "kept",
+                     p ? p->value : 0u);
+        }
+    }
 }
 
 // DMA_DATA into or out of GDS.
@@ -1448,6 +1537,7 @@ void gds_dma(const std::uint32_t* b, unsigned src_sel, unsigned dst_sel, std::si
                 ok = host_gpu_counter_copy(to, h.word, 4);
             } else if (h.kind == GdsHeld::kValue) {
                 ok = host_gpu_counter_fill(to, h.value, 4);
+                if (ok) note_counter_given(to);
             } else {
                 gds_log_once(unknown_logs, "gnm exec: DMA_DATA out of GDS dword %llu, which nothing loaded, to 0x%llx: dropped",
                              at + k, static_cast<unsigned long long>(to));
@@ -1661,6 +1751,7 @@ void execute_packet(std::uint32_t op, const std::uint32_t* b, std::size_t n, int
                     bool ok = true;
                     for (std::size_t k = 0; k + 3 < n && ok; ++k) ok = host_gpu_counter_fill(va + 4 * k, b[3 + k], 4);
                     if (ok) {
+                        for (std::size_t k = 0; k + 3 < n; ++k) note_counter_given(va + 4 * k);
                         g_counter_writes.fetch_add(1, std::memory_order_relaxed);
                         break;
                     }
@@ -1713,6 +1804,7 @@ void execute_packet(std::uint32_t op, const std::uint32_t* b, std::size_t n, int
                     const bool ok = src_sel == 2 ? host_gpu_counter_fill(dst, b[1], bytes) : host_gpu_counter_copy(dst, gpu_va(b[1], b[2]), bytes);
                     if (ok && g_cp_census) census_dma(kCdCounter, bytes);
                     if (ok) {
+                        for (std::size_t k = 0; k + 4 <= bytes && k < 64; k += 4) note_counter_given(dst + k);
                         (src_sel == 2 ? g_counter_writes : g_counter_reads).fetch_add(1, std::memory_order_relaxed);
                         // A count copied out (CopyStructureCount into a draw's
                         // arguments): its destination now holds a GPU value too.
@@ -2194,7 +2286,18 @@ void execute_packet(std::uint32_t op, const std::uint32_t* b, std::size_t n, int
                         }
                     }
                     if (dd.dim[0] && dd.dim[1] && dd.dim[2] && dd.threads[0]) {
-                        bind_gds_counters(dd);
+                        // The counters: from the token (the engine's objects), or
+                        // from the moves through GDS around it (checked against the
+                        // token's when it carries them).
+                        bool token_counters = false;
+                        for (const GpuDispatch::GdsCounter& c : dd.gds) token_counters |= c.word != 0;
+                        if (dd.gds_from_token) {
+                            adopt_token_counters(dd);
+                        } else if (token_counters) {
+                            check_token_counters(dd);
+                        } else {
+                            bind_gds_counters(dd);
+                        }
                         if (!host_gpu_dispatch(dd)) g_dispatch_failed.fetch_add(1);
                     }
                 }
@@ -3282,6 +3385,14 @@ void hle_gnm_exec_histogram() {
                  static_cast<unsigned long long>(g_gds_loads.load()), static_cast<unsigned long long>(g_gds_stores_folded.load()),
                  static_cast<unsigned long long>(g_gds_stores_moved.load()), words, static_cast<unsigned long long>(g_counter_reads.load()),
                  static_cast<unsigned long long>(g_counter_writes.load()));
+        if (g_tc_adopted.load() || g_tc_check_dispatches.load()) {
+            host_log("gnm: GPU particle counters from the dispatch tokens (BBHOST_GX_TOKEN_COUNTERS): %llu dispatches counted with them; "
+                     "%llu counters kept from memory that nothing gave a count; checked against the moves through GDS: %llu dispatches, "
+                     "%llu counters the same, %llu differing",
+                     static_cast<unsigned long long>(g_tc_adopted.load()), static_cast<unsigned long long>(g_tc_kept_unset.load()),
+                     static_cast<unsigned long long>(g_tc_check_dispatches.load()), static_cast<unsigned long long>(g_tc_check_same.load()),
+                     static_cast<unsigned long long>(g_tc_check_differ.load()));
+        }
     }
     for (int k = 0; k < 2; ++k) {
         const std::uint64_t n = g_cp_dispatch_n[k].load();
