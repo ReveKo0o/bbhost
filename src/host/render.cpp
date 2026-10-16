@@ -1308,6 +1308,10 @@ void keep_params(const std::string& name, const gcn::StageParams& params, int st
 std::atomic<std::uint64_t> g_cb_realigned{0}, g_cb_realigned_bytes{0};
 std::atomic<std::uint64_t> g_cb_snapshots{0};  // of them, memory the game writes on the CPU (BBHOST_CB_SNAPSHOT)
 std::atomic<std::uint64_t> g_cb_snapshots_shared{0};  // bindings that took an earlier snapshot of the recording (BBHOST_CB_SNAPSHOT_DEDUPE)
+// BBHOST_CB_SNAPSHOT_DEDUPE=check / =compare: the bindings that found an
+// earlier snapshot of the recording and compared its bytes with the guest's,
+// and how many of those differed.
+std::atomic<std::uint64_t> g_cb_snapshots_compared{0}, g_cb_snapshots_changed{0};
 const bool g_trace = [] {
     const char* e = std::getenv("BBHOST_TRACE_RENDER");
     return e && e[0] == '1';
@@ -9665,9 +9669,18 @@ void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t
                 // pushed ones (`exact`), each bound where its own copy is; the
                 // copy stays where it is for the rest of the lap (segment_serial).
                 // BBHOST_CB_SNAPSHOT_DEDUPE=0: each binding copies its own.
-                static const bool dedupe = [] {
+                // =check: shares as by default, but first compares the copy
+                // with the guest's bytes now and counts those that changed
+                // since (the report's "changed"); =compare: shares only a copy
+                // whose bytes still match, and copies again otherwise. Both
+                // read the write-combined ring back: slow, for checks.
+                enum { kDedupeOff, kDedupeOn, kDedupeCheck, kDedupeCompare };
+                static const int dedupe = [] {
                     const char* e = std::getenv("BBHOST_CB_SNAPSHOT_DEDUPE");
-                    return !(e && e[0] == '0');
+                    if (!e || !*e) return int{kDedupeOn};
+                    if (std::strcmp(e, "check") == 0) return int{kDedupeCheck};
+                    if (std::strcmp(e, "compare") == 0) return int{kDedupeCompare};
+                    return e[0] == '0' ? int{kDedupeOff} : int{kDedupeOn};
                 }();
                 struct SnapMemo {
                     std::uint64_t base = 0, bytes = 0, at = 0, serial = ~0ull, lap = 0;
@@ -9679,7 +9692,22 @@ void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t
                 const bool whole_ring = !exact && snapshot && g.ssbo_max_range >= kScratch;
                 if (dedupe && whole_ring && scratch.map) {
                     memo = &snap_memo[((base >> 4) ^ (base >> 14)) & 1023];
-                    if (memo->base == base && memo->serial == g.record_serial && memo->lap == scratch_lap && memo->bytes >= bytes) {
+                    bool share = memo->base == base && memo->serial == g.record_serial && memo->lap == scratch_lap && memo->bytes >= bytes;
+                    if (share && dedupe >= kDedupeCheck) {
+                        const bool same = std::memcmp(static_cast<const std::uint8_t*>(scratch.map) + memo->at,
+                                                      reinterpret_cast<const void*>(static_cast<std::uintptr_t>(base)), bytes) == 0;
+                        bump(g_cb_snapshots_compared);
+                        if (!same) {
+                            bump(g_cb_snapshots_changed);
+                            static std::atomic<int> told{0};
+                            if (told.fetch_add(1, std::memory_order_relaxed) < 8)
+                                host_log("render: a constant buffer snapshotted again in recording %llu changed since its first copy: "
+                                         "0x%llx, %llu bytes", static_cast<unsigned long long>(g.record_serial),
+                                         static_cast<unsigned long long>(base), static_cast<unsigned long long>(bytes));
+                            if (dedupe == kDedupeCompare) share = false;
+                        }
+                    }
+                    if (share) {
                         info = VkDescriptorBufferInfo{scratch.buffer, 0, kScratch};
                         params.cb_valid |= 1u << i;
                         params.cb_bias_dw[i] = static_cast<std::uint32_t>(memo->at / 4);
@@ -9834,8 +9862,11 @@ void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t
                      static_cast<unsigned long long>(g_cb_realigned.load()),
                      static_cast<unsigned long long>(g_cb_realigned_bytes.load() >> 20),
                      static_cast<unsigned long long>(g_sf_cb_snapshots.load()), static_cast<unsigned long long>(g_cb_snapshots.load()));
-            host_log("render:   %llu of those snapshots bound the copy an earlier binding of the same recording made (BBHOST_CB_SNAPSHOT_DEDUPE)",
-                     static_cast<unsigned long long>(g_cb_snapshots_shared.load()));
+            host_log("render:   %llu of those snapshots bound the copy an earlier binding of the same recording made (BBHOST_CB_SNAPSHOT_DEDUPE); "
+                     "compared with the guest's bytes %llu, changed since the copy %llu",
+                     static_cast<unsigned long long>(g_cb_snapshots_shared.load()),
+                     static_cast<unsigned long long>(g_cb_snapshots_compared.load()),
+                     static_cast<unsigned long long>(g_cb_snapshots_changed.load()));
         }
     }
 }
