@@ -27,10 +27,15 @@
 # large as its smallest target, so where an area turns glow on (or Glow:
 # force on does) the world was drawn into its top-left 80x45 and the rest
 # left black (NVIDIA players' screenshots, 2026-10-14).
+#
+# Off until turned on: the game's own sizes are half and a quarter of the
+# render size, so at 1920x1080 this takes the velocity map from 960x540 down
+# to 640x360, below what the game shipped with.
 [patch]
 name = "low-res-aux-targets"
 eboot = "941f887a562aae054fac35af8cc8f27cf075f3d4cc2e029fb5ae2a663aaa5ae7"
 description = "motion blur's buffers - the velocity map and the depth it tests against - at 640x360 (the quarter-size depth at 320x180) at every resolution, as the shadPS4 resolution patches"
+enabled = false
 order = 53
 
 # sub_125b0xx: mov eax, [rbx]; shr eax, 1; mov [rsp], eax -> mov dword [rsp], 640

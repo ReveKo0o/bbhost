@@ -138,7 +138,7 @@ Shipped patches:
 | `deflate-level.toml` | the game's run-time compression at level 1 instead of 9, removing a periodic ~25 ms hitch |
 | `old-hunters.toml` | makes the game treat itself as The Old Hunters edition, so the DLC is available (Kyo's 1.09 patch) |
 | `debug-camera.toml` | restores the debug free camera (Lance McDonald's 1.09 patch): hold Action and press L3 to cycle its modes. Off by default; it replaces a debug-menu test step, which then must not be used |
-| `low-res-aux-targets.toml` | the low-resolution renders of Kyo's shadPS4 resolution patches at every resolution: motion blur's velocity map and its depth at 640x360, the quarter-size depth at 320x180 (on by default). Not the patches' 80x45 glow buffer, which blacked out the lit world where glow is on |
+| `low-res-aux-targets.toml` | the low-resolution renders of Kyo's shadPS4 resolution patches at every resolution: motion blur's velocity map and its depth at 640x360, the quarter-size depth at 320x180 (off by default: at 1920x1080 the game's own velocity map is 960x540). Not the patches' 80x45 glow buffer, which blacked out the lit world where glow is on |
 | `screen-space-reflections.toml` | Enable Screen Space Reflections (enable only, keeps res), Kyo's patch (off by default) |
 | `disable-misc-renders.toml` | Disable Misc. Renders, Kyo's patch: four of the scene's extra targets are not made (off by default) |
 | `disable-dynamic-light-shadow.toml` | Disable Dynamic Light Shadow, Kyo's patch (off by default) |
