@@ -1453,10 +1453,22 @@ bool plausible_extent(std::uint32_t v, std::uint32_t padded) {
 // extent learned. target_image() reuses its last answer until then.
 std::uint64_t g_rt_gen = 1;
 
+// Milliseconds of a monotonic clock, for ages of a second and more (the
+// reuse retire's idle times, the once-a-second sweeps). On Linux the kernel's
+// coarse clock - its last tick, no TSC read: rt_written stamps every target
+// of every draw, and the precise clock there was 1% of the command
+// processor at Mensis.
 std::uint64_t steady_ms() {
+#if defined(__linux__)
+    timespec ts{};
+    clock_gettime(CLOCK_MONOTONIC_COARSE, &ts);
+    return static_cast<std::uint64_t>(ts.tv_sec) * 1000u + static_cast<std::uint64_t>(ts.tv_nsec) / 1000000u;
+#else
     return static_cast<std::uint64_t>(
         std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+#endif
 }
+std::uint64_t g_rt_write_seq = 0;  // under g.mu
 // A draw, a fill or a copy wrote the target (the reuse retire's age and order).
 // The time is read again once a flip and every 64 writes: every target of
 // every draw comes here, and the clock was 2.3% of the command processor in
@@ -1470,6 +1482,7 @@ void rt_written(RtImage& r) {
     }
     r.written_flip = f;
     r.written_ms = ms;
+    r.written_seq = ++g_rt_write_seq;
 }
 // The reuse retire's bases and when it retired them, to count a target made
 // again at a base it had retired within the idle time - the sign of retiring
@@ -11164,7 +11177,7 @@ std::uint64_t g_cv_stencil_by_htile = 0, g_cv_depth_by_htile = 0, g_cv_stencil_k
 // the clears of an image no draw had bound since its last clear; by image.
 std::uint64_t g_cv_bytes[kCvKinds] = {}, g_cv_pass_ends[kCvKinds] = {}, g_cv_again[kCvKinds] = {};  // under g.mu
 struct ClearCost {
-    std::uint64_t clears = 0, bytes = 0, again = 0, written_ms = 0;
+    std::uint64_t clears = 0, bytes = 0, again = 0, written_seq = 0;
     std::uint32_t width = 0, height = 0, layers = 0;
     int kind = 0;
 };
@@ -11322,7 +11335,7 @@ bool host_gpu_clear_view(const GpuClearView& c, bool apply, GpuClearViewResult* 
         ClearCost& cc = g_cv_by_image[r->base];
         // rt_written stamps an image at every draw that binds it (target_image)
         // and at this clear: unchanged since the last clear, no draw came between.
-        if (cc.clears && cc.written_ms == r->written_ms) {
+        if (cc.clears && cc.written_seq == r->written_seq) {
             ++cc.again;
             ++g_cv_again[kind];
         }
@@ -11394,14 +11407,14 @@ bool host_gpu_clear_view(const GpuClearView& c, bool apply, GpuClearViewResult* 
         }
         ++g_vc_set;
         rt_written(*r);
-        g_cv_by_image[r->base].written_ms = r->written_ms;
+        g_cv_by_image[r->base].written_seq = r->written_seq;
         return true;
     }
     if (!c.depth) {
         clear_image_locked(*r, c.rgba, first, count);
         note_fill_last(*r, r->base, rt_size_bytes(*r), c.rgba);
         rt_written(*r);
-        g_cv_by_image[r->base].written_ms = r->written_ms;
+        g_cv_by_image[r->base].written_seq = r->written_seq;
         return true;
     }
     // An HTILE clear an earlier fill left for this target's next draw is
@@ -11420,7 +11433,7 @@ bool host_gpu_clear_view(const GpuClearView& c, bool apply, GpuClearViewResult* 
     if (!planes.depth || (has_stencil && !planes.stencil)) ++g_cv_aspects[kind];
     clear_depth_layers_locked(*r, planes.depth, planes.stencil, planes.depth_value, planes.stencil_value, first, count);
     rt_written(*r);
-    g_cv_by_image[r->base].written_ms = r->written_ms;
+    g_cv_by_image[r->base].written_seq = r->written_seq;
     return true;
 }
 

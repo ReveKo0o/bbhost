@@ -970,8 +970,10 @@ struct RtImage {
     std::uint32_t view_clear_first = 0, view_clear_count = 0;
     // The flip it was made at, and the flip and the time (steady clock, ms) a
     // draw, a fill or a copy last wrote it: its age and order for the reuse
-    // retire (image_reuse_sweep_locked).
-    std::uint64_t created_flip = 0, written_flip = 0, written_ms = 0;
+    // retire (image_reuse_sweep_locked). written_seq numbers the writes (one
+    // counter for every target): what the clear costs compare to tell whether
+    // a draw came between two clears.
+    std::uint64_t created_flip = 0, written_flip = 0, written_ms = 0, written_seq = 0;
     // How its image was made, to make it again elsewhere (a target that went
     // to host memory for want of video memory comes back: render_return_targets_locked).
     VkImageCreateFlags create_flags = 0;
