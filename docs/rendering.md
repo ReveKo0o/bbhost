@@ -237,8 +237,9 @@ the default, and nothing waits on DXC:
   Cancel keeps what is done; the window stays live and Play waits for it. The
   run logs to `<data>/bbhost/shader-compile.log` and records its result in
   `<data>/bbhost/shader-compile.txt`. On the RTX 4070 it takes ~60 s (3,281
-  shaders, 3,682 DXC modules, 16 workers). What it does not do is a first
-  session's first sight: the variants a draw makes (clip-discard pixel
+  shaders, 3,682 DXC modules, 16 workers), on a laptop's RTX 3070 Ti (Ryzen 7
+  6800H, Windows) ~90 s and on the Steam Deck ~150 s. What it does not do is
+  a first session's first sight: the variants a draw makes (clip-discard pixel
   shaders, vertex layouts, the eboot's own programs, the tessellation LS
   pipelines) come from the pipeline manifest, which only earlier sessions
   fill; a first tour after it built as many pipelines on arrival as a cold
@@ -316,6 +317,28 @@ the default, and nothing waits on DXC:
     compiled. Against the same build with `BBHOST_HLSL=0` the GPU is busy
     2-5% less at five places (DXC's optimized code) and more at none.
   Compute dispatches take DXC's modules too.
+  - *A Windows laptop* (RTX 3070 Ti Laptop GPU): after Compile shaders now,
+    every start at 60 fps with no stall after the first in-game frame, the GPU
+    busy ~4.5% less than with the lift (409-415 against 429-430 ms/s), the
+    frames within the runs' own noise; its driver builds every lift and every
+    DXC module of the game (`gcn2hlsl --sweep`: none refused).
+  - *The Steam Deck*: after Compile shaders now, 60 fps as with the lift, and
+    GPU-bound (uncapped) 66.6-67.1 fps against the lift's 66.5-66.9. A first
+    session's compiles beside the world cost it ~2 fps and a long frame almost
+    every second, hence the hold on an integrated GPU (above): with it a first
+    session's world holds 60.0 fps (p95 16.8 ms, as the lift's own first
+    start does), and an install that skips Compile shaders now takes DXC's
+    modules a few hundred at a time, compiled over the title, the menus and
+    the loading screens of its next starts.
+- **Halves on a device that rounds them itself.** GCN's
+  `v_cvt_pkrtz_f16_f32` rounds toward zero. On a device that converts that
+  way inside a module and keeps f16 denormals (RADV, so the Steam Deck) the
+  lift uses the device's conversion, two operations a pair instead of ~6
+  integer operations a component. `BBHOST_HALF_NATIVE=0` keeps the integer
+  form, which a driver cannot fold (RADV's compiler drops some f32-to-f16-to-f32
+  round trips the native form leaves to it); on the Deck it cost ~1.8% of the
+  frame rate GPU-bound (65.3-66.0 against 66.6-67.1 fps uncapped), so the
+  device's own rounding stays the default.
 - **A driver that refuses DXC's module.** A pipeline the driver will not
   build from DXC's modules is built again from the lifts' own: a graphics
   pipeline whole or from its libraries, the native hulls' included, and a
@@ -360,12 +383,8 @@ the default, and nothing waits on DXC:
 - The completions the game waits on (GX's block pools and command arena, Map,
   query results) from the host's own submission timeline rather than labels,
   after which the PM4 command processor only orders work.
-- The HLSL default checked in game on Windows and the Steam Deck (the
-  driver sweeps there accepted every module), and whether a device that rounds
-  halves toward zero itself (the Deck's RADV) keeps that or takes the exact
-  integer form (`BBHOST_HALF_NATIVE=0`), measured on the Deck.
 - Editable source beyond replacing one stage's HLSL: edits read again while
-  the game runs, and names that survive a translator update.
+  the game runs.
 
 ## Tools
 
