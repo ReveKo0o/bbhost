@@ -6409,6 +6409,13 @@ void apply_relinks_locked() {
 // draw that recorded it built it - stages, libraries, the link or the whole
 // pipeline, then the optimized relink with the specialization that draw gave
 // it - and kept, by its content key, for the draw that needs it.
+}  // namespace
+}  // namespace gpu
+namespace {
+void replan_recorded_vertex_input(gpu::VertexInputPlan& p, bool tess_native);  // defined with pack_vertex_input
+}  // namespace
+namespace gpu {
+namespace {
 void replay_recipe(Precompiler& w, const std::shared_ptr<const PipelineRecipe>& recipe) {
     const PipelineRecipe& r = *recipe;
     const auto t0 = std::chrono::steady_clock::now();
@@ -6423,7 +6430,14 @@ void replay_recipe(Precompiler& w, const std::shared_ptr<const PipelineRecipe>& 
     }
     RtImage formats[9];
     const DrawState s = recipe_draw_state(r, formats);
-    const VertexInputPlan* vi = r.has_vertex_input ? &r.vertex_input : nullptr;
+    // The recorded vertex input as this build's draws plan theirs (a list or a
+    // manifest from another build: replan_recorded_vertex_input).
+    VertexInputPlan planned;
+    if (r.has_vertex_input) {
+        planned = r.vertex_input;
+        replan_recorded_vertex_input(planned, r.s.tess_native);
+    }
+    const VertexInputPlan* vi = r.has_vertex_input ? &planned : nullptr;
     reflection_from_bundle(r.vs_name);
     reflection_from_bundle(r.ps_name);
     if (r.has_ls) reflection_from_bundle(r.ls.name);
@@ -12530,7 +12544,7 @@ const bool g_vertex_pack = [] {
     const char* e = std::getenv("BBHOST_VERTEX_PACK");
     return !(e && e[0] == '0');
 }();
-void pack_vertex_input(VertexInputPlan& p) {
+void pack_vertex_input(VertexInputPlan& p, bool ask_usable = true) {
     bool any = false;
     for (VkVertexInputAttributeDescription& a : p.attributes) {
         if (a.location >= p.elements.size() || a.binding >= p.bindings.size()) continue;
@@ -12540,12 +12554,34 @@ void pack_vertex_input(VertexInputPlan& p) {
         const std::uint32_t bytes = vertex_format_bytes(dfmt);  // 2, 4 or 8
         const VkFormat f = bytes == 2 ? VK_FORMAT_R16_UINT : bytes == 4 ? VK_FORMAT_R32_UINT : VK_FORMAT_R32G32_UINT;
         const VkDeviceSize align = bytes == 2 ? 2 : 4;  // the packed format's component
-        if ((p.offset[a.binding] + a.offset) % align || p.bindings[a.binding].stride % align || !vertex_format_usable(f)) continue;
+        if ((p.offset[a.binding] + a.offset) % align || p.bindings[a.binding].stride % align || (ask_usable && !vertex_format_usable(f))) continue;
         a.format = f;
         el.packed = bits;
         any = true;
     }
     if (any) p.hash = vertex_plan_hash(p);
+}
+// A recipe's vertex input as this build's draws plan theirs (replay_recipe).
+// A draw here packs the elements pack_vertex_input packs, and the plan's
+// identity hash covers the elements' struct, which perf/next2 grew by
+// VertexElement::packed: a recipe recorded by a build without the packing (a
+// list, or a manifest from before) kept a plan and a hash no draw here
+// computes, and its pipeline was built for nothing. Such a recipe - its
+// recorded hash not this build's hash of its plan - is replanned: packed where
+// a draw would pack, the bindings taken as aligned (their offsets are not
+// recorded; the game's vertex buffers are), the hash made again, so it builds
+// the pipeline the draws look up. A recipe this build recorded is left as it
+// went in (a draw whose binding was not aligned kept its elements unpacked).
+// On a precompile worker: the packed formats are not asked about
+// (vertex_format_usable's answers are kept under g.mu), since R16_UINT,
+// R32_UINT and R32G32_UINT are vertex formats every Vulkan device must have.
+void replan_recorded_vertex_input(VertexInputPlan& p, bool tess_native) {
+    if (vertex_plan_hash(p) == p.hash) return;
+    if (g_vertex_pack && !tess_native && g_vertex_format_params && use_pipeline_library() &&
+        gcn::vertex_formats_from_params_supported(p.elements)) {
+        pack_vertex_input(p, false);
+    }
+    p.hash = vertex_plan_hash(p);
 }
 
 // The record a resource slot's pending-state object gives for a descriptor
