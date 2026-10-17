@@ -820,33 +820,45 @@ void census_faults_locked() {
     }
 }
 
-std::string fault_census_text() {
-    std::string out = "; write faults on mirror pages by what GX says of their 4 KiB (BBHOST_RESOURCE_CENSUS):";
+// The census on lines of its own (a log line holds 1024 bytes, which the
+// shadow's report fills by itself): the faults by class at every report, and
+// every twelfth (about a minute) each class with its four first writers.
+const char* const kFaultGxCode[kFaultOwners] = {"gx-buffers", "gx-part", "yebis", "scaleform", "nobody"};
+const char* const kFaultHandCode[kFaultHanders] = {"map", "pool", "ring", "yebis-rename", "none"};
+void log_fault_census() {
+    static unsigned calls = 0;
+    std::string line;
+    for (unsigned c = 0; c < kFaultClasses; ++c) {
+        if (!g_fault_class[c]) continue;
+        char buf[96];
+        std::snprintf(buf, sizeof(buf), "%s %s/%s %llu", line.empty() ? "" : ",", kFaultGxCode[c / kFaultHanders], kFaultHandCode[c % kFaultHanders],
+                      static_cast<unsigned long long>(g_fault_class[c]));
+        line += buf;
+    }
+    host_log("  buffer shadow census: mirror write faults by memory owner/hander:%s; other pages' faults %llu; 4 KiB pages handed out: by "
+             "Maps %llu (in pool memory %llu, in ring memory %llu), by the upload pool %llu, by the ring %llu, by YEBIS's renames %llu; GX "
+             "resources made over handed-out memory %llu",
+             line.empty() ? " none" : line.c_str(), static_cast<unsigned long long>(g_fault_census_other),
+             static_cast<unsigned long long>(g_hand_pages[kHandMap]), static_cast<unsigned long long>(g_map_in_pool),
+             static_cast<unsigned long long>(g_map_in_ring), static_cast<unsigned long long>(g_hand_pages[kHandPool]),
+             static_cast<unsigned long long>(g_hand_pages[kHandRing]), static_cast<unsigned long long>(g_hand_pages[kHandYebis]),
+             static_cast<unsigned long long>(g_made_over_handed));
+    if (calls++ % 12 != 0) return;
     for (unsigned c = 0; c < kFaultClasses; ++c) {
         if (!g_fault_class[c]) continue;
         std::vector<std::pair<std::uint64_t, std::uint64_t>> top(g_fault_writers[c].begin(), g_fault_writers[c].end());
         std::sort(top.begin(), top.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
-        char buf[160];
-        std::snprintf(buf, sizeof(buf), " %s memory %s %llu", kFaultGxName[c / kFaultHanders], kFaultHandName[c % kFaultHanders],
-                      static_cast<unsigned long long>(g_fault_class[c]));
-        out += buf;
-        for (std::size_t k = 0; k < top.size() && k < 4; ++k) {
-            std::snprintf(buf, sizeof(buf), "%s0x%llx x%llu", k ? ", " : " (", static_cast<unsigned long long>(top[k].first ? gx_guest_to_bn(top[k].first) : 0),
+        std::string w;
+        for (std::size_t k = 0; k < top.size() && k < 6; ++k) {
+            char buf[64];
+            std::snprintf(buf, sizeof(buf), "%s0x%llx x%llu", k ? ", " : "", static_cast<unsigned long long>(top[k].first ? gx_guest_to_bn(top[k].first) : 0),
                           static_cast<unsigned long long>(top[k].second));
-            out += buf;
+            w += buf;
         }
-        out += top.empty() ? ";" : ");";
+        host_log("  buffer shadow census: %s/%s (%s memory %s): %llu faults; writers %s", kFaultGxCode[c / kFaultHanders],
+                 kFaultHandCode[c % kFaultHanders], kFaultGxName[c / kFaultHanders], kFaultHandName[c % kFaultHanders],
+                 static_cast<unsigned long long>(g_fault_class[c]), w.c_str());
     }
-    char buf[384];
-    std::snprintf(buf, sizeof(buf),
-                  " other pages' faults %llu; 4 KiB pages handed out: by Maps %llu (Maps in pool memory %llu, in ring memory %llu), by the "
-                  "upload pool %llu, by the ring and YEBIS's renames %llu (GX resources made over handed-out memory %llu)",
-                  static_cast<unsigned long long>(g_fault_census_other), static_cast<unsigned long long>(g_hand_pages[kHandMap]),
-                  static_cast<unsigned long long>(g_map_in_pool), static_cast<unsigned long long>(g_map_in_ring),
-                  static_cast<unsigned long long>(g_hand_pages[kHandPool]), static_cast<unsigned long long>(g_hand_pages[kHandRing] + g_hand_pages[kHandYebis]),
-                  static_cast<unsigned long long>(g_made_over_handed));
-    out += buf;
-    return out;
 }
 
 }  // namespace
@@ -2015,10 +2027,12 @@ std::string shadow_report() {
                   static_cast<unsigned long long>(g_snapshot_staged.load()), static_cast<unsigned long long>(g_snapshot_pending.load()));
     out += st;
     out += sn;
+    // What GX's calls told the mirrors, on a line of its own (the report
+    // fills one).
     if (g_shadow_gx) {
-        char gx[512];
+        char gx[640];
         std::snprintf(gx, sizeof(gx),
-                      "; told by GX's calls (BBHOST_SHADOW_GX): pages bound from host memory for memory GX hands out %llu%s (resources "
+                      "told by GX's calls (BBHOST_SHADOW_GX): pages bound from host memory for memory GX hands out %llu%s (resources "
                       "made over such memory %llu), %llu page copies told and not watched, watched instead %llu (GX buffers cover them in "
                       "part) + %llu (none), GX writes %llu, told pages invalidated by them %llu (kept for a submission made before the write "
                       "%llu)%s",
@@ -2028,27 +2042,27 @@ std::string shadow_report() {
                       static_cast<unsigned long long>(g_watched_none), static_cast<unsigned long long>(g_gx_records.load()),
                       static_cast<unsigned long long>(g_told_invalid), static_cast<unsigned long long>(g_told_held),
                       g_told_overflows || g_told_unmapped ? "; every told page copied again after a queue overflow or an unmapped range" : "");
-        out += gx;
+        std::string told = gx;
         if (const std::uint64_t dropped = g_hand_dropped.load()) {
             char hd[96];
             std::snprintf(hd, sizeof(hd), "; hand-outs the full queue dropped %llu", static_cast<unsigned long long>(dropped));
-            out += hd;
+            told += hd;
         }
         if (g_verify) {
             char vt[64];
             std::snprintf(vt, sizeof(vt), "; stale told pages %llu", static_cast<unsigned long long>(g_verify_stale_told));
-            out += vt;
+            told += vt;
         }
+        host_log("  buffer shadow, %s", told.c_str());
     }
     if (g_map_census) {
         drain_gx_writes_locked();
         census_faults_locked();
-        out += fault_census_text();
-        char mc[200];
-        std::snprintf(mc, sizeof(mc), "; pages the write watch found written: a GX write explains %llu, on a GX resource it does not %llu, on none %llu",
-                      static_cast<unsigned long long>(g_written_by_gx.load()), static_cast<unsigned long long>(g_written_not_gx.load()),
-                      static_cast<unsigned long long>(g_written_no_resource.load()));
-        out += mc;
+        log_fault_census();
+        host_log("  buffer shadow census: pages the write watch found written: a GX write explains %llu, on a GX resource it does not %llu, on "
+                 "none %llu",
+                 static_cast<unsigned long long>(g_written_by_gx.load()), static_cast<unsigned long long>(g_written_not_gx.load()),
+                 static_cast<unsigned long long>(g_written_no_resource.load()));
     }
     return out;
 }
