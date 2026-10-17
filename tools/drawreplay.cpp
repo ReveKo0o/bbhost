@@ -40,6 +40,13 @@
 // multiset of its records; every other byte of every page exactly. --cs
 // FILE.spv: the dispatch again with another compute module (the lift against
 // a captured translation, or the reverse), against A by the same rules.
+// --cs-buffers FILE.json (gcnlift --lean's lean-buffers.json): the variant is
+// a lean module, which reads storage buffers the renderer binds: each
+// binding's V# or pointer resolved from the captured user data and pages and
+// bound over the pages it covers, with its bias, stride and valid bit in a
+// params block of its own (render.cpp resolve_stage_buffers). --cs-base
+// FILE.spv: A and B run this module instead of the captured one (the walking
+// translation today's translator makes, gcnlift's reference.spv).
 //
 // Exit 0: every check passed; 1: a check failed; 2: bad capture or Vulkan error.
 #include "core/sha256.h"
@@ -1932,6 +1939,8 @@ struct Options {
     fs::path hs;   // a tessellated draw's control stage
     fs::path native;  // gcnlift --native's folder: a game-hull draw's three stages on stage I/O
     fs::path cs;      // a dispatch capture's variant compute module
+    fs::path cs_base;     // a dispatch capture's module for A and B in place of the captured one
+    fs::path cs_buffers;  // gcnlift --lean's lean-buffers.json: the variant binds these storage buffers
     fs::path ls_set4;  // gcnlift --ls's ls-set4.json: the --ls variant binds its constant buffers in set 4
     bool live = true;
     bool validate = false;
@@ -1942,7 +1951,8 @@ struct Options {
 
 [[noreturn]] void usage() {
     std::fprintf(stderr, "usage: drawreplay <capture-dir> [--out DIR] [--atol X] [--rtol Y] [--ps FILE.spv] [--vs FILE.spv] [--ds FILE.spv] [--ls FILE.spv] "
-                         "[--hs FILE.spv] [--ls-set4 FILE.json] [--native DIR] [--cs FILE.spv] [--library] [--specialize] [--no-live] [--validate] "
+                         "[--hs FILE.spv] [--ls-set4 FILE.json] [--native DIR] [--cs FILE.spv] [--cs-base FILE.spv] [--cs-buffers FILE.json] [--library] "
+                         "[--specialize] [--no-live] [--validate] "
                          "[--bench N]\n");
     std::exit(2);
 }
@@ -1960,6 +1970,8 @@ Options parse_args(int argc, char** argv) {
         else if (a == "--rtol") o.tol.rtol = std::strtod(value().c_str(), nullptr);
         else if (a == "--ps") o.ps = value();
         else if (a == "--cs") o.cs = value();
+        else if (a == "--cs-base") o.cs_base = value();
+        else if (a == "--cs-buffers") o.cs_buffers = value();
         else if (a == "--vs" || a == "--ds") o.vs = value();
         else if (a == "--ls") o.ls = value();
         else if (a == "--native") o.native = value();
@@ -2030,6 +2042,7 @@ public:
     ~DispatchReplayer() {
         if (variant_pipeline_) vkDestroyPipeline(dev_.device, variant_pipeline_, nullptr);
         if (variant_module_) vkDestroyShaderModule(dev_.device, variant_module_, nullptr);
+        dev_.destroy(variant_params_);
         if (pipeline_) vkDestroyPipeline(dev_.device, pipeline_, nullptr);
         if (module_) vkDestroyShaderModule(dev_.device, module_, nullptr);
         for (auto& [id, v] : views_) vkDestroyImageView(dev_.device, v, nullptr);
@@ -2045,6 +2058,106 @@ public:
         dev_.destroy(l1_);
         for (auto& [i, t] : l2_) dev_.destroy(t);
     }
+
+    // --cs-base: A's (and B's, the sentinel run's) module in place of the captured one.
+    void base(const std::vector<std::uint32_t>& words) {
+        if (pipeline_) vkDestroyPipeline(dev_.device, pipeline_, nullptr);
+        if (module_) vkDestroyShaderModule(dev_.device, module_, nullptr);
+        pipeline_ = VK_NULL_HANDLE;
+        module_ = VK_NULL_HANDLE;
+        make_pipeline(words, module_, pipeline_, "base");
+    }
+
+    // --cs-buffers: the variant's storage buffers, bound as the renderer's
+    // resolve_stage_buffers binds a lean dispatch's (gpu.cpp
+    // resolve_dispatch_buffers): the V# (or pointer) from its path over the
+    // captured user data and pages; a null one to the sink page; the range
+    // the shader may read - max_dw dwords, a V# read by index its records
+    // (count x stride, the stride in cb_stride), one read at a run-time
+    // offset its range (in cb_stride) - over the captured pages, which must
+    // hold it whole and in order; the bias of the base inside the device's
+    // offset alignment in cb_bias_dw. Empty, or why a binding cannot be made
+    // (the renderer would run the walking pipeline then).
+    std::string variant_buffers(const json::Value& lean) {
+        gcn::StageParams sp = params_host_;
+        VkPhysicalDeviceProperties props{};
+        vkGetPhysicalDeviceProperties(dev_.phys, &props);
+        const VkDeviceSize align = std::max<VkDeviceSize>(4, props.limits.minStorageBufferOffsetAlignment);
+        struct Bound {
+            std::uint32_t binding;
+            VkDescriptorBufferInfo info;
+        };
+        std::vector<Bound> bound;
+        const auto& list = json::arr(lean, "buffers");
+        if (list.size() > 16) return "more than 16 buffers";
+        for (std::size_t i = 0; i < list.size(); ++i) {
+            const json::Value& b = list[i];
+            const bool pointer = json::flag(b, "pointer"), indexed = json::flag(b, "indexed"), ranged = json::flag(b, "ranged");
+            const std::string what = "buffer " + std::to_string(i) + " (" + json::str(json::member(b, "path"), "text") + ")";
+            std::uint32_t words[4] = {};
+            if (!resolve(json::member(b, "path"), pointer ? 2 : indexed || ranged ? 4 : 2, words)) return what + ": not in the captured user data or pages";
+            VkDeviceSize bytes = static_cast<VkDeviceSize>(json::u32(b, "max_dw")) * 4;
+            if (indexed) {
+                const std::uint32_t stride = (words[1] >> 16) & 0x3fff;
+                if (!stride || stride % 4) return what + ": a stride the binding cannot index";
+                bytes = std::max<VkDeviceSize>(bytes, static_cast<VkDeviceSize>(words[2]) * stride);
+                sp.cb_stride[i] = stride;
+                sp.cb_w3[i] = words[3];
+            }
+            if (ranged) {
+                const std::uint64_t range_dw = gcn::vsharp_range_dwords(words[1], words[2]);
+                bytes = std::max<VkDeviceSize>(bytes, range_dw * 4);
+                sp.cb_stride[i] = static_cast<std::uint32_t>(std::min<std::uint64_t>(range_dw, 0xffffffffu));
+            }
+            bytes = std::max<VkDeviceSize>(bytes, 4);
+            const std::uint64_t hi = pointer ? words[1] : (words[1] & 0xff);
+            const std::uint64_t va = static_cast<std::uint64_t>(words[0]) | (hi << 32);
+            VkDescriptorBufferInfo info{};
+            if (!va) {
+                if (bytes > kPage) return what + ": a null V# longer than the sink page";
+                info = {sink_.buffer, 0, bytes};
+                sp.cb_bias_dw[i] = 0;
+            } else {
+                if (va & 3) return what + ": a base not on a dword";
+                const std::uint64_t first = va & ~(kPage - 1), last = (va + bytes - 1) & ~(kPage - 1);
+                const auto it = std::lower_bound(page_vas_.begin(), page_vas_.end(), first);
+                if (it == page_vas_.end() || *it != first) return what + ": the capture lacks its first page";
+                const std::size_t idx = static_cast<std::size_t>(it - page_vas_.begin());
+                std::size_t k = 0;
+                for (std::uint64_t pg = first; pg <= last; pg += kPage, ++k) {
+                    if (idx + k >= page_vas_.size() || page_vas_[idx + k] != pg) return what + ": the capture lacks a page it covers";
+                }
+                const VkDeviceSize off = static_cast<VkDeviceSize>(idx) * kPage + (va - first);
+                const VkDeviceSize start = off & ~(align - 1);
+                info = {pages_.buffer, start, off - start + bytes};
+                sp.cb_bias_dw[i] = static_cast<std::uint32_t>((off - start) / 4);
+            }
+            sp.cb_valid |= 1u << i;
+            bound.push_back({json::u32(b, "binding"), info});
+        }
+        variant_params_ = dev_.buffer((sizeof(gcn::StageParams) + 255) & ~std::size_t{255}, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
+        std::memcpy(variant_params_.map, &sp, sizeof(sp));
+        VkDescriptorSetAllocateInfo dai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+        dai.descriptorPool = pool_;
+        dai.descriptorSetCount = 1;
+        dai.pSetLayouts = &set_layout_;
+        check(vkAllocateDescriptorSets(dev_.device, &dai, &variant_set_), "vkAllocateDescriptorSets (variant)");
+        write_set(variant_set_, variant_params_);
+        std::vector<VkWriteDescriptorSet> writes;
+        for (const Bound& x : bound) {
+            VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+            w.dstSet = variant_set_;
+            w.dstBinding = x.binding;
+            w.descriptorCount = 1;
+            w.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            w.pBufferInfo = &x.info;
+            writes.push_back(w);
+        }
+        if (!writes.empty()) vkUpdateDescriptorSets(dev_.device, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
+        variant_bound_ = bound.size();
+        return {};
+    }
+    std::size_t variant_bound() const { return variant_bound_; }
 
     // A second pipeline from another compute module (--cs), on the same layout.
     void variant(const std::vector<std::uint32_t>& words) {
@@ -2073,7 +2186,8 @@ public:
             mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
             vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
             vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, with_variant ? variant_pipeline_ : pipeline_);
-            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, layout_, 0, 1, &set_, 0, nullptr);
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, layout_, 0, 1, with_variant && variant_set_ ? &variant_set_ : &set_, 0,
+                                    nullptr);
             vkCmdDispatch(cmd, groups_[0], groups_[1], groups_[2]);
             mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
             mb.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
@@ -2107,7 +2221,8 @@ public:
             mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
             vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
             vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, with_variant ? variant_pipeline_ : pipeline_);
-            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, layout_, 0, 1, &set_, 0, nullptr);
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, layout_, 0, 1, with_variant && variant_set_ ? &variant_set_ : &set_, 0,
+                                    nullptr);
             vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, qpool, 0);
             for (std::uint32_t k = 0; k < repeat; ++k) {
                 vkCmdDispatch(cmd, groups_[0], groups_[1], groups_[2]);
@@ -2308,11 +2423,14 @@ private:
         plci.setLayoutCount = 1;
         plci.pSetLayouts = &set_layout_;
         check(vkCreatePipelineLayout(dev_.device, &plci, nullptr, &layout_), "vkCreatePipelineLayout");
-        const VkDescriptorPoolSize sizes[] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1}, {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 32},
-                                              {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 32}};
+        // Two sets: A's, and the variant's when it binds storage buffers (--cs-buffers).
+        const VkDescriptorPoolSize sizes[] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 2},
+                                              {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 64},
+                                              {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 64},
+                                              {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, gcn::kMaxBuffers}};
         VkDescriptorPoolCreateInfo dpci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
-        dpci.maxSets = 1;
-        dpci.poolSizeCount = 3;
+        dpci.maxSets = 2;
+        dpci.poolSizeCount = 4;
         dpci.pPoolSizes = sizes;
         check(vkCreateDescriptorPool(dev_.device, &dpci, nullptr, &pool_), "vkCreateDescriptorPool");
         VkDescriptorSetAllocateInfo dai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
@@ -2364,12 +2482,20 @@ private:
         gcn::StageParams sp{};
         std::memcpy(&sp, params.data(), params.size());
         sp.l1_table = l1_.address;
+        params_host_ = sp;
         params_ = dev_.buffer((sizeof(gcn::StageParams) + 255) & ~std::size_t{255}, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
         std::memcpy(params_.map, &sp, sizeof(sp));
+        write_set(set_, params_);
+        make_pipeline(words_of(cap_.blob(json::str(stage, "spirv")), "the compute module"), module_, pipeline_, "");
+    }
+
+    // A set's params block and the captured images, as A's set has them.
+    void write_set(VkDescriptorSet set, const Buffer& params) {
+        const json::Value& stage = json::member(cap_.m, "stage");
         std::vector<VkWriteDescriptorSet> writes;
-        VkDescriptorBufferInfo ubi{params_.buffer, 0, sizeof(gcn::StageParams)};
+        VkDescriptorBufferInfo ubi{params.buffer, 0, sizeof(gcn::StageParams)};
         VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
-        w.dstSet = set_;
+        w.dstSet = set;
         w.dstBinding = gcn::kBindingParams;
         w.descriptorCount = 1;
         w.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
@@ -2383,7 +2509,7 @@ private:
             if (it == views_.end()) fail("an image binding names an image the capture lacks");
             infos.push_back({VK_NULL_HANDLE, it->second, VK_IMAGE_LAYOUT_GENERAL});
             VkWriteDescriptorSet iw{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
-            iw.dstSet = set_;
+            iw.dstSet = set;
             iw.dstBinding = json::u32(b, "binding");
             iw.descriptorCount = 1;
             iw.descriptorType = storage_ids_.count(json::str(b, "image")) ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE : VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
@@ -2391,18 +2517,56 @@ private:
             writes.push_back(iw);
         }
         vkUpdateDescriptorSets(dev_.device, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
-        const std::vector<std::uint32_t> words = words_of(cap_.blob(json::str(stage, "spirv")), "the compute module");
+    }
+    void make_pipeline(const std::vector<std::uint32_t>& words, VkShaderModule& module, VkPipeline& pipeline, const std::string& what) {
         VkShaderModuleCreateInfo mci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
         mci.codeSize = words.size() * 4;
         mci.pCode = words.data();
-        check(vkCreateShaderModule(dev_.device, &mci, nullptr, &module_), "vkCreateShaderModule");
+        check(vkCreateShaderModule(dev_.device, &mci, nullptr, &module), ("vkCreateShaderModule" + (what.empty() ? "" : " (" + what + ")")).c_str());
         VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
         ci.layout = layout_;
         ci.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
         ci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
-        ci.stage.module = module_;
+        ci.stage.module = module;
         ci.stage.pName = "main";
-        check(vkCreateComputePipelines(dev_.device, VK_NULL_HANDLE, 1, &ci, nullptr, &pipeline_), "vkCreateComputePipelines");
+        check(vkCreateComputePipelines(dev_.device, VK_NULL_HANDLE, 1, &ci, nullptr, &pipeline),
+              ("vkCreateComputePipelines" + (what.empty() ? "" : " (" + what + ")")).c_str());
+    }
+
+    // `ndw` dwords at a guest address from the captured pages (before the dispatch).
+    bool read_guest(std::uint64_t va, int ndw, std::uint32_t* out) const {
+        const auto& blob = before();
+        for (int k = 0; k < ndw; ++k) {
+            const std::uint64_t a = va + static_cast<std::uint64_t>(k) * 4;
+            const auto it = std::lower_bound(page_vas_.begin(), page_vas_.end(), a & ~(kPage - 1));
+            if (it == page_vas_.end() || *it != (a & ~(kPage - 1))) return false;
+            std::memcpy(&out[k], blob.data() + static_cast<std::size_t>(it - page_vas_.begin()) * kPage + (a & (kPage - 1)), 4);
+        }
+        return true;
+    }
+    // A resource path (gcnlift --lean's lean-buffers.json) over the captured
+    // user data and pages, as the renderer's resolve_resource_impl walks it.
+    bool resolve(const json::Value& path, int ndw, std::uint32_t* out) const {
+        const int us = static_cast<int>(json::num(path, "user_sgpr"));
+        if (us < 0 || us + 1 >= 16) return false;
+        const std::uint32_t* user = params_host_.user_sgpr;
+        if (json::flag(path, "immediate")) {
+            if (us + ndw > 16) return false;
+            std::memcpy(out, user + us, static_cast<std::size_t>(ndw) * 4);
+            return true;
+        }
+        const auto base_of = [](const std::uint32_t* w, bool vsharp) {
+            return vsharp ? (static_cast<std::uint64_t>(w[0]) | (static_cast<std::uint64_t>(w[1] & 0xff) << 32))
+                          : (static_cast<std::uint64_t>(w[0]) | (static_cast<std::uint64_t>(w[1]) << 32));
+        };
+        std::uint32_t cur[4] = {user[us], user[us + 1], us + 2 < 16 ? user[us + 2] : 0u, us + 3 < 16 ? user[us + 3] : 0u};
+        for (const json::Value& st : json::arr(path, "loads")) {
+            const std::uint64_t addr = base_of(cur, json::flag(st, "vsharp")) + static_cast<std::uint64_t>(json::u32(st, "offset_dw")) * 4;
+            if (!read_guest(addr, 4, cur)) return false;
+        }
+        const std::uint64_t addr = base_of(cur, json::flag(path, "final_vsharp")) +
+                                   static_cast<std::uint64_t>(static_cast<std::int64_t>(json::num(path, "final_offset_dw"))) * 4;
+        return read_guest(addr, ndw, out);
     }
 
     const Capture& cap_;
@@ -2420,6 +2584,10 @@ private:
     VkDescriptorSet set_ = VK_NULL_HANDLE;
     VkShaderModule module_ = VK_NULL_HANDLE, variant_module_ = VK_NULL_HANDLE;
     VkPipeline pipeline_ = VK_NULL_HANDLE, variant_pipeline_ = VK_NULL_HANDLE;
+    gcn::StageParams params_host_{};                // A's params block as the replay gives it
+    VkDescriptorSet variant_set_ = VK_NULL_HANDLE;  // --cs-buffers: the variant's set
+    Buffer variant_params_;
+    std::size_t variant_bound_ = 0;
     std::uint32_t groups_[3] = {1, 1, 1};
     std::vector<std::uint64_t> counters_;
     std::vector<Written> written_;
@@ -2432,7 +2600,20 @@ int dispatch_replay_main(const Options& o, const Capture& cap, const fs::path& o
     std::printf("drawreplay: dispatch %s (%s, flip %llu) on %s\n", o.capture.string().c_str(), json::str(identity, "pipeline").c_str(),
                 static_cast<unsigned long long>(json::u64(identity, "flip")), dev.name.c_str());
     DispatchReplayer r(cap, dev);
+    if (!o.cs_base.empty()) r.base(words_of(read_file(o.cs_base), "the base compute module"));
     if (!o.cs.empty()) r.variant(words_of(read_file(o.cs), "the variant compute module"));
+    if (!o.cs_buffers.empty()) {
+        const std::vector<std::uint8_t> text = read_file(o.cs_buffers);
+        json::Value lean;
+        std::string error;
+        if (!json::parse(std::string(text.begin(), text.end()), lean, error)) fail(o.cs_buffers.string() + ": " + error);
+        const std::string why = r.variant_buffers(lean);
+        if (!why.empty()) {
+            std::printf("  the variant's buffers cannot be bound: %s\n", why.c_str());
+            return 3;
+        }
+        std::printf("  the variant binds %zu storage buffers\n", r.variant_bound());
+    }
     const auto a = r.run(false);
     const auto b = r.run(false);
     const auto sentinel = r.run(true);

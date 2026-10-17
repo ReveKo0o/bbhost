@@ -547,7 +547,32 @@ int run_native(const fs::path& capture, const fs::path& out) {
 // for a capture taken with the lift bound), and the lift made against it.
 // Replay with `drawreplay <capture-dir> --cs <out-dir>/lifted.spv` (or
 // reference.spv for a captured lift).
-int run_dispatch(const fs::path& capture, const fs::path& out, const json::Value& m) {
+//
+// --lean: also the dispatch's lean translation (gpu.cpp compute_options with
+// its buffers: cb_ssbo, cb_no_fallback - here in the stage's own set, bias
+// from the params) and its lift: lean-reference.spv, lean-lifted.spv and
+// lean-buffers.json (each binding's path and shape, for drawreplay
+// --cs-buffers). The rebuilt walking translation, reference.spv, is the base
+// they are replayed against (drawreplay --cs-base), so a capture whose
+// module an older translator made still compares.
+json::Value path_json(const gcn::ResourcePath& p) {
+    json::Value v = json::Value::make_object();
+    v.set("user_sgpr", static_cast<long>(p.user_sgpr));
+    json::Value loads = json::Value::make_array();
+    for (const gcn::ResourceStep& st : p.loads) {
+        json::Value l = json::Value::make_object();
+        l.set("offset_dw", static_cast<unsigned long>(st.offset_dw));
+        l.set("vsharp", st.vsharp);
+        loads.push(l);
+    }
+    v.set("loads", loads);
+    v.set("final_offset_dw", static_cast<long>(p.final_offset_dw));
+    v.set("final_vsharp", p.final_vsharp);
+    v.set("immediate", p.immediate);
+    v.set("text", p.str());
+    return v;
+}
+int run_dispatch(const fs::path& capture, const fs::path& out, const json::Value& m, bool lean) {
     const json::Value& blobs = json::member(m, "blobs");
     const auto blob = [&](const std::string& name) { return read_file(capture / json::str(json::member(blobs, name.c_str()), "file")); };
     const json::Value& stage = json::member(m, "stage");
@@ -608,6 +633,50 @@ int run_dispatch(const fs::path& capture, const fs::path& out, const json::Value
     std::printf("rebuilt %s compute module %s the captured SPIR-V; lift %s%s\n", captured_lifted ? "lifted" : "translated",
                 same_reference ? "matches" : "DOES NOT MATCH", lifted.ok() ? "ok" : "rejected", invalid.empty() ? "" : (" but INVALID: " + invalid).c_str());
     for (const std::string& r : lifted.rejections) std::printf("  rejected: %s\n", r.c_str());
+    if (lean) {
+        gcn::TranslateOptions lo = o;
+        lo.cb_ssbo = true;
+        lo.cb_no_fallback = true;
+        lo.cb_descriptor_set = -1;
+        lo.cb_bias_zero = false;
+        const gcn::TranslateResult lean_ref = gcn::translate(program, lo);
+        const gcn::LiftResult lean_lift = lean_ref.ok() ? gcn::lift_compute_shader(program, lo, lean_ref) : gcn::LiftResult{};
+        const std::string lean_invalid = lean_lift.ok() ? validate(lean_lift.spirv) : std::string();
+        json::Value buffers = json::Value::make_array();
+        for (const gcn::BufferBinding& b : lean_ref.buffers) {
+            json::Value x = json::Value::make_object();
+            x.set("path", path_json(b.path));
+            x.set("pointer", b.pointer);
+            x.set("indexed", b.indexed);
+            x.set("ranged", b.ranged);
+            x.set("written", b.written);
+            x.set("max_dw", static_cast<unsigned long>(b.max_dw));
+            x.set("binding", static_cast<unsigned long>(b.binding));
+            buffers.push(x);
+        }
+        json::Value lj = json::Value::make_object();
+        lj.set("schema", "bbhost-lean-buffers");
+        lj.set("buffers", buffers);
+        json::Value walks = json::Value::make_array();
+        for (const auto& [why, n] : lean_ref.walks) walks.push(why + " x" + std::to_string(n));
+        lj.set("walks", walks);
+        lj.set("translated", lean_ref.ok());
+        lj.set("lifted", lean_lift.ok());
+        lj.set("lift_valid", lean_lift.ok() && lean_invalid.empty());
+        json::Value lr = json::Value::make_array();
+        for (const std::string& r : lean_lift.rejections) lr.push(r);
+        lj.set("lift_rejections", lr);
+        write_file(out / "lean-buffers.json", json::dump(lj));
+        if (lean_ref.ok()) write_file(out / "lean-reference.spv", spv_text(lean_ref.spirv));
+        if (lean_lift.ok()) write_file(out / "lean-lifted.spv", spv_text(lean_lift.spirv));
+        std::printf("lean: translation %s, %zu buffers, %zu walks left; lift %s%s\n", lean_ref.ok() ? "ok" : lean_ref.errors[0].c_str(),
+                    lean_ref.buffers.size(), lean_ref.walks.size(), lean_lift.ok() ? "ok" : "rejected",
+                    lean_invalid.empty() ? "" : (" but INVALID: " + lean_invalid).c_str());
+        for (const std::string& r : lean_lift.rejections) std::printf("  lean rejected: %s\n", r.c_str());
+        // Replayed against the rebuilt walking translation: no need for it
+        // to reproduce the captured module.
+        return reference.ok() && lean_ref.ok() && lean_lift.ok() && lean_invalid.empty() ? 0 : 1;
+    }
     if (!same_reference) {
         std::printf("  the rebuilt options do not reproduce the dispatch's shader; the lift is not comparable\n");
         return 1;
@@ -615,12 +684,12 @@ int run_dispatch(const fs::path& capture, const fs::path& out, const json::Value
     return lifted.ok() && invalid.empty() ? 0 : 1;
 }
 
-int run(const fs::path& capture, const fs::path& out, bool vs) {
+int run(const fs::path& capture, const fs::path& out, bool vs, bool lean = false) {
     const std::vector<std::uint8_t> text = read_file(capture / "manifest.json");
     json::Value m;
     std::string error;
     if (!json::parse(std::string(text.begin(), text.end()), m, error)) fail("manifest.json: " + error);
-    if (json::str(m, "schema") == "bbhost-dispatch-capture") return run_dispatch(capture, out, m);
+    if (json::str(m, "schema") == "bbhost-dispatch-capture") return run_dispatch(capture, out, m, lean);
     if (json::str(m, "schema") != "bbhost-draw-capture") fail("not a draw capture");
     const json::Value& blobs = json::member(m, "blobs");
     const auto blob = [&](const std::string& name) { return read_file(capture / json::str(json::member(blobs, name.c_str()), "file")); };
@@ -744,14 +813,15 @@ int main(int argc, char** argv) {
     const bool ls = argc == 4 && std::strcmp(argv[3], "--ls") == 0;
     const bool ds = argc == 4 && std::strcmp(argv[3], "--ds") == 0;
     const bool native = argc == 4 && std::strcmp(argv[3], "--native") == 0;
-    if (argc != 3 && !vs && !ls && !ds && !native) {
-        std::fprintf(stderr, "usage: gcnlift <capture-dir> <out-dir> [--vs | --ls | --ds | --native]\n");
+    const bool lean = argc == 4 && std::strcmp(argv[3], "--lean") == 0;
+    if (argc != 3 && !vs && !ls && !ds && !native && !lean) {
+        std::fprintf(stderr, "usage: gcnlift <capture-dir> <out-dir> [--vs | --ls | --ds | --native | --lean]\n");
         return 2;
     }
     try {
         if (native) return run_native(argv[1], argv[2]);
         if (ls || ds) return run_tess(argv[1], argv[2], ls);
-        return run(argv[1], argv[2], vs);
+        return run(argv[1], argv[2], vs, lean);
     } catch (const std::exception& e) {
         std::fprintf(stderr, "gcnlift: %s\n", e.what());
         return 2;

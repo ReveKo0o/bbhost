@@ -20,6 +20,14 @@ module from the same inputs and compares the guest pages and storage images
 On lavapipe the dispatches run with LP_NUM_THREADS=1 (unless set), so the
 workgroups take their counter steps in the same order in every run.
 
+With --stage cs --lean each dispatch is checked in its lean form (the
+variant a dispatch runs with its buffers pushed, ComputeLean): gcnlift --lean
+rebuilds the walking translation and makes the lean translation and its
+lift, and drawreplay runs each of those two against the rebuilt walking
+translation (--cs-base), binding their storage buffers from the captured
+pages (--cs-buffers). A capture whose module an older translator made still
+compares; one whose buffers the capture does not hold whole is "not bound".
+
 Writes <out>/summary.json and prints one line per capture plus the totals:
 lifted and byte-identical, lifted but different, rejected (with the reasons),
 not comparable (the rebuilt options did not reproduce the captured shader, or
@@ -126,6 +134,63 @@ def verify(capture, out, gcnlift, drawreplay, timeout, keep_replay, stage="ps", 
     return row
 
 
+def verify_lean(capture, out, gcnlift, drawreplay, timeout):
+    """One dispatch capture in its lean form: the lean lift and the lean
+    translation, each against the rebuilt walking translation."""
+    name = capture.name
+    row = {"capture": str(capture), "name": name, "stage": "cs", "lean": True}
+    lift_dir = out / name / "lift"
+    lift = subprocess.run([str(gcnlift), str(capture), str(lift_dir), "--lean"], capture_output=True, text=True, timeout=timeout)
+    report = load(lift_dir / "report.json")
+    lean = load(lift_dir / "lean-buffers.json")
+    row["gcnlift_exit"] = lift.returncode
+    if report is None or lean is None:
+        row["status"] = "error"
+        row["detail"] = (lift.stderr or lift.stdout).strip().splitlines()[-1:] or ["no report"]
+        return row
+    row["pipeline"] = report.get("pipeline")
+    row["buffers"] = len(lean.get("buffers", []))
+    row["walks_left"] = lean.get("walks", [])
+    if not lean.get("translated") or not lean.get("lifted") or not lean.get("lift_valid"):
+        row["status"] = "rejected"
+        row["detail"] = lean.get("lift_rejections", []) or ["the lean translation failed"]
+        return row
+    env = dict(os.environ)
+    env.setdefault("LP_NUM_THREADS", "1")
+    verdicts = {}
+    for variant in ("lean-lifted", "lean-reference"):
+        replay_dir = out / name / ("replay-" + variant)
+        replay = subprocess.run([str(drawreplay), str(capture), "--cs-base", str(lift_dir / "reference.spv"), "--cs", str(lift_dir / (variant + ".spv")),
+                                 "--cs-buffers", str(lift_dir / "lean-buffers.json"), "--no-live", "--out", str(replay_dir)],
+                                capture_output=True, text=True, timeout=timeout, env=env)
+        if replay.returncode == 3:
+            row["status"] = "not bound"
+            row["detail"] = [l.strip() for l in replay.stdout.splitlines() if "cannot be bound" in l][:1]
+            return row
+        rep = load(replay_dir / "report.json")
+        v = ((rep or {}).get("comparisons") or {}).get("A_vs_variant")
+        for f in (replay_dir.iterdir() if replay_dir.is_dir() else []):
+            if f.suffix in (".bin", ".ppm"):
+                f.unlink()
+        if v is None:
+            row["status"] = "not comparable"
+            row["detail"] = (replay.stderr or replay.stdout).strip().splitlines()[-2:] or ["no replay report"]
+            return row
+        own = {k: val for k, val in ((rep or {}).get("verdict") or {}).items() if k in ("A_vs_B", "A_vs_sentinel")}
+        if any(val is False for val in own.values()):
+            row["status"] = "not comparable"
+            row["detail"] = ["the rebuilt translation failed its own checks: %s" % ", ".join(k for k, val in own.items() if val is False)]
+            return row
+        verdicts[variant] = "identical" if v.get("bytes_identical") else "same records" if v.get("pass") else "different"
+        if verdicts[variant] == "different":
+            row.setdefault("detail", []).append(variant + ": " + json.dumps({k: x for k, x in v.items() if k != "note"})[:300])
+    row["lean_lift"] = verdicts["lean-lifted"]
+    row["lean_translation"] = verdicts["lean-reference"]
+    worst = "different" if "different" in verdicts.values() else "same records" if "same records" in verdicts.values() else "identical"
+    row["status"] = worst
+    return row
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("captures", type=Path, help="directory holding the capture directories")
@@ -139,7 +204,11 @@ def main():
                         help="lift the pixel (default) or the vertex shader, or (cs) a dispatch capture's compute shader")
     parser.add_argument("--specialize", action="store_true",
                         help="replay with the specialization constants bbhost's optimized relink gives (drawreplay --specialize)")
+    parser.add_argument("--lean", action="store_true",
+                        help="with --stage cs: each dispatch's lean translation and its lift against the rebuilt walking translation")
     args = parser.parse_args()
+    if args.lean and args.stage != "cs":
+        parser.error("--lean needs --stage cs")
     captures = sorted(p for p in args.captures.iterdir() if (p / "manifest.json").is_file())
     if not captures:
         print(f"no captures under {args.captures}", file=sys.stderr)
@@ -148,7 +217,8 @@ def main():
     rows = []
     for capture in captures:
         try:
-            row = verify(capture, args.out, args.gcnlift, args.drawreplay, args.timeout, args.keep_replay, args.stage, args.specialize)
+            row = (verify_lean(capture, args.out, args.gcnlift, args.drawreplay, args.timeout) if args.lean else
+                   verify(capture, args.out, args.gcnlift, args.drawreplay, args.timeout, args.keep_replay, args.stage, args.specialize))
         except subprocess.TimeoutExpired:
             row = {"capture": str(capture), "name": capture.name, "status": "error", "detail": ["timed out"]}
         rows.append(row)
@@ -165,6 +235,7 @@ def main():
     summary = {
         "schema": "bbhost-lift-verify",
         "stage": args.stage,
+        "lean": args.lean,
         "captures": len(rows),
         "totals": dict(totals),
         "rejection_reasons": reasons.most_common(),
