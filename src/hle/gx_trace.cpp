@@ -6307,8 +6307,25 @@ void hle_gx_trace_arm(GuestMemory* mem) {
     int patched = 0, kept = 0;
     if (g_dead_packets && !g_dead_writers && !g_cp_writers && g_backend == 1) {
         const bool context_dead = skip_state_packets();
+        // BBHOST_CP_DEAD_KEEP=<i,j,...> (a bisection aid): those writers, by
+        // their place in the table, are left writing.
+        const char* keep = std::getenv("BBHOST_CP_DEAD_KEEP");
+        const auto kept_by_env = [keep](std::size_t i) {
+            for (const char* q = keep; q && *q;) {
+                char* end = nullptr;
+                const long v = std::strtol(q, &end, 10);
+                if (end == q) break;
+                if (v == static_cast<long>(i)) return true;
+                q = *end == ',' ? end + 1 : end;
+            }
+            return false;
+        };
         for (std::size_t i = 0; i < kDeadWriterCount; ++i) {
             const DeadWriter& w = kDeadWriters[i];
+            if (kept_by_env(i)) {
+                ++kept;
+                continue;
+            }
             if (w.context && !context_dead) {
                 ++kept;
                 continue;
