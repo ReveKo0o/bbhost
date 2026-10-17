@@ -1091,6 +1091,24 @@ struct Translator {
         res.store_buffers.push_back(path);
     }
 
+    // A load that walks the page table through the V# (4 registers) or the
+    // 64-bit pointer (2) in s[reg]: its base on TranslateResult::read_buffers.
+    void note_read(std::uint16_t reg, bool pointer, std::uint32_t end_dw) {
+        ResourcePath path;
+        if (!sym_path(reg, 2, path)) {
+            ++res.untraced_reads;
+            return;
+        }
+        const std::string key = path.str();
+        for (TranslateResult::BufferRead& r : res.read_buffers) {
+            if (r.pointer == pointer && r.path.str() == key) {
+                r.max_dw = std::max(r.max_dw, end_dw);
+                return;
+            }
+        }
+        res.read_buffers.push_back({path, pointer, end_dw});
+    }
+
     // ---- images
     ImageVar image_for(const Inst& in, bool storage, bool depth, std::uint32_t& dim_out, bool& arrayed_out) {
         ResourcePath path;
@@ -2285,6 +2303,7 @@ struct Translator {
                               : res.buffers.size() >= kMaxBuffers  ? " past the buffer limit"
                                                                    : " excluded";
             note_walk(std::string(pointer ? "s_load" : "s_buffer_load") + why);
+            note_read(in.src0, pointer, known ? known_off + static_cast<std::uint32_t>(count) : 0);
         }
         const std::vector<Id> loaded = ranged      ? load_buffer_ranged(in, cb_path, cb_key, offset, count, base)
                                        : as_buffer ? load_buffer_run(cb_path, cb_key, pointer, in.src0, known_off, count, addr)
@@ -2346,6 +2365,7 @@ struct Translator {
             if (op < 112 && !store_bindable(in, path, key)) note_walk(mnemonic(in) + buffer_walk_form(in));
         }
         if ((op >= 4 && op <= 7) || (op >= 24 && op <= 31) || (op >= 48 && op < 112)) note_store(in);
+        if (op <= 3 || (op >= 8 && op <= 15) || (op >= 48 && op < 112)) note_read(in.srsrc, false, 0);
         auto load_n = [&](int n) {
             const BufferAddr ba = buffer_address(in);
             const std::vector<Id> vals = load_u32_run(ba.addr, n);
@@ -2840,6 +2860,7 @@ struct Translator {
             std::vector<Id> comps;
             if (!indexed_buffer_load(in, comps)) {
                 note_walk(mnemonic(in) + buffer_walk_form(in) + indexed_reject);
+                note_read(in.srsrc, false, 0);
                 comps = format_load(buffer_address(in).addr, in.dfmt, in.nfmt, 4);
             }
             if (tbuffer_dst_sel()) {

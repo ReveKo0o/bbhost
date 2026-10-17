@@ -45,7 +45,7 @@ namespace {
 // program, and a result field the entry does not hold would come back empty.
 #if defined(__GLIBCXX__) && defined(__x86_64__)
 static_assert(sizeof(gcn::TranslateOptions) == 320, "a new TranslateOptions field: add it to hash_options");  // a bool can land in padding: check the list too
-static_assert(sizeof(gcn::TranslateResult) == 424, "a new TranslateResult field: add it to write_result and read_result");
+static_assert(sizeof(gcn::TranslateResult) == 456, "a new TranslateResult field: add it to write_result and read_result");
 static_assert(sizeof(gcn::ResourcePath) == 40 && sizeof(gcn::ResourceStep) == 8, "a new ResourcePath field: add it to the entry");
 static_assert(sizeof(gcn::ImageBinding) == 64 && sizeof(gcn::SamplerBinding) == 56 && sizeof(gcn::BufferBinding) == 56,
               "a new binding field: add it to the entry");
@@ -317,6 +317,13 @@ void write_result(Writer& w, const gcn::TranslateResult& r, bool with_spirv) {
     w.u32(static_cast<std::uint32_t>(r.store_buffers.size()));
     for (const gcn::ResourcePath& p : r.store_buffers) w.path(p);
     w.u32(r.untraced_stores);
+    w.u32(static_cast<std::uint32_t>(r.read_buffers.size()));
+    for (const gcn::TranslateResult::BufferRead& b : r.read_buffers) {
+        w.path(b.path);
+        w.u8(b.pointer ? 1 : 0);
+        w.u32(b.max_dw);
+    }
+    w.u32(r.untraced_reads);
     w.u32(r.unnormalized_samples);
     w.u32(static_cast<std::uint32_t>(r.walks.size()));
     for (const auto& [why, n] : r.walks) {
@@ -376,6 +383,13 @@ bool read_result(Reader& r, gcn::TranslateResult& t) {
     t.store_buffers.resize(r.count(10));
     for (gcn::ResourcePath& p : t.store_buffers) r.path(p);
     t.untraced_stores = r.u32();
+    t.read_buffers.resize(r.count(10));
+    for (gcn::TranslateResult::BufferRead& b : t.read_buffers) {
+        r.path(b.path);
+        b.pointer = r.u8() != 0;
+        b.max_dw = r.u32();
+    }
+    t.untraced_reads = r.u32();
     t.unnormalized_samples = r.u32();
     const std::uint32_t walks = r.count(8);
     for (std::uint32_t k = 0; k < walks && r.ok; ++k) {
