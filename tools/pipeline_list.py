@@ -15,12 +15,15 @@ files name it (its footer's hash), with its word count and hash, and bbhost
 takes the words from the player's own files at the start - the bundles, or
 the eboot for the eboot's own programs (YEBIS's, Scaleform's), with --eboot -
 patched as the draws read them, dropping a record whose hash does not match.
-Records that need a fetch shader's words (made by the engine at run time, in
-no file) are left out of a list; `list` says how many.
+A fetch shader's words are made by the engine at run time and are in no file:
+a list carries them as the manifest does (the owner accepted that on
+2026-10-17, so tessellated pipelines are listed too); --no-fetch-words leaves
+those records out instead. A tessellated record may also carry the host
+tessellator's LS passes (version 3): each LS is named like the other programs.
 
   pipeline_list.py stats <file>...
   pipeline_list.py merge --out <manifest> <manifest>...
-  pipeline_list.py list --app0 <game folder> [--eboot <eboot>] --out <list> <manifest>...
+  pipeline_list.py list --app0 <game folder> [--eboot <eboot>] [--no-fetch-words] --out <list> <manifest>...
   pipeline_list.py check --app0 <game folder> [--eboot <eboot>] <list>
 
 Whether a list is shipped with releases is the owner's decision; this tool
@@ -37,9 +40,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import shaderbnd  # noqa: E402
 
 MAGIC = 0x4D504242  # "BBPM"
-VERSION = 2  # 2: tessellated pipelines (their LS and hull programs, the LS's fetch shader)
+VERSION = 3  # 2: tessellated pipelines (their LS and hull programs, the LS's fetch shader); 3: the host tessellator's LS passes
+READS = (2, 3)
 VS_REF, PS_REF, LS_REF, HS_REF = 256, 512, 1024, 2048
-TESS_HAS_LS, TESS_HAS_HS, TESS_HAS_FETCH = 64, 128, 256
+TESS_HAS_LS, TESS_HAS_HS, TESS_HAS_FETCH, TESS_LS_PASSES = 64, 128, 256, 1024
 HAS_VERTEX_INPUT, RELINK = 4, 8
 GX_BLEND, GX_DEPTH, GX_RASTER = 66, 16, 20  # sizeof GxBlendDesc, GxDepthStencilDesc, GxRasterDesc
 BUNDLES = ("gxshader.shaderbnd.dcx", "gxrenderershader.shaderbnd.dcx", "gxposteffect.shaderbnd.dcx", "gxgui.shaderbnd.dcx",
@@ -146,6 +150,18 @@ class Recipe:
             self.hs, self.hs_ref = program(r, self.flags & HS_REF)
             self.hs_name, self.hs_sgpr = r.str(), r.u32()
         self.ls_fetch = r.words() if self.tess_flags & TESS_HAS_FETCH else None
+        # The host tessellator's LS passes (version 3, flag 1024): a count,
+        # then each one's registers, its LS (named in a list), its fetch
+        # shader's words.
+        self.lsps = []
+        if self.tess_flags & TESS_LS_PASSES:
+            for _ in range(r.u32()):
+                ref = r.u32() & 1
+                regs = r.take(5 * 4)
+                prog, pref = program(r, ref)
+                name, sgpr = r.str(), r.u32()
+                fetch = r.words() if r.u32() else None
+                self.lsps.append({"regs": regs, "prog": prog, "ref": pref, "name": name, "sgpr": sgpr, "fetch": fetch})
         if r.p != r.end:
             raise ValueError("a record longer than its fields")
         return self
@@ -160,14 +176,19 @@ class Recipe:
             out += [program_bytes(self.hs, self.hs_ref), wstr(self.hs_name), w32(self.hs_sgpr)]
         if self.tess_flags & TESS_HAS_FETCH:
             out.append(w32(len(self.ls_fetch) // 4) + self.ls_fetch)
+        if self.tess_flags & TESS_LS_PASSES:
+            out.append(w32(len(self.lsps)))
+            for e in self.lsps:
+                out += [w32(1 if e["prog"] is None else 0), e["regs"], program_bytes(e["prog"], e["ref"]), wstr(e["name"]), w32(e["sgpr"])]
+                out.append(w32(1) + w32(len(e["fetch"]) // 4) + e["fetch"] if e["fetch"] is not None else w32(0))
         return b"".join(out)
 
 
 def read_file(path):
     d = Path(path).read_bytes()
     r = Reader(d)
-    if r.u32() != MAGIC or r.u32() != VERSION:
-        raise ValueError("%s: not a pipeline manifest this tool reads (version %d)" % (path, VERSION))
+    if r.u32() != MAGIC or r.u32() not in READS:
+        raise ValueError("%s: not a pipeline manifest this tool reads (versions %s)" % (path, READS))
     run = r.u32()
     origin = {"translator": r.str(), "vendor": r.u32(), "device": r.u32(), "driver": r.u32(), "uuid": r.take(16).hex(),
               "libraries": bool(r.u8())}
@@ -258,14 +279,63 @@ def describe(path, run, origin, recipes):
         names[rc.ps_name] += 1
     words = sum(len(rc.vs or b"") + len(rc.ps or b"") + len(rc.fetch) + len(rc.ls or b"") + len(rc.hs or b"") + len(rc.ls_fetch or b"")
                 for rc in recipes)
-    print("%s: run %d, %d pipelines (%d with an optimized relink's specialization, %d on vertex input, %d tessellated), %d programs by name; "
+    print("%s: run %d, %d pipelines (%d with an optimized relink's specialization, %d on vertex input, %d tessellated, %d with LS passes), "
+          "%d programs by name; "
           "%.1f KiB of program words; made by translator %s on device %04x:%04x driver %08x%s" % (
               path, run, len(recipes), sum(1 for rc in recipes if rc.flags & RELINK),
               sum(1 for rc in recipes if rc.flags & HAS_VERTEX_INPUT), sum(1 for rc in recipes if rc.tess_flags & 1 or rc.tess_flags & 32),
+              sum(1 for rc in recipes if rc.lsps),
               len(names), words / 1024.0, origin["translator"][:12],
               origin["vendor"], origin["device"], origin["driver"], ", with pipeline libraries" if origin["libraries"] else ", whole pipelines"))
     used = Counter(rc.uses for rc in recipes)
     print("  starts that used each: %s" % ", ".join("%d: %d" % (k, used[k]) for k in sorted(used)))
+
+
+def make_list(recipes, progs, eboot_given=True, fetch_words=True):
+    """The list records: each program named by its footer hash, count and hash
+    instead of its words. (out, left Counter, plain, patched)."""
+    out, left = [], Counter()
+    plain = patched = 0
+    for rc in recipes:
+        if rc.vs_name not in progs or (rc.ps is not None and rc.ps and rc.ps_name not in progs):
+            left["a program neither the bundles nor the eboot hold" if eboot_given else
+                 "a program the bundles do not hold (the eboot's own: give --eboot)"] += 1
+            continue
+        if not fetch_words and ((rc.fetch and not rc.flags & HAS_VERTEX_INPUT) or rc.ls_fetch is not None or
+                                any(e["fetch"] is not None for e in rc.lsps)):
+            left["a fetch shader's words (made at run time; --no-fetch-words)"] += 1
+            continue
+        if (rc.ls is not None and rc.ls_name not in progs) or (rc.hs is not None and rc.hs_name not in progs) or \
+                any(e["prog"] is not None and e["name"] not in progs for e in rc.lsps):
+            left["a tessellation program neither the bundles nor the eboot hold"] += 1
+            continue
+        for prog, name in ((rc.vs, rc.vs_name), (rc.ps, rc.ps_name)):
+            if prog:
+                if progs[name] == prog:
+                    plain += 1
+                else:
+                    patched += 1  # bbhost patched it (host/shader_patch.cpp): the hash is the patched words'
+        rc.flags |= VS_REF
+        rc.vs_ref = (len(rc.vs) // 4, fnv1a(rc.vs))
+        rc.vs = None
+        if rc.ps:
+            rc.flags |= PS_REF
+            rc.ps_ref = (len(rc.ps) // 4, fnv1a(rc.ps))
+            rc.ps = None
+        if rc.flags & HAS_VERTEX_INPUT:
+            rc.fetch = b""  # unused on vertex input (vs_translate_options)
+        if rc.ls is not None:
+            rc.flags |= LS_REF
+            rc.ls_ref, rc.ls = (len(rc.ls) // 4, fnv1a(rc.ls)), None
+        if rc.hs is not None:
+            rc.flags |= HS_REF
+            rc.hs_ref, rc.hs = (len(rc.hs) // 4, fnv1a(rc.hs)), None
+        for e in rc.lsps:
+            if e["prog"] is not None:
+                e["ref"], e["prog"] = (len(e["prog"]) // 4, fnv1a(e["prog"])), None
+        rc.uses = rc.last_run = 0
+        out.append(rc)
+    return out, left, plain, patched
 
 
 def main():
@@ -279,6 +349,7 @@ def main():
     p = sub.add_parser("list")
     p.add_argument("--app0", required=True)
     p.add_argument("--eboot", help="the 1.09 eboot: its own programs are named too (else left out)")
+    p.add_argument("--no-fetch-words", action="store_true", help="leave out the records that need a fetch shader's words")
     p.add_argument("--out", required=True)
     p.add_argument("files", nargs="+")
     p = sub.add_parser("check")
@@ -313,41 +384,7 @@ def main():
             return 2
         for name, code in eboot_programs(args.eboot).items():
             progs.setdefault(name, code)
-        out, left = [], Counter()
-        plain = patched = 0
-        for rc in recipes:
-            if rc.vs_name not in progs or (rc.ps is not None and rc.ps and rc.ps_name not in progs):
-                left["a program neither the bundles nor the eboot hold" if args.eboot else
-                     "a program the bundles do not hold (the eboot's own: give --eboot)"] += 1
-                continue
-            if (rc.fetch and not rc.flags & HAS_VERTEX_INPUT) or rc.ls_fetch is not None:
-                left["a fetch shader's words (made at run time)"] += 1
-                continue
-            if (rc.ls is not None and rc.ls_name not in progs) or (rc.hs is not None and rc.hs_name not in progs):
-                left["a tessellation program neither the bundles nor the eboot hold"] += 1
-                continue
-            for prog, name in ((rc.vs, rc.vs_name), (rc.ps, rc.ps_name)):
-                if prog:
-                    if progs[name] == prog:
-                        plain += 1
-                    else:
-                        patched += 1  # bbhost patched it (host/shader_patch.cpp): the hash is the patched words'
-            rc.flags |= VS_REF
-            rc.vs_ref = (len(rc.vs) // 4, fnv1a(rc.vs))
-            rc.vs = None
-            if rc.ps:
-                rc.flags |= PS_REF
-                rc.ps_ref = (len(rc.ps) // 4, fnv1a(rc.ps))
-                rc.ps = None
-            rc.fetch = b""  # unused on vertex input (vs_translate_options)
-            if rc.ls is not None:
-                rc.flags |= LS_REF
-                rc.ls_ref, rc.ls = (len(rc.ls) // 4, fnv1a(rc.ls)), None
-            if rc.hs is not None:
-                rc.flags |= HS_REF
-                rc.hs_ref, rc.hs = (len(rc.hs) // 4, fnv1a(rc.hs)), None
-            rc.uses = rc.last_run = 0
-            out.append(rc)
+        out, left, plain, patched = make_list(recipes, progs, bool(args.eboot), not args.no_fetch_words)
         write_file(args.out, 0, origin, out)
         size = Path(args.out).stat().st_size
         print("%s: %d of %d pipelines (%.1f KiB, no program words: %d programs as the game's files have them, %d as bbhost patches them)" % (
@@ -362,9 +399,11 @@ def main():
         progs.setdefault(name, code)
     ok = bad = patched = 0
     for rc in recipes:
-        for flag, ref, name in ((VS_REF, rc.vs_ref, rc.vs_name), (PS_REF, rc.ps_ref, rc.ps_name), (LS_REF, rc.ls_ref, rc.ls_name),
-                                (HS_REF, rc.hs_ref, rc.hs_name)):
-            if not rc.flags & flag:
+        refs = [(rc.flags & flag, ref, name) for flag, ref, name in
+                ((VS_REF, rc.vs_ref, rc.vs_name), (PS_REF, rc.ps_ref, rc.ps_name), (LS_REF, rc.ls_ref, rc.ls_name), (HS_REF, rc.hs_ref, rc.hs_name))]
+        refs += [(e["prog"] is None, e["ref"], e["name"]) for e in rc.lsps]
+        for named, ref, name in refs:
+            if not named:
                 continue
             code = progs.get(name)
             if code is None:

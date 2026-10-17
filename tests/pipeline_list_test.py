@@ -82,6 +82,37 @@ class PipelineListTest(unittest.TestCase):
         again = pl.Recipe().parse(rc.body())
         self.assertEqual((again.ls, again.ls_ref, again.hs), (None, (3, pl.fnv1a(ls)), hs))
 
+    def test_ls_pass_record(self):
+        """Version 3: a tessellated record with the host tessellator's LS passes
+        (each its registers, its LS, its fetch shader) reads and writes back as
+        it was, and a list names each LS and keeps the fetch shaders' words."""
+        vs, ps, lsp, fetch = (struct.pack("<2I", 1, 2), struct.pack("<I", 3), struct.pack("<3I", 4, 5, 6), struct.pack("<2I", 8, 9))
+        rc = recipe(10, 1, vs, ps)
+        tess = struct.pack("<I", 1 | pl.TESS_LS_PASSES) + bytes(9 * 4 + 16 + 8 + 48 + 8)
+        entry = lambda name, words: struct.pack("<I", 0) + struct.pack("<5I", 0x11, 0x22, 1, 64, 3) + struct.pack("<I", len(words) // 4) + words + \
+            pl.wstr(name) + struct.pack("<I", 2) + struct.pack("<I", 1) + struct.pack("<I", 2) + fetch
+        body = rc.body()[:-len(rc.tess)] + tess + struct.pack("<I", 2) + entry("0000eeee", lsp) + entry("0000ffff", lsp + lsp)
+        rc = pl.Recipe().parse(body)
+        self.assertEqual([(e["prog"], e["name"], e["sgpr"], e["fetch"]) for e in rc.lsps],
+                         [(lsp, "0000eeee", 2, fetch), (lsp + lsp, "0000ffff", 2, fetch)])
+        self.assertEqual(rc.body(), body)
+        progs = {"0000aaaa": vs, "0000bbbb": ps, "0000eeee": lsp, "0000ffff": lsp + lsp}
+        out, left, _plain, _patched = pl.make_list([rc], progs)
+        self.assertEqual((len(out), sum(left.values())), (1, 0))
+        listed = pl.Recipe().parse(out[0].body())
+        self.assertEqual([(e["prog"], e["ref"], e["fetch"]) for e in listed.lsps],
+                         [(None, (3, pl.fnv1a(lsp)), fetch), (None, (6, pl.fnv1a(lsp + lsp)), fetch)])
+        out, left, _plain, _patched = pl.make_list([pl.Recipe().parse(body)], progs, fetch_words=False)
+        self.assertEqual((len(out), sum(left.values())), (0, 1))  # --no-fetch-words leaves it out
+
+    def test_versions_agree(self):
+        """The record format pipeline_list.py writes is the one bbhost writes
+        (render.cpp recipe_file::kVersion)."""
+        src = (ROOT / "src" / "host" / "render.cpp").read_text()
+        at = src.index("namespace recipe_file {")
+        version = int(src[at:at + 400].split("kVersion = ")[1].split(";")[0])
+        self.assertEqual(version, pl.VERSION)
+
 
 if __name__ == "__main__":
     unittest.main()

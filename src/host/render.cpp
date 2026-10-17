@@ -4229,6 +4229,20 @@ struct PipelineRecipe {
     bool has_ls = false, has_hs = false, has_ls_fetch = false;
     CachedProgram ls, hs;
     FetchProgram ls_fetch;
+    // The host tessellator's LS passes the recorded pipeline's draws ran,
+    // whose compute pipelines the start builds too (ls_pass_prebuild): each an
+    // LS, its fetch shader, its resource registers and, with the game's hull,
+    // the window and control points (tess_ls_pass_locked's key). One pipeline
+    // draws with several (the game's hull pipeline 62fa34d8+bb10e440 takes six
+    // LS programs over the Forbidden Woods and the Nightmare Frontier); a
+    // tessellated draw whose pass a recipe lacks adds it (recipe_attach_ls_pass).
+    struct LsPassRecord {
+        CachedProgram ls;
+        bool has_fetch = false, hull = false;
+        FetchProgram fetch;
+        std::uint32_t rsrc1 = 0, rsrc2 = 0, window = 0, control_points = 0;
+    };
+    std::vector<LsPassRecord> ls_passes;
     // The optimized relink's specialization by its first draw (queue_library_relink).
     bool relink = false;
     std::uint32_t spec_w3[2][16] = {}, spec_stride[2][16] = {};
@@ -4400,6 +4414,17 @@ std::uint64_t pipeline_content_key(const GfxPipeline& pl, const DrawState& s, co
     }
     return k ? k : 1;
 }
+// The LS pass of the tessellated draw being drawn (t_tess), into a recipe that
+// lacks it: true when it was added (the manifest is then dirty). Under
+// g_pmanifest.mu for a recipe the manifest holds. Defined with the LS pass.
+bool recipe_attach_ls_pass(PipelineRecipe& r);
+// A recipe's LS passes' compute pipelines, built on this precompile worker
+// unless they are built already (replay_recipe). Defined with the LS pass.
+void ls_pass_prebuild(const PipelineRecipe& r);
+// The LS passes' compute pipelines for the exit report: built from recipes at
+// the start (failed), taken by draws, built by the command processor.
+std::string ls_pass_report();
+
 // At a build (not one from a recipe): what it was built from, for the
 // manifest once its pipeline is created.
 void recipe_note_build(GfxPipeline& pl, const DrawState& s, const std::vector<std::uint32_t>& vs_words,
@@ -4462,6 +4487,7 @@ void recipe_note_build(GfxPipeline& pl, const DrawState& s, const std::vector<st
         r->vertex_input.attributes = vertex_input->attributes;
         r->vertex_input.hash = vertex_input->hash;
     }
+    if (recipe_tessellated(s)) recipe_attach_ls_pass(*r);
     pl.recipe = std::move(r);
 }
 // BBHOST_LOG_NEW_RECIPES=1: each pipeline the manifest had no recipe for, as
@@ -4492,6 +4518,7 @@ void recipe_note_created(GfxPipeline& pl, std::uint64_t key) {
         }
     } else {
         pl.recipe = it->second;  // a later relink's specialization goes to the kept one
+        if (recipe_tessellated(it->second->s) && recipe_attach_ls_pass(*it->second)) g_pmanifest.dirty = true;
         if (it->second->last_run != g_pmanifest.run) {
             it->second->last_run = g_pmanifest.run;
             it->second->order = g_pmanifest.next_order.fetch_add(1, std::memory_order_relaxed);
@@ -4562,6 +4589,7 @@ bool take_prebuilt(GfxPipeline& pl, std::uint64_t key) {
     if (recipe) {
         std::lock_guard<std::mutex> lk(g_pmanifest.mu);
         pl.recipe = recipe;
+        if (recipe_tessellated(recipe->s) && recipe_attach_ls_pass(*recipe)) g_pmanifest.dirty = true;
         if (recipe->last_run != g_pmanifest.run) {
             recipe->last_run = g_pmanifest.run;
             recipe->order = g_pmanifest.next_order.fetch_add(1, std::memory_order_relaxed);
@@ -6429,6 +6457,9 @@ void replay_recipe(Precompiler& w, const std::shared_ptr<const PipelineRecipe>& 
     t_library_owner = nullptr;
     t_replaying = false;
     ok = ok && key != 0 && pl->pipeline;
+    // The host tessellator's LS passes the recorded draws ran: their compute
+    // pipelines too, or a draw builds them on the command processor.
+    if (ok) ls_pass_prebuild(r);
     // Relinked here, with its first draw's specialization, so the draw takes
     // the optimized pipeline at once.
     if (ok && pl->library && pl->relink_pending && r.relink && g_library_relink) {
@@ -7529,7 +7560,7 @@ bool read(Reader& r, ManifestStage& m) {
 
 namespace recipe_file {
 constexpr std::uint32_t kMagic = 0x4d504242;  // "BBPM"
-constexpr std::uint32_t kVersion = 2;  // 2: tessellated pipelines
+constexpr std::uint32_t kVersion = 3;  // 2: tessellated pipelines; 3: the host tessellator's LS passes (a 2 is read as well)
 using manifest_file::Reader;
 using manifest_file::Writer;
 // What made the file: the translator and the device, for the report (the
@@ -7674,7 +7705,8 @@ void write(Writer& out, const PipelineRecipe& rc) {
     // Tessellation: the draw state for it, then the programs (a list names the
     // LS and the hull as it names the others: flags 1024 and 2048).
     w.u32((s.tess_hw ? 1u : 0u) | (s.tess_attrs ? 2u : 0u) | (s.tess_hull ? 4u : 0u) | (s.tess_quads ? 8u : 0u) | (s.tess_cw ? 16u : 0u) |
-          (s.tess_native ? 32u : 0u) | (rc.has_ls ? 64u : 0u) | (rc.has_hs ? 128u : 0u) | (rc.has_ls_fetch ? 256u : 0u));
+          (s.tess_native ? 32u : 0u) | (rc.has_ls ? 64u : 0u) | (rc.has_hs ? 128u : 0u) | (rc.has_ls_fetch ? 256u : 0u) |
+          (!rc.ls_passes.empty() ? 1024u : 0u));
     for (std::uint32_t v : {s.tess_control_points, s.tess_attr_vec4s, s.ls_rsrc1, s.ls_rsrc2, s.hs_rsrc1, s.hs_rsrc2, s.tess_window,
                             static_cast<std::uint32_t>(s.tess_spacing), s.domain_level}) {
         w.u32(v);
@@ -7690,6 +7722,21 @@ void write(Writer& out, const PipelineRecipe& rc) {
         w.u32(static_cast<std::uint32_t>(cp->fetch_sgpr));
     }
     if (rc.has_ls_fetch) words(w, rc.ls_fetch.words);
+    if (!rc.ls_passes.empty()) {
+        // The LS passes (version 3, flag 1024): a count, then each one's
+        // flags (1: its LS named, as a list names programs), registers, LS
+        // and the fetch shader's words when it has one.
+        w.u32(static_cast<std::uint32_t>(rc.ls_passes.size()));
+        for (const PipelineRecipe::LsPassRecord& p : rc.ls_passes) {
+            w.u32(0u);
+            for (std::uint32_t v : {p.rsrc1, p.rsrc2, p.hull ? 1u : 0u, p.window, p.control_points}) w.u32(v);
+            words(w, p.ls.words);
+            str(w, p.ls.name);
+            w.u32(static_cast<std::uint32_t>(p.ls.fetch_sgpr));
+            w.u32(p.has_fetch ? 1u : 0u);
+            if (p.has_fetch) words(w, p.fetch.words);
+        }
+    }
     out.u32(static_cast<std::uint32_t>(w.out.size()));
     out.out.insert(out.out.end(), w.out.begin(), w.out.end());
 }
@@ -7840,6 +7887,35 @@ bool read(Reader& in, PipelineRecipe& rc) {
         words(r, rc.ls_fetch.words);
         rc.ls_fetch.hash = fnv1a(rc.ls_fetch.words.data(), rc.ls_fetch.words.size() * 4);
     }
+    // The LS passes (flag 1024): a count, then each one's flags (1: its LS
+    // named), registers, LS and the fetch shader's words when it has one.
+    const std::uint32_t passes = (tf & 1024) ? r.count(28) : 0u;
+    for (std::uint32_t k = 0; k < passes && r.ok; ++k) {
+        PipelineRecipe::LsPassRecord p;
+        const bool ref = (r.u32() & 1u) != 0;
+        std::uint32_t hull = 0;
+        for (std::uint32_t* v : {&p.rsrc1, &p.rsrc2, &hull, &p.window, &p.control_points}) *v = r.u32();
+        p.hull = hull != 0;
+        std::uint32_t count = 0;
+        std::uint64_t hash = 0;
+        if (ref) {
+            count = r.u32();
+            pod(r, hash);
+        } else {
+            words(r, p.ls.words);
+        }
+        if (!str(r, p.ls.name)) return false;
+        p.ls.fetch_sgpr = static_cast<int>(r.u32());
+        if (ref && !from_bundle(p.ls.name, count, hash, p.ls.words)) return false;
+        p.ls.hash = fnv1a(p.ls.words.data(), p.ls.words.size() * 4);
+        std::memset(p.ls.head, 0, sizeof(p.ls.head));
+        p.has_fetch = r.u32() != 0;
+        if (p.has_fetch) {
+            words(r, p.fetch.words);
+            p.fetch.hash = fnv1a(p.fetch.words.data(), p.fetch.words.size() * 4);
+        }
+        rc.ls_passes.push_back(std::move(p));
+    }
     // The addresses the build tests for a program are the run's that recorded
     // it; the recipe's build takes the copies (tess_program).
     if (!rc.has_ls) s.ls_va = 0;
@@ -7863,13 +7939,13 @@ void precompile_report() {
         }
         host_log("render: pipeline manifest: %llu pipelines from earlier runs, %llu built at start (%.1f s of worker time, %llu relinked), "
                  "%llu failed and dropped; pipeline builds that took one %llu (one recorded but not built yet %llu, another layout %llu); "
-                 "%llu recorded in this run, %zu kept, %llu left out for the size limit",
+                 "%llu recorded in this run, %zu kept, %llu left out for the size limit; %s",
                  static_cast<unsigned long long>(g_pmanifest.loaded.load()), static_cast<unsigned long long>(g_pmanifest.done.load()),
                  g_pmanifest.build_us.load() / 1e6, static_cast<unsigned long long>(g_pmanifest.relinked.load()),
                  static_cast<unsigned long long>(g_pmanifest.failed.load()), static_cast<unsigned long long>(g_pmanifest.taken.load()),
                  static_cast<unsigned long long>(g_pmanifest.not_ready.load()), static_cast<unsigned long long>(g_pmanifest.layout_differs.load()),
                  static_cast<unsigned long long>(g_pmanifest.recorded.load()), kept,
-                 static_cast<unsigned long long>(g_pmanifest.dropped.load()));
+                 static_cast<unsigned long long>(g_pmanifest.dropped.load()), ls_pass_report().c_str());
     }
     if (!precompile_enabled()) return;
     Precompiler& w = precompiler();
@@ -14097,6 +14173,13 @@ std::uint64_t g_tess_lds_next = 0;
 
 struct TessDraw {
     std::uint32_t count = 0, level = 1;
+    // The LS pass tess_ls_pass_locked ran for it (the compute pipeline's
+    // inputs), for the recipe of the pipeline that draws it; lsp_cp_built:
+    // the command processor built its compute pipeline for this draw.
+    bool lsp_used = false, lsp_cp_built = false;
+    const CachedProgram* lsp_ls = nullptr;
+    const FetchProgram* lsp_fetch = nullptr;
+    std::uint32_t lsp_rsrc1 = 0, lsp_rsrc2 = 0;
     // Drawn by the host's tessellator, with the hull shader's own
     // factors, instead of the topology the domain prologue invents.
     bool hw = false;
@@ -14654,6 +14737,142 @@ bool tess_hull_constants_locked(const GpuDraw& d, TessDraw& t) {
     return true;
 }
 
+// ---- The host tessellator's LS pass: its compute pipelines ----
+// One per LS program, fetch shader, resource registers and (with the game's
+// hull) window and control points. Built on the command processor at a draw's
+// first sight, or at the start from a recipe that recorded the pass
+// (ls_pass_prebuild), whichever comes first: the cache is shared, and a
+// pipeline once made is never destroyed (dispatches recorded with it keep it).
+struct LsPipe {
+    bool failed = false;
+    VkPipeline pipeline = VK_NULL_HANDLE;
+    bool standin = false;  // unoptimized until bb-cs-optimize has built it (first_compute_pipeline)
+    std::uint64_t opt_seen = 0;
+    gcn::TranslateResult meta;
+    std::string name;
+    bool prebuilt = false;  // made from a recipe at the start
+};
+struct LsPassInputs {
+    const CachedProgram* ls = nullptr;
+    const FetchProgram* fetch = nullptr;
+    std::uint32_t rsrc1 = 0, rsrc2 = 0;
+    bool hull = false;
+    std::uint32_t window = 0, control_points = 0;
+};
+constexpr std::uint64_t kLsOptimizeTag = 0x15c0000000000000ull;  // its optimized build's key, apart from the dispatches'
+std::mutex g_ls_pipes_mu;
+std::unordered_map<std::uint64_t, std::shared_ptr<LsPipe>> g_ls_pipes;  // under g_ls_pipes_mu
+std::atomic<std::uint64_t> g_ls_pipes_prebuilt{0}, g_ls_pipes_prebuilt_failed{0}, g_ls_pipes_taken{0}, g_ls_pipes_cp_built{0};
+std::uint64_t ls_pipe_key(const LsPassInputs& in) {
+    const std::uint64_t fetch_hash = in.fetch ? in.fetch->hash : 0;
+    const std::uint32_t rs[4] = {in.rsrc1, in.rsrc2, in.hull ? in.window : 0u, in.hull ? in.control_points : 0u};
+    return fnv1a(rs, sizeof(rs), fnv1a(&fetch_hash, 8, in.ls->hash ^ 0x15c0ull));
+}
+// The pipeline itself, with no lock held: the LS translated as a compute
+// shader that runs the fetch shader's loads, its module, the pipeline.
+std::shared_ptr<LsPipe> ls_pipe_build(const LsPassInputs& in, std::uint64_t key) {
+    auto pl = std::make_shared<LsPipe>();
+    pl->name = in.ls->name + "-ls";
+    const gcn::Program prog = gcn::decode(in.ls->words.data(), in.ls->words.size());
+    gcn::Program fprog;
+    if (in.fetch) fprog = gcn::decode(in.fetch->words.data(), in.fetch->words.size());
+    gcn::TranslateOptions o;
+    o.stage = gcn::Stage::Compute;
+    o.tess_role = gcn::TranslateOptions::TessRole::LsCompute;
+    o.rsrc1 = in.rsrc1;
+    o.rsrc2 = in.rsrc2;
+    o.cs_threads[0] = 64;
+    o.fetch = in.fetch ? &fprog : nullptr;
+    o.exec_known = g.exec_known;
+    o.tess_lds_bound = tess_lds_bound();
+    if (in.hull) {
+        o.tess_window = in.window;
+        o.tess_patch_control_points = in.control_points;
+    }
+    pl->meta = translate_cached(prog, o);
+    VkShaderModule module = VK_NULL_HANDLE;
+    if (!prog.errors.empty() || !pl->meta.ok()) {
+        host_log("render: tessellation LS %s: %s", pl->name.c_str(),
+                 !prog.errors.empty() ? prog.errors[0].what.c_str() : pl->meta.errors[0].c_str());
+        pl->failed = true;
+    } else if (!make_module(pl->meta.spirv, module)) {
+        pl->failed = true;
+    } else {
+        dump_spirv(pl->name, pl->meta.spirv);
+        pl->pipeline = first_compute_pipeline(module, key ^ kLsOptimizeTag, pl->name, pl->meta.spirv, pl->standin, pl->name);
+        if (!pl->pipeline) pl->failed = true;
+        vkDestroyShaderModule(g.device, module, nullptr);
+    }
+    return pl;
+}
+// Declared with the pipeline manifest (gpu's own namespace, where the recipes are).
+}  // namespace
+namespace gpu {
+namespace {
+std::string ls_pass_report() {
+    char buf[256];
+    std::snprintf(buf, sizeof(buf),
+                  "the tessellator's LS passes: %llu compute pipelines built from recipes at the start (%llu failed), %llu of them taken by draws, "
+                  "%llu built by the command processor",
+                  static_cast<unsigned long long>(g_ls_pipes_prebuilt.load()), static_cast<unsigned long long>(g_ls_pipes_prebuilt_failed.load()),
+                  static_cast<unsigned long long>(g_ls_pipes_taken.load()), static_cast<unsigned long long>(g_ls_pipes_cp_built.load()));
+    return buf;
+}
+constexpr std::size_t kLsPassesMax = 16;  // a recipe's LS passes kept at most
+bool recipe_attach_ls_pass(PipelineRecipe& r) {
+    if (!t_tess || !t_tess->lsp_used || !t_tess->lsp_ls || r.ls_passes.size() >= kLsPassesMax) return false;
+    const TessDraw& t = *t_tess;
+    const std::uint64_t fetch_hash = t.lsp_fetch ? t.lsp_fetch->hash : 0;
+    for (const PipelineRecipe::LsPassRecord& p : r.ls_passes) {
+        if (p.ls.hash == t.lsp_ls->hash && (p.has_fetch ? p.fetch.hash : 0) == fetch_hash && p.rsrc1 == t.lsp_rsrc1 && p.rsrc2 == t.lsp_rsrc2 &&
+            p.hull == t.hull && (!t.hull || (p.window == t.window && p.control_points == t.control_points))) {
+            return false;  // this pass is in it already
+        }
+    }
+    PipelineRecipe::LsPassRecord p;
+    p.ls = *t.lsp_ls;
+    p.has_fetch = t.lsp_fetch != nullptr;
+    if (t.lsp_fetch) p.fetch = *t.lsp_fetch;
+    p.rsrc1 = t.lsp_rsrc1;
+    p.rsrc2 = t.lsp_rsrc2;
+    p.hull = t.hull;
+    p.window = t.hull ? t.window : 0u;
+    p.control_points = t.hull ? t.control_points : 0u;
+    r.ls_passes.push_back(std::move(p));
+    return true;
+}
+void ls_pass_prebuild(const PipelineRecipe& r) {
+    std::vector<PipelineRecipe::LsPassRecord> passes;
+    {
+        std::lock_guard<std::mutex> lk(g_pmanifest.mu);  // a draw may add a pass meanwhile (recipe_attach_ls_pass)
+        passes = r.ls_passes;
+    }
+    for (const PipelineRecipe::LsPassRecord& p : passes) {
+        if (p.ls.words.empty()) continue;
+        LsPassInputs in;
+        in.ls = &p.ls;
+        in.fetch = p.has_fetch ? &p.fetch : nullptr;
+        in.rsrc1 = p.rsrc1;
+        in.rsrc2 = p.rsrc2;
+        in.hull = p.hull;
+        in.window = p.window;
+        in.control_points = p.control_points;
+        const std::uint64_t key = ls_pipe_key(in);
+        {
+            std::lock_guard<std::mutex> lk(g_ls_pipes_mu);
+            if (g_ls_pipes.count(key)) continue;
+        }
+        std::shared_ptr<LsPipe> pl = ls_pipe_build(in, key);
+        pl->prebuilt = true;
+        (pl->failed ? g_ls_pipes_prebuilt_failed : g_ls_pipes_prebuilt).fetch_add(1, std::memory_order_relaxed);
+        std::lock_guard<std::mutex> lk(g_ls_pipes_mu);
+        g_ls_pipes.emplace(key, std::move(pl));  // a draw's build that came first stays
+    }
+}
+}  // namespace
+}  // namespace gpu
+namespace {
+
 bool tess_ls_pass_locked(const GpuDraw& d, TessDraw& t) {
     const GpuDrawInputs* plan_gx = tess_gx(d);
     t.hw = tess_hw_locked(t);
@@ -14833,59 +15052,45 @@ bool tess_ls_pass_locked(const GpuDraw& d, TessDraw& t) {
         return true;
     }
 
-    struct LsPipe {
-        bool failed = false;
-        VkPipeline pipeline = VK_NULL_HANDLE;
-        bool standin = false;  // unoptimized until bb-cs-optimize has built it (first_compute_pipeline)
-        std::uint64_t opt_seen = 0;
-        gcn::TranslateResult meta;
-        std::string name;
-    };
-    static std::unordered_map<std::uint64_t, LsPipe> pipes;
-    const std::uint64_t fetch_hash = fetch ? fetch->hash : 0;
-    const std::uint32_t rs[4] = {rsrc1, rsrc2, t.hull ? t.window : 0u, t.hull ? t.control_points : 0u};
-    const std::uint64_t key = fnv1a(rs, sizeof(rs), fnv1a(&fetch_hash, 8, ls->hash ^ 0x15c0ull));
-    LsPipe& pl = pipes[key];
-    constexpr std::uint64_t kLsOptimizeTag = 0x15c0000000000000ull;  // its optimized build's key, apart from the dispatches'
-    if (pl.standin) adopt_optimized_compute(key ^ kLsOptimizeTag, pl.pipeline, pl.standin, pl.opt_seen);
-    if (!pl.pipeline && !pl.failed) {
+    LsPassInputs lin;
+    lin.ls = ls;
+    lin.fetch = fetch;
+    lin.rsrc1 = rsrc1;
+    lin.rsrc2 = rsrc2;
+    lin.hull = t.hull;
+    lin.window = t.window;
+    lin.control_points = t.control_points;
+    const std::uint64_t key = ls_pipe_key(lin);
+    std::shared_ptr<LsPipe> plp;
+    {
+        std::lock_guard<std::mutex> lk(g_ls_pipes_mu);
+        if (const auto it = g_ls_pipes.find(key); it != g_ls_pipes.end()) plp = it->second;
+    }
+    if (!plp) {
         struct BuildTime {  // the stall line's compute pipelines
             std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
             ~BuildTime() { note_cp_compute_build(work_us_since(t0)); }
         } build_time;
-        pl.name = ls->name + "-ls";
-        const gcn::Program prog = gcn::decode(ls->words.data(), ls->words.size());
-        gcn::Program fprog;
-        if (fetch) fprog = gcn::decode(fetch->words.data(), fetch->words.size());
-        gcn::TranslateOptions o;
-        o.stage = gcn::Stage::Compute;
-        o.tess_role = gcn::TranslateOptions::TessRole::LsCompute;
-        o.rsrc1 = rsrc1;
-        o.rsrc2 = rsrc2;
-        o.cs_threads[0] = 64;
-        o.fetch = fetch ? &fprog : nullptr;
-        o.exec_known = g.exec_known;
-        o.tess_lds_bound = tess_lds_bound();
-        if (t.hull) {
-            o.tess_window = t.window;
-            o.tess_patch_control_points = t.control_points;
-        }
-        pl.meta = translate_cached(prog, o);
-        VkShaderModule module = VK_NULL_HANDLE;
-        if (!prog.errors.empty() || !pl.meta.ok()) {
-            host_log("render: tessellation LS %s: %s", pl.name.c_str(),
-                     !prog.errors.empty() ? prog.errors[0].what.c_str() : pl.meta.errors[0].c_str());
-            pl.failed = true;
-        } else if (!make_module(pl.meta.spirv, module)) {
-            pl.failed = true;
-        } else {
-            dump_spirv(pl.name, pl.meta.spirv);
-            pl.pipeline = first_compute_pipeline(module, key ^ kLsOptimizeTag, pl.name, pl.meta.spirv, pl.standin, pl.name);
-            if (!pl.pipeline) pl.failed = true;
-            vkDestroyShaderModule(g.device, module, nullptr);
-            host_log("render: tessellation LS %s%s (%zu images)", pl.name.c_str(), pl.failed ? " failed" : " ready", pl.meta.images.size());
-        }
+        std::shared_ptr<LsPipe> built = ls_pipe_build(lin, key);
+        host_log("render: tessellation LS %s%s (%zu images)", built->name.c_str(), built->failed ? " failed" : " ready", built->meta.images.size());
+        g_ls_pipes_cp_built.fetch_add(1, std::memory_order_relaxed);
+        t.lsp_cp_built = true;
+        std::lock_guard<std::mutex> lk(g_ls_pipes_mu);
+        plp = g_ls_pipes.emplace(key, std::move(built)).first->second;  // one a worker finished meanwhile stays
+    } else if (plp->prebuilt && !plp->failed) {
+        static std::mutex seen_mu;
+        static std::unordered_set<std::uint64_t> seen;  // first takes only
+        std::lock_guard<std::mutex> lk(seen_mu);
+        if (seen.insert(key).second) g_ls_pipes_taken.fetch_add(1, std::memory_order_relaxed);
     }
+    LsPipe& pl = *plp;
+    if (pl.standin) adopt_optimized_compute(key ^ kLsOptimizeTag, pl.pipeline, pl.standin, pl.opt_seen);
+    // The pass this draw ran, for the recipe of the pipeline that draws it.
+    t.lsp_used = true;
+    t.lsp_ls = ls;
+    t.lsp_fetch = fetch;
+    t.lsp_rsrc1 = rsrc1;
+    t.lsp_rsrc2 = rsrc2;
     if (pl.failed) return false;
     // Room for every control point and the invocations past the count
     // (which write slack slots), at the larger of the LS's and the domain
@@ -16337,6 +16542,14 @@ static bool draw_impl(const GpuDraw& d) {
                                    vs_sampler_modes, ps_sampler_modes, tess_native, vertex_plan, tess_native || !lean_first, layout_only);
     pipeline_timer.next(kPhaseBind);
     if (tess_native && (pl.failed || !pl.tess_native || !pl.pipeline)) return tess_native_refuse("its native pipeline was not built");
+    // An LS pass the command processor had to build for this draw (no recipe
+    // held it) joins the recipe of the pipeline drawing it: a take or a build
+    // adds only the first draw's pass, and one pipeline meets several (the
+    // start builds every recipe's passes into the one cache the draws share).
+    if (t_tess && t_tess->lsp_cp_built && !pl.building && !pl.failed) {
+        std::lock_guard<std::mutex> lk(g_pmanifest.mu);
+        if (pl.recipe && recipe_attach_ls_pass(*pl.recipe)) g_pmanifest.dirty = true;
+    }
     if (pl.failed) {
         draw_failed(kFailPipeline);
         // Which pipelines, once each: the exit report only counts them.
@@ -20074,7 +20287,8 @@ bool read_recipe_file(const std::string& path, std::uint32_t& run, recipe_file::
     if (!in) return false;
     const std::vector<std::uint8_t> data((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
     manifest_file::Reader r{data.data(), data.data() + data.size()};
-    if (data.size() < 12 || r.u32() != recipe_file::kMagic || r.u32() != recipe_file::kVersion) {
+    const std::uint32_t magic = data.size() >= 12 ? r.u32() : 0, version = data.size() >= 12 ? r.u32() : 0;
+    if (magic != recipe_file::kMagic || (version != recipe_file::kVersion && version != 2)) {
         if (!data.empty()) host_log("render: pipeline manifest: %s is not one this build reads", path.c_str());
         return false;
     }
