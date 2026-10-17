@@ -3884,6 +3884,12 @@ std::uint8_t state_packet_dwords(Kind id) {
         case kSetUserData: return 6;
         case kSetIndexBuffer: return 3;
         case kSetNumInstances: case kSetIndexSize: return 2;
+        case kSetCs: case kSetCsQueue: return 25;
+        case kSetBase: return 4;
+        case kCsUd4: case kCsUdN: return 8;
+        case kCsUd8: case kCsUd8b: return 12;
+        case kCsUd1: return 5;
+        case kCsUdPtr: return 6;
         default: return 3;
     }
 }
@@ -3898,6 +3904,14 @@ bool skip_state_packets() {
     }();
     return v;
 }
+
+// The compute stage's packets - its program, its user data and the indirect
+// arguments' base - go too when every dispatch is a token and the dead
+// packets are on (hle_gx_trace_arm sets it): the tokens carry all three, from
+// the hooks' records, and a dispatch that falls back to its packet writes
+// their image before it (write_cs_image).
+bool g_cs_packets_dead = false;
+std::atomic<std::uint64_t> g_cs_images{0}, g_cs_images_failed{0};
 
 // True when this setter's packet is dead: the host reads none of it.
 bool suppressible(Kind id, std::uint32_t stage) {
@@ -3923,7 +3937,17 @@ std::uint64_t wrapper_note(Kind id, const std::uint64_t* f) {
     const std::uint64_t cb = f[5];
     if (!cb) return 0;
     const auto u32 = [&](int i) { return static_cast<std::uint32_t>(f[i]); };
+    // A compute-stage packet not written: the setter returns what the game's
+    // returns on success - SetCsShader the Gnm driver's 0, the others the
+    // write pointer (their packet's address) - though no caller reads it.
+    const auto suppress_cs = [&]() -> std::uint64_t {
+        if (!g_cs_packets_dead) return 0;
+        g_state_packets_skipped[id].fetch_add(1, std::memory_order_relaxed);
+        const_cast<std::uint64_t*>(f)[-1] = id == kSetCs || id == kSetCsQueue ? 0 : rd64(cb + 0x10);
+        return 1;
+    };
     const auto suppress = [&](std::uint32_t stage) -> std::uint64_t {
+        if (stage == 0 && (id == kUd4a || id == kUd8 || id == kUd4b || id == kUd1 || id == kUdPtr || id == kSetUserData)) return suppress_cs();
         if (!skip_state_packets() || !suppressible(id, stage)) return 0;
         g_state_packets_skipped[id].fetch_add(1, std::memory_order_relaxed);
         return 1;
@@ -3934,13 +3958,13 @@ std::uint64_t wrapper_note(Kind id, const std::uint64_t* f) {
         case kUd1: note_user_value(cb, u32(4), u32(3), f[2], 1); return suppress(u32(4));
         case kUdPtr: note_user_value(cb, u32(4), u32(3), f[2], 2); return suppress(u32(4));
         case kSetUserData: note_user_data(cb, u32(4), u32(3), f[2], u32(1)); return suppress(u32(4));
-        // The compute-typed writers: (cb, sgpr, ...) for stage 0. Never suppressed.
-        case kCsUdN: note_user_data(cb, 0, u32(4), f[3], u32(2)); return 0;
-        case kCsUd8: note_user_data(cb, 0, u32(4), f[3], 4); return 0;
-        case kCsUd4: note_user_data(cb, 0, u32(4), f[3], 4); return 0;
-        case kCsUd1: note_user_value(cb, 0, u32(4), f[3], 1); return 0;
-        case kCsUdPtr: note_user_value(cb, 0, u32(4), f[3], 2); return 0;
-        case kCsUd8b: note_user_data(cb, 0, u32(4), f[3], 8); return 0;
+        // The compute-typed writers: (cb, sgpr, ...) for stage 0.
+        case kCsUdN: note_user_data(cb, 0, u32(4), f[3], u32(2)); return suppress_cs();
+        case kCsUd8: note_user_data(cb, 0, u32(4), f[3], 4); return suppress_cs();
+        case kCsUd4: note_user_data(cb, 0, u32(4), f[3], 4); return suppress_cs();
+        case kCsUd1: note_user_value(cb, 0, u32(4), f[3], 1); return suppress_cs();
+        case kCsUdPtr: note_user_value(cb, 0, u32(4), f[3], 2); return suppress_cs();
+        case kCsUd8b: note_user_data(cb, 0, u32(4), f[3], 8); return suppress_cs();
         default: break;
     }
     // The state setters: the guest reads below happen before the lock.
@@ -4031,8 +4055,8 @@ std::uint64_t wrapper_note(Kind id, const std::uint64_t* f) {
             break;
         }
         case kSetIndxOffset: wrapper_state(cb).indx_offset = u32(4); break;
-        case kSetCs: case kSetCsQueue: wrapper_state(cb).cs_gnm = f[4] ? f[4] - 8 : 0; break;
-        case kSetBase: wrapper_state(cb).indirect_base = f[4] & ~7ull; break;
+        case kSetCs: case kSetCsQueue: wrapper_state(cb).cs_gnm = f[4] ? f[4] - 8 : 0; return suppress_cs();
+        case kSetBase: wrapper_state(cb).indirect_base = f[4] & ~7ull; return suppress_cs();
         case kSetIndexBuffer: wrapper_state(cb).index_base = f[4]; break;
         default: break;
     }
@@ -4848,6 +4872,55 @@ void refuse_dispatch(DsRefusal why, std::uint64_t caller) {
     std::lock_guard<std::mutex> lk(g_ds_mu);
     if (g_ds_refused_callers.size() < 64 || g_ds_refused_callers.count(caller)) ++g_ds_refused_callers[caller];
 }
+// A dispatch that falls back to its packet while the compute stage's packets
+// are not written (g_cs_packets_dead): their image, written before the
+// dispatch's packet as the register file would have had it - the program
+// from its command buffer's last SetCsShader, the user data as this thread's
+// compute writers wrote it in call order, and for an indirect dispatch the
+// arguments' base. SET_SH_REG and SET_BASE as Gnm writes them.
+void write_cs_image(std::uint64_t cb, const ComputeWrapperState* w, bool indirect) {
+    if (!g_cs_packets_dead) return;
+    std::uint32_t pk[48];
+    std::size_t n = 0;
+    const auto sh = [&](std::uint32_t reg, const std::uint32_t* v, std::uint32_t count) {
+        pk[n++] = 0xC0007602u | (count << 16);
+        pk[n++] = reg;
+        for (std::uint32_t k = 0; k < count; ++k) pk[n++] = v[k];
+    };
+    if (w && w->cs_gnm) {
+        std::uint32_t regs[7];
+        if (safe_read(w->cs_gnm + 8, regs, sizeof regs)) {
+            sh(0x20c, regs, 2);      // COMPUTE_PGM_LO/HI
+            sh(0x212, regs + 2, 2);  // COMPUTE_PGM_RSRC1/2
+            sh(0x207, regs + 4, 3);  // COMPUTE_NUM_THREAD_X/Y/Z
+        }
+    }
+    sh(0x240, t_cs_user.user, 16);   // COMPUTE_USER_DATA_0..15
+    if (indirect && w && w->indirect_base) {
+        pk[n++] = (rd32(cb + 0x28) & 2) | 0xC0021100u;  // SET_BASE, the indirect arguments' table
+        pk[n++] = 1;
+        pk[n++] = static_cast<std::uint32_t>(w->indirect_base) & 0xfffffff8u;
+        pk[n++] = static_cast<std::uint32_t>(w->indirect_base >> 32) & 0xffu;
+    }
+    std::uint64_t cmd = rd64(cb + 0x10), end = rd64(cb + 0x8);
+    if (cmd && end >= cmd && (end - cmd) / 4 < n) {
+        const std::uint64_t fn = rd64(cb + 0x18), arg = rd64(cb + 0x20);
+        const bool refilled = fn && (hle_call_guest<std::int64_t>(reinterpret_cast<void*>(static_cast<std::uintptr_t>(fn)), cb, n, arg,
+                                                                   (end - cmd) / 4) & 0xff);
+        cmd = rd64(cb + 0x10);
+        end = rd64(cb + 0x8);
+        if (!refilled) cmd = 0;
+    }
+    if (!cmd || end < cmd || (end - cmd) / 4 < n) {
+        g_cs_images_failed.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    std::memcpy(reinterpret_cast<void*>(static_cast<std::uintptr_t>(cmd)), pk, n * 4);
+    const std::uint64_t next = cmd + n * 4;
+    std::memcpy(reinterpret_cast<void*>(static_cast<std::uintptr_t>(cb + 0x10)), &next, sizeof next);
+    g_cs_images.fetch_add(1, std::memory_order_relaxed);
+}
+
 constexpr std::uint64_t kYebisDispatchSite = 0x15fbd4a;  // yebis_gnm_dispatch's call of the dispatch emitter returns here
 void check_yebis_dispatch(const std::uint32_t* user, std::uint32_t loaded);
 int wrapper_dispatch(Kind kind, const std::uint64_t* f, std::uint64_t caller) {
@@ -4860,10 +4933,12 @@ int wrapper_dispatch(Kind kind, const std::uint64_t* f, std::uint64_t caller) {
     const ComputeWrapperState* w = wrapper_compute_copy(cb, w_copy) ? &w_copy : nullptr;
     if (!w || !w->cs_gnm) {
         refuse_dispatch(kDsRefNoProgram, caller);
+        write_cs_image(cb, w, kind == kEmitDispatchIndirect);
         return 0;
     }
     if (kind == kEmitDispatchIndirect && !w->indirect_base) {
         refuse_dispatch(kDsRefNoBase, caller);
+        write_cs_image(cb, w, true);
         return 0;
     }
     if (g_ud_trace) {
@@ -4941,6 +5016,7 @@ int wrapper_dispatch(Kind kind, const std::uint64_t* f, std::uint64_t caller) {
             g_ds_records.erase(id);
         }
         refuse_dispatch(kDsRefNotWritten, caller);
+        write_cs_image(cb, w, kind == kEmitDispatchIndirect);
         return 0;
     }
     {
@@ -5279,6 +5355,11 @@ void report_state_packets() {
     }
     host_log("gx-state: %llu state packets not written (about %llu dwords, %.1f MiB): %s", static_cast<ull>(calls), static_cast<ull>(dwords),
              static_cast<double>(dwords) * 4 / (1 << 20), by_kind.c_str());
+    if (g_cs_packets_dead) {
+        host_log("gx-state: dispatches that fell back to their packet with the compute stage's image written before it: %llu (%llu with "
+                 "no room for it)",
+                 static_cast<ull>(g_cs_images.load()), static_cast<ull>(g_cs_images_failed.load()));
+    }
     std::uint64_t dead_calls = 0, dead_dwords = 0;
     std::string dead_by;
     for (std::size_t i = 0; i < kDeadWriterCount; ++i) {
@@ -6316,6 +6397,12 @@ void hle_gx_trace_arm(GuestMemory* mem) {
         const bool context_dead = on && skip_state_packets();
         const std::uint64_t keep = gnm_dead_keep_mask(std::getenv("BBHOST_CP_DEAD_KEEP"));
         gnm_dead_writers_configure(on ? dead : GnmDeadMode::kWrite, context_dead ? dead : GnmDeadMode::kWrite, keep);
+        // The compute stage's program, user data and indirect base: with
+        // every dispatch a token, which carries them.
+        g_cs_packets_dead = context_dead && g_native_dispatch == 2 && g_native == 2;
+        host_log("gx: the compute stage's packets (its program, user data and indirect base) are %s",
+                 g_cs_packets_dead ? "not written: every dispatch is a token, and a fallback writes their image before its packet"
+                                   : "written");
         std::size_t ours = 0, nothing = 0, kept = 0;
         for (std::size_t i = 0; i < kDeadWriterCount; ++i) {
             if (!gnm_dead_writer_placed(i)) continue;
