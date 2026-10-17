@@ -184,6 +184,8 @@ u64 call(std::size_t i, bool game, const Args& a) {
         case kSetPredication: return CALL((u64, u64, u32, u32), gnm_set_predication, c, a.r[1], d(2), d(3));
         case kClearPredication: return CALL((u64), gnm_clear_predication, c);
         case kIndirectBuffer: return CALL((u64, u64, u32), gnm_dispatch_write_indirect_buffer, c, a.r[1], d(2));
+        case kIncrementDeCounter: return CALL((u64), gnm_increment_de_counter, c);
+        case kWaitOnCeCounter: return CALL((u64), gnm_wait_on_ce_counter, c);
         default: return 0;
     }
 #undef CALL

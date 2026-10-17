@@ -1,10 +1,12 @@
-// Gnm's label, wait, inline-data, predication and indirect-buffer writers as
-// our source (docs/decomp.md). Ten small leaf methods of Gnm's command
-// buffers through which every completion the game asks the GPU for is
-// written, every wait it makes the GPU do on one - GX's block pools and
-// command arena, Map and its queries, YEBIS's drains and compute utilities,
-// Scaleform's fences, the compute ring's retirement, the flip - and the
-// compute ring's calls of the command buffers it runs:
+// Gnm's label, wait, inline-data, predication, indirect-buffer and counter
+// writers as our source (docs/decomp.md). Twelve small leaf methods of Gnm's
+// command buffers - every writer of a packet the command processor acts on,
+// besides our tokens, that the game calls - through which every completion
+// the game asks the GPU for is written, every wait it makes the GPU do on one
+// - GX's block pools and command arena, Map and its queries, YEBIS's drains
+// and compute utilities, Scaleform's fences, the compute ring's retirement,
+// the flip - the compute ring's calls of the command buffers it runs, and the
+// draw engine's side of the constant engine's counters:
 //
 // - EVENT_WRITE_EOP (0x14778f0): a label written when the work before it has
 //   left the pipe - 4.4M a 12-place tour;
@@ -20,7 +22,10 @@
 // - SET_PREDICATION on an occlusion result, and cleared (0x1477570,
 //   0x1477600), with the command buffer's predication flag - none in a tour;
 // - INDIRECT_BUFFER on the compute command buffer (0x148b330,
-//   GXComputeQueue::Submit's) - 79.
+//   GXComputeQueue::Submit's) - 79;
+// - the draw engine's side of the constant engine's counters,
+//   INCREMENT_DE_COUNTER (0x1478220) and WAIT_ON_CE_COUNTER (0x14781d0) -
+//   YEBIS's draws through its constant engine, 75 in a six-place session.
 //
 // Each is the game's function as source, instruction for instruction: the
 // same room check (the low 32 bits of the dwords left, against the packet's
@@ -71,6 +76,8 @@ enum Writer : std::size_t {
     kSetPredication,
     kClearPredication,
     kIndirectBuffer,
+    kIncrementDeCounter,
+    kWaitOnCeCounter,
     kWriters
 };
 
@@ -101,6 +108,11 @@ const LabelWriter kTable[kWriters] = {
     // push rbp; mov rbp, rsp; push r15, r14, rbx, rax; mov r14, rdx; mov r15, rsi.
     {"gnm_dispatch_write_indirect_buffer", 0x148b330, 16,
      {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x53, 0x50, 0x49, 0x89, 0xd6, 0x49, 0x89, 0xf7}, 4},
+    // push rbp; mov rbp, rsp; push rbx, rax; mov rbx, rdi; mov rcx, [rbx+8]; mov rax, [rbx+0x10].
+    {"gnm_increment_de_counter", 0x1478220, 17,
+     {0x55, 0x48, 0x89, 0xe5, 0x53, 0x50, 0x48, 0x89, 0xfb, 0x48, 0x8b, 0x4b, 0x08, 0x48, 0x8b, 0x43, 0x10}, 2},
+    {"gnm_wait_on_ce_counter", 0x14781d0, 17,
+     {0x55, 0x48, 0x89, 0xe5, 0x53, 0x50, 0x48, 0x89, 0xfb, 0x48, 0x8b, 0x4b, 0x08, 0x48, 0x8b, 0x43, 0x10}, 2},
 };
 #undef PUSH6
 
@@ -298,6 +310,17 @@ inline u64 w_indirect_buffer(u64 cb, u64 addr, u32 dwords) {
     return wp;
 }
 
+// The draw engine's side of the constant engine's counters: INCREMENT_DE_COUNTER,
+// and WAIT_ON_CE_COUNTER (its one dword 1), a qword each.
+inline u64 w_counter(u64 cb, u64 packet, u32 op) {
+    u64 wp, failed;
+    if (!make_room(cb, 2, &wp, &failed)) return failed;
+    store<u64>(wp, packet);
+    store<u64>(cb + 0x10, wp + 8);
+    host_lists::note(cb, wp, op);
+    return wp;
+}
+
 // SET_PREDICATION cleared, and the flag.
 inline u64 w_clear_predication(u64 cb) {
     u64 wp, failed;
@@ -339,6 +362,8 @@ DECOMP_LEAF u64 gnm_set_predication(u64 cb, u64 block, u32 draw_if_visible, u32 
 }
 DECOMP_LEAF u64 gnm_clear_predication(u64 cb) { return w_clear_predication(cb); }
 DECOMP_LEAF u64 gnm_dispatch_write_indirect_buffer(u64 cb, u64 addr, u32 dwords) { return w_indirect_buffer(cb, addr, dwords); }
+DECOMP_LEAF u64 gnm_increment_de_counter(u64 cb) { return w_counter(cb, 0x00000000c0008500ull, 0x85); }
+DECOMP_LEAF u64 gnm_wait_on_ce_counter(u64 cb) { return w_counter(cb, 0x00000001c0008600ull, 0x86); }
 
 namespace {
 
@@ -365,6 +390,8 @@ u64 write_as_game(std::size_t i, const Args& a) {
         case kSetPredication: return w_set_predication(cb, a.r[1], d(2), d(3));
         case kClearPredication: return w_clear_predication(cb);
         case kIndirectBuffer: return w_indirect_buffer(cb, a.r[1], d(2));
+        case kIncrementDeCounter: return w_counter(cb, 0x00000000c0008500ull, 0x85);
+        case kWaitOnCeCounter: return w_counter(cb, 0x00000001c0008600ull, 0x86);
         default: return 0;
     }
 }
@@ -491,6 +518,8 @@ void decomp_gx_labels_add() {
         reinterpret_cast<void*>(&gnm_set_predication),
         reinterpret_cast<void*>(&gnm_clear_predication),
         reinterpret_cast<void*>(&gnm_dispatch_write_indirect_buffer),
+        reinterpret_cast<void*>(&gnm_increment_de_counter),
+        reinterpret_cast<void*>(&gnm_wait_on_ce_counter),
     };
     static const std::array<void*, kWriters> kCompare = compare_table(std::make_index_sequence<kWriters>{});
     for (std::size_t i = 0; i < kWriters; ++i) {
