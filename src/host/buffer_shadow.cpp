@@ -802,7 +802,7 @@ bool shadow_stage_locked(std::uint64_t va, std::uint64_t bytes, Located& loc) {
     loc.avail = bytes;
     g_stage_fill[slot] += need;
     bump(g_staged);
-    g_staged_bytes.fetch_add(bytes, std::memory_order_relaxed);
+    bump(g_staged_bytes, bytes);
     return true;
 }
 

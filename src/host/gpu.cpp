@@ -7933,8 +7933,8 @@ bool copy_version_make_locked(std::uint64_t dst, std::uint64_t src, std::uint64_
     // costs nothing more, and a later transfer of the batch could read it.
     if (!g_copy_versions_mode || (g_copy_versions_mode == 1 && !render_pass_open_locked()) || g.in_transfer) return false;
     const auto refuse = [](int why) {
-        g_cv_refused.fetch_add(1, std::memory_order_relaxed);
-        g_cv_refused_why[why].fetch_add(1, std::memory_order_relaxed);
+        bump(g_cv_refused);
+        bump(g_cv_refused_why[why]);
         return false;
     };
     if (!bytes || bytes > kCopyVersionMax || ((dst | src | bytes) & 3)) return refuse(kCvSize);
@@ -7951,7 +7951,7 @@ bool copy_version_make_locked(std::uint64_t dst, std::uint64_t src, std::uint64_
     if (const CopyVersion* v = copy_version_over(src, bytes)) {
         if (src < v->dst || src + bytes > v->dst + v->bytes) return refuse(kCvSource);
         from = static_cast<const std::uint8_t*>(v->copy.map) + (src - v->dst);
-        g_cv_from_version.fetch_add(1, std::memory_order_relaxed);
+        bump(g_cv_from_version);
     }
     CopyVersion v;
     v.dst = dst;
@@ -7961,7 +7961,7 @@ bool copy_version_make_locked(std::uint64_t dst, std::uint64_t src, std::uint64_
     std::memcpy(v.copy.map, from, bytes);
     note_gpu_write_over_marker("guest copy", dst, src, bytes);
     copy_version_add(v);
-    g_cv_made.fetch_add(1, std::memory_order_relaxed);
+    bump(g_cv_made);  // not a locked add: that waits for the copy to leave the write-combining buffers
     return true;
 }
 
