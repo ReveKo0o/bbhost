@@ -3,8 +3,9 @@
 // section has the seven widget rows its handler fills (engine/option_menu.cpp:
 // anti-aliasing, ambient occlusion, HLSL Shaders, three sliders, the
 // resolution list) with the Defaults label below them, the other sections keep
-// their slots, and every language's message bundle carries HLSL Shaders' text
-// and line help. Skips (77) without the dump (BBHOST_APP0).
+// their slots, every language's message bundle carries HLSL Shaders' text and
+// line help, and every PC row's line help fits the menus' help line. Skips (77)
+// without the dump (BBHOST_APP0).
 #include "test_app0.h"
 
 #include "engine/menu_assets.cpp"
@@ -121,6 +122,23 @@ int main() {
     }
     CHECK(languages > 0);
     std::printf("%d language bundles carry HLSL Shaders\n", languages);
+
+    // 3. Every PC row's line help fits the help line, which shows one line
+    // and cuts it off past the dialog (about 130 characters of its font; the
+    // Resolution row's 198 and Frame Rate's 175 were cut): 96 at most. The
+    // System list's rows (110006..110013) and the port's sections (116000 on).
+    int helps = 0;
+    for (const auto& [id, row] : rows) {
+        const bool pc_row = (id >= 110006 && id <= 110013) || (id >= 116000 && id < 125000);
+        if (!pc_row || row.help.empty()) continue;
+        ++helps;
+        if (row.help.size() > 96) {
+            std::fprintf(stderr, "%d's help is %zu characters (96 at most): %s\n", static_cast<int>(id), row.help.size(), row.help.c_str());
+            ++g_failures;
+        }
+    }
+    CHECK(helps > 40);
+    std::printf("%d PC rows' help within 96 characters\n", helps);
     if (g_failures) {
         std::fprintf(stderr, "%d failures\n", g_failures);
         return 1;
