@@ -592,16 +592,26 @@ void report() {
     if (once) return;
     once = true;
     std::string modes[3];
-    std::size_t n[3] = {};
+    std::size_t n[3] = {}, compared = 0;
     for (std::size_t i = 0; i < kWriters; ++i) {
-        if (!gnm_dead_writer_placed(i)) continue;
+        const int placed = decomp_placed(kTable[i].name);
+        if (!placed) continue;
+        if (placed == 2) {  // the compare stand-in ran the game's version
+            ++compared;
+            continue;
+        }
         const u8 m = g_mode[i] < 3 ? g_mode[i] : 0;
         modes[m] += modes[m].empty() ? kTable[i].name : std::string(", ") + kTable[i].name;
         ++n[m];
     }
-    host_log("decomp: Gnm packet writers nothing reads: %zu write nothing%s%s, %zu nothing and a poisoned address%s%s, %zu the game's packet%s%s",
-             n[1], n[1] ? ": " : "", modes[1].c_str(), n[2], n[2] ? ": " : "", modes[2].c_str(), n[0], n[0] ? ": " : "",
-             modes[0].c_str());
+    if (compared) {
+        host_log("decomp: Gnm packet writers nothing reads: %zu compared, writing the game's packets (BBHOST_DECOMP_COMPARE=1)", compared);
+    } else {
+        host_log("decomp: Gnm packet writers nothing reads: %zu write nothing%s%s, %zu nothing and a poisoned address%s%s, %zu the game's "
+                 "packet%s%s",
+                 n[1], n[1] ? ": " : "", modes[1].c_str(), n[2], n[2] ? ": " : "", modes[2].c_str(), n[0], n[0] ? ": " : "",
+                 modes[0].c_str());
+    }
     if (g_compare_refills.load()) {
         host_log("decomp: Gnm packet writers compared: %llu calls ran the game's alone (the refill served them)",
                  static_cast<ull>(g_compare_refills.load()));

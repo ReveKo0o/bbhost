@@ -17,6 +17,7 @@
 #include "core/portable.h"
 #include "core/tally.h"
 #include "core/thunk.h"
+#include "decomp/decomp.h"
 #include "decomp/gx/dead_packets.h"
 #include "engine/addr.h"
 #include "host/gpu.h"
@@ -6279,6 +6280,7 @@ void hle_gx_trace_arm(GuestMemory* mem) {
             if (!gnm_dead_writer_placed(i)) continue;
             ++ours;
             if (gnm_dead_writer(i).dead && ((keep >> i) & 1)) ++kept;
+            if (decomp_comparing()) continue;  // the compare stand-ins write the game's packets
             if (gnm_dead_writer_mode(i) != GnmDeadMode::kWrite) ++nothing;
         }
         host_log("gx: dead packets: %zu of %zu writers ours (decomp), %zu of them write nothing%s (BBHOST_CP_DEAD_PACKETS=0 writes the game's "
