@@ -6993,29 +6993,20 @@ bool host_gpu_dispatch(const GpuDispatch& d_in) {
     }
     static thread_local StageImages stage_images;
     prefetch_stage_images(pl.meta, d.user_data, stage_images);
-    // On-demand imports: a dispatch binds no buffers - its shader walks the
-    // page table for every one - so what it reads and writes is imported first.
+    // On-demand imports (window imports): what the dispatch's shader reaches
+    // through the page table is imported before it runs - its stores and its
+    // counter words here, what it reads once the variant that runs is known
+    // (below: the lean one binds its buffers).
+    const auto import_path = [&](const gcn::ResourcePath& path, bool pointer, std::uint64_t min_bytes) {
+        std::uint32_t v[4]{};
+        if (!resolve_resource(path, d.user_data, pointer ? 2 : 4, v)) return;
+        const std::uint64_t base = v[0] | (static_cast<std::uint64_t>(pointer ? v[1] : (v[1] & 0xff)) << 32);
+        const std::uint32_t stride = pointer ? 0 : (v[1] >> 16) & 0x3fff;
+        const std::uint64_t bytes = pointer ? 0 : stride ? std::uint64_t{v[2]} * stride : v[2];
+        if (base) import_windows(base, std::min<std::uint64_t>(std::max(bytes, min_bytes), 64ull << 20));
+    };
     if (!g_import_whole) {
-        const auto import_path = [&](const gcn::ResourcePath& path, bool pointer, std::uint64_t min_bytes) {
-            std::uint32_t v[4]{};
-            if (!resolve_resource(path, d.user_data, pointer ? 2 : 4, v)) return;
-            const std::uint64_t base = v[0] | (static_cast<std::uint64_t>(pointer ? v[1] : (v[1] & 0xff)) << 32);
-            const std::uint32_t stride = pointer ? 0 : (v[1] >> 16) & 0x3fff;
-            const std::uint64_t bytes = pointer ? 0 : stride ? std::uint64_t{v[2]} * stride : v[2];
-            if (base) import_windows(base, std::min<std::uint64_t>(std::max(bytes, min_bytes), 64ull << 20));
-        };
-        for (const gcn::BufferBinding& b : pl.meta.buffers) import_path(b.path, b.pointer, std::max<std::uint64_t>(b.max_dw * 4ull, 16));
         for (const gcn::ResourcePath& p : pl.meta.store_buffers) import_path(p, false, 16);
-        // What it reads through the page table (TranslateResult::read_buffers):
-        // a V#'s records, a pointer's dwords up to the highest a load reads
-        // (64 KiB when no load's offset is known).
-        for (const gcn::TranslateResult::BufferRead& r : pl.meta.read_buffers) {
-            import_path(r.path, r.pointer, r.pointer ? (r.max_dw ? r.max_dw * 4ull : 64ull << 10) : 16);
-        }
-        g_dispatch_read_imports.fetch_add(pl.meta.read_buffers.size(), std::memory_order_relaxed);
-        // A load or store whose base does not trace to user data reaches
-        // memory nothing here imports: counted, the fallback's own reason.
-        if (pl.meta.untraced_reads || pl.meta.untraced_stores) g_dispatch_untraced.fetch_add(1, std::memory_order_relaxed);
         // BBHOST_VB_RACE=1: what the dispatch reads and never stores to, as
         // the draws' constants are checked (render.cpp).
         if (vb_race_on()) {
@@ -7171,6 +7162,27 @@ bool host_gpu_dispatch(const GpuDispatch& d_in) {
         } else {
             g_cs_lean_dispatches.fetch_add(1, std::memory_order_relaxed);
         }
+    }
+    // Window imports: what the variant that runs reads through the page
+    // table - every buffer of the walking one; of the lean one, whose buffers
+    // bound above (a copy as recorded, or a binding's own import), only the
+    // walks left in it (TranslateResult::read_buffers: a V#'s records, a
+    // pointer's dwords up to the highest a load reads, 64 KiB when no load's
+    // offset is known), and its stores.
+    if (!g_import_whole) {
+        const gcn::TranslateResult& walks = lean ? lean->meta : pl.meta;
+        if (!lean) {
+            for (const gcn::BufferBinding& b : pl.meta.buffers) import_path(b.path, b.pointer, std::max<std::uint64_t>(b.max_dw * 4ull, 16));
+        } else {
+            for (const gcn::ResourcePath& p : lean->meta.store_buffers) import_path(p, false, 16);
+        }
+        for (const gcn::TranslateResult::BufferRead& r : walks.read_buffers) {
+            import_path(r.path, r.pointer, r.pointer ? (r.max_dw ? r.max_dw * 4ull : 64ull << 10) : 16);
+        }
+        g_dispatch_read_imports.fetch_add(walks.read_buffers.size(), std::memory_order_relaxed);
+        // A load or store whose base does not trace to user data reaches
+        // memory nothing here imports: counted, the fallback's own reason.
+        if (walks.untraced_reads || walks.untraced_stores) g_dispatch_untraced.fetch_add(1, std::memory_order_relaxed);
     }
     VkDescriptorBufferInfo ubi{};
     alloc_params_slot_locked(params, ubi);
