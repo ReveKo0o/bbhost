@@ -73,22 +73,41 @@ compiles it with DXC ([rendering.md](rendering.md#hlsl)). You can edit
 that HLSL and have the game use your version.
 
 1. Write out the HLSL. Start the game once with `BBHOST_HLSL_DUMP=1`. Each
-   shader the game uses is saved to `<data>/bbhost/hlsl-dump/` as
-   `<hash>.<stage>.hlsl`, for example `7de085b59d21219a.ps.hlsl` (a pixel
-   shader). The stages are `ps`, `vs`, `hs`, `ds` and `cs`. Beside each file
-   is the lift it came from (`.lift.spv`). Each file's first line names the
-   shader: its name in the game's shader bundles and GX's name for it, for
-   example `// GXGuiShader_Tex.ppo (6d921b0b)`. The game's own built-in
-   shaders (the menus' Scaleform, YEBIS) have only GX's name. So
-   `grep -l GXFlver_Sword <data>/bbhost/hlsl-dump/*.hlsl` finds the weapon
-   shaders. A file is written the first time the game compiles or loads that
-   shader, so play through the places you want first.
+   shader the game uses is saved to `<data>/bbhost/hlsl-dump/`, named after
+   the shader and its stage. For example,
+   `GXGuiShader_Tex.ppo@6d921b0b.ps.hlsl` is the pixel shader of
+   `GXGuiShader_Tex.ppo`: its name in the game's shader bundles, then GX's
+   name for it.
+   - The game's own built-in shaders (the menus' Scaleform, YEBIS) have only
+     GX's name, as in `38d65b32.ps.hlsl`.
+   - The stages are `ps`, `vs`, `hs`, `ds` and `cs`.
+   - Beside each file is the lift it came from (`.lift.spv`).
+   - The first line names the shader again; the second gives this build's lift
+     hash.
+
+   So `ls <data>/bbhost/hlsl-dump/GXFlver_Sword*` finds the weapon shaders. A
+   file is written the first time the game compiles or loads that shader, so
+   play through the places you want first.
+
+   One shader can be compiled more than one way: a variant with a clip plane,
+   another input layout or another depth test. The first variant met gets the
+   plain name. Each other one gets its lift hash after a `~`, as in
+   `GXGuiShader_Tex.ppo@6d921b0b.ps~7de085b59d21219a.hlsl`.
 2. Copy the files you want to change into `<data>/bbhost/shaders/`. Keep
    each file's name, and edit the copy.
 3. Start the game. The log lists the edited files it found (`render: HLSL
    overrides: N edited shaders in ...`). The first time a shader is used,
    its edited file is compiled, and the log says whether it was taken
-   (`render: HLSL override <file> compiled and taken`).
+   (`render: HLSL override <file> compiled and taken for <shader>`).
+
+For each shader, the game looks for an edited file in this order:
+
+1. `<name>.<stage>~<hash>.hlsl`: that one variant;
+2. `<name>.<stage>.hlsl`: every variant of the shader in that stage whose
+   inputs and outputs match the file. A variant that doesn't match keeps
+   its own shader, and the log says so;
+3. `<hash>.<stage>.hlsl`: a file named only by this build's lift hash. This
+   is the fallback, for a shader whose name is not known.
 
 An edited shader is refused, and the game uses its own version of that
 shader, when:
@@ -103,11 +122,17 @@ reads.
 
 Things to know:
 
-- **The names are per machine.** A file's hash identifies the shader as it
-  was translated for your GPU: the device's features (half-precision
-  rounding, run-time sample offsets) and the bbhost version are part of it.
-  Write out a fresh set on the machine that will use it, and again after an
-  update. A file whose hash no shader has does nothing.
+- **Names survive updates; hashes don't.** A file named after the shader
+  (`<name>.<stage>.hlsl`) keeps working after a bbhost update and on another
+  machine: both parts come from the game's own files. A lift hash
+  identifies the shader as translated for your GPU and this bbhost version:
+  the device's features (half-precision rounding, run-time sample offsets)
+  and the translator are part of it. So `~<hash>` variant files and
+  `<hash>` fallback files stop matching after an update; write out a fresh
+  set then. A file that no shader matches does nothing.
+- **An update can change the shader's interface.** If the update changes the
+  inputs or outputs the game's own version declares, your file is refused,
+  the log says why, and the game uses its own until you edit it again.
 - **When changes take effect.** Edits are read at the start, so restart the
   game to try a change.
 - **The off switch turns this off too.** Edited shaders apply only while the

@@ -2,9 +2,10 @@
 // BBHOST_HLSL unset): a stage keeps its lift while bb-hlsl compiles DXC's
 // module behind it, and takes that module from the cache afterwards; the
 // queue's lanes (what draws took before what GX only created, a drawn stage
-// moved up); BBHOST_HLSL_DUMP=1's folder; and edited HLSL in shaders/, taken
+// moved up); BBHOST_HLSL_DUMP=1's folder; edited HLSL in shaders/, taken
 // when it compiles with the lift's interface and refused (the stage keeps its
-// own module) when it does not. Synthetic programs only: no game shader is
+// own module) when it does not; and the files' stable names (bundle entry, GX
+// name, stage), which a lift with other words still finds. Synthetic programs only: no game shader is
 // read. Skips (77) without DXC (host/dxc.h: BBHOST_HLSL_DXC, beside the
 // executable, or the system's).
 #include "host/translation_cache.cpp"
@@ -183,6 +184,57 @@ int main() {
     CHECK(x_now.ok() && x_now.spirv != x_lift.spirv);  // refused: DXC's module of the lift, from the cache
     (void)lift_cached(false, x.prog, x.o, x.ref);
     CHECK(g_hlsl_overrides.refused.load() == 1);  // decided once a run
+
+    // 4. Stable names. A lift whose program is known is dumped under the
+    // shader's identity - its bundle entry and GX's name, and the stage - as
+    // Test_Shader.ppo@deadbeef.ps.hlsl, another lift of the same program as
+    // ...ps~<lift hash>.hlsl, the hash on each file's second line. An edited
+    // file under the identity's name is taken by a lift with other words (what
+    // a translator update makes), and a variant's own file comes first.
+    hlsl_set_name_lookup(+[](const std::string& gx) -> std::string { return gx == "deadbeef" ? "Test_Shader.ppo" : std::string(); });
+    const Ps p1 = make_ps({0, 2, 1, 3}), p2 = make_ps({1, 3, 0, 2}), p3 = make_ps({3, 1, 2, 0});
+    const gcn::LiftResult l1 = gcn::lift_pixel_shader(p1.prog, p1.o, p1.ref), l2 = gcn::lift_pixel_shader(p2.prog, p2.o, p2.ref),
+                          l3 = gcn::lift_pixel_shader(p3.prog, p3.o, p3.ref);
+    const std::uint64_t done_before = g_hlsl_behind.done.load();
+    hlsl_name_next("deadbeef");
+    (void)lift_cached(false, p1.prog, p1.o, p1.ref);
+    CHECK(wait_done(done_before + 1));
+    hlsl_name_next("deadbeef");
+    (void)lift_cached(false, p2.prog, p2.o, p2.ref);
+    CHECK(wait_done(done_before + 2));
+    const std::filesystem::path stable_dump = dir / "hlsl-dump" / "Test_Shader.ppo@deadbeef.ps.hlsl";
+    const std::filesystem::path variant_dump = dir / "hlsl-dump" / ("Test_Shader.ppo@deadbeef.ps~" + lift_hash_hex(l2.spirv) + ".hlsl");
+    CHECK(std::filesystem::exists(stable_dump));
+    CHECK(std::filesystem::exists(variant_dump));
+    CHECK(dump_is_lift(stable_dump, lift_hash_hex(l1.spirv)));
+    CHECK(dump_is_lift(variant_dump, lift_hash_hex(l2.spirv)));
+    {
+        std::ifstream in(stable_dump, std::ios::binary);
+        std::string first;
+        std::getline(in, first);
+        CHECK(first == "// Test_Shader.ppo (deadbeef)");
+    }
+    std::string stable_source;
+    {
+        std::ifstream in(stable_dump, std::ios::binary);
+        stable_source.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+    }
+    std::ofstream(dir / "shaders" / "Test_Shader.ppo@deadbeef.ps.hlsl", std::ios::binary) << "// edited\n" << stable_source;
+    std::ofstream(dir / "shaders" / ("Test_Shader.ppo@deadbeef.ps~" + lift_hash_hex(l2.spirv) + ".hlsl"), std::ios::binary) << "not HLSL either\n";
+    hlsl_set_folders(dir.string());
+    const std::uint64_t taken_before = g_hlsl_overrides.taken.load(), refused_before = g_hlsl_overrides.refused.load();
+    hlsl_name_next("deadbeef");
+    const gcn::LiftResult e3 = lift_cached(false, p3.prog, p3.o, p3.ref);  // never met: other words, the same program and stage
+    CHECK(g_hlsl_overrides.taken.load() == taken_before + 1);
+    CHECK(e3.ok() && e3.spirv != l3.spirv);
+    CHECK(gcn::hlsl_interface_diff(l3.spirv, e3.spirv).empty());
+    hlsl_name_next("deadbeef");
+    const gcn::LiftResult e2 = lift_cached(false, p2.prog, p2.o, p2.ref);  // its own variant file, which does not compile
+    CHECK(g_hlsl_overrides.refused.load() == refused_before + 1);
+    CHECK(e2.ok() && e2.spirv != l2.spirv);  // refused: DXC's module of the lift, from the cache
+    hlsl_name_next("deadbee0");
+    (void)lift_cached(false, p1.prog, p1.o, p1.ref);  // another program's name: the identity's file is not its
+    CHECK(g_hlsl_overrides.taken.load() == taken_before + 1);
 
     translation_cache_report();
     std::filesystem::remove_all(dir, ec);

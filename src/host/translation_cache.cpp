@@ -661,18 +661,92 @@ std::string hlsl_title(const std::string& name) {
     }
     return name;
 }
-std::string hlsl_dump(const std::vector<std::uint32_t>& lifted, const gcn::HlslResult& h) {
-    const char* dir = hlsl_dump_dir();
-    if (!dir) return {};
+// The shader's stable identity, what its dumped and edited files are named
+// by: the bundle entry and GX's name ("GXGuiShader_Tex.ppo@6d921b0b"), or GX's
+// name alone for the eboot's own programs. Both come from the game's files, so
+// a translator update keeps them; the lift's hash does not survive one. Empty
+// when the lift's program is not known.
+std::string hlsl_stable_name(const std::string& gx) {
+    if (gx.empty()) return {};
+    std::string file;
+    if (auto lookup = g_hlsl_name_lookup.load()) file = lookup(gx);
+    std::string name = file.empty() ? gx : file + "@" + gx;
+    for (char& c : name) {
+        if (std::strchr("<>:\"/\\|?*", c) || static_cast<unsigned char>(c) < 32) c = '_';  // a file name on every system
+    }
+    return name;
+}
+// "ps", "vs", "hs", "ds", "cs": the lift's stage, from its entry point's
+// execution model.
+std::string lift_stage_tag(const std::vector<std::uint32_t>& spirv) {
+    for (std::size_t i = 5; i < spirv.size();) {
+        const std::uint32_t len = spirv[i] >> 16, op = spirv[i] & 0xffff;
+        if (!len) break;
+        if (op == 15 && i + 1 < spirv.size()) {  // OpEntryPoint
+            switch (spirv[i + 1]) {
+                case 0: return "vs";
+                case 1: return "hs";
+                case 2: return "ds";
+                case 4: return "ps";
+                case 5: return "cs";
+                default: return "xx";
+            }
+        }
+        i += len;
+    }
+    return "xx";
+}
+std::string lift_hash_hex(const std::vector<std::uint32_t>& lifted) {
     KeyHasher n;
     for (const std::uint32_t w : lifted) n.u32(w);
-    char name[40];
-    std::snprintf(name, sizeof(name), "%016llx.%s", static_cast<unsigned long long>(n.a), h.profile.empty() ? "xx" : h.profile.substr(0, 2).c_str());
+    char buf[24];
+    std::snprintf(buf, sizeof(buf), "%016llx", static_cast<unsigned long long>(n.a));
+    return buf;
+}
+// Whether the dumped file at `p` was written for the lift `hash16` (its second
+// line says "// lift <hash>").
+bool dump_is_lift(const std::filesystem::path& p, const std::string& hash16) {
+    std::ifstream in(p, std::ios::binary);
+    std::string line;
+    for (int k = 0; k < 3 && std::getline(in, line); ++k) {
+        if (line.find("// lift " + hash16) == 0) return true;
+    }
+    return false;
+}
+// BBHOST_HLSL_DUMP: the HLSL, and the lift it was printed from (to compile it
+// again with gcn2hlsl --spv). Named by the shader's stable identity and stage
+// - <stable>.<stage>.hlsl for the first lift of that program and stage met,
+// <stable>.<stage>~<lift hash>.hlsl for each other variant - or, for a lift
+// whose program is not known, by the lift's hash (<hash>.<stage>.hlsl).
+std::string hlsl_dump(const std::vector<std::uint32_t>& lifted, const gcn::HlslResult& h, const std::string& stable) {
+    const char* dir = hlsl_dump_dir();
+    if (!dir) return {};
+    const std::string hash16 = lift_hash_hex(lifted);
+    const std::string stage = h.profile.size() >= 2 ? h.profile.substr(0, 2) : lift_stage_tag(lifted);
+    std::lock_guard<std::mutex> lk(g_hlsl_dump_mu);  // the name chosen and the file written as one
     std::error_code ec;
     std::filesystem::create_directories(dir, ec);
+    std::string name;
+    if (stable.empty()) {
+        name = hash16 + "." + stage;
+    } else {
+        const std::filesystem::path first = std::filesystem::path(dir) / (stable + "." + stage + ".hlsl");
+        name = !std::filesystem::exists(first, ec) || dump_is_lift(first, hash16) ? stable + "." + stage : stable + "." + stage + "~" + hash16;
+    }
     const std::filesystem::path base = std::filesystem::path(dir) / name;
     if (std::filesystem::exists(base.string() + ".hlsl", ec)) return base.string();  // written already
-    if (!h.source.empty()) std::ofstream(base.string() + ".hlsl", std::ios::binary) << h.source;
+    if (!h.source.empty()) {
+        // The lift's hash on the second line: the dump's own check, and an
+        // edited file's fallback match.
+        const std::size_t nl = h.source.find('\n');
+        std::ofstream out(base.string() + ".hlsl", std::ios::binary);
+        if (nl == std::string::npos) {
+            out << h.source << "\n// lift " << hash16 << "\n";
+        } else {
+            out << h.source.substr(0, nl + 1) << "// lift " << hash16 << " (this build's lift; the name above is what a translator update keeps)\n"
+                << h.source.substr(nl + 1);
+        }
+    }
     std::ofstream(base.string() + ".lift.spv", std::ios::binary)
         .write(reinterpret_cast<const char*>(lifted.data()), static_cast<std::streamsize>(lifted.size() * 4));
     return base.string();
@@ -680,9 +754,10 @@ std::string hlsl_dump(const std::vector<std::uint32_t>& lifted, const gcn::HlslR
 // Prints, compiles and checks one lifted module: DXC's SPIR-V, or empty with `why`.
 std::vector<std::uint32_t> hlsl_compile(const std::vector<std::uint32_t>& lifted, const gcn::HlslOptions& hopt, const Dxc& dxc, std::string& why) {
     gcn::HlslOptions titled = hopt;  // a dump's header names the program by its bundle entry too
-    if (hlsl_dump_dir()) titled.title = hlsl_title(hopt.title);
+    const bool dumping = hlsl_dump_dir() != nullptr;
+    if (dumping) titled.title = hlsl_title(hopt.title);
     const gcn::HlslResult h = gcn::emit_hlsl(lifted, titled);
-    const std::string dumped = hlsl_dump(lifted, h);
+    const std::string dumped = dumping ? hlsl_dump(lifted, h, hlsl_stable_name(hopt.title)) : std::string();
     // The first few failures in full, with where they were dumped.
     const auto log_failure = [&](const std::string& what) {
         static std::atomic<int> logged{0};
@@ -1039,17 +1114,20 @@ void hlsl_defer(const Key& key, const std::vector<std::uint32_t>& lifted, const 
     g_hlsl_behind.cv.notify_one();
 }
 
-// ---- Edited HLSL: <data>/bbhost/shaders/<hash>.<profile>.hlsl ----
-// A player's own source for a lift, named as BBHOST_HLSL_DUMP names it (the
-// lift's hash on this machine): compiled with DXC at the stage's first use and
-// taken in place of the lift's module when it declares the same interface and
-// validates; otherwise the lift's own module (or DXC's of it) is kept. Every
-// outcome is logged once.
+// ---- Edited HLSL: <data>/bbhost/shaders/<name>.hlsl ----
+// A player's own source for a stage, named as BBHOST_HLSL_DUMP names it:
+// compiled with DXC at the stage's first use and taken in place of the lift's
+// module when it declares the same interface and validates; otherwise the
+// stage keeps its own module (the lift's, or DXC's of it). For a lift, the
+// files tried in order are <stable>.<stage>~<lift hash> (that one variant),
+// <stable>.<stage> (every variant of the program and stage whose interface it
+// matches - the name a translator update keeps), then <lift hash>.<stage>
+// (the fallback, this build's lift only). Every outcome is logged once.
 struct HlslOverrides {
     std::mutex mu;
-    std::string dir;                                       // under mu
-    std::unordered_map<std::uint64_t, std::string> files;  // under mu: lift hash -> file
-    std::unordered_map<std::uint64_t, std::vector<std::uint32_t>> compiled;  // under mu: this run's results (empty: refused)
+    std::string dir;                                      // under mu
+    std::unordered_map<std::string, std::string> files;   // under mu: name without .hlsl -> file
+    std::unordered_map<std::uint64_t, std::vector<std::uint32_t>> compiled;  // under mu: this run's results by lift (empty: refused)
     std::atomic<std::uint64_t> taken{0}, refused{0};
     std::atomic<bool> any{false};
 } g_hlsl_overrides;
@@ -1065,17 +1143,31 @@ std::uint64_t lift_hash(const std::vector<std::uint32_t>& lifted) {
 bool hlsl_override(const std::vector<std::uint32_t>& lifted, const gcn::HlslOptions& hopt, const Dxc& dxc, std::vector<std::uint32_t>& out) {
     if (!g_hlsl_overrides.any.load(std::memory_order_acquire)) return false;
     const std::uint64_t hash = lift_hash(lifted);
-    std::string file;
     {
         std::lock_guard<std::mutex> lk(g_hlsl_overrides.mu);
         if (const auto it = g_hlsl_overrides.compiled.find(hash); it != g_hlsl_overrides.compiled.end()) {
             out = it->second;
             return !out.empty();
         }
-        const auto it = g_hlsl_overrides.files.find(hash);
-        if (it == g_hlsl_overrides.files.end()) return false;
-        file = it->second;
     }
+    const std::string hash16 = lift_hash_hex(lifted), stage = lift_stage_tag(lifted), stable = hlsl_stable_name(hopt.title);
+    std::vector<std::string> names;
+    if (!stable.empty()) {
+        names.push_back(stable + "." + stage + "~" + hash16);
+        names.push_back(stable + "." + stage);
+    }
+    names.push_back(hash16 + "." + stage);
+    std::string file;
+    {
+        std::lock_guard<std::mutex> lk(g_hlsl_overrides.mu);
+        for (const std::string& n : names) {
+            if (const auto it = g_hlsl_overrides.files.find(n); it != g_hlsl_overrides.files.end()) {
+                file = it->second;
+                break;
+            }
+        }
+    }
+    if (file.empty()) return false;
     std::vector<std::uint32_t> spirv;
     std::string why;
     gcn::HlslResult h = gcn::emit_hlsl(lifted, hopt);  // the profile, entry point and arguments the lift needs
@@ -1120,10 +1212,12 @@ bool hlsl_override(const std::vector<std::uint32_t>& lifted, const gcn::HlslOpti
     }
     if (spirv.empty()) {
         g_hlsl_overrides.refused.fetch_add(1, std::memory_order_relaxed);
-        host_log("render: HLSL override %s refused, the stage keeps its own module: %s", file.c_str(), why.c_str());
+        host_log("render: HLSL override %s refused for %s (lift %s), the stage keeps its own module: %s", file.c_str(),
+                 stable.empty() ? "a lift of no known program" : stable.c_str(), hash16.c_str(), why.c_str());
     } else {
         g_hlsl_overrides.taken.fetch_add(1, std::memory_order_relaxed);
-        host_log("render: HLSL override %s compiled and taken (%zu words)", file.c_str(), spirv.size());
+        host_log("render: HLSL override %s compiled and taken for %s (lift %s, %zu words)", file.c_str(),
+                 stable.empty() ? "a lift of no known program" : stable.c_str(), hash16.c_str(), spirv.size());
     }
     out = std::move(spirv);
     return !out.empty();
@@ -1184,7 +1278,7 @@ void hlsl_stage(gcn::LiftResult& l, const Key* lift_key, const gcn::TranslateOpt
         if (!spirv.empty() && hlsl_dump_dir()) {
             gcn::HlslOptions titled = hopt;
             titled.title = hlsl_title(hopt.title);
-            hlsl_dump(l.spirv, gcn::emit_hlsl(l.spirv, titled));
+            hlsl_dump(l.spirv, gcn::emit_hlsl(l.spirv, titled), hlsl_stable_name(hopt.title));
         }
     } else if (hlsl_mode() == 2 && !g_hlsl_inline.load(std::memory_order_relaxed)) {
         // Behind the game: never compiled on the thread that needs the stage.
@@ -1252,22 +1346,13 @@ void hlsl_set_folders(const std::string& bbhost_dir) {
         g_hlsl_dump_default = (std::filesystem::path(bbhost_dir) / "hlsl-dump").string();
     }
     const std::string dir = (std::filesystem::path(bbhost_dir) / "shaders").string();
-    std::unordered_map<std::uint64_t, std::string> files;
+    std::unordered_map<std::string, std::string> files;
     std::error_code ec;
     for (const auto& e : std::filesystem::directory_iterator(dir, ec)) {
         if (!e.is_regular_file(ec)) continue;
         const std::string name = e.path().filename().string();
-        if (name.size() < 22 || name.compare(name.size() - 5, 5, ".hlsl") != 0) continue;
-        std::uint64_t hash = 0;
-        bool hex = true;
-        for (int i = 0; i < 16 && hex; ++i) {
-            const char c = name[i];
-            const int v = c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 : c >= 'A' && c <= 'F' ? c - 'A' + 10 : -1;
-            if (v < 0) hex = false;
-            hash = hash << 4 | static_cast<std::uint64_t>(v < 0 ? 0 : v);
-        }
-        if (!hex || name[16] != '.') continue;
-        files[hash] = e.path().string();
+        if (name.size() <= 5 || name.compare(name.size() - 5, 5, ".hlsl") != 0) continue;
+        files[name.substr(0, name.size() - 5)] = e.path().string();
     }
     std::lock_guard<std::mutex> lk(g_hlsl_overrides.mu);
     g_hlsl_overrides.dir = dir;
