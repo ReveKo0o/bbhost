@@ -7678,7 +7678,7 @@ void host_gpu_set_compile_session(bool on) {
 }
 HostShaderCompileProgress host_gpu_compile_progress() {
     HostShaderCompileProgress p;
-    gpu::compile_session_progress(p.total, p.done, p.failed, p.listed, p.finished, p.reasons);
+    gpu::compile_session_progress(p.total, p.done, p.failed, p.listed, p.finished, p.reasons, p.recipes_total, p.recipes_done);
     return p;
 }
 void host_gpu_compile_cancel() { gpu::compile_session_cancel(); }

@@ -42,7 +42,8 @@ translator's own shaders while that runs, and may stutter a little more than
 later ones the first time it meets each place. To compile before playing -
 after installing or updating bbhost or your graphics driver - open the setup
 window's Shaders tab and press **Compile shaders now**: every shader of the
-game's, and the pipelines your earlier sessions drew, then the first session
+game's, the pipelines your earlier sessions drew and those on the list a
+release ships (`pipeline-list.bin`, below), then the first session
 needs no compiling in the background. (The few pipelines a place needs the
 first time you ever visit it are still built then.) The tab shows whether the
 shader caches are up to date for this bbhost and this driver, and the

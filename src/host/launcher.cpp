@@ -565,7 +565,7 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
                 }
                 if (!cache_state.last.empty()) {
                     // shader-compile.txt's "key value" lines, as sentences.
-                    std::string result, when, version, stages, hlsl, seconds, device;
+                    std::string result, when, version, stages, hlsl, seconds, device, pipelines;
                     std::vector<std::string> failed, lift;
                     for (const std::string& l : cache_state.last) {
                         const std::size_t sp = l.find(' ');
@@ -578,6 +578,7 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
                         else if (k == "seconds") seconds = v;
                         else if (k == "device") device = v.substr(v.find(' ') == std::string::npos ? 0 : v.find(' ') + 1);
                         else if (k == "failed") failed.push_back(v);
+                        else if (k == "pipelines") pipelines = v;
                         else if (k == "lift") lift.push_back(v);
                     }
                     ImGui::Text("The last compile: %s, %s (%s s), bbhost %s", result == "done" ? "finished" : result.c_str(), when.c_str(),
@@ -585,6 +586,7 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
                     ImGui::Indent();
                     ImGui::PushTextWrapPos(0.0f);
                     ImGui::TextDisabled("On %s: shaders %s; %s.", device.c_str(), stages.c_str(), hlsl.c_str());
+                    if (!pipelines.empty() && pipelines.rfind("0 of 0", 0) != 0) ImGui::TextDisabled("Pipelines %s.", pipelines.c_str());
                     for (const std::string& r : failed) {
                         if (r.find("LDS use outside a compute shader") != std::string::npos)
                             ImGui::TextDisabled("Not compiled alone (%s): vertex shaders that write LDS, which only run inside another stage (tessellation); they are compiled when the game draws them.",
@@ -626,6 +628,9 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
                         ImGui::Text("%.0f s", cv.seconds);
                     ImGui::Text("%llu took DXC's module, %llu kept the lift; %llu failed", static_cast<unsigned long long>(cv.hlsl),
                                 static_cast<unsigned long long>(cv.lift), static_cast<unsigned long long>(cv.failed));
+                    if (cv.recipes_total)
+                        ImGui::Text("Pipelines from your earlier sessions and the shipped list: %llu of %llu",
+                                    static_cast<unsigned long long>(cv.recipes_done), static_cast<unsigned long long>(cv.recipes_total));
                     if (cv.finished) ImGui::TextColored(good, "Done: the next start takes these from the caches.");
                     if (cv.cancelled) ImGui::TextColored(warn, "Cancelled: what was compiled is kept; the game compiles the rest.");
                     if (!cv.error.empty()) ImGui::TextColored(warn, "%s", cv.error.c_str());

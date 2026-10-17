@@ -222,12 +222,15 @@ the default, and nothing waits on DXC:
   what the last compile did, and has **Compile shaders now**: bbhost starts
   itself again with `--compile-shaders`, a run with no game and no window
   that starts the GPU and compiles every shader in the game's bundles (the
-  debug menu's aside) and every stage and pipeline the manifests name -
-  translations, lifts, DXC's modules and the driver's pipelines - into the
-  same caches, on the game's own precompile workers. Progress (N of M, the
-  time left), failures by reason and the HLSL counts show as it runs; Cancel
-  keeps what is done; the window stays live and Play waits for it. The run
-  logs to `<data>/bbhost/shader-compile.log` and records its result in
+  debug menu's aside) and every stage and pipeline the manifests name - the
+  player's earlier sessions' and the list a release ships beside bbhost
+  (`pipeline-list.bin`, [running.md](running.md)) - translations, lifts, DXC's
+  modules and the driver's pipelines - into the same caches, on the game's own
+  precompile workers. Progress (N of M, the time left; the manifests' and the
+  list's pipelines counted in it and on a line of their own), failures by
+  reason and the HLSL counts show as it runs, and it ends when every job has;
+  Cancel keeps what is done; the window stays live and Play waits for it. The
+  run logs to `<data>/bbhost/shader-compile.log` and records its result in
   `<data>/bbhost/shader-compile.txt`. On the RTX 4070 it takes ~60 s (3,281
   shaders, 3,682 DXC modules, 16 workers). What it does not do is a first
   session's first sight: the variants a draw makes (clip-discard pixel

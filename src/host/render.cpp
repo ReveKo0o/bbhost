@@ -7211,9 +7211,18 @@ void note_sweep_hit(std::uint64_t key) {
 // shaders and the precompile workers' jobs (the manifests' stages and
 // pipelines, run before the sweep's), done and in all.
 void compile_session_progress(std::uint64_t& total, std::uint64_t& done, std::uint64_t& failed, bool& listed, bool& finished,
-                              std::string& reasons) {
+                              std::string& reasons, std::uint64_t& recipes_total, std::uint64_t& recipes_done) {
     const std::uint64_t pre_done = g_precompile_jobs_done.load();
-    const std::uint64_t pre_left = precompile_backlog();
+    // The precompile workers' queue with the predictions behind it: the
+    // session waits for both, and for the pipelines the manifests replay -
+    // the player's own and the shipped list's (pipeline_manifest_load).
+    std::uint64_t pre_left = precompile_backlog();
+    if (Precompiler* w = g_precompiler.load()) {
+        std::lock_guard<std::mutex> lk(w->mu);
+        pre_left += w->later.size();
+    }
+    recipes_total = g_pmanifest.queued.load();
+    recipes_done = g_pmanifest.done.load() + g_pmanifest.failed.load();
     std::uint64_t sweep_total = 0, sweep_left = 0;
     bool sweep_finished = false;
     {
@@ -7236,6 +7245,13 @@ void compile_session_progress(std::uint64_t& total, std::uint64_t& done, std::ui
 // Cancel: what the sweep has not begun is dropped; what runs ends.
 void compile_session_cancel() {
     g_sweep_cancel.store(true);
+    // The manifests' and the list's pipelines not begun, and the predictions,
+    // are dropped too: they only warm the caches.
+    if (Precompiler* w = g_precompiler.load()) {
+        std::lock_guard<std::mutex> lk(w->mu);
+        w->jobs.clear();
+        w->later.clear();
+    }
     std::lock_guard<std::mutex> lk(g_sweeper.mu);
     g_sweeper.jobs.clear();
     g_sweeper.cv.notify_all();

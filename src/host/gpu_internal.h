@@ -621,7 +621,7 @@ void shader_sweep_start(const std::string& stamp_path, const std::string& eboot_
 // starts; the sweep then takes the bundles' shaders at once, in full.
 inline std::atomic<bool> g_compile_session{false};
 void compile_session_progress(std::uint64_t& total, std::uint64_t& done, std::uint64_t& failed, bool& listed, bool& finished,
-                              std::string& reasons);
+                              std::string& reasons, std::uint64_t& recipes_total, std::uint64_t& recipes_done);
 void compile_session_cancel();
 // What it has left while the title or a loading screen is up (else 0).
 std::size_t shader_sweep_left();

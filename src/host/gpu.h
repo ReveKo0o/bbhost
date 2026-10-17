@@ -629,6 +629,7 @@ std::size_t host_gpu_shader_backlog();
 void host_gpu_set_compile_session(bool on);
 struct HostShaderCompileProgress {
     std::uint64_t total = 0, done = 0, failed = 0;
+    std::uint64_t recipes_total = 0, recipes_done = 0;  // pipelines replayed from the manifest and the shipped list
     bool listed = false, finished = false;
     std::string reasons;  // one "why xN" a line
 };

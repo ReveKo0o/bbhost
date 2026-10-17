@@ -60,6 +60,7 @@ public:
     struct View {
         bool running = false, finished = false, cancelled = false, failed_to_run = false;
         std::uint64_t done = 0, total = 0, failed = 0, hlsl = 0, lift = 0;
+        std::uint64_t recipes_done = 0, recipes_total = 0;  // pipelines from the manifest and the shipped list
         double seconds = 0, eta = -1;
         std::string phase, error;
         std::vector<std::string> reasons;
