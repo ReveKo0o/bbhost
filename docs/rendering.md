@@ -116,8 +116,11 @@ needs subgroup operations. A barrier is accepted only where every invocation
 of the workgroup provably reaches it, and LDS, which no game compute shader
 uses, is refused. `BBHOST_LIFT_COMPUTE=0` keeps every compute shader
 translated. A compute shader reads its constant buffers, tables and typed
-loads through storage buffers its dispatch pushes, where every one of them
-binds, rather than through the page-table walk (`BBHOST_CS_BUFFERS=0`: the
+loads, and reads and writes the elements of its particle buffers (typed
+loads and stores at an index or offset, format loads, atomic adds; GCN's
+bounds checks kept), through storage buffers its dispatch pushes, where
+every one of them binds, rather than through the page-table walk
+(`BBHOST_CS_BUFFERS=0`: the walk; `BBHOST_CS_BOUND_ELEMENTS=0`: the elements
 walk): a translated one as that variant of its translation, a lifted one as
 the lift of that translation, which reads what the translation binds from the
 same buffers and walks what it walks (`BBHOST_LIFT_CS_BUFFERS=0`: a lifted

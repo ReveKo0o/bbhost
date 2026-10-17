@@ -2703,8 +2703,9 @@ private:
     // translate.cpp format_load_dynamic: buffer_load_format_* with the format
     // from the V#'s word 3, the 32-, 16- and 8-bit families, 0, 0, 0, 1 past
     // the format's components.
-    std::vector<Id> format_load_dynamic(Id va, Id dfmt, Id nfmt, int want) {
-        const std::vector<Id> words = load_u32_any(va, want);
+    std::vector<Id> format_load_dynamic(Id va, Id dfmt, Id nfmt, int want) { return format_decode_dynamic(load_u32_any(va, want), dfmt, nfmt, want); }
+    // translate.cpp format_decode_dynamic: the components from an element's first dwords.
+    std::vector<Id> format_decode_dynamic(const std::vector<Id>& words, Id dfmt, Id nfmt, int want) {
         const Id w0 = words[0], w1 = want > 1 ? words[1] : w0, w2 = want > 2 ? words[2] : w0, w3 = want > 3 ? words[3] : w0;
         const auto sel = [&](Id c, Id a, Id b) { return m.emit(spv::OpSelect, t_u32, {c, a, b}); };
         const auto lor = [&](Id a, Id b) { return m.emit(spv::OpLogicalOr, t_bool, {a, b}); };
@@ -3148,8 +3149,14 @@ private:
     // by its static format, with the identity select (gcn::tbuffer_dst_sel).
     void mtbuf(const Inst& in) {
         if (compute()) {
-            // Only a typed load the lean reference bound reads a binding.
-            if (!opt.cb_ssbo || in.op >= 4 || !ref.buffer_at.count(in.offset)) return guest_mtbuf(in);
+            // What the lean reference bound reads or writes the binding; the rest walks.
+            const auto site = ref.buffer_at.find(in.offset);
+            if (!opt.cb_ssbo || site == ref.buffer_at.end()) return guest_mtbuf(in);
+            if (bound_element_shape(in)) return bound_element_cs(in, site->second);
+            if (in.op >= 4) {
+                reject(std::string(mnemonic(in)) + ": a store the reference binds in a shape the lift does not take");
+                return;
+            }
             ++cs_bound_loads;
         }
         if (in.op >= 4) {
@@ -3180,6 +3187,13 @@ private:
             const Id at = ibin(spv::OpIAdd, bias, ibin(spv::OpIAdd, first, cu(static_cast<std::uint32_t>(k))));
             words.push_back(m.load(t_u32, m.access_chain(p_ssbo_u32, buffer_vars[index], {cu(0), at})));
         }
+        typed_load_result(in, words, count, bits);
+        ++buffer_loads;
+    }
+    // A typed load's VGPRs from the dwords of its element, as the translator
+    // decodes them (format_decode) and writes them: the identity select, or
+    // the V#'s with BBHOST_TBUFFER_DST_SEL=1.
+    void typed_load_result(const Inst& in, const std::vector<Id>& words, int count, const int bits[4]) {
         const bool integer = in.nfmt == 4 || in.nfmt == 5;
         const Id one = integer ? cu(1) : as_u(float_const(1.0f));
         std::vector<Id> comps(4, cu(0));
@@ -3204,7 +3218,129 @@ private:
             for (int k = 0; k < (in.op & 3) + 1; ++k) out.push_back(word(k < count ? comps[static_cast<std::size_t>(k)] : cu(0)));
         }
         for (std::size_t k = 0; k < out.size(); ++k) write_v(in.vdata + static_cast<int>(k), out[k]);
-        ++buffer_loads;
+    }
+
+    // translate.cpp bound_compute_access, which a lean reference binds: an
+    // element at a VGPR index or offset through a V#'s storage buffer - typed
+    // loads at a VGPR offset, typed stores of 32-bit components,
+    // buffer_load_format_* with the V#'s format, buffer_atomic_add. The
+    // element's first dword (offset12 + soffset) / 4, plus index * stride / 4
+    // with idxen, plus the VGPR offset / 4 with offen; an index at or past
+    // num_records - or, with no index, a dword at or past the range in
+    // cb_stride - reads 0 and is not written; stores and the atomic only where
+    // the invocation's EXEC bit is set. The same expressions as the reference,
+    // in its order.
+    static bool bound_element_shape(const Inst& in) {
+        const bool mt = in.enc == Enc::MTBUF;
+        const int kind = mt ? (in.op < 4 ? 1 : in.op < 8 ? 2 : 0) : (in.op <= 3 ? 3 : in.op == 50 ? 4 : 0);
+        return kind && (in.idxen || in.offen) && !(kind == 1 && !in.offen);
+    }
+    std::size_t cs_bound_elements = 0;
+    void bound_element_cs(const Inst& in, std::uint32_t index) {
+        const std::string name = mnemonic(in) ? mnemonic(in) : "a buffer access";
+        const bool mt = in.enc == Enc::MTBUF;
+        const bool typed_load = mt && in.op < 4, typed_store = mt && in.op >= 4, format_load = !mt && in.op <= 3, atomic_add = !mt && in.op == 50;
+        if (index >= buffer_vars.size()) {
+            reject(name + " is not read through a storage buffer the reference binds");
+            return;
+        }
+        const BufferBinding& b = ref.buffers[index];
+        const std::int32_t constant = in.soffset <= 192 ? static_cast<std::int32_t>(in.soffset) - 128 : 192 - static_cast<std::int32_t>(in.soffset);
+        const std::int32_t off = static_cast<std::int32_t>(in.offset12) + constant;
+        int count = 0, bits[4] = {};
+        if ((in.idxen ? !b.indexed : !b.ranged) || ((typed_store || atomic_add) && !b.written) || in.addr64 || in.lds || in.tfe || in.soffset < 128 ||
+            in.soffset > 208 || off < 0 || off % 4 != 0 || (mt && (!format_layout(in.dfmt, count, bits) || bits[0] != 32))) {
+            reject(name + ": the reference's bound element has another shape");
+            return;
+        }
+        int va = in.vaddr;
+        Id first = cu(static_cast<std::uint32_t>(off / 4));
+        Id index_ok = 0;
+        if (in.idxen) {
+            const Id stride_dw = shift(spv::OpShiftRightLogical, stride_value(index), cu(2));
+            const Id vindex = as_u(value(256 + va++));
+            first = ibin(spv::OpIAdd, first, ibin(spv::OpIMul, vindex, stride_dw));
+            index_ok = m.emit(spv::OpULessThan, t_bool, {vindex, as_u(read(static_cast<std::uint16_t>(in.srsrc + 2), in))});
+        }
+        if (in.offen) first = ibin(spv::OpIAdd, first, shift(spv::OpShiftRightLogical, as_u(value(256 + va)), cu(2)));
+        if (!res.rejections.empty()) return;
+        const Id bias = cb_bias(index);
+        const Id range_dw = in.idxen ? 0 : params_load(stride_loads, 5, index);
+        const auto ok_at = [&](Id at) { return in.idxen ? index_ok : m.emit(spv::OpULessThan, t_bool, {at, range_dw}); };
+        const auto word_ptr = [&](Id at) { return m.access_chain(p_ssbo_u32, buffer_vars[index], {cu(0), ibin(spv::OpIAdd, bias, at)}); };
+        const auto load_at = [&](Id at) {
+            const Id ok = ok_at(at);
+            const Id w = m.load(t_u32, word_ptr(m.emit(spv::OpSelect, t_u32, {ok, at, cu(0)})));
+            return m.emit(spv::OpSelect, t_u32, {ok, w, cu(0)});
+        };
+        // `body` where `cond` holds, as the reference's if_then.
+        const auto where = [&](Id cond, const std::function<void()>& body) {
+            const Id l_then = m.fresh(), l_merge = m.fresh();
+            m.emit_void(spv::OpSelectionMerge, {l_merge, 0u});
+            m.emit_void(spv::OpBranchConditional, {cond, l_then, l_merge});
+            cur_label = m.label(l_then);
+            body();
+            m.emit_void(spv::OpBranch, {l_merge});
+            cur_label = m.label(l_merge);
+        };
+        ++cs_bound_elements;
+        if (typed_load) {
+            std::vector<Id> words;
+            for (int k = 0; k < count; ++k) words.push_back(load_at(ibin(spv::OpIAdd, first, cu(static_cast<std::uint32_t>(k)))));
+            typed_load_result(in, words, count, bits);
+            return;
+        }
+        if (format_load) {
+            const Id w3 = as_u(read(static_cast<std::uint16_t>(in.srsrc + 3), in));
+            const Id dfmt = m.emit(spv::OpBitFieldUExtract, t_u32, {w3, cu(15), cu(4)}), nfmt = m.emit(spv::OpBitFieldUExtract, t_u32, {w3, cu(12), cu(3)});
+            const auto sel = [&](Id c, Id a, Id x) { return m.emit(spv::OpSelect, t_u32, {c, a, x}); };
+            const Id last = sel(m.emit(spv::OpLogicalOr, t_bool, {ieq(dfmt, cu(11)), ieq(dfmt, cu(12))}), cu(1),
+                                sel(ieq(dfmt, cu(13)), cu(2), sel(ieq(dfmt, cu(14)), cu(3), cu(0))));
+            std::vector<Id> words;
+            for (std::uint32_t k = 0; k < 4; ++k) {
+                const Id kk = k ? ext(spv::GlslUMin, {cu(k), last}, t_u32) : cu(0);
+                words.push_back(load_at(ibin(spv::OpIAdd, first, kk)));
+            }
+            const std::vector<Id> comps = format_decode_dynamic(words, dfmt, nfmt, 4);
+            const Id is_int = m.emit(spv::OpLogicalOr, t_bool, {ieq(nfmt, cu(4)), ieq(nfmt, cu(5))});
+            const std::vector<Id> swz = apply_dst_sel(comps, w3, is_int);
+            for (std::uint32_t k = 0; k <= in.op; ++k) write_v(in.vdata + static_cast<int>(k), word(swz[k]));
+            return;
+        }
+        const Val e = exec_lane();
+        if (typed_store) {
+            const int n = (in.op & 3) + 1;
+            std::vector<Id> vals;
+            for (int k = 0; k < n; ++k) vals.push_back(as_u(value(256 + in.vdata + k)));
+            where_exec(e, [&] {
+                for (int k = 0; k < n && k < count; ++k) {
+                    const Id at = ibin(spv::OpIAdd, first, cu(static_cast<std::uint32_t>(k)));
+                    where(ok_at(at), [&] { m.store(word_ptr(at), vals[static_cast<std::size_t>(k)]); });
+                }
+            });
+            note += " stored";
+            return;
+        }
+        // buffer_atomic_add: the value before the add where GLC is set, 0 where it did not run.
+        const Id v = as_u(value(256 + in.vdata));
+        const Id r = where_exec_value(e, [&] {
+            const Id ok = ok_at(first);
+            const Id from = cur_label;
+            const Id l_then = m.fresh(), l_merge = m.fresh();
+            m.emit_void(spv::OpSelectionMerge, {l_merge, 0u});
+            m.emit_void(spv::OpBranchConditional, {ok, l_then, l_merge});
+            cur_label = m.label(l_then);
+            const Id added = m.emit(spv::OpAtomicIAdd, t_u32, {word_ptr(first), cu(spv::ScopeDevice), cu(spv::MsNone), v});
+            const Id end = cur_label;
+            m.emit_void(spv::OpBranch, {l_merge});
+            cur_label = m.label(l_merge);
+            return m.emit(spv::OpPhi, t_u32, {added, end, cu(0), from});
+        });
+        if (in.glc) {
+            inst_uniform = false;
+            write_v(in.vdata, word(r));
+        }
+        note += " atomic";
     }
 
     // buffer_store_dword* a compute shader's lean reference makes through a
@@ -3259,8 +3395,11 @@ private:
     void mubuf(const Inst& in) {
         if (compute()) {
             const auto site = ref.buffer_at.find(in.offset);
-            if (!opt.cb_ssbo || in.op < 28 || in.op > 31 || site == ref.buffer_at.end()) return guest_mubuf(in);
-            return bound_store_cs(in, site->second);
+            if (!opt.cb_ssbo || site == ref.buffer_at.end()) return guest_mubuf(in);
+            if (bound_element_shape(in)) return bound_element_cs(in, site->second);
+            if (in.op >= 28 && in.op <= 31) return bound_store_cs(in, site->second);
+            reject(std::string(mnemonic(in)) + ": the reference binds it in a shape the lift does not take");
+            return;
         }
         if (in.op < 28 || in.op > 31) {
             reject(std::string(mnemonic(in)) + " is not lifted");
@@ -7572,12 +7711,14 @@ private:
             std::snprintf(wg, sizeof(wg), "%ux%ux%u", opt.cs_threads[0], opt.cs_threads[1], opt.cs_threads[2]);
             head.push_back(std::string("a dispatch's compute shader: one invocation a lane of GCN's wave (workgroup ") + wg +
                            "), the workgroup id and local id where the reference places them; no workgroup memory (LDS)");
-            if (cs_bound_loads || cs_bound_stores) {
+            if (cs_bound_loads || cs_bound_stores || cs_bound_elements) {
                 head.push_back("the lean reference's bindings (ComputeLean): " + std::to_string(cs_bound_loads) +
                                " scalar and typed loads read from the storage buffer the reference binds at that instruction, " +
                                std::to_string(cs_bound_stores) +
                                " buffer stores through its written binding, each dword inside the V#'s range in dwords and where the invocation's "
-                               "EXEC bit is set");
+                               "EXEC bit is set, " + std::to_string(cs_bound_elements) +
+                               " elements at a VGPR index or offset (typed loads and stores, format loads, atomic adds) in their binding, an index "
+                               "past num_records or a dword past the range read as 0 and not written");
             }
             head.push_back("guest memory through the page table at StageParams::l1_table, as the reference reaches it: " +
                            std::to_string(buffer_loads - cs_bound_loads) + " scalar loads, " + std::to_string(guest_loads) +

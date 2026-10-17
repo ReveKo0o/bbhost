@@ -82,6 +82,16 @@ bool bound_stores_on() {
     }();
     return on;
 }
+// BBHOST_CS_BOUND_ELEMENTS: a compute shader's lean translation (cb_ssbo,
+// cb_no_fallback) reads and writes buffer elements at a VGPR index or offset
+// through bindings too (Translator::bound_compute_access); 0 walks them.
+bool cs_bound_elements_on() {
+    static const bool on = [] {
+        const char* e = std::getenv("BBHOST_CS_BOUND_ELEMENTS");
+        return !(e && e[0] == '0');
+    }();
+    return on;
+}
 constexpr std::uint32_t kLdsWordsMax = 16384;  // GCN's 64 KiB per workgroup
 
 // COMPUTE_PGM_RSRC2.LDS_SIZE: bits 15..23, in units of 128 dwords. Declaring
@@ -2359,6 +2369,7 @@ struct Translator {
     }
     void mubuf(const Inst& in) {
         const std::uint32_t op = in.op;
+        if (bound_compute_access(in)) return;
         {
             ResourcePath path;
             std::string key;
@@ -2660,6 +2671,133 @@ struct Translator {
         comps = format_decode(read_bound(index, in.srsrc, first, nwords, guest), in.dfmt, in.nfmt, 4);
         return true;
     }
+    // TranslateOptions::cb_ssbo + cb_no_fallback in a compute shader (a
+    // dispatch's lean translation, ComputeLean): an element a buffer
+    // instruction reaches at a VGPR index or offset through a V# traced to
+    // user data or a table - typed loads at a VGPR offset (indexed_buffer_load
+    // takes those at an index alone), typed stores of 32-bit components,
+    // buffer_load_format_* with the V#'s own format, buffer_atomic_add - in
+    // the V#'s storage buffer instead of through the page table. The element's
+    // first dword is (offset12 + soffset) / 4, plus index * stride / 4 with
+    // idxen (the binding indexed: the host binds the V#'s records and passes
+    // the stride in cb_stride), plus the VGPR offset / 4 with offen (with no
+    // index the binding is ranged: the V#'s range, its dwords in cb_stride);
+    // the walk takes these addresses as dword-aligned too. As GCN, an element
+    // whose index is at or past num_records - or, ranged, a dword at or past
+    // the range - reads 0 and is not written, and only lanes EXEC holds write.
+    // A store or atomic's binding is written (in place, never a copy) and its
+    // V# a store buffer. False, with nothing emitted, for any other access.
+    bool bound_compute_access(const Inst& in) {
+        if (opt.stage != Stage::Compute || !opt.cb_ssbo || !opt.cb_no_fallback || !cs_bound_elements_on()) return false;
+        enum Kind { kNone, kTypedLoad, kTypedStore, kFormatLoad, kAtomicAdd };
+        const bool mt = in.enc == Enc::MTBUF;
+        const Kind kind = mt ? (in.op < 4 ? kTypedLoad : in.op < 8 ? kTypedStore : kNone)
+                             : (in.op <= 3 ? kFormatLoad : in.op == 50 ? kAtomicAdd : kNone);
+        if (kind == kNone || (!in.idxen && !in.offen) || (kind == kTypedLoad && !in.offen)) return false;
+        if (in.addr64 || in.lds || in.tfe || in.soffset < 128 || in.soffset > 208) return false;
+        const std::int32_t constant = in.soffset <= 192 ? static_cast<std::int32_t>(in.soffset) - 128 : 192 - static_cast<std::int32_t>(in.soffset);
+        const std::int32_t off = static_cast<std::int32_t>(in.offset12) + constant;
+        if (off < 0 || off % 4) return false;
+        int count = 0, bits[4] = {};
+        if (mt && (!format_layout(in.dfmt, count, bits) || bits[0] != 32)) return false;
+        ResourcePath path;
+        if (!sym_path(in.srsrc, 4, path) || path.user_sgpr < 0 || path.user_sgpr + 1 >= 16) return false;
+        const std::string key = path.str();
+        if (std::find(opt.cb_ssbo_exclude.begin(), opt.cb_ssbo_exclude.end(), key) != opt.cb_ssbo_exclude.end()) return false;
+        if (const auto it = buffer_index.find(key); it != buffer_index.end()) {
+            const BufferBinding& b = res.buffers[it->second];
+            if (b.pointer || (in.idxen ? b.ranged : b.indexed)) return false;  // cb_stride holds the other
+        } else if (res.buffers.size() >= kMaxBuffers) {
+            return false;
+        }
+        const int nwords = mt ? count : kind == kFormatLoad ? 4 : 1;
+        const std::size_t index = buffer_for(path, key, false, static_cast<std::uint32_t>(off / 4 + nwords));
+        (in.idxen ? res.buffers[index].indexed : res.buffers[index].ranged) = true;
+        if (kind == kTypedStore || kind == kAtomicAdd) {
+            res.buffers[index].written = true;
+            note_store(in);
+        }
+        res.buffer_at[cur_offset] = static_cast<std::uint32_t>(index);
+        buffer_sites.push_back({in.srsrc, index, sym_key(sym_of(in.srsrc)), sym_key(sym_of(in.srsrc + 1)), def_seq++, cur_block});
+        int va = in.vaddr;
+        Id first = cu(static_cast<std::uint32_t>(off / 4));
+        Id index_ok = 0;
+        if (in.idxen) {
+            Id stride = params_u32(5, index);
+            Id& spec = cb_stride_spec[index];  // translate.h kCbStrideSpecId, as indexed_buffer_load reads it
+            if (!spec) spec = m.spec_const_u32(0, kCbStrideSpecId + static_cast<std::uint32_t>(index));
+            stride = sel(ine(spec, c_zero_u), spec, stride);
+            const Id vindex = ld(vgpr_var(va++));
+            first = iadd(first, imul(vindex, shr(stride, cu(2))));
+            index_ok = ult(vindex, read_s(static_cast<std::uint16_t>(in.srsrc + 2), in));
+        }
+        if (in.offen) first = iadd(first, shr(ld(vgpr_var(va)), cu(2)));
+        const Id bias = cb_bias(index);
+        const Id range_dw = in.idxen ? 0 : params_u32(5, index);
+        const auto ok_at = [&](Id at) { return in.idxen ? index_ok : ult(at, range_dw); };
+        const auto word_ptr = [&](Id at) { return m.access_chain(p_ssbo_u32, buffer_vars[index], {c_zero_u, iadd(bias, at)}); };
+        // A dword the element holds, 0 out of range (read in range: dword 0 of the element's binding).
+        const auto load_at = [&](Id at) {
+            const Id ok = ok_at(at);
+            return sel(ok, m.load(t_u32, word_ptr(sel(ok, at, c_zero_u))), c_zero_u);
+        };
+        switch (kind) {
+        case kTypedLoad: {
+            std::vector<Id> words;
+            for (int k = 0; k < (count + 0); ++k) words.push_back(load_at(iadd(first, cu(static_cast<std::uint32_t>(k)))));
+            const std::vector<Id> comps = format_decode(words, in.dfmt, in.nfmt, 4);
+            const int n = (in.op & 3) + 1;
+            if (tbuffer_dst_sel()) {
+                write_swizzled(in.vdata, n, comps, read_s(in.srsrc + 3, in), m.const_bool(in.nfmt == 4 || in.nfmt == 5));
+            } else {
+                for (int k = 0; k < n; ++k) write_v(in.vdata + k, k < count ? comps[static_cast<std::size_t>(k)] : c_zero_u);
+            }
+            break;
+        }
+        case kTypedStore: {
+            const int n = (in.op & 3) + 1;
+            std::vector<Id> vals;
+            for (int k = 0; k < n; ++k) vals.push_back(ld(vgpr_var(in.vdata + k)));
+            exec_guard([&] {
+                for (int k = 0; k < n && k < count; ++k) {
+                    const Id at = iadd(first, cu(static_cast<std::uint32_t>(k)));
+                    if_then(ok_at(at), [&] { m.store(word_ptr(at), vals[static_cast<std::size_t>(k)]); });
+                }
+            });
+            break;
+        }
+        case kFormatLoad: {
+            const Id w3 = read_s(in.srsrc + 3, in);
+            const Id dfmt = ubfe(w3, 15, 4), nfmt = ubfe(w3, 12, 3);
+            // The element's dwords by its format (32_32 and 16_16_16_16 two,
+            // 32_32_32 three, 32_32_32_32 four, the rest one); the reads past
+            // them stay on its last, as only its own components are kept.
+            const Id last = sel(bor(ieq(dfmt, cu(11)), ieq(dfmt, cu(12))), c_one_u, sel(ieq(dfmt, cu(13)), cu(2), sel(ieq(dfmt, cu(14)), cu(3), c_zero_u)));
+            std::vector<Id> words;
+            for (int k = 0; k < 4; ++k) {
+                const Id kk = k ? m.ext_inst(t_u32, spv::GlslUMin, {cu(static_cast<std::uint32_t>(k)), last}) : c_zero_u;
+                words.push_back(load_at(iadd(first, kk)));
+            }
+            const std::vector<Id> comps = format_decode_dynamic(words, dfmt, nfmt, 4);
+            write_swizzled(in.vdata, static_cast<int>(in.op) + 1, comps, w3, bor(ieq(nfmt, cu(4)), ieq(nfmt, cu(5))));
+            break;
+        }
+        case kAtomicAdd: {
+            const Id val = ld(vgpr_var(in.vdata));
+            const Id result = m.local_variable(p_fn_u32, c_zero_u);
+            exec_guard([&] {
+                if_then(ok_at(first), [&] {
+                    m.store(result, m.emit(spv::OpAtomicIAdd, t_u32, {word_ptr(first), cu(spv::ScopeDevice), cu(spv::MsNone), val}));
+                });
+            });
+            if (in.glc) write_v(in.vdata, ld(result));
+            break;
+        }
+        case kNone:
+            break;
+        }
+        return true;
+    }
     // A static format's `want` components from the dwords holding one element.
     std::vector<Id> format_decode(const std::vector<Id>& words, std::uint32_t dfmt, std::uint32_t nfmt, int want) {
         int count, bits[4];
@@ -2757,10 +2895,14 @@ struct Translator {
     }
     // Dynamic format (from V#): supports the 32-bit and 16-bit families; others load raw dwords.
     std::vector<Id> format_load_dynamic(Id addr, Id dfmt, Id nfmt, int want) {
-        std::vector<Id> out;
         // Select stride/width by dfmt at runtime: handle 32, 32_32, 32_32_32, 32_32_32_32 (raw floats),
         // 16, 16_16, 16_16_16_16 (float16 or unorm), 8_8_8_8 (unorm) — common vertex/format cases.
-        const std::vector<Id> words = load_u32_any(addr, want);
+        return format_decode_dynamic(load_u32_any(addr, want), dfmt, nfmt, want);
+    }
+    // The components of one element from its first `want` dwords, by the
+    // run-time data and number format (format_load_dynamic's decode).
+    std::vector<Id> format_decode_dynamic(const std::vector<Id>& words, Id dfmt, Id nfmt, int want) {
+        std::vector<Id> out;
         const Id w0 = words[0];
         const Id w1 = want > 1 ? words[1] : w0;
         const Id w2 = want > 2 ? words[2] : w0;
@@ -2851,6 +2993,7 @@ struct Translator {
     }
     void mtbuf(const Inst& in) {
         const int n = (in.op & 3) + 1;
+        if (bound_compute_access(in)) return;
         if (in.op < 4) {
             // A typed load takes its format from the instruction and the
             // identity select, whatever the V#'s DST_SEL says (the Sea Islands

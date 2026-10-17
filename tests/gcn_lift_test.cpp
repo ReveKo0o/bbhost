@@ -10,6 +10,7 @@
 #include "gcn/container.h"
 #include "gcn/isa.h"
 #include "gcn/lift.h"
+#include "gcn/hlsl.h"
 #include "gcn/translate.h"
 
 #include <spirv-tools/libspirv.hpp>
@@ -4187,6 +4188,84 @@ void lean_reference() {
         const gcn::LiftResult w = gcn::lift_compute_shader(p, options(), walk);
         CHECK(lifted_valid(w, "walking reference, the same store"));
         CHECK(proof_has(w, "1 buffer stores and"));
+    }
+    // Elements at a VGPR index or offset (translate.cpp bound_compute_access):
+    // a typed store of four floats at v0's index, buffer_load_format_x at it,
+    // buffer_atomic_add at index and offset with GLC, a typed load at a VGPR
+    // offset alone (a ranged binding) - each bound in the lean reference, read
+    // and written there by the lift, nothing through the page table.
+    {
+        const auto mtbuf = [](Asm& a, std::uint32_t op, std::uint32_t dfmt, bool idxen, bool offen, std::uint32_t vdata, std::uint32_t vaddr,
+                              std::uint32_t srsrc, std::uint32_t offset12) {
+            a.w.push_back(0xe8000000u | 7u << 23 | dfmt << 19 | op << 16 | (idxen ? 1u << 13 : 0u) | (offen ? 1u << 12 : 0u) | offset12);
+            a.w.push_back(vaddr | vdata << 8 | (srsrc / 4) << 16 | 128u << 24);
+        };
+        const auto mubuf = [](Asm& a, std::uint32_t op, bool idxen, bool offen, bool glc, std::uint32_t vdata, std::uint32_t vaddr, std::uint32_t srsrc) {
+            a.w.push_back(0xe0000000u | op << 18 | (idxen ? 1u << 13 : 0u) | (offen ? 1u << 12 : 0u) | (glc ? 1u << 14 : 0u));
+            a.w.push_back(vaddr | vdata << 8 | (srsrc / 4) << 16 | 128u << 24);
+        };
+        gcn::TranslateOptions o = lean(options());
+        o.rsrc2 = 9u << 1;  // two V#s: s[0:3] and s[4:7] (and s8)
+        {
+            Asm a;
+            a.vop1(kVMov, 1, kC0 + 1);
+            a.vop1(kVMov, 2, kC0 + 2);
+            a.vop1(kVMov, 3, kC0 + 3);
+            a.vop1(kVMov, 4, kC0 + 4);
+            mtbuf(a, 7, 14, true, false, 1, 0, 0, 16);  // tbuffer_store_format_xyzw v[1:4], v0, s[0:3] idxen offset:16
+            mubuf(a, 0, true, false, false, 5, 0, 4);   // buffer_load_format_x v5, v0, s[4:7] idxen
+            a.waitcnt();
+            a.vop2(kVLshlrev, 6, kC0 + 2, 0);           // v6 = 4 x
+            a.vop1(kVMov, 7, 0);                        // v7 = x: [v7, v8] = index, offset
+            a.vop1(kVMov, 8, kV + 6);
+            mubuf(a, 50, true, true, true, 5, 7, 4);    // buffer_atomic_add v5, v[7:8], s[4:7] idxen offen glc
+            a.waitcnt();
+            mtbuf(a, 0, 4, false, true, 9, 6, 0, 0);    // tbuffer_load_format_x v9, v6, s[0:3] offen: no index
+            a.waitcnt();
+            a.store_offen(9, 6, 4);                     // walked: buffer_store_dword at a VGPR offset of s[4:7]... bound? no: offen
+            a.endpgm();
+            const gcn::Program p = gcn::decode(a.w.data(), a.w.size());
+            CHECK(p.errors.empty());
+            const gcn::TranslateResult ref = gcn::translate(p, o);
+            CHECK(ref.ok());
+            if (!ref.ok() && !ref.errors.empty()) std::fprintf(stderr, "lean elements: %s\n", ref.errors[0].c_str());
+            // s[0:3] is read at an index and at an offset alone: the second
+            // binds nothing (cb_stride holds the stride) and walks.
+            CHECK(ref.buffers.size() == 2);
+            bool written = true;
+            for (const gcn::BufferBinding& b : ref.buffers) written = written && b.written;
+            CHECK(written);
+            const gcn::LiftResult r = gcn::lift_compute_shader(p, o, ref);
+            CHECK(lifted_valid(r, "lean reference, bound elements"));
+            CHECK(proof_has(r, "3 elements at a VGPR index or offset"));
+            CHECK(count_op(r.spirv, 234) == 1);  // OpAtomicIAdd, on the binding
+            // HLSL: the written bindings as RWByteAddressBuffers, the add as their InterlockedAdd.
+            const gcn::HlslResult h = gcn::emit_hlsl(r.spirv);
+            CHECK(h.ok());
+            CHECK(h.source.find("RWByteAddressBuffer") != std::string::npos);
+            CHECK(h.source.find(".InterlockedAdd(") != std::string::npos);
+        }
+        {
+            Asm a;  // the offset-only typed load alone: a ranged binding
+            a.vop2(kVLshlrev, 6, kC0 + 2, 0);
+            mtbuf(a, 0, 4, false, true, 9, 6, 0, 0);  // tbuffer_load_format_x v9, v6, s[0:3] offen
+            a.waitcnt();
+            mtbuf(a, 4, 4, false, true, 9, 6, 4, 0);  // tbuffer_store_format_x v9, v6, s[4:7] offen
+            a.endpgm();
+            const gcn::Program p = gcn::decode(a.w.data(), a.w.size());
+            const gcn::TranslateResult ref = gcn::translate(p, o);
+            CHECK(ref.ok());
+            CHECK(ref.buffers.size() == 2 && ref.buffers[0].ranged && ref.buffers[1].ranged && ref.buffers[1].written && ref.walks.empty());
+            const gcn::LiftResult r = gcn::lift_compute_shader(p, o, ref);
+            CHECK(lifted_valid(r, "lean reference, ranged elements"));
+            CHECK(proof_has(r, "2 elements at a VGPR index or offset"));
+            // Walked in the walking reference, and by its lift.
+            gcn::TranslateOptions wo = options();
+            wo.rsrc2 = o.rsrc2;
+            const gcn::TranslateResult walk = gcn::translate(p, wo);
+            CHECK(walk.ok() && walk.buffers.empty());
+            CHECK(lifted_valid(gcn::lift_compute_shader(p, wo, walk), "walking reference, the same elements"));
+        }
     }
 }
 
