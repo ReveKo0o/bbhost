@@ -938,7 +938,9 @@ void hlsl_behind_thread() {
         if (g_hlsl_behind.waiting == 0 && !running && !g_hlsl_behind.drained_logged) {
             g_hlsl_behind.drained_logged = true;
             g_hlsl_drained.store(true);  // the next periodic save writes them
-            host_log("render: HLSL: every stage met so far has its DXC module for the next start: %llu compiled on %d bb-hlsl thread%s in %.1f s of "
+            // Logged the first few times: later ones are a few stages a new place brought.
+            static int drained_logs = 0;
+            if (++drained_logs <= 3) host_log("render: HLSL: every stage met so far has its DXC module for the next start: %llu compiled on %d bb-hlsl thread%s in %.1f s of "
                      "their time, %.1f s after the first was queued (%llu waited %.1f s for the start's own compiles); %llu failed",
                      static_cast<unsigned long long>(g_hlsl_behind.done.load()), g_hlsl_behind.threads, g_hlsl_behind.threads == 1 ? "" : "s",
                      g_hlsl_behind.done_us.load() / 1e6,
