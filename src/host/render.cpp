@@ -11271,7 +11271,7 @@ void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t
         bool shape = true;
         if (b.indexed) {
             const std::uint32_t stride = (words[1] >> 16) & 0x3fff;
-            shape = stride != 0 && stride % 4 == 0;
+            shape = stride != 0 && (stride % 4 == 0 || b.bytes);  // a byte table: BufferBinding::bytes
             // BBHOST_CB_RECORDS=1 (with BBHOST_ROBUST=1): bind exactly the V#'s
             // records, not the larger of that and the shader's highest dword.
             // GCN bounds-checks a buffer load against num_records and returns

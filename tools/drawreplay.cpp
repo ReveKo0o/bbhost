@@ -2099,7 +2099,9 @@ public:
             VkDeviceSize bytes = static_cast<VkDeviceSize>(json::u32(b, "max_dw")) * 4;
             if (indexed) {
                 const std::uint32_t stride = (words[1] >> 16) & 0x3fff;
-                if (!stride || stride % 4) return what + ": a stride the binding cannot index";
+                const json::Value* by = b.find("bytes");
+                const bool byte_table = by && by->type == json::Value::Type::Bool && by->boolean;  // BufferBinding::bytes
+                if (!stride || (stride % 4 && !byte_table)) return what + ": a stride the binding cannot index";
                 bytes = std::max<VkDeviceSize>(bytes, static_cast<VkDeviceSize>(words[2]) * stride);
                 sp.cb_stride[i] = stride;
                 sp.cb_w3[i] = words[3];

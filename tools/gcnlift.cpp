@@ -650,6 +650,7 @@ int run_dispatch(const fs::path& capture, const fs::path& out, const json::Value
             x.set("indexed", b.indexed);
             x.set("ranged", b.ranged);
             x.set("written", b.written);
+            x.set("bytes", b.bytes);
             x.set("max_dw", static_cast<unsigned long>(b.max_dw));
             x.set("binding", static_cast<unsigned long>(b.binding));
             buffers.push(x);

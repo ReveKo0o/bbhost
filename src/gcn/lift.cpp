@@ -3255,20 +3255,26 @@ private:
         }
         int va = in.vaddr;
         Id first = cu(static_cast<std::uint32_t>(off / 4));
-        Id index_ok = 0;
+        Id index_ok = 0, vindex = 0, voffset = 0, records = 0;
+        bool index_zero = false;
         if (in.idxen) {
             const Val vi = value(256 + va++);
-            const Id vindex = as_u(vi);
+            vindex = as_u(vi);
             // An index the lift knows is 0 adds nothing: no stride is read
             // (DXC would drop the stride's specialization constant, which
             // the HLSL path's interface check then misses).
-            if (!vi.constant || vi.bits != 0) {
+            index_zero = vi.constant && vi.bits == 0;
+            if (!index_zero) {
                 const Id stride_dw = shift(spv::OpShiftRightLogical, stride_value(index), cu(2));
                 first = ibin(spv::OpIAdd, first, ibin(spv::OpIMul, vindex, stride_dw));
             }
-            index_ok = m.emit(spv::OpULessThan, t_bool, {vindex, as_u(read(static_cast<std::uint16_t>(in.srsrc + 2), in))});
+            records = as_u(read(static_cast<std::uint16_t>(in.srsrc + 2), in));
+            index_ok = m.emit(spv::OpULessThan, t_bool, {vindex, records});
         }
-        if (in.offen) first = ibin(spv::OpIAdd, first, shift(spv::OpShiftRightLogical, as_u(value(256 + va)), cu(2)));
+        if (in.offen) {
+            voffset = as_u(value(256 + va));
+            first = ibin(spv::OpIAdd, first, shift(spv::OpShiftRightLogical, voffset, cu(2)));
+        }
         if (!res.rejections.empty()) return;
         const Id bias = cb_bias(index);
         const Id range_dw = in.idxen ? 0 : params_load(stride_loads, 5, index);
@@ -3300,12 +3306,36 @@ private:
             const Id w3 = as_u(read(static_cast<std::uint16_t>(in.srsrc + 3), in));
             const Id dfmt = m.emit(spv::OpBitFieldUExtract, t_u32, {w3, cu(15), cu(4)}), nfmt = m.emit(spv::OpBitFieldUExtract, t_u32, {w3, cu(12), cu(3)});
             const auto sel = [&](Id c, Id a, Id x) { return m.emit(spv::OpSelect, t_u32, {c, a, x}); };
-            const Id last = sel(m.emit(spv::OpLogicalOr, t_bool, {ieq(dfmt, cu(11)), ieq(dfmt, cu(12))}), cu(1),
-                                sel(ieq(dfmt, cu(13)), cu(2), sel(ieq(dfmt, cu(14)), cu(3), cu(0))));
             std::vector<Id> words;
-            for (std::uint32_t k = 0; k < 4; ++k) {
-                const Id kk = k ? ext(spv::GlslUMin, {cu(k), last}, t_u32) : cu(0);
-                words.push_back(load_at(ibin(spv::OpIAdd, first, kk)));
+            if (in.idxen) {
+                // translate.cpp: at a byte offset, the element's dwords funnel-shifted
+                // out of the binding's (any stride; past the records 0).
+                const Id stride = index_zero ? cu(0) : stride_value(index);
+                Id at_byte = ibin(spv::OpIAdd, cu(static_cast<std::uint32_t>(off)), ibin(spv::OpIMul, vindex, stride));
+                if (in.offen) at_byte = ibin(spv::OpIAdd, at_byte, voffset);
+                const Id d0 = shift(spv::OpShiftRightLogical, at_byte, cu(2));
+                const Id sh = shift(spv::OpShiftLeftLogical, ibin(spv::OpBitwiseAnd, at_byte, cu(3)), cu(3));
+                const Id end_dw = shift(spv::OpShiftRightLogical, ibin(spv::OpIAdd, ibin(spv::OpIMul, records, index_zero ? stride_value(index) : stride), cu(3)), cu(2));
+                std::vector<Id> raw;
+                for (std::uint32_t k = 0; k < 5; ++k) {
+                    const Id at = ibin(spv::OpIAdd, d0, cu(k));
+                    const Id ok = m.emit(spv::OpLogicalAnd, t_bool, {index_ok, m.emit(spv::OpULessThan, t_bool, {at, end_dw})});
+                    const Id w = m.load(t_u32, word_ptr(sel(ok, at, cu(0))));
+                    raw.push_back(sel(ok, w, cu(0)));
+                }
+                const Id aligned = ieq(sh, cu(0));
+                const Id back = ibin(spv::OpISub, cu(32), sh);
+                for (std::uint32_t k = 0; k < 4; ++k) {
+                    words.push_back(sel(aligned, raw[k],
+                                        ibin(spv::OpBitwiseOr, shift(spv::OpShiftRightLogical, raw[k], sh), shift(spv::OpShiftLeftLogical, raw[k + 1], back))));
+                }
+            } else {
+                const Id last = sel(m.emit(spv::OpLogicalOr, t_bool, {ieq(dfmt, cu(11)), ieq(dfmt, cu(12))}), cu(1),
+                                    sel(ieq(dfmt, cu(13)), cu(2), sel(ieq(dfmt, cu(14)), cu(3), cu(0))));
+                for (std::uint32_t k = 0; k < 4; ++k) {
+                    const Id kk = k ? ext(spv::GlslUMin, {cu(k), last}, t_u32) : cu(0);
+                    words.push_back(load_at(ibin(spv::OpIAdd, first, kk)));
+                }
             }
             const std::vector<Id> comps = format_decode_dynamic(words, dfmt, nfmt, 4);
             const Id is_int = m.emit(spv::OpLogicalOr, t_bool, {ieq(nfmt, cu(4)), ieq(nfmt, cu(5))});

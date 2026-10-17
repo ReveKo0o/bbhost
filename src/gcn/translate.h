@@ -88,6 +88,10 @@ struct BufferBinding {
     // and the host binds the guest memory itself - never a copy or snapshot,
     // which would take the stores in its place.
     bool written = false;
+    // Every access at an index through it is a format load that takes its
+    // element at a byte offset (Translator::bound_compute_access): the host
+    // binds it with a stride that is not whole dwords too (a byte table).
+    bool bytes = false;
 };
 // A V#'s range in dwords as GCN checks a buffer load against it, from its
 // words 1 (stride in [29:16]) and 2 (num_records): num_records bytes, times the

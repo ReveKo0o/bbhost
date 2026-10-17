@@ -2658,6 +2658,7 @@ struct Translator {
         const int nwords = (total + 31) / 32;
         const std::size_t index = buffer_for(path, key, false, static_cast<std::uint32_t>(nwords));
         res.buffers[index].indexed = true;
+        res.buffers[index].bytes = false;  // read by dwords
         Id stride = params_u32(5, index);
         if (opt.cb_no_fallback) {
             Id& spec = cb_stride_spec[index];  // translate.h kCbStrideSpecId
@@ -2711,8 +2712,12 @@ struct Translator {
             return false;
         }
         const int nwords = mt ? count : kind == kFormatLoad ? 4 : 1;
+        const bool fresh = !buffer_index.count(key);
         const std::size_t index = buffer_for(path, key, false, static_cast<std::uint32_t>(off / 4 + nwords));
         (in.idxen ? res.buffers[index].indexed : res.buffers[index].ranged) = true;
+        // A format load at an index reads its element at a byte offset; any
+        // other access at an index, by dwords (BufferBinding::bytes).
+        if (in.idxen) res.buffers[index].bytes = kind == kFormatLoad && (fresh || res.buffers[index].bytes);
         if (kind == kTypedStore || kind == kAtomicAdd) {
             res.buffers[index].written = true;
             note_store(in);
@@ -2721,17 +2726,21 @@ struct Translator {
         buffer_sites.push_back({in.srsrc, index, sym_key(sym_of(in.srsrc)), sym_key(sym_of(in.srsrc + 1)), def_seq++, cur_block});
         int va = in.vaddr;
         Id first = cu(static_cast<std::uint32_t>(off / 4));
-        Id index_ok = 0;
+        Id index_ok = 0, stride = 0, vindex = 0, voffset = 0, records = 0;
         if (in.idxen) {
-            Id stride = params_u32(5, index);
+            stride = params_u32(5, index);
             Id& spec = cb_stride_spec[index];  // translate.h kCbStrideSpecId, as indexed_buffer_load reads it
             if (!spec) spec = m.spec_const_u32(0, kCbStrideSpecId + static_cast<std::uint32_t>(index));
             stride = sel(ine(spec, c_zero_u), spec, stride);
-            const Id vindex = ld(vgpr_var(va++));
+            vindex = ld(vgpr_var(va++));
             first = iadd(first, imul(vindex, shr(stride, cu(2))));
-            index_ok = ult(vindex, read_s(static_cast<std::uint16_t>(in.srsrc + 2), in));
+            records = read_s(static_cast<std::uint16_t>(in.srsrc + 2), in);
+            index_ok = ult(vindex, records);
         }
-        if (in.offen) first = iadd(first, shr(ld(vgpr_var(va)), cu(2)));
+        if (in.offen) {
+            voffset = ld(vgpr_var(va));
+            first = iadd(first, shr(voffset, cu(2)));
+        }
         const Id bias = cb_bias(index);
         const Id range_dw = in.idxen ? 0 : params_u32(5, index);
         const auto ok_at = [&](Id at) { return in.idxen ? index_ok : ult(at, range_dw); };
@@ -2769,14 +2778,36 @@ struct Translator {
         case kFormatLoad: {
             const Id w3 = read_s(in.srsrc + 3, in);
             const Id dfmt = ubfe(w3, 15, 4), nfmt = ubfe(w3, 12, 3);
-            // The element's dwords by its format (32_32 and 16_16_16_16 two,
-            // 32_32_32 three, 32_32_32_32 four, the rest one); the reads past
-            // them stay on its last, as only its own components are kept.
-            const Id last = sel(bor(ieq(dfmt, cu(11)), ieq(dfmt, cu(12))), c_one_u, sel(ieq(dfmt, cu(13)), cu(2), sel(ieq(dfmt, cu(14)), cu(3), c_zero_u)));
             std::vector<Id> words;
-            for (int k = 0; k < 4; ++k) {
-                const Id kk = k ? m.ext_inst(t_u32, spv::GlslUMin, {cu(static_cast<std::uint32_t>(k)), last}) : c_zero_u;
-                words.push_back(load_at(iadd(first, kk)));
+            if (in.idxen) {
+                // At an index: the element at byte offset12 + soffset + index
+                // * stride (+ the VGPR offset), its four dwords funnel-shifted
+                // out of the five of the binding under them - a stride that is
+                // not whole dwords too (BufferBinding::bytes). A dword past the
+                // V#'s records reads 0 (only the format's own bytes are kept).
+                Id at_byte = iadd(cu(static_cast<std::uint32_t>(off)), imul(vindex, stride));
+                if (in.offen) at_byte = iadd(at_byte, voffset);
+                const Id d0 = shr(at_byte, cu(2));
+                const Id sh = shl(iand(at_byte, cu(3)), cu(3));
+                const Id end_dw = shr(iadd(imul(records, stride), cu(3)), cu(2));
+                std::vector<Id> raw;
+                for (int k = 0; k < 5; ++k) {
+                    const Id at = iadd(d0, cu(static_cast<std::uint32_t>(k)));
+                    const Id ok = band(index_ok, ult(at, end_dw));
+                    raw.push_back(sel(ok, m.load(t_u32, word_ptr(sel(ok, at, c_zero_u))), c_zero_u));
+                }
+                const Id aligned = ieq(sh, c_zero_u);
+                const Id back = isub(cu(32), sh);
+                for (int k = 0; k < 4; ++k) words.push_back(sel(aligned, raw[k], ior(shr(raw[k], sh), shl(raw[k + 1], back))));
+            } else {
+                // The element's dwords by its format (32_32 and 16_16_16_16 two,
+                // 32_32_32 three, 32_32_32_32 four, the rest one); the reads past
+                // them stay on its last, as only its own components are kept.
+                const Id last = sel(bor(ieq(dfmt, cu(11)), ieq(dfmt, cu(12))), c_one_u, sel(ieq(dfmt, cu(13)), cu(2), sel(ieq(dfmt, cu(14)), cu(3), c_zero_u)));
+                for (int k = 0; k < 4; ++k) {
+                    const Id kk = k ? m.ext_inst(t_u32, spv::GlslUMin, {cu(static_cast<std::uint32_t>(k)), last}) : c_zero_u;
+                    words.push_back(load_at(iadd(first, kk)));
+                }
             }
             const std::vector<Id> comps = format_decode_dynamic(words, dfmt, nfmt, 4);
             write_swizzled(in.vdata, static_cast<int>(in.op) + 1, comps, w3, bor(ieq(nfmt, cu(4)), ieq(nfmt, cu(5))));
