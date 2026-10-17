@@ -8,6 +8,7 @@ time, from a few places:
 | Replacement files (menus, text, textures, layouts) | the mods folder | no |
 | Param values (weapons, enemies, item lots, shops) | `<mods>/params/*.toml` | no |
 | Byte patches to the game's code | `patches/*.toml` | no |
+| Shaders, as HLSL source | `<data>/bbhost/shaders/*.hlsl` | no (HLSL) |
 | Anything else | a plugin ([plugins.md](plugins.md)) | yes |
 
 ## The mods folder
@@ -64,6 +65,50 @@ Per-area lighting, fog, tone mapping and post effects are data in
 `param/drawparam/*.gparam.dcx`. `tools/gparam.py --list <file>` shows a
 file's parameters; `tools/gparam.py --set "Name=value" <dump> <mods>` writes
 edited copies of every file into the mods folder.
+
+## Shaders
+
+bbhost turns each of the game's shaders into HLSL on your machine and
+compiles it with DXC ([rendering.md](rendering.md#hlsl)). You can edit
+that HLSL and have the game use your version.
+
+1. Write out the HLSL. Start the game once with `BBHOST_HLSL_DUMP=1`. Each
+   shader the game uses is saved to `<data>/bbhost/hlsl-dump/` as
+   `<hash>.<stage>.hlsl`, for example `7de085b59d21219a.ps.hlsl` (a pixel
+   shader). The stages are `ps`, `vs`, `hs`, `ds` and `cs`. Beside each file
+   is the lift it came from (`.lift.spv`).
+2. Copy the files you want to change into `<data>/bbhost/shaders/`. Keep
+   each file's name, and edit the copy.
+3. Start the game. The log lists the edited files it found (`render: HLSL
+   overrides: N edited shaders in ...`). The first time a shader is used,
+   its edited file is compiled, and the log says whether it was taken
+   (`render: HLSL override <file> compiled and taken`).
+
+An edited shader is refused, and the game uses its own version of that
+shader, when:
+
+- DXC cannot compile it (the log shows DXC's error);
+- it declares other inputs, outputs, resources or bindings than the
+  original;
+- its SPIR-V does not validate.
+
+Nothing else is checked. An edited shader may compute anything with what it
+reads.
+
+Things to know:
+
+- **The names are per machine.** A file's hash identifies the shader as it
+  was translated for your GPU: the device's features (half-precision
+  rounding, run-time sample offsets) and the bbhost version are part of it.
+  Write out a fresh set on the machine that will use it, and again after an
+  update. A file whose hash no shader has does nothing.
+- **When changes take effect.** Edits are read at the start, so restart the
+  game to try a change.
+- **The off switch turns this off too.** Edited shaders apply only while the
+  HLSL path is on. With Shaders set to Lifted, or `BBHOST_HLSL=0`, they are
+  ignored.
+- **Don't share the files.** They are generated from the game's own shaders,
+  so they stay on your machine and are never published.
 
 ## Text
 

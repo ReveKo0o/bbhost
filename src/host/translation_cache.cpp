@@ -862,7 +862,9 @@ struct HlslBehind {
     std::chrono::steady_clock::time_point first{};                   // under mu: the first job's queueing
     std::atomic<std::uint64_t> deferred{0}, done{0}, done_us{0}, failed{0}, promoted{0}, gated_ms{0};
     std::atomic<std::uint64_t> lane_done[kLanes] = {};
-} g_hlsl_behind;
+};
+// Never destroyed: its threads wait on it until the process ends.
+HlslBehind& g_hlsl_behind = *new HlslBehind;
 // render.cpp's: whether the start's own compiles (the precompile workers) are
 // still busy; bb-hlsl waits for them.
 std::atomic<bool (*)()> g_hlsl_busy{nullptr};

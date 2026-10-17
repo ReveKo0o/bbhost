@@ -618,6 +618,15 @@ if(UNIX)
   add_dependencies(translation_cache_test bbhost_translator_fingerprint)
   add_test(NAME translation_cache_test COMMAND translation_cache_test)
   set_tests_properties(translation_cache_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
+  # The HLSL default (translation_cache.cpp, which it includes): compiles
+  # behind the game, their lanes, the dump and edited HLSL; synthetic shaders,
+  # skipped without DXC.
+  add_executable(hlsl_default_test tests/hlsl_default_test.cpp src/core/paced_file.cpp src/host/dxc.cpp)
+  target_include_directories(hlsl_default_test PRIVATE src ${CMAKE_BINARY_DIR}/gen)
+  target_link_libraries(hlsl_default_test PRIVATE gcn ZLIB::ZLIB ${CMAKE_DL_LIBS})
+  add_dependencies(hlsl_default_test bbhost_translator_fingerprint)
+  add_test(NAME hlsl_default_test COMMAND hlsl_default_test)
+  set_tests_properties(hlsl_default_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
   add_executable(gcn_wave_test tests/gcn_wave_test.cpp)
   target_link_libraries(gcn_wave_test PRIVATE gcn)
   add_test(NAME gcn_wave_test COMMAND gcn_wave_test)
