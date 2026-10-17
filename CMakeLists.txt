@@ -627,6 +627,13 @@ if(UNIX)
   add_dependencies(hlsl_default_test bbhost_translator_fingerprint)
   add_test(NAME hlsl_default_test COMMAND hlsl_default_test)
   set_tests_properties(hlsl_default_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
+  # The PC options' generated menu assets (engine/menu_assets.cpp, which it
+  # includes) against the game's option movie and message bundles.
+  add_executable(menu_assets_test tests/menu_assets_test.cpp)
+  target_include_directories(menu_assets_test PRIVATE src ${CMAKE_BINARY_DIR}/gen)
+  target_link_libraries(menu_assets_test PRIVATE ZLIB::ZLIB)
+  add_test(NAME menu_assets_test COMMAND menu_assets_test)
+  set_tests_properties(menu_assets_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
   add_executable(gcn_wave_test tests/gcn_wave_test.cpp)
   target_link_libraries(gcn_wave_test PRIVATE gcn)
   add_test(NAME gcn_wave_test COMMAND gcn_wave_test)

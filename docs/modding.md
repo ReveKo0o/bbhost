@@ -136,8 +136,8 @@ Things to know:
 - **When changes take effect.** Edits are read at the start, so restart the
   game to try a change.
 - **The off switch turns this off too.** Edited shaders apply only while the
-  HLSL path is on. With Shaders set to Lifted, or `BBHOST_HLSL=0`, they are
-  ignored.
+  HLSL path is on. With Shaders set to Lifted (HLSL Shaders off in the game's
+  PC Graphics), or `BBHOST_HLSL=0`, they are ignored.
 - **Don't share the files.** They are generated from the game's own shaders,
   so they stay on your machine and are never published.
 

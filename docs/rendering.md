@@ -212,7 +212,8 @@ the default, and nothing waits on DXC:
   modules, and its precompile builds their pipelines from the manifests
   before the world is drawn.
 - **The off switch.** The Shaders setting (F10, under Graphics; HLSL or
-  Lifted; `video.shaders` in `bbhost.toml`) applies at the next start.
+  Lifted; the game's System > PC Graphics > HLSL Shaders, On or Off;
+  `video.shaders` in `bbhost.toml`) applies at the next start.
   `BBHOST_HLSL=0` is the lift alone, `=1` compiles each module at its first
   use (the start waits for DXC: for checks), `=2` is the default; the
   variable wins over the setting.

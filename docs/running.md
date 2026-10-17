@@ -48,8 +48,9 @@ first time you ever visit it are still built then.) The tab shows whether the
 shader caches are up to date for this bbhost and this driver, and the
 compile's progress, time left and any failures; it can be cancelled, and what
 was compiled is kept. The same tab has the Shaders setting (HLSL, or Lifted
-for the translator's own shaders only). `bbhost --compile-shaders` does the
-same from a terminal.
+for the translator's own shaders only; also F10 under Graphics, and HLSL
+Shaders in the game's System > PC Graphics). `bbhost --compile-shaders` does
+the same from a terminal.
 
 Without a display (a headless run) bbhost writes a template config instead and
 tells you which paths to fill in.
