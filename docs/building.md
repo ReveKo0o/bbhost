@@ -112,6 +112,17 @@ server, so they play on the live server (`https://thehuntersdream.com`),
 bbhost's default; `tools/check_release_bundle.sh` fails a release whose
 packages would go anywhere else, or that carries a playtest kit.
 
+The Windows and Linux packages (and so the Steam Deck kit) carry the pipeline
+list beside the executable, `pipeline-list.bin`: every pipeline a tour of the
+whole game drew, which a first start builds before the player reaches it
+([full-tour.md](full-tour.md)). It is an asset of its own release, and
+`tools/fetch_pipeline_list.sh` downloads it pinned by tag and SHA-256 (kept in
+`build/pipeline-list`). `BBHOST_PACKAGE_PIPELINE_LIST=<file>` packs a local
+list instead, `BBHOST_PIPELINE_LIST_FETCH=0` leaves it out (a development
+kit), and `tools/check_release_bundle.sh` fails a release whose packages lack
+the pinned list. Until the first list is published the pin is empty: the
+packages carry none and the check asks for none.
+
 ## Continuous integration
 
 `.github/workflows/build.yml` runs `tools/ci_build.sh` (a Linux build from

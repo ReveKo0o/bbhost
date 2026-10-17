@@ -41,6 +41,18 @@ cp bbhost.example.toml "$dir/bbhost.example.toml"
 # The HLSL path's compiler beside the binary, where bbhost looks first.
 tools/fetch_dxc.sh linux "$dir"
 dxc_tag=$(cat third_party/dxc/VERSION)
+# The pipeline list beside the binary, where bbhost reads it at each start and
+# builds every pipeline it names (render.cpp pipeline_manifest_load): the
+# pinned release asset (tools/fetch_pipeline_list.sh), or the local list
+# BBHOST_PACKAGE_PIPELINE_LIST names (a new one under test);
+# BBHOST_PIPELINE_LIST_FETCH=0 leaves it out (a development kit). It names the
+# game's programs by hash and holds none of their code.
+if [ -n "${BBHOST_PACKAGE_PIPELINE_LIST:-}" ]; then
+    python3 tools/pipeline_list.py stats "$BBHOST_PACKAGE_PIPELINE_LIST" > /dev/null
+    cp "$BBHOST_PACKAGE_PIPELINE_LIST" "$dir/pipeline-list.bin"
+elif [ "${BBHOST_PIPELINE_LIST_FETCH:-1}" != 0 ]; then
+    tools/fetch_pipeline_list.sh "$dir"
+fi
 
 # What the binary still loads from the system, from its own dynamic section,
 # so the README cannot drift from the build.

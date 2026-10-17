@@ -35,6 +35,18 @@ cp "$exe" "$out/$name.debug.exe"
 # The HLSL path's compiler beside the exe, where bbhost looks first.
 tools/fetch_dxc.sh windows "$dir"
 dxc_tag=$(cat third_party/dxc/VERSION)
+# The pipeline list beside the binary, where bbhost reads it at each start and
+# builds every pipeline it names (render.cpp pipeline_manifest_load): the
+# pinned release asset (tools/fetch_pipeline_list.sh), or the local list
+# BBHOST_PACKAGE_PIPELINE_LIST names (a new one under test);
+# BBHOST_PIPELINE_LIST_FETCH=0 leaves it out (a development kit). It names the
+# game's programs by hash and holds none of their code.
+if [ -n "${BBHOST_PACKAGE_PIPELINE_LIST:-}" ]; then
+    python3 tools/pipeline_list.py stats "$BBHOST_PACKAGE_PIPELINE_LIST" > /dev/null
+    cp "$BBHOST_PACKAGE_PIPELINE_LIST" "$dir/pipeline-list.bin"
+elif [ "${BBHOST_PIPELINE_LIST_FETCH:-1}" != 0 ]; then
+    tools/fetch_pipeline_list.sh "$dir"
+fi
 sed -e 's#^app0 = .*#app0 = "C:/Games/CUSA00900"#' \
     -e 's#^eboot = .*#eboot = "./eboot-109-decrypted.bin"#' \
     -e 's#^skip_intro = false#skip_intro = true#' bbhost.example.toml > "$dir/bbhost.example.toml"

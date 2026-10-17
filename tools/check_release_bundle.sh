@@ -16,6 +16,18 @@ n=0
 for z in "$d"/bbhost-win-*.zip; do [ -f "$z" ] || continue; mkdir -p "$work/w$n"; unzip -q "$z" -d "$work/w$n"; n=$((n + 1)); done
 for t in "$d"/bbhost-linux-*.tar.gz "$d"/bbhost-steamdeck-*.tar.gz; do [ -f "$t" ] || continue; mkdir -p "$work/l$n"; tar xzf "$t" -C "$work/l$n"; n=$((n + 1)); done
 [ "$n" -gt 0 ] || fail "no bundles in $d"
+# Every bundle carries the pinned pipeline list (tools/fetch_pipeline_list.sh),
+# once one is published (an empty pin: none yet, and none in any bundle).
+list_sha=$("$(dirname "$0")/fetch_pipeline_list.sh" --sha256)
+for b in "$work"/*/; do
+    f=$(find "$b" -name pipeline-list.bin | head -1)
+    if [ -z "$list_sha" ]; then
+        [ -z "$f" ] || fail "${f#"$work"/}: a pipeline list, but none is pinned (tools/fetch_pipeline_list.sh)"
+        continue
+    fi
+    [ -n "$f" ] || fail "${b#"$work"/}: no pipeline-list.bin (tools/fetch_pipeline_list.sh)"
+    [ "$(sha256sum "$f" | cut -d' ' -f1)" = "$list_sha" ] || fail "${f#"$work"/}: not the pinned pipeline list (tools/fetch_pipeline_list.sh)"
+done
 # Only the example config may name a server (it shows the defaults).
 if find "$work" -name '*.toml' ! -name bbhost.example.toml -exec grep -lE '^[[:space:]]*(host|np_server|auth_server)[[:space:]]*=' {} + | grep .; then
     fail "a bundle carries a config that names a server"
@@ -50,4 +62,5 @@ for b in "$d"/bbhost "$d"/bbhost.exe; do
         grep -qxF "$want" <<<"$s" || fail "$(basename "$b"): its first-start config lacks $want"
     done
 done
-echo "release bundles: $n checked, the live server over https by default, no playtest kit, DXC $(cat "$(dirname "$0")/../third_party/dxc/VERSION") beside each executable"
+if [ -n "$list_sha" ]; then listmsg="and the pinned pipeline list (${list_sha:0:12}) beside each executable"; else listmsg="beside each executable (no pipeline list pinned yet)"; fi
+echo "release bundles: $n checked, the live server over https by default, no playtest kit, DXC $(cat "$(dirname "$0")/../third_party/dxc/VERSION") $listmsg"

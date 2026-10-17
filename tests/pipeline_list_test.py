@@ -107,11 +107,13 @@ class PipelineListTest(unittest.TestCase):
 
     def test_versions_agree(self):
         """The record format pipeline_list.py writes is the one bbhost writes
-        (render.cpp recipe_file::kVersion)."""
+        (render.cpp recipe_file::kVersion), and the one the pinned list is."""
         src = (ROOT / "src" / "host" / "render.cpp").read_text()
         at = src.index("namespace recipe_file {")
         version = int(src[at:at + 400].split("kVersion = ")[1].split(";")[0])
         self.assertEqual(version, pl.VERSION)
+        fetch = (ROOT / "tools" / "fetch_pipeline_list.sh").read_text()
+        self.assertIn("LIST_FORMAT=%d\n" % pl.VERSION, fetch)
 
 
 if __name__ == "__main__":
