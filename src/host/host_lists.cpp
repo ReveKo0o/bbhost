@@ -27,27 +27,32 @@ using u32 = std::uint32_t;
 using u64 = std::uint64_t;
 using ull = unsigned long long;
 
-// A chunk's list. Entries are the packet's place in the chunk in dwords << 8
-// | its opcode, in the order written - which is the chunk's order, as the
-// write pointer only moves forward through a chunk. A packet written at or
-// before the last one recorded is the first of the chunk written over again
-// (a command buffer reset in place, without a new chunk): every packet before
-// it in this round would have come first, so all the list held is gone.
-constexpr u64 kMaxChunkBytes = 64ull << 20;  // the place's 24 bits
+// A chunk's list, found by the chunk's end - the command buffer object's
+// +0x8, which stays put while its +0x0 moves to each segment's start (GX moves
+// it at every segment it submits), so all of a chunk's segments share one
+// list. Entries are the packet's place in dwords from 64 MiB below the end
+// (kMaxChunkBytes, the place's 24 bits) << 8 | its opcode, in the order
+// written - which is the chunk's order, as the write pointer only moves
+// forward through a chunk. A packet written at or before the last one
+// recorded is the first of the chunk written over again (a command buffer
+// reset in place, without a new chunk): every packet before it in this round
+// would have come first, so all the list held is gone.
+constexpr u64 kMaxChunkBytes = 64ull << 20;
 constexpr u32 kOverflow = 1, kReady = 2, kDead = 4;
 struct Region {
-    u64 begin = 0;
-    std::atomic<u64> end{0};
+    u64 end = 0;                 // the key
+    std::atomic<u64> lo{~0ull};  // the lowest segment start seen: as far down as the chunk is known
     u32* entry = nullptr;
     u32 cap = 0;
     std::atomic<u32> count{0};
     std::atomic<u32> flags{0};
 };
+u64 base_of(u64 end) { return end > kMaxChunkBytes ? end - kMaxChunkBytes : 0; }
 constexpr u32 kRegions = 8192;
 Region g_regions[kRegions];
 std::atomic<u32> g_region_count{0};
 
-// The chunk's start -> its region (index + 1; kNoRegion when it could not be
+// The chunk's end -> its region (index + 1; kNoRegion when it could not be
 // made), open addressing.
 constexpr u32 kSlots = 16384, kProbes = 64, kNoRegion = ~0u;
 struct Slot {
@@ -58,49 +63,49 @@ Slot g_slots[kSlots];
 
 // Every list's entries come out of one block, taken when the mode is on
 // (before any of the game's code runs): a chunk's list holds one entry per
-// four of its dwords (a token's size), and one that fills up stops recording
-// until the chunk starts over - its ranges are not covered.
+// four of its dwords (a token's size) - at least 4096 - and one that fills up
+// stops recording until the chunk starts over: its ranges are not covered.
 constexpr u64 kPoolEntries = 16ull << 20;  // 64 MiB
 u32* const g_pool = g_mode ? static_cast<u32*>(host_page_alloc(kPoolEntries * 4, false)) : nullptr;
 std::atomic<u64> g_pool_used{0};
 
 std::atomic<u64> g_unkeyed{0}, g_unrecorded{0}, g_overflowed{0}, g_stale{0};
 
-u32 slot_of(u64 begin) { return static_cast<u32>(((begin >> 3) * 0x9E3779B97F4A7C15ull) >> 50) & (kSlots - 1); }
+u32 slot_of(u64 key) { return static_cast<u32>(((key >> 3) * 0x9E3779B97F4A7C15ull) >> 50) & (kSlots - 1); }
 
 // Leaf-safe: a new chunk's region, or kNoRegion when there is no room left.
-u32 make_region(u64 begin, u64 end) {
+u32 make_region(u64 end, u64 begin) {
     const u32 i = g_region_count.fetch_add(1, std::memory_order_acq_rel);
     if (i >= kRegions) return kNoRegion;
     Region& r = g_regions[i];
-    const u64 cap = std::min<u64>((end - begin) / 16 + 64, 1u << 20);
-    const u64 at = g_pool ? g_pool_used.fetch_add(cap, std::memory_order_relaxed) : kPoolEntries;
-    r.begin = begin;
-    r.end.store(end, std::memory_order_relaxed);
-    if (at + cap > kPoolEntries) {
+    const u64 cap = std::min<u64>(std::max<u64>((end - begin) / 16 + 64, 4096), 1u << 20);
+    const u64 at = g_pool ? g_pool_used.load(std::memory_order_relaxed) : kPoolEntries;
+    r.end = end;
+    r.lo.store(begin, std::memory_order_relaxed);
+    if (at + cap > kPoolEntries || g_pool_used.fetch_add(cap, std::memory_order_relaxed) + cap > kPoolEntries) {
         r.flags.store(kReady | kDead, std::memory_order_release);
         return kNoRegion;
     }
-    r.entry = g_pool + at;
+    r.entry = g_pool + (g_pool_used.load(std::memory_order_relaxed) - cap);
     r.cap = static_cast<u32>(cap);
     r.flags.store(kReady, std::memory_order_release);
     return i + 1;
 }
 
-// Leaf-safe: the region of the chunk at `begin`, made on its first packet.
-Region* region_of(u64 begin, u64 end) {
-    const u32 h = slot_of(begin);
+// Leaf-safe: the region of the chunk ending at `end`, made on its first packet.
+Region* region_of(u64 end, u64 begin) {
+    const u32 h = slot_of(end);
     for (u32 p = 0; p < kProbes; ++p) {
         Slot& s = g_slots[(h + p) & (kSlots - 1)];
         u64 k = s.key.load(std::memory_order_acquire);
         if (k == 0) {
-            if (s.key.compare_exchange_strong(k, begin, std::memory_order_acq_rel)) {
-                const u32 r = make_region(begin, end);
+            if (s.key.compare_exchange_strong(k, end, std::memory_order_acq_rel)) {
+                const u32 r = make_region(end, begin);
                 s.region.store(r, std::memory_order_release);
                 return r == kNoRegion ? nullptr : &g_regions[r - 1];
             }
         }
-        if (k != begin) continue;
+        if (k != end) continue;
         u32 r;
         while ((r = s.region.load(std::memory_order_acquire)) == 0) {
             // Another thread is making it (a chunk's first two packets on
@@ -108,45 +113,39 @@ Region* region_of(u64 begin, u64 end) {
         }
         if (r == kNoRegion) return nullptr;
         Region* region = &g_regions[r - 1];
-        if (region->end.load(std::memory_order_relaxed) != end) region->end.store(end, std::memory_order_relaxed);
+        for (u64 lo = region->lo.load(std::memory_order_relaxed); begin < lo;) {
+            if (region->lo.compare_exchange_weak(lo, begin, std::memory_order_relaxed)) break;
+        }
         return region;
     }
     return nullptr;
 }
 
-Region* find_region(u64 begin) {
-    const u32 h = slot_of(begin);
-    for (u32 p = 0; p < kProbes; ++p) {
-        Slot& s = g_slots[(h + p) & (kSlots - 1)];
-        const u64 k = s.key.load(std::memory_order_acquire);
-        if (k == 0) return nullptr;
-        if (k != begin) continue;
-        const u32 r = s.region.load(std::memory_order_acquire);
-        return r == 0 || r == kNoRegion ? nullptr : &g_regions[r - 1];
-    }
-    return nullptr;
-}
-
-// The submitting side's index of the regions by their start (hosted).
+// The submitting side's index of the regions by their end (hosted).
 std::mutex g_index_mu;
 std::map<u64, u32> g_index;
 u32 g_indexed = 0;
 
-Region* containing(u64 va, std::size_t bytes) {
-    std::lock_guard<std::mutex> lk(g_index_mu);
+void sync_index_locked() {
     const u32 n = std::min(g_region_count.load(std::memory_order_acquire), kRegions);
     while (g_indexed < n) {
         Region& r = g_regions[g_indexed];
         const u32 f = r.flags.load(std::memory_order_acquire);
         if (!(f & kReady)) break;  // still being made; the next take indexes it
-        if (!(f & kDead)) g_index[r.begin] = g_indexed;
+        if (!(f & kDead)) g_index[r.end] = g_indexed;
         ++g_indexed;
     }
-    auto it = g_index.upper_bound(va);
-    for (int k = 0; k < 4 && it != g_index.begin(); ++k) {
-        --it;
+}
+
+// The region whose chunk holds [va, va + bytes): the first ends at or past
+// its end, the innermost that reaches down to va.
+Region* containing(u64 va, std::size_t bytes) {
+    std::lock_guard<std::mutex> lk(g_index_mu);
+    sync_index_locked();
+    auto it = g_index.lower_bound(va + bytes);
+    for (int k = 0; k < 4 && it != g_index.end(); ++k, ++it) {
         Region& r = g_regions[it->second];
-        if (va >= r.begin && va + bytes <= r.end.load(std::memory_order_relaxed)) return &r;
+        if (r.lo.load(std::memory_order_relaxed) <= va && va >= base_of(r.end)) return &r;
     }
     return nullptr;
 }
@@ -188,7 +187,7 @@ bool carried(u32 op, const u32* body, std::size_t n) {
 
 // What the shadow found (shadow_*), by opcode where it says.
 struct Counters {
-    std::atomic<u64> ranges{0}, covered{0}, no_list{0}, overflowed{0}, differed{0}, bytes{0}, bytes_covered{0};
+    std::atomic<u64> ranges{0}, covered{0}, covered_empty{0}, no_list{0}, overflowed{0}, differed{0}, bytes{0}, bytes_covered{0};
     std::atomic<u64> nested{0}, nested_covered{0};
     std::atomic<u64> matched[256] = {}, walked_not_listed[256] = {}, listed_not_walked[256] = {}, listed_not_carried[256] = {};
 };
@@ -201,18 +200,21 @@ struct Frame {
     std::size_t count = 0, cursor = 0;
     u64 base = 0, guest = 0;
     u32 hi = 0;  // dwords
-    bool bad = false, nested = false;
+    bool bad = false, nested = false, no_list = false;
 };
 constexpr int kFrames = 6;
 thread_local Frame t_frames[kFrames];
 thread_local int t_depth = -1;
 
+std::atomic<int> g_logs_no_list{0};
 void differ(Frame& f, const char* what, u32 op, u32 at) {
     f.bad = true;
-    if (g_logs.fetch_add(1) < 24) {
-        host_log("host-lists (shadow): %s: opcode 0x%02x at +0x%x of the %s range 0x%llx (%u bytes); its list has %zu entries%s", what, op,
-                 at * 4, f.nested ? "indirect" : "submitted", static_cast<ull>(f.guest), f.hi * 4, f.count,
-                 f.cursor < f.count ? "" : ", none left");
+    std::atomic<int>& logs = f.no_list ? g_logs_no_list : g_logs;
+    if (logs.fetch_add(1) < (f.no_list ? 12 : 24)) {
+        host_log("host-lists (shadow): %s: opcode 0x%02x at +0x%x of the %s range 0x%llx (%u bytes); %s", what, op, at * 4,
+                 f.nested ? "indirect" : "submitted", static_cast<ull>(f.guest), f.hi * 4,
+                 f.no_list ? "no list holds it" : (std::string("its list has ") + std::to_string(f.count) + " entries" +
+                                                   (f.cursor < f.count ? "" : ", none left")).c_str());
     }
 }
 
@@ -226,12 +228,12 @@ void note_slow(u64 cb, u64 va, u32 op) {
         g_unkeyed.fetch_add(1, std::memory_order_relaxed);
         return;
     }
-    Region* r = region_of(begin, end);
+    Region* r = region_of(end, begin);
     if (!r) {
         g_unrecorded.fetch_add(1, std::memory_order_relaxed);
         return;
     }
-    const u32 at = static_cast<u32>((va - begin) >> 2);
+    const u32 at = static_cast<u32>((va - base_of(end)) >> 2);
     u32 n = r->count.load(std::memory_order_relaxed);
     if (n && (r->entry[n - 1] >> 8) >= at) {
         n = 0;
@@ -246,11 +248,16 @@ void note_slow(u64 cb, u64 va, u32 op) {
     r->count.store(n + 1, std::memory_order_release);
 }
 
-void chunk_handed_out(u64 chunk_va) {
+void chunk_handed_out(u64 chunk_va, std::size_t chunk_bytes) {
     if (!g_mode) return;
-    if (Region* r = find_region(chunk_va)) {
-        r->flags.fetch_and(~kOverflow, std::memory_order_relaxed);
-        r->count.store(0, std::memory_order_release);
+    std::lock_guard<std::mutex> lk(g_index_mu);
+    sync_index_locked();
+    // The chunk's list: the region whose end lies inside the chunk.
+    for (auto it = g_index.upper_bound(chunk_va); it != g_index.end() && it->first <= chunk_va + chunk_bytes; ++it) {
+        Region& r = g_regions[it->second];
+        r.flags.fetch_and(~kOverflow, std::memory_order_relaxed);
+        r.count.store(0, std::memory_order_release);
+        r.lo.store(chunk_va, std::memory_order_relaxed);
     }
 }
 
@@ -264,14 +271,15 @@ void take(u64 va, std::size_t bytes, Taken* out) {
         return;
     }
     const u32 n = r->count.load(std::memory_order_acquire);
-    const u32 lo = static_cast<u32>((va - r->begin) >> 2), hi = lo + static_cast<u32>(bytes >> 2);
+    const u64 base = base_of(r->end);
+    const u32 lo = static_cast<u32>((va - base) >> 2), hi = lo + static_cast<u32>(bytes >> 2);
     const u32* e = r->entry;
     std::size_t i = static_cast<std::size_t>(std::lower_bound(e, e + n, lo << 8) - e);
     for (; i < n && (e[i] >> 8) < hi; ++i) {
         // The packet's header still there: an entry left from a chunk's
         // earlier round that its new round wrote no packet over is not.
         u32 hdr;
-        std::memcpy(&hdr, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(r->begin + static_cast<u64>(e[i] >> 8) * 4)), 4);
+        std::memcpy(&hdr, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(base + static_cast<u64>(e[i] >> 8) * 4)), 4);
         if ((hdr >> 30) != 3 || ((hdr >> 8) & 0xff) != (e[i] & 0xff)) {
             g_stale.fetch_add(1, std::memory_order_relaxed);
             continue;
@@ -370,13 +378,15 @@ void shadow_begin(const Taken* taken, u64 walk_va, std::size_t bytes) {
     f.hi = static_cast<u32>(bytes >> 2);
     f.bad = false;
     f.nested = false;
+    f.no_list = !taken || taken->state == Taken::kNoList;
     g.ranges.fetch_add(1, std::memory_order_relaxed);
     g.bytes.fetch_add(bytes, std::memory_order_relaxed);
-    if (!taken || taken->state != Taken::kTaken) {
-        (taken && taken->state == Taken::kOverflowed ? g.overflowed : g.no_list).fetch_add(1, std::memory_order_relaxed);
-        f.bad = true;
-        t_depth = -1;  // not compared: counted by why
+    if (taken && taken->state == Taken::kOverflowed) {
+        g.overflowed.fetch_add(1, std::memory_order_relaxed);
+        t_depth = -1;  // not compared: counted
     }
+    // With no list it is compared with an empty one: covered if the walk
+    // meets nothing it would have to carry.
 }
 
 void shadow_push(u64 va, std::size_t bytes) {
@@ -395,7 +405,8 @@ void shadow_push(u64 va, std::size_t bytes) {
     f.base = va;
     f.guest = va;
     f.hi = static_cast<u32>(bytes >> 2);
-    f.bad = t.state != Taken::kTaken;
+    f.bad = t.state == Taken::kOverflowed;
+    f.no_list = t.state == Taken::kNoList;
     f.nested = true;
     g.nested.fetch_add(1, std::memory_order_relaxed);
 }
@@ -446,9 +457,10 @@ void shadow_end() {
         differ(f, "listed past the walk", f.e[f.cursor] & 0xff, f.e[f.cursor] >> 8);
     }
     if (f.bad) {
-        g.differed.fetch_add(1, std::memory_order_relaxed);
+        (f.no_list ? g.no_list : g.differed).fetch_add(1, std::memory_order_relaxed);
     } else {
         g.covered.fetch_add(1, std::memory_order_relaxed);
+        if (f.no_list) g.covered_empty.fetch_add(1, std::memory_order_relaxed);
         g.bytes_covered.fetch_add(static_cast<u64>(f.hi) * 4, std::memory_order_relaxed);
     }
     t_depth = -1;
@@ -486,11 +498,13 @@ void report() {
         return;
     }
     if (g_mode != 2) return;
-    host_log("host-lists (shadow): %llu submitted ranges (%.1f MiB) walked, %llu covered by their lists (%.1f MiB); not: %llu with no "
-             "list, %llu over a full list, %llu where the list and the walk differ; indirect buffers inside them %llu, %llu covered",
+    host_log("host-lists (shadow): %llu submitted ranges (%.1f MiB) walked, %llu covered by their lists (%.1f MiB; %llu of them with no "
+             "list and nothing to carry); not: %llu with no list and something to carry, %llu over a full list, %llu where the list and the "
+             "walk differ; indirect buffers inside them %llu, %llu covered",
              static_cast<ull>(g.ranges.load()), static_cast<double>(g.bytes.load()) / (1 << 20), static_cast<ull>(g.covered.load()),
-             static_cast<double>(g.bytes_covered.load()) / (1 << 20), static_cast<ull>(g.no_list.load()), static_cast<ull>(g.overflowed.load()),
-             static_cast<ull>(g.differed.load()), static_cast<ull>(g.nested.load()), static_cast<ull>(g.nested_covered.load()));
+             static_cast<double>(g.bytes_covered.load()) / (1 << 20), static_cast<ull>(g.covered_empty.load()), static_cast<ull>(g.no_list.load()),
+             static_cast<ull>(g.overflowed.load()), static_cast<ull>(g.differed.load()), static_cast<ull>(g.nested.load()),
+             static_cast<ull>(g.nested_covered.load()));
     host_log("host-lists (shadow): met in place and in order, by opcode:%s", by_op(g.matched).c_str());
     host_log("host-lists (shadow): walked but not listed:%s; listed but not walked:%s; listed but nothing reads them:%s",
              by_op(g.walked_not_listed).c_str(), by_op(g.listed_not_walked).c_str(), by_op(g.listed_not_carried).c_str());

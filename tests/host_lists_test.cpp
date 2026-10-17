@@ -18,6 +18,16 @@ using namespace host_lists;
 
 namespace {
 
+// The region of the chunk ending at `end`, if there is one.
+Region* region_at(u64 end) {
+    for (const Slot& s : g_slots) {
+        if (s.key.load() != end) continue;
+        const u32 r = s.region.load();
+        return r && r != kNoRegion ? &g_regions[r - 1] : nullptr;
+    }
+    return nullptr;
+}
+
 int g_failed = 0;
 void check(bool ok, const char* what, int line) {
     if (ok) return;
@@ -172,6 +182,30 @@ int main() {
         CHECK(entries(t) == (std::vector<std::uint32_t>{e(10, 0x47)}) && g_stale.load() == stale + 1);
     }
 
+    // A chunk's segments: the command buffer's start moves to each one's
+    // first packet (GX's segment close), its end stays - one list, each
+    // segment's range taken from it.
+    {
+        Buffer b(4096);
+        for (std::size_t dw : {0, 8, 20, 30, 44}) b.put(dw, 0x10, 4, kGxNativeMagic);
+        b.note(0, 0x10);
+        b.note(8, 0x10);
+        b.object[0] = b.at(20);  // the first segment, [0, 20), submitted
+        b.note(20, 0x10);
+        b.note(30, 0x10);
+        b.object[0] = b.at(40);
+        b.note(44, 0x10);
+        Taken t;
+        take(b.at(0), 20 * 4, &t);
+        CHECK(entries(t) == (std::vector<std::uint32_t>{e(0, 0x10), e(8, 0x10)}));
+        take(b.at(20), 20 * 4, &t);
+        CHECK(entries(t) == (std::vector<std::uint32_t>{e(0, 0x10), e(10, 0x10)}));
+        take(b.at(40), 8 * 4, &t);
+        CHECK(entries(t) == (std::vector<std::uint32_t>{e(4, 0x10)}));
+        Region* r = region_at(b.object[1]);
+        CHECK(r && r->lo.load() == b.begin() && r->count.load() == 5);
+    }
+
     // GX's arena hands the chunk out again: its list starts over.
     {
         Buffer b(1024);
@@ -180,26 +214,26 @@ int main() {
         b.put(9, 0x10, 4, kGxNativeMagic);
         b.note(5, 0x47);
         b.note(9, 0x10);
-        chunk_handed_out(b.begin());
+        chunk_handed_out(b.begin(), 1024 * 4);
         Taken t;
         take(b.at(0), 64, &t);
         CHECK(t.state == Taken::kTaken && t.entries.empty());
         b.note(2, 0x10);
         take(b.at(0), 64, &t);
         CHECK(entries(t) == (std::vector<std::uint32_t>{e(2, 0x10)}));
-        chunk_handed_out(b.begin() + 4096 * 64);  // a chunk with no list: nothing
+        chunk_handed_out(b.begin() + 4096 * 64, 4096);  // a chunk with no list: nothing
     }
 
     // A list that fills up stops recording, and its ranges are not covered,
     // until the chunk starts over.
     {
-        Buffer b(256);  // room for 256 * 4 / 16 + 64 = 128 entries
-        const u64 dwords = 256;
+        Buffer b(8192);  // room for 4096 entries: the least a list has
+        const u64 dwords = 8192;
         Region* r = nullptr;
-        for (std::uint32_t k = 0; k < dwords; ++k) b.chunk[k] = 0xc0001000u;  // one-dword NOPs: header and op 0x10
+        for (std::uint32_t k = 0; k < dwords; ++k) b.chunk[k] = 0xc0001000u;  // NOP headers, op 0x10
         for (std::uint32_t k = 0; k < dwords; ++k) b.note(k, 0x10);
-        r = find_region(b.begin());
-        CHECK(r && r->cap == dwords * 4 / 16 + 64);
+        r = region_at(b.object[1]);
+        CHECK(r && r->cap == 4096);  // at least 4096 entries a list
         CHECK(r && (r->flags.load() & kOverflow));
         Taken t;
         take(b.at(0), dwords * 4, &t);
@@ -226,9 +260,17 @@ int main() {
         const u64 unkeyed = g_unkeyed.load();
         host_lists::note(b.cb(), b.at(600), 0x47);
         CHECK(g_unkeyed.load() == unkeyed + 1);
+        // A range with no list is compared with an empty one: covered when
+        // the walk meets nothing to carry, not when it meets a token.
         const Seen s0 = seen();
+        const u64 empty = g.covered_empty.load();
         take(b.at(0) - 4096, 64, &t);
         shadow_begin(&t, b.at(0) - 4096, 64);
+        shadow_end();
+        CHECK(seen().covered == s0.covered + 1 && g.covered_empty.load() == empty + 1);
+        const std::uint32_t token[3] = {kGxNativeMagic, 0, 0};
+        shadow_begin(&t, b.at(0) - 4096, 64);
+        shadow_packet(b.at(0) - 4096, 0x10, token, 3);
         shadow_end();
         CHECK(seen().no_list == s0.no_list + 1);
     }
@@ -356,8 +398,8 @@ int main() {
         }
         // Two threads making one new chunk's region at once: one region.
         const u64 key = reinterpret_cast<u64>(carve(4096));
-        std::thread a([key] { (void)region_of(key, key + 4096 * 4); });
-        std::thread b2([key] { (void)region_of(key, key + 4096 * 4); });
+        std::thread a([key] { (void)region_of(key + 4096 * 4, key); });
+        std::thread b2([key] { (void)region_of(key + 4096 * 4, key); });
         Taken t;
         for (int round = 0; round < 200; ++round) take(bufs[round % kChunks].at(0), 64, &t);
         for (auto& th : threads) th.join();
@@ -372,7 +414,7 @@ int main() {
         }
         CHECK(bad == 0);
         int regions_at = 0;
-        for (const Slot& s : g_slots) regions_at += s.key.load() == key;
+        for (const Slot& s : g_slots) regions_at += s.key.load() == key + 4096 * 4;
         CHECK(regions_at == 1);
     }
 

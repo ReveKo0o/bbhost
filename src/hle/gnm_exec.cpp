@@ -3406,7 +3406,7 @@ GUEST_ABI int hle_gx_arena_acquire(std::uint64_t* allocator, std::uint64_t* out)
                 if (__sync_bool_compare_and_swap(marker, std::uint64_t{0}, std::uint64_t{1})) {
                     allocator[4] = idx;
                     *out = base + idx * chunk * 8;
-                    host_lists::chunk_handed_out(*out);
+                    host_lists::chunk_handed_out(*out, chunk * 8);
                     if (g_arena_monitor) note_arena_handed_out(*out);
                     return 0;
                 }

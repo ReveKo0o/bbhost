@@ -3,8 +3,9 @@
 // retiring the walk of those buffers (docs/rendering.md, "The command
 // processor"). A list belongs to a chunk of command buffer (what a Gnm command
 // buffer object writes into: GX's arena chunks, YEBIS's, Gnmx's and the
-// compute ring's buffers), found by the chunk's start - the object's +0x0 -
-// and holds, in the order written, each such packet's place in the chunk and
+// compute ring's buffers), found by the chunk's end - the object's +0x8,
+// which stays put while +0x0 moves to each segment's start - and holds, in
+// the order written, each such packet's place in the chunk and
 // its opcode: our tokens, the labels, the waits, predication, the compute
 // ring's calls, data written inline. Data the shaders read in place, markers
 // and register packets nothing reads are not in it.
@@ -42,9 +43,9 @@ inline void note(std::uint64_t cb, std::uint64_t va, std::uint32_t op) {
     if (g_mode) note_slow(cb, va, op);
 }
 
-// Hosted: GX's command arena handed out the chunk at `chunk_va` (hle_gx_arena_acquire);
-// what its list held is gone.
-void chunk_handed_out(std::uint64_t chunk_va);
+// Hosted: GX's command arena handed out the chunk [chunk_va, + chunk_bytes)
+// (hle_gx_arena_acquire); what its list held is gone.
+void chunk_handed_out(std::uint64_t chunk_va, std::size_t chunk_bytes);
 
 // A submitted range's part of its list: each entry the packet's place from
 // the range's start in dwords << 8 | its opcode.
