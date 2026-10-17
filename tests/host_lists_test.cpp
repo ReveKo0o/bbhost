@@ -223,6 +223,46 @@ int main() {
         CHECK(r && r->lo.load() == b.begin() && r->count.load() == 5);
     }
 
+    // An arena's chunk: its command buffer's start moves to each segment's
+    // and its end down by each label carved from the chunk's end, so the
+    // arena's geometry names the chunk - one list for all its packets.
+    {
+        std::uint32_t* mem = carve(4 * 1024);           // four chunks of 4 KiB
+        const u64 base = reinterpret_cast<u64>(mem) + 16;  // as GX's arenas, not aligned to the chunk
+        note_arena(base, 4096, 3);
+        note_arena(base, 4096, 3);  // met again: once
+        CHECK(g_arena_count.load() >= 1);
+        Buffer b(1);  // only its object: the chunk is the arena's second
+        b.object[0] = base + 4096;
+        b.object[1] = base + 2 * 4096 - 8;
+        b.object[2] = base + 4096;
+        const auto at = [&](std::size_t dw) { return base + 4096 + dw * 4; };
+        const auto put = [&](std::size_t dw, std::uint32_t op, std::size_t len, std::uint32_t first) {
+            auto* p = reinterpret_cast<std::uint32_t*>(at(dw));
+            p[0] = 0xc0000000u | (static_cast<std::uint32_t>(len - 2) << 16) | (op << 8);
+            for (std::size_t k = 1; k < len; ++k) p[k] = 0;
+            if (len > 1) p[1] = first;
+        };
+        put(0, 0x10, 4, kGxNativeMagic);
+        host_lists::note(b.cb(), at(0), 0x10);
+        b.object[1] -= 8;  // a label carved from the end
+        put(4, 0x47, 6, 0);
+        host_lists::note(b.cb(), at(4), 0x47);
+        b.object[0] = at(10);  // a segment submitted
+        put(10, 0x10, 4, kGxNativeMagic);
+        host_lists::note(b.cb(), at(10), 0x10);
+        Taken t;
+        take(at(0), 10 * 4, &t);
+        CHECK(entries(t) == (std::vector<std::uint32_t>{e(0, 0x10), e(4, 0x47)}));
+        take(at(10), 4 * 4, &t);
+        CHECK(entries(t) == (std::vector<std::uint32_t>{e(0, 0x10)}));
+        Region* r = region_at(base + 2 * 4096);
+        CHECK(r && r->lo.load() == base + 4096 && r->count.load() == 3);
+        chunk_handed_out(base + 4096, 4096);
+        take(at(0), 14 * 4, &t);
+        CHECK(t.state == Taken::kTaken && t.entries.empty());
+    }
+
     // GX's arena hands the chunk out again: its list starts over.
     {
         Buffer b(1024);

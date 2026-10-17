@@ -71,6 +71,18 @@ std::atomic<u64> g_pool_used{0};
 
 std::atomic<u64> g_unkeyed{0}, g_unrecorded{0}, g_overflowed{0}, g_stale{0};
 
+// GX's command arenas, as the arena's acquire meets them (note_arena): a
+// packet in one belongs to the chunk the arena's geometry puts it in - its
+// command buffer's +0x0 moves to each segment's start and its +0x8 down by
+// each label GX carves from the chunk's end, so neither names the chunk.
+struct Arena {
+    u64 base = 0, end = 0, chunk = 0;
+};
+constexpr u32 kArenas = 8;
+Arena g_arenas[kArenas];
+std::atomic<u32> g_arena_count{0};
+std::mutex g_arena_mu;
+
 u32 slot_of(u64 key) { return static_cast<u32>(((key >> 3) * 0x9E3779B97F4A7C15ull) >> 50) & (kSlots - 1); }
 
 // Leaf-safe: a new chunk's region, or kNoRegion when there is no room left.
@@ -228,12 +240,22 @@ void note_slow(u64 cb, u64 va, u32 op) {
         g_unkeyed.fetch_add(1, std::memory_order_relaxed);
         return;
     }
-    Region* r = region_of(end, begin);
+    // The chunk: an arena's by its geometry, any other by its end.
+    u64 key = end, lo = begin;
+    for (u32 i = 0, n = g_arena_count.load(std::memory_order_acquire); i < n; ++i) {
+        const Arena& a = g_arenas[i];
+        if (va >= a.base && va < a.end) {
+            lo = a.base + (va - a.base) / a.chunk * a.chunk;
+            key = lo + a.chunk;
+            break;
+        }
+    }
+    Region* r = region_of(key, lo);
     if (!r) {
         g_unrecorded.fetch_add(1, std::memory_order_relaxed);
         return;
     }
-    const u32 at = static_cast<u32>((va - base_of(end)) >> 2);
+    const u32 at = static_cast<u32>((va - base_of(key)) >> 2);
     u32 n = r->count.load(std::memory_order_relaxed);
     if (n && (r->entry[n - 1] >> 8) >= at) {
         n = 0;
@@ -246,6 +268,17 @@ void note_slow(u64 cb, u64 va, u32 op) {
     }
     r->entry[n] = (at << 8) | (op & 0xff);
     r->count.store(n + 1, std::memory_order_release);
+}
+
+void note_arena(u64 base, u64 chunk_bytes, u64 chunks) {
+    if (!g_mode || !chunk_bytes || !chunks) return;
+    std::lock_guard<std::mutex> lk(g_arena_mu);
+    const u32 n = g_arena_count.load(std::memory_order_relaxed);
+    for (u32 i = 0; i < n; ++i)
+        if (g_arenas[i].base == base) return;
+    if (n == kArenas) return;
+    g_arenas[n] = Arena{base, base + chunk_bytes * chunks, chunk_bytes};
+    g_arena_count.store(n + 1, std::memory_order_release);
 }
 
 void chunk_handed_out(u64 chunk_va, std::size_t chunk_bytes) {
@@ -368,7 +401,7 @@ bool hand_over(u64 va, std::size_t bytes, const Taken& t, std::vector<std::uint8
     return true;
 }
 
-void shadow_begin(const Taken* taken, u64 walk_va, std::size_t bytes) {
+void shadow_begin(const Taken* taken, u64 walk_va, std::size_t bytes, u64 guest_va) {
     t_depth = 0;
     Frame& f = t_frames[0];
     f.own.clear();
@@ -376,7 +409,7 @@ void shadow_begin(const Taken* taken, u64 walk_va, std::size_t bytes) {
     f.count = f.e ? taken->entries.size() : 0;
     f.cursor = 0;
     f.base = walk_va;
-    f.guest = walk_va;
+    f.guest = guest_va ? guest_va : walk_va;
     f.hi = static_cast<u32>(bytes >> 2);
     f.bad = false;
     f.nested = false;

@@ -2806,7 +2806,8 @@ void cp_thread(Queue* q, int id) {
             const bool shadow = host_lists::g_mode == 2 && job.cbs[i].first && job.cbs[i].second >= 4;
             if (shadow) {
                 host_lists::shadow_begin(i < job.lists.size() ? &job.lists[i] : nullptr, reinterpret_cast<std::uintptr_t>(job.cbs[i].first),
-                                         job.cbs[i].second);
+                                         job.cbs[i].second,
+                                         i < job.guest.size() ? reinterpret_cast<std::uintptr_t>(job.guest[i].first) : 0);
             }
             execute_one(job.cbs[i].first, job.cbs[i].second, !job.owned.empty());
             if (shadow) host_lists::shadow_end();
@@ -3265,6 +3266,7 @@ void note_arena_extent(const std::uint64_t* allocator) {
     const std::uint64_t chunk_bytes = allocator[1] * 8;
     g_arena_extents[n] = {id, allocator[3], allocator[3] + allocator[2] * chunk_bytes, chunk_bytes};
     g_arena_extent_count.store(n + 1);
+    host_lists::note_arena(allocator[3], chunk_bytes, allocator[2]);
     // BBHOST_ARENA_WATCH=1: a thread that scans this arena's markers every
     // 2 ms and logs each one that becomes anything but 0, 1 or 2, with what
     // it was before and where the frame and the host GPU were. The protocol

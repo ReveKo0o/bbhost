@@ -43,6 +43,10 @@ inline void note(std::uint64_t cb, std::uint64_t va, std::uint32_t op) {
     if (g_mode) note_slow(cb, va, op);
 }
 
+// Hosted: a GX command arena the arena's acquire met - `chunks` chunks of
+// `chunk_bytes` from `base` (hle_gx_arena_acquire, note_arena_extent).
+void note_arena(std::uint64_t base, std::uint64_t chunk_bytes, std::uint64_t chunks);
+
 // Hosted: GX's command arena handed out the chunk [chunk_va, + chunk_bytes)
 // (hle_gx_arena_acquire); what its list held is gone.
 void chunk_handed_out(std::uint64_t chunk_va, std::size_t chunk_bytes);
@@ -67,11 +71,12 @@ void take(std::uint64_t va, std::size_t bytes, Taken* out);
 bool hand_over(std::uint64_t va, std::size_t bytes, const Taken& taken, std::vector<std::uint8_t>* out);
 
 // Hosted, on a command-processor thread (shadow): a top-level range's walk
-// begins - `walk_va` where the walker reads it (its copy), `taken` what the
-// list holds for it - and ends; an indirect buffer's walk inside it begins
-// and ends (taken from the callee's list there and then); each packet the
-// walk meets in between, at `va` where the walker reads it.
-void shadow_begin(const Taken* taken, std::uint64_t walk_va, std::size_t bytes);
+// begins - `walk_va` where the walker reads it (its copy), `guest_va` where
+// the game wrote it (for the logs), `taken` what the list holds for it - and
+// ends; an indirect buffer's walk inside it begins and ends (taken from the
+// callee's list there and then); each packet the walk meets in between, at
+// `va` where the walker reads it.
+void shadow_begin(const Taken* taken, std::uint64_t walk_va, std::size_t bytes, std::uint64_t guest_va = 0);
 void shadow_push(std::uint64_t va, std::size_t bytes);
 void shadow_packet(std::uint64_t va, std::uint32_t op, const std::uint32_t* body, std::size_t n);
 void shadow_pop();
