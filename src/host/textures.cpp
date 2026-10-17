@@ -4430,9 +4430,9 @@ std::string textures_census_window_locked() {
             } else {
                 ++o.n;
                 o.bytes += sf.memory.size;
-                if (gx_yebis_at(sf.base, span)) {
-                    ++o.yebis;
-                    o.yebis_bytes += sf.memory.size;
+                if (const int mw = gx_middleware_at(sf.base, span)) {
+                    ++(mw == 1 ? o.yebis : o.scaleform);
+                    (mw == 1 ? o.yebis_bytes : o.scaleform_bytes) += sf.memory.size;
                 }
             }
         }
@@ -4456,13 +4456,17 @@ std::string textures_census_window_locked() {
                       static_cast<ull>(rt[1].gone_bytes >> 20), static_cast<ull>(tex[0].gone), static_cast<ull>(tex[0].gone_bytes >> 20),
                       static_cast<ull>(tex[1].gone), static_cast<ull>(tex[1].gone_bytes >> 20));
         out += std::string("\n  ") + l4;
-        char l5[300];
+        char l5[480];
         std::snprintf(l5, sizeof(l5),
-                      "resources: of those on memory no GX resource holds, on YEBIS's own textures and buffers: targets %llu (%llu MiB), snapshots "
-                      "%llu (%llu MiB), shader-written textures %llu (%llu MiB), other textures %llu (%llu MiB)",
-                      static_cast<ull>(rt[0].yebis), static_cast<ull>(rt[0].yebis_bytes >> 20), static_cast<ull>(rt[1].yebis),
-                      static_cast<ull>(rt[1].yebis_bytes >> 20), static_cast<ull>(tex[0].yebis), static_cast<ull>(tex[0].yebis_bytes >> 20),
-                      static_cast<ull>(tex[1].yebis), static_cast<ull>(tex[1].yebis_bytes >> 20));
+                      "resources: of those on memory no GX resource holds, on YEBIS's own textures and buffers / on Scaleform's textures: targets "
+                      "%llu (%llu MiB) / %llu (%llu MiB), snapshots %llu (%llu MiB) / %llu (%llu MiB), shader-written textures %llu (%llu MiB) / "
+                      "%llu (%llu MiB), other textures %llu (%llu MiB) / %llu (%llu MiB)",
+                      static_cast<ull>(rt[0].yebis), static_cast<ull>(rt[0].yebis_bytes >> 20), static_cast<ull>(rt[0].scaleform),
+                      static_cast<ull>(rt[0].scaleform_bytes >> 20), static_cast<ull>(rt[1].yebis), static_cast<ull>(rt[1].yebis_bytes >> 20),
+                      static_cast<ull>(rt[1].scaleform), static_cast<ull>(rt[1].scaleform_bytes >> 20), static_cast<ull>(tex[0].yebis),
+                      static_cast<ull>(tex[0].yebis_bytes >> 20), static_cast<ull>(tex[0].scaleform), static_cast<ull>(tex[0].scaleform_bytes >> 20),
+                      static_cast<ull>(tex[1].yebis), static_cast<ull>(tex[1].yebis_bytes >> 20), static_cast<ull>(tex[1].scaleform),
+                      static_cast<ull>(tex[1].scaleform_bytes >> 20));
         out += std::string("\n  ") + l5;
     }
     return out;

@@ -132,6 +132,11 @@ constexpr std::uint8_t kYebisCreate13Prologue[17] = {BB_PUSH6, 0x50, 0x4d, 0x89,
 constexpr std::uint8_t kYebisCreateBufferPrologue[17] = {BB_PUSH6, 0x50, 0x49, 0x89, 0xce};  // push rax; mov r14, rcx
 constexpr std::uint8_t kYebisMapPrologue[20] = {BB_PUSH6, 0x48, 0x81, 0xec, 0x98, 0x00, 0x00, 0x00};
 constexpr std::uint8_t kYebisUpdatePrologue[20] = {BB_PUSH6, 0x48, 0x81, 0xec, 0x58, 0x01, 0x00, 0x00};
+// Scaleform's PS4 Texture::Initialize (0x7a1d30, slot 2 of vtable 0x55bbf20;
+// its prologue is kPrologue58's): true when it made the hardware texture, an
+// array (+0x60) of +0x45 planes of 0x58 bytes - size (+0), T# (+4), memory
+// (+0x50, from the HAL's memory manager). Census only.
+constexpr std::uint64_t kScaleformTexInit = 0x7a1d30;
 #undef BB_PUSH6
 // push rbp; mov rbp, rsp; push r15; push r14; push rbx; push rax; mov r14, rdi; mov rdi, [r14]
 constexpr std::uint8_t kBufferReleasePrologue[16] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56,
@@ -141,7 +146,7 @@ constexpr std::uint8_t kDtorHead[9] = {0x55, 0x48, 0x89, 0xe5, 0x53, 0x50, 0x48,
 
 enum Kind : std::uint8_t {
     kBuffer = 1, kTexture = 2, kTexture3D = 3, kMapCall = 4, kTsharp = 5, kResource1D = 6, kObject = 7, kPoolCall = 8,
-    kYebisCreate = 9, kYebisMapCall = 10
+    kYebisCreate = 9, kYebisMapCall = 10, kScaleformInit = 11
 };
 
 struct Pending {
@@ -205,7 +210,7 @@ std::atomic<std::uint64_t> g_ring_calls{0}, g_ring_bytes{0}, g_pool_calls{0}, g_
 // (under g_mu) for the buffer shadow's and the texture cache's censuses.
 struct YebisObject {
     std::uint64_t object = 0, bytes = 0;
-    std::uint32_t kind = 0;
+    std::uint32_t kind = 0;  // YEBIS's kind (1-4); 8 a Scaleform texture plane
 };
 std::map<std::uint64_t, YebisObject> g_yebis_by_memory;     // under g_mu
 std::unordered_map<std::uint64_t, std::uint64_t> g_yebis_by_object;  // object -> memory, under g_mu
@@ -213,6 +218,9 @@ std::atomic<std::uint64_t> g_yebis_made[5] = {}, g_yebis_made_bytes[5] = {}, g_y
 std::atomic<std::uint64_t> g_yebis_rt{0}, g_yebis_depth{0}, g_yebis_destroyed{0}, g_yebis_destroyed_unknown{0};
 std::atomic<std::uint64_t> g_yebis_maps[5][6] = {}, g_yebis_map_own{0}, g_yebis_map_other{0}, g_yebis_updates[5] = {};
 std::atomic<int> g_yebis_logged[5] = {}, g_yebis_map_logged{0};
+// Scaleform's textures (census): initialized, their planes and bytes, failed.
+std::atomic<std::uint64_t> g_sf_inits{0}, g_sf_planes{0}, g_sf_bytes{0}, g_sf_failed{0};
+std::atomic<int> g_sf_logged{0};
 std::atomic<std::uint64_t> g_lookups{0}, g_lookup_hits{0};
 std::atomic<std::uint64_t> g_peak_live{0};
 // New resources made over part of a live one's memory: [old type][new type].
@@ -733,6 +741,38 @@ GUEST_ABI std::int64_t yebis_tex2d_dtor_hook(std::uint64_t, const std::uint64_t*
     return 0;
 }
 
+GUEST_ABI std::int64_t scaleform_init_hook(std::uint64_t, const std::uint64_t* saved) {
+    Pending p{saved[6], kScaleformInit, 0, saved[5], 0};
+    t_pending.push_back(p);
+    const_cast<std::uint64_t*>(saved)[6] = reinterpret_cast<std::uint64_t>(&gx_res_ret);
+    return 0;
+}
+
+// A Scaleform texture made its hardware planes: each one's memory and size.
+void note_scaleform_texture(std::uint64_t texture) {
+    std::uint8_t planes = 0;
+    std::uint64_t array = 0;
+    if (!rd(texture + 0x45, &planes) || !rd(texture + 0x60, &array) || !array || planes > 4) return;
+    g_sf_inits.fetch_add(1, std::memory_order_relaxed);
+    for (unsigned i = 0; i < planes; ++i) {
+        const std::uint64_t rec = array + i * 0x58ull;
+        std::uint32_t size = 0, t[8] = {};
+        std::uint64_t memory = 0;
+        if (!rd(rec, &size) || !rd(rec + 0x50, &memory)) continue;
+        host_read_safe(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(rec + 4)), t, sizeof(t));
+        g_sf_planes.fetch_add(1, std::memory_order_relaxed);
+        g_sf_bytes.fetch_add(size, std::memory_order_relaxed);
+        if (g_sf_logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+            // T# word 2: width - 1 in bits 0-13, height - 1 in 14-27; word 1: data format in bits 20-25.
+            host_log("gx-resources: Scaleform texture 0x%llx plane %u: %ux%u, format %u, memory 0x%llx, %u bytes", static_cast<unsigned long long>(texture),
+                     i, (t[2] & 0x3fff) + 1, ((t[2] >> 14) & 0x3fff) + 1, (t[1] >> 20) & 0x3f, static_cast<unsigned long long>(memory), size);
+        }
+        if (!memory || memory == ~0ull || !size) continue;
+        std::lock_guard<std::mutex> lk(g_mu);
+        g_yebis_by_memory[memory] = YebisObject{texture, size, 8};
+    }
+}
+
 // What YEBIS's device made: its memory, size, kind and (2D) description.
 void note_yebis_created(std::uint64_t object, std::uint32_t what, std::uint64_t desc, bool data) {
     std::uint64_t memory = 0;
@@ -920,6 +960,9 @@ extern "C" GUEST_ABI std::uint64_t gx_res_after(std::uint64_t result) {
         } else {
             g_yebis_failed[what].fetch_add(1, std::memory_order_relaxed);
         }
+    } else if (p.kind == kScaleformInit) {
+        if (result & 0xff) note_scaleform_texture(p.holder);
+        else g_sf_failed.fetch_add(1, std::memory_order_relaxed);
     } else if (p.kind == kYebisMapCall) {
         const std::uint32_t kind = yebis_kind(p.extra);
         g_yebis_maps[kind][p.type < 6 ? p.type : 0].fetch_add(1, std::memory_order_relaxed);
@@ -1086,6 +1129,7 @@ void gx_resources_install(ElfImage* image) {
         hook(kYebisMap, kYebisMapPrologue, sizeof(kYebisMapPrologue), reinterpret_cast<void*>(&yebis_map_hook), 0);
         hook(kYebisUpdate, kYebisUpdatePrologue, sizeof(kYebisUpdatePrologue), reinterpret_cast<void*>(&yebis_update_hook), 0);
         dtor_with(kYebisTex2DDelete, kYebisTex2DVtable, reinterpret_cast<void*>(&yebis_tex2d_dtor_hook));
+        hook(kScaleformTexInit, kPrologue58, sizeof(kPrologue58), reinterpret_cast<void*>(&scaleform_init_hook), 0);
     }
     // The pool's blocks are memory the buffer shadow binds from host memory
     // (it is rewritten every frame or so) unless BBHOST_SHADOW_GX=0.
@@ -1291,14 +1335,15 @@ bool gx_view_resource(std::uint64_t view, GxResourceInfo* out) {
     return view && rd(view + 0x08, &holder) && gx_resource_by_holder(holder, out);
 }
 
-bool gx_yebis_at(std::uint64_t va, std::size_t bytes) {
-    if (!bytes) return false;
+int gx_middleware_at(std::uint64_t va, std::size_t bytes) {
+    if (!bytes) return 0;
     std::lock_guard<std::mutex> lk(g_mu);
-    if (g_yebis_by_memory.empty()) return false;
+    if (g_yebis_by_memory.empty()) return 0;
     auto it = g_yebis_by_memory.upper_bound(va + bytes - 1);
-    if (it == g_yebis_by_memory.begin()) return false;
+    if (it == g_yebis_by_memory.begin()) return 0;
     --it;
-    return it->first + it->second.bytes > va;
+    if (it->first + it->second.bytes <= va) return 0;
+    return it->second.kind == 8 ? 2 : 1;
 }
 
 bool gx_resource_overlapping(std::uint64_t va, std::size_t bytes, GxResourceInfo* out) {
@@ -1441,8 +1486,10 @@ void gx_resources_report() {
             live = g_yebis_by_memory.size();
             for (const auto& [m, o] : g_yebis_by_memory) live_bytes += o.bytes;
         }
+        host_log("gx-resources: Scaleform's textures initialized %llu (%llu planes, %llu MiB), failed %llu", static_cast<ull>(g_sf_inits.load()),
+                 static_cast<ull>(g_sf_planes.load()), static_cast<ull>(g_sf_bytes.load() >> 20), static_cast<ull>(g_sf_failed.load()));
         host_log("gx-resources: YEBIS's own device made%s 2D render targets %llu, depth %llu; 2D destroyed %llu (%llu it had not seen made); live "
-                 "%zu (%llu MiB); by resource:%s Map's pointer its memory %llu, elsewhere %llu",
+                 "YEBIS and Scaleform objects %zu (%llu MiB); by resource:%s Map's pointer its memory %llu, elsewhere %llu",
                  made.empty() ? " nothing;" : made.c_str(), static_cast<ull>(g_yebis_rt.load()), static_cast<ull>(g_yebis_depth.load()),
                  static_cast<ull>(g_yebis_destroyed.load()), static_cast<ull>(g_yebis_destroyed_unknown.load()), live,
                  static_cast<ull>(live_bytes >> 20), maps.empty() ? " none;" : maps.c_str(), static_cast<ull>(g_yebis_map_own.load()),

@@ -1357,6 +1357,7 @@ struct OrphanImages {
     std::uint64_t partial = 0, partial_bytes = 0;  // one over part of it, none over all
     std::uint64_t gone = 0, gone_bytes = 0;    // the image of a GX resource (generation) that is no longer live
     std::uint64_t yebis = 0, yebis_bytes = 0;  // of `n`, on memory YEBIS's own device made (BBHOST_RESOURCE_CENSUS)
+    std::uint64_t scaleform = 0, scaleform_bytes = 0;  // of `n`, on a Scaleform texture's (the same)
 };
 // Colour and depth targets [0], snapshots [1] whose memory no live GX
 // resource covers (render.cpp).

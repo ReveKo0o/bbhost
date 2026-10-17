@@ -773,11 +773,11 @@ void drain_gx_writes_locked() {
 // calls could tell the mirrors of the writes the watch now catches. Taken at
 // each report from the faults since the last (the ring holds 16384).
 // A fault's class: what covers its 4 KiB (GX buffers whole, a GX resource in
-// part, a texture or buffer of YEBIS's own device, nothing) times what handed
-// it out (a Map, the upload pool, the ring, nothing GX said), as
-// owner * (kHandKinds + 1) + handed.
-constexpr unsigned kFaultHanders = kHandKinds + 1, kFaultOwners = 4, kFaultClasses = kFaultOwners * kFaultHanders;
-const char* const kFaultGxName[kFaultOwners] = {"GX buffers'", "a GX resource's in part", "YEBIS's", "no GX or YEBIS resource's"};
+// part, a texture or buffer of YEBIS's own device, a Scaleform texture,
+// nothing) times what handed it out (a Map, the upload pool, the ring,
+// nothing GX said), as owner * (kHandKinds + 1) + handed.
+constexpr unsigned kFaultHanders = kHandKinds + 1, kFaultOwners = 5, kFaultClasses = kFaultOwners * kFaultHanders;
+const char* const kFaultGxName[kFaultOwners] = {"GX buffers'", "a GX resource's in part", "YEBIS's", "Scaleform's", "nobody's"};
 const char* const kFaultHandName[kFaultHanders] = {"Maps hand out", "the upload pool hands out", "the ring hands out", "nothing GX hands out"};
 std::uint64_t g_fault_census_seq = 0, g_fault_census_other = 0;
 std::uint64_t g_fault_class[kFaultClasses] = {};
@@ -806,10 +806,11 @@ void census_faults_locked() {
                 break;
             }
         }
+        const int mw = gx_middleware_at(page, 0x1000);
         const unsigned gx = gx_buffers_cover(page, 0x1000)                 ? 0
                             : gx_resource_overlapping(page, 0x1000, nullptr) ? 1
-                            : gx_yebis_at(page, 0x1000)                      ? 2
-                                                                             : 3;
+                            : mw                                             ? 1 + static_cast<unsigned>(mw)
+                                                                             : 4;
         const unsigned c = gx * kFaultHanders + by;
         ++g_fault_class[c];
         auto& w = g_fault_writers[c];
