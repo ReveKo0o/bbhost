@@ -855,11 +855,15 @@ bool snap_ring_make() {
     const VkMemoryPropertyFlags visible = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
     // Video memory the CPU writes on an integrated GPU, and on a discrete one
     // where the rings go there (rings_in_vram); else host memory.
+    // Either only while the heap's budget leaves room (ring_fits_budget).
     std::uint32_t type = UINT32_MAX;
     if (g.integrated || rings_in_vram()) type = find_memory_type(req.memoryTypeBits, visible | VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    std::string note;
+    if (type != UINT32_MAX && !ring_fits_budget(type, req.size, "the rewritten vertex data's ring", &note)) type = UINT32_MAX;
     if (type != UINT32_MAX) {
         mai.memoryTypeIndex = type;
         if (vkAllocateMemory(g.device, &mai, nullptr, &g_snap.memory) == VK_SUCCESS) g_snap.device_local = true;
+        note_ring_placed(g_snap.device_local, req.size);
     }
     if (!g_snap.memory) {
         mai.memoryTypeIndex = find_memory_type(req.memoryTypeBits, visible);
@@ -873,10 +877,11 @@ bool snap_ring_make() {
     void* p = nullptr;
     if (vkMapMemory(g.device, g_snap.memory, 0, VK_WHOLE_SIZE, 0, &p) != VK_SUCCESS) return false;
     g_snap.map = static_cast<std::uint8_t*>(p);
-    host_log("buffer shadow: vertex data the game rewrites is copied as its draws record, into a %llu MiB ring in %s "
+    host_log("buffer shadow: vertex data the game rewrites is copied as its draws record, into a %llu MiB ring in %s%s%s "
              "(BBHOST_VERTEX_SNAPSHOT=0: read as the GPU reaches it)",
              static_cast<unsigned long long>(kSnapRing >> 20),
-             g_snap.device_local ? "video memory the CPU writes" : "host memory, staged into video memory per draw");
+             g_snap.device_local ? "video memory the CPU writes" : "host memory, staged into video memory per draw",
+             g_snap.device_local && !note.empty() ? " - " : "", g_snap.device_local ? note.c_str() : "");
     return true;
 }
 }  // namespace

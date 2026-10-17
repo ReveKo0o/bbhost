@@ -5,6 +5,7 @@
 #include "host/foreign_hooks.h"
 #include "host/draw_capture.h"
 #include "host/gpu_internal.h"
+#include "host/ring_budget.h"
 #include "host/shader_patch.h"
 #include "host/shaders/gpu_stall.spv.h"
 #include "host/translation_cache.h"
@@ -995,6 +996,9 @@ bool create_dev_buffer(DevBuffer& b, std::uint64_t size, bool host_visible, bool
 // memory the CPU can write, on a discrete GPU. In host memory (as on the
 // integrated GPU they were measured on, where it is the same RAM) every
 // shader's constant reads crossed the bus. BBHOST_RINGS_IN_VRAM=0: host memory.
+// Each one goes there only while the heap's budget leaves room for it
+// (ring_fits_budget); =1 puts them there whatever the budget says (a
+// measurement).
 bool rings_in_vram() {
     static const bool on = [] {
         const char* e = std::getenv("BBHOST_RINGS_IN_VRAM");
@@ -1002,6 +1006,67 @@ bool rings_in_vram() {
         return !g.integrated;
     }();
     return on;
+}
+
+namespace {
+const bool g_rings_forced = [] {
+    const char* e = std::getenv("BBHOST_RINGS_IN_VRAM");
+    return e && e[0] == '1';
+}();
+// The rings rings_in_vram offered to video memory the CPU writes: placed there,
+// or left in host memory because the heap's budget had no room (the memory
+// report's "rings:" line).
+std::atomic<int> g_rings_vram{0}, g_rings_host{0};
+std::atomic<std::uint64_t> g_rings_vram_bytes{0}, g_rings_host_bytes{0};
+}  // namespace
+
+void note_ring_placed(bool vram, VkDeviceSize bytes) {
+    (vram ? g_rings_vram : g_rings_host).fetch_add(1, std::memory_order_relaxed);
+    (vram ? g_rings_vram_bytes : g_rings_host_bytes).fetch_add(bytes, std::memory_order_relaxed);
+}
+
+bool ring_fits_budget(std::uint32_t type, VkDeviceSize bytes, const char* what, std::string* note) {
+    if (type >= g.mem_props.memoryTypeCount) return false;
+    const std::uint32_t h = g.mem_props.memoryTypes[type].heapIndex;
+    const VkDeviceSize heap = g.mem_props.memoryHeaps[h].size;
+    const bool have = g.has_memory_budget && g.phys;
+    VkDeviceSize budget = 0, used = 0;
+    if (have) {
+        VkPhysicalDeviceMemoryBudgetPropertiesEXT mb{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
+        VkPhysicalDeviceMemoryProperties2 mp{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2};
+        mp.pNext = &mb;
+        vkGetPhysicalDeviceMemoryProperties2(g.phys, &mp);
+        budget = mb.heapBudget[h];
+        used = mb.heapUsage[h];
+    }
+    const RingBudget r = ring_budget_fits(heap, have, budget, used, bytes);
+    char buf[200];
+    if (have) {
+        std::snprintf(buf, sizeof(buf), "heap %u of %llu MiB: %llu of %llu MiB of its budget in use, %llu MiB kept free", h,
+                      static_cast<unsigned long long>(heap >> 20), static_cast<unsigned long long>(used >> 20),
+                      static_cast<unsigned long long>(budget >> 20), static_cast<unsigned long long>(r.keep >> 20));
+    } else {
+        std::snprintf(buf, sizeof(buf), "heap %u of %llu MiB, no budget from the driver", h, static_cast<unsigned long long>(heap >> 20));
+    }
+    if (note) *note = buf;
+    if (r.fits || g_rings_forced) return true;
+    host_log("gpu: %s (%llu MiB) in host memory, read across the bus: video memory the CPU writes has no room for it in its budget "
+             "(%s)%s",
+             what, static_cast<unsigned long long>(bytes >> 20), buf,
+             have ? "" : " - a window under 1 GiB is shared with every other program");
+    note_ring_placed(false, bytes);
+    return false;
+}
+
+std::string rings_placement_report() {
+    const int v = g_rings_vram.load(std::memory_order_relaxed), h = g_rings_host.load(std::memory_order_relaxed);
+    if (!v && !h) return {};
+    char buf[200];
+    std::snprintf(buf, sizeof(buf), "gpu: rings: %d in video memory the CPU writes (%llu MiB), %d in host memory by the heap's budget (%llu MiB)%s",
+                  v, static_cast<unsigned long long>(g_rings_vram_bytes.load(std::memory_order_relaxed) >> 20), h,
+                  static_cast<unsigned long long>(g_rings_host_bytes.load(std::memory_order_relaxed) >> 20),
+                  g_rings_forced ? " (BBHOST_RINGS_IN_VRAM=1: the budget not asked)" : "");
+    return buf;
 }
 
 bool create_upload_buffer(DevBuffer& b, std::uint64_t size, const char* what) {
@@ -1021,21 +1086,27 @@ bool create_upload_buffer(DevBuffer& b, std::uint64_t size, const char* what) {
             mai.memoryTypeIndex = find_memory_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT |
                                                                            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
                                                                            VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-            if (mai.memoryTypeIndex != UINT32_MAX && vkAllocateMemory(g.device, &mai, nullptr, &b.memory) == VK_SUCCESS) {
+            std::string note;
+            const bool room = mai.memoryTypeIndex != UINT32_MAX && ring_fits_budget(mai.memoryTypeIndex, req.size, what, &note);
+            if (room && vkAllocateMemory(g.device, &mai, nullptr, &b.memory) == VK_SUCCESS) {
                 vkBindBufferMemory(g.device, b.buffer, b.memory, 0);
                 VkBufferDeviceAddressInfo bai{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
                 bai.buffer = b.buffer;
                 b.address = vkGetBufferDeviceAddress(g.device, &bai);
                 b.size = size;
                 vkMapMemory(g.device, b.memory, 0, VK_WHOLE_SIZE, 0, &b.map);
-                host_log("gpu: %s in video memory the CPU writes (memory type %u, heap %u; BBHOST_RINGS_IN_VRAM=0: host memory)", what,
-                         mai.memoryTypeIndex, g.mem_props.memoryTypes[mai.memoryTypeIndex].heapIndex);
+                note_ring_placed(true, req.size);
+                host_log("gpu: %s in video memory the CPU writes (memory type %u, %s before it; BBHOST_RINGS_IN_VRAM=0: host memory)", what,
+                         mai.memoryTypeIndex, note.c_str());
                 return true;
             }
             vkDestroyBuffer(g.device, b.buffer, nullptr);
             b.buffer = VK_NULL_HANDLE;
-            host_log("gpu: %s: no room in video memory the CPU writes (%s); in host memory, read across the bus", what,
-                     mai.memoryTypeIndex == UINT32_MAX ? "the GPU has none" : "it is full");
+            if (mai.memoryTypeIndex == UINT32_MAX || room) {
+                host_log("gpu: %s: no room in video memory the CPU writes (%s); in host memory, read across the bus", what,
+                         mai.memoryTypeIndex == UINT32_MAX ? "the GPU has none" : "it is full");
+                if (room) note_ring_placed(false, req.size);
+            }
         }
     }
     return create_dev_buffer(b, size, true);
@@ -2559,11 +2630,14 @@ bool init_locked() {
     if (rings_in_vram()) {
         const std::uint32_t vram = find_memory_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
                                                                              VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-        if (vram != UINT32_MAX) {
+        std::string note;
+        if (vram != UINT32_MAX && ring_fits_budget(vram, req.size, "the params ring", &note)) {
             const std::uint32_t host_type = mai.memoryTypeIndex;
             mai.memoryTypeIndex = vram;
             params_allocated = vkAllocateMemory(g.device, &mai, nullptr, &g.ubo_mem) == VK_SUCCESS;
             if (!params_allocated) mai.memoryTypeIndex = host_type;
+            note_ring_placed(params_allocated, req.size);
+            if (params_allocated) host_log("gpu: the params ring in video memory the CPU writes (%s before it)", note.c_str());
         }
     }
     host_log("gpu: params ring in memory type %u (flags 0x%x)", mai.memoryTypeIndex,
@@ -7016,6 +7090,7 @@ std::string host_gpu_memory_budget_report() {
         out += buf;
     }
     out += "\n[bbhost]   " + bb_memory_sites_report();
+    if (const std::string rings = rings_placement_report(); !rings.empty()) out += "\n[bbhost]   " + rings;
     if (g_import_audit) out += "\n[bbhost]   " + import_audit_report() + "\n[bbhost]   " + audit_pages_report();
     return out;
 }

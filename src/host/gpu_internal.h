@@ -717,6 +717,14 @@ bool create_dev_buffer(DevBuffer& b, std::uint64_t size, bool host_visible, bool
 // create_dev_buffer(b, size, true). `what` names it in the log.
 bool create_upload_buffer(DevBuffer& b, std::uint64_t size, const char* what);
 bool rings_in_vram();
+// Whether a ring of `bytes` may go in memory type `type` (video memory the CPU
+// writes) by its heap's budget (host/ring_budget.h); logs and counts it as left
+// in host memory when not. `note` gets the heap's numbers for the caller's log.
+bool ring_fits_budget(std::uint32_t type, VkDeviceSize bytes, const char* what, std::string* note);
+// Counts a ring placed in video memory the CPU writes (true) or left in host
+// memory by the budget (false), for rings_placement_report.
+void note_ring_placed(bool vram, VkDeviceSize bytes);
+std::string rings_placement_report();
 std::uint32_t find_memory_type(std::uint32_t type_bits, VkMemoryPropertyFlags want);
 bool extract_program(std::uint64_t code_va, std::vector<std::uint32_t>& words, std::string& name);
 // A GX shader creator ran (render.cpp; host_gpu_note_shader_created).
