@@ -47,7 +47,8 @@ and keyboard instead, pick the Gamepad layout in its controller settings
   kept, so the next start is smoother. To compile the game's shaders before
   playing (after an update, say), start bbhost with the setup window
   (`--setup`, or in Desktop Mode), open its Shaders tab and press Compile
-  shaders now. It can take several minutes, and it can be cancelled; what is
+  shaders now; the window recommends it when the caches are missing or out
+  of date (about 2-3 minutes on the Deck). It can be cancelled; what is
   done is kept. Without it, the game's HLSL shaders are compiled in the
   background only while the title and loading screens are up (on the Deck,
   compiling during play cost ~2 fps), and are used from the start after.

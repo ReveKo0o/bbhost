@@ -48,10 +48,13 @@ needs no compiling in the background. (The few pipelines a place needs the
 first time you ever visit it are still built then.) The tab shows whether the
 shader caches are up to date for this bbhost and this driver, and the
 compile's progress, time left and any failures; it can be cancelled, and what
-was compiled is kept. The same tab has the Shaders setting (HLSL, or Lifted
-for the translator's own shaders only; also F10 under Graphics, and HLSL
-Shaders in the game's System > PC Graphics). `bbhost --compile-shaders` does
-the same from a terminal.
+was compiled is kept. When the caches are missing or out of date - a new
+install, a bbhost update that changed the shader translator, a new graphics
+driver - the tab, and a line on the main tab, recommend it with the time it
+is likely to take; it is never forced. The same tab has the Shaders setting
+(HLSL, or Lifted for the translator's own shaders only; also F10 under
+Graphics, and HLSL Shaders in the game's System > PC Graphics).
+`bbhost --compile-shaders` does the same from a terminal.
 
 Without a display (a headless run) bbhost writes a template config instead and
 tells you which paths to fill in.

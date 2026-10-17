@@ -225,6 +225,9 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
     ShaderCacheState cache_state;
     std::chrono::steady_clock::time_point cache_state_at{};
     bool cache_state_devices = false, compile_was_running = false;
+    // The main tab's "Compile shaders now" starts the compile and shows the
+    // Shaders tab, where its progress is.
+    bool select_shaders_tab = false;
     // The PC enhancements, through the same calls: each is read when the
     // game starts (main.cpp, config_set_enhancements).
     struct Enhancement {
@@ -415,6 +418,34 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
         // The tabs above the buttons: the game's settings, and the plugins.
         const float footer = ImGui::GetFrameHeightWithSpacing() * 4.2f;
         bool game_tab = false;
+        // The compile's progress and the caches' state, which the Shaders tab
+        // shows and the main tab's recommendation reads: the state again every
+        // few seconds, and when a compile ends.
+        const ShaderCompileJob::View cv = compile_job.view();
+        {
+            const auto now = std::chrono::steady_clock::now();
+            if (now - cache_state_at > std::chrono::seconds(3) || (compile_was_running && !cv.running) ||
+                (devices_ready.load() && !cache_state_devices)) {
+                std::lock_guard<std::mutex> lk(devices_mu);
+                cache_state = shader_cache_state(f[kData].str(), devices);
+                cache_state_at = now;
+                cache_state_devices = devices_ready.load();
+            }
+            compile_was_running = cv.running;
+        }
+        // Caches that are not this bbhost's or this driver's: Compile shaders
+        // now is recommended (never started by itself) until a compile has run
+        // in this window.
+        const ShaderCompileAdvice advice = shader_compile_advice(cache_state, host_steam_deck(), std::thread::hardware_concurrency());
+        const bool recommend_compile = advice.recommend && !cv.running && !cv.finished && !cv.cancelled && cv.error.empty();
+        const ImVec4 good(0.55f, 0.85f, 0.55f, 1.0f), warn(0.95f, 0.75f, 0.35f, 1.0f);
+        auto start_compile = [&] {
+            // The child reads the saved settings: save first.
+            if (save()) {
+                std::string err;
+                compile_job.start(err);
+            }
+        };
         if (ImGui::BeginTabBar("##tabs")) {
             if (ImGui::BeginTabItem("Game")) {
                 game_tab = true;
@@ -520,19 +551,23 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
                 ImGui::EndChild();
                 ImGui::EndTabItem();
             }
-            if (ImGui::BeginTabItem("Shaders")) {
+            const ImGuiTabItemFlags sflags = select_shaders_tab ? ImGuiTabItemFlags_SetSelected : 0;
+            select_shaders_tab = false;
+            if (ImGui::BeginTabItem("Shaders", nullptr, sflags)) {
                 ImGui::BeginChild("##shaders", ImVec2(0, ImGui::GetContentRegionAvail().y - footer));
-                const ShaderCompileJob::View cv = compile_job.view();
-                // The caches' state: read again every few seconds, and when a compile ends.
-                const auto now = std::chrono::steady_clock::now();
-                if (now - cache_state_at > std::chrono::seconds(3) || (compile_was_running && !cv.running) ||
-                    (devices_ready.load() && !cache_state_devices)) {
-                    std::lock_guard<std::mutex> lk(devices_mu);
-                    cache_state = shader_cache_state(f[kData].str(), devices);
-                    cache_state_at = now;
-                    cache_state_devices = devices_ready.load();
+                if (recommend_compile) {
+                    ImGui::TextColored(warn, "Recommended: compile the shaders now.");
+                    ImGui::PushTextWrapPos(0.0f);
+                    ImGui::TextUnformatted((advice.why + ". Compiling now takes " + advice.time +
+                                            "; otherwise the game compiles them while you play.")
+                                               .c_str());
+                    ImGui::PopTextWrapPos();
+                    ImGui::BeginDisabled(!app0_ok || !eboot.ok);
+                    if (ImGui::Button("Compile shaders now##advice")) start_compile();
+                    ImGui::EndDisabled();
+                    ImGui::Separator();
+                    ImGui::Spacing();
                 }
-                compile_was_running = cv.running;
                 ImGui::TextWrapped("bbhost turns the game's shaders into HLSL on this PC and compiles them with DXC. The game does this "
                                    "itself: a start uses what is ready and compiles the rest in the background for the next start, so "
                                    "you can play straight away. Compiling now does all of it up front.");
@@ -547,7 +582,6 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
                                     "the game reads it at its start.");
                 ImGui::PopTextWrapPos();
                 ImGui::SeparatorText("The caches");
-                const ImVec4 good(0.55f, 0.85f, 0.55f, 1.0f), warn(0.95f, 0.75f, 0.35f, 1.0f);
                 ImGui::TextDisabled("%s", cache_state.dir.c_str());
                 if (!cache_state.have_caches) {
                     ImGui::TextColored(warn, "No shader caches yet: the first start compiles everything.");
@@ -601,13 +635,7 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
                 ImGui::SeparatorText("Compile now");
                 if (!cv.running) {
                     ImGui::BeginDisabled(!app0_ok || !eboot.ok);
-                    if (ImGui::Button("Compile shaders now")) {
-                        // The child reads the saved settings: save first.
-                        if (save()) {
-                            std::string err;
-                            compile_job.start(err);
-                        }
-                    }
+                    if (ImGui::Button("Compile shaders now")) start_compile();
                     ImGui::EndDisabled();
                     ImGui::SameLine();
                     ImGui::TextDisabled("Every shader the game uses, with this PC's graphics driver. It can be cancelled.");
@@ -669,6 +697,19 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
         };
 
         if (game_tab) {
+        if (recommend_compile) {
+            ImGui::AlignTextToFramePadding();
+            ImGui::TextColored(warn, "%s.", advice.why.c_str());
+            ImGui::SameLine();
+            ImGui::BeginDisabled(!app0_ok || !eboot.ok);
+            if (ImGui::SmallButton("Compile shaders now##main")) {
+                start_compile();
+                select_shaders_tab = true;
+            }
+            ImGui::EndDisabled();
+            ImGui::SameLine();
+            ImGui::TextDisabled("%s; optional.", advice.time.c_str());
+        }
         ImGui::SeparatorText("Game files");
         path_row("Game folder (the one that contains dvdroot_ps4)", kApp0, true, "C:/Games/Bloodborne/CUSA00900");
         status_line(app0_ok, "has dvdroot_ps4",

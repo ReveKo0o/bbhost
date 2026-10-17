@@ -234,8 +234,13 @@ the default, and nothing waits on DXC:
   precompile workers. Progress (N of M, the time left; the manifests' and the
   list's pipelines counted in it and on a line of their own), failures by
   reason and the HLSL counts show as it runs, and it ends when every job has;
-  Cancel keeps what is done; the window stays live and Play waits for it. The
-  run logs to `<data>/bbhost/shader-compile.log` and records its result in
+  Cancel keeps what is done; the window stays live and Play waits for it.
+  When the caches are missing, or were made by another bbhost's translator or
+  for another GPU or driver, the window recommends it - on the Shaders tab and
+  in a line on the main tab, each with its button and the time it is likely
+  to take (the last compile's, else a guess: about 2-3 minutes on a Steam
+  Deck); it never starts by itself. The run logs to
+  `<data>/bbhost/shader-compile.log` and records its result in
   `<data>/bbhost/shader-compile.txt`. On the RTX 4070 it takes ~60 s (3,281
   shaders, 3,682 DXC modules, 16 workers), on a laptop's RTX 3070 Ti (Ryzen 7
   6800H, Windows) ~90 s and on the Steam Deck ~150 s. What it does not do is

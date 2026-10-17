@@ -16,6 +16,7 @@
 #pragma once
 
 #include <cstdint>
+#include <cstdlib>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -46,6 +47,44 @@ struct ShaderCacheState {
 // check enumerates this machine's Vulkan devices: done on a thread of its own
 // by ShaderCompileJob::refresh.
 ShaderCacheState shader_cache_state(const std::string& data, const std::vector<std::string>& devices);
+
+// Whether the setup window recommends "Compile shaders now" (its Shaders tab,
+// and a line on its main tab): when the caches were not made by this bbhost's
+// translator or for this machine's graphics driver, or there are none - a new
+// install, an update, a new driver. Only a recommendation, one click: the game
+// compiles what it lacks itself. `time` is what the compile is likely to take:
+// the last finished one's seconds if there was one (shader-compile.txt), else a
+// guess from the machine: a Steam Deck took ~150 s, a laptop's 8-core Ryzen
+// (16 threads) ~90 s, a 16-worker Xeon ~60 s.
+struct ShaderCompileAdvice {
+    bool recommend = false;
+    std::string why;   // a sentence without its full stop
+    std::string time;  // "about 2-3 minutes on a Steam Deck"
+};
+inline std::string shader_compile_minutes(double seconds) {
+    if (seconds < 50) return "about a minute";
+    const int lo = seconds < 120 ? 1 : static_cast<int>(seconds / 60.0);
+    return "about " + std::to_string(lo) + "-" + std::to_string(lo + 1) + " minutes";
+}
+inline ShaderCompileAdvice shader_compile_advice(const ShaderCacheState& s, bool steam_deck, unsigned hw_threads) {
+    ShaderCompileAdvice a;
+    if (!s.have_caches) a.why = "There are no shader caches yet";
+    else if (!s.translator_current) a.why = "The shader caches were made by another bbhost version";
+    else if (s.device_current == 0) a.why = "The shader caches were made for another GPU or graphics driver";
+    a.recommend = !a.why.empty();
+    double last = -1;
+    bool done = false;
+    for (const std::string& l : s.last) {
+        if (l == "result done") done = true;
+        else if (l.rfind("seconds ", 0) == 0) last = std::atof(l.c_str() + 8);
+    }
+    if (done && last > 0) a.time = shader_compile_minutes(last) + " (the last compile here took " + std::to_string(static_cast<long long>(last)) + " s)";
+    else if (steam_deck) a.time = "about 2-3 minutes on a Steam Deck";
+    else if (hw_threads >= 16) a.time = "about 1-2 minutes on this PC";
+    else if (hw_threads >= 8) a.time = "about 2-3 minutes on this PC";
+    else a.time = "about 3-5 minutes on this PC";
+    return a;
+}
 // This machine's Vulkan devices, "vendor:device uuid" each (pipelineCacheUUID).
 std::vector<std::string> shader_vulkan_devices();
 
