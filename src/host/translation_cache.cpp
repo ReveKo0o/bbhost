@@ -517,10 +517,17 @@ std::string path_tmp(const std::string& path) { return path + ".tmp" + std::to_s
 
 // Under g_tc.mu: a write is due when entries came in (or one is to be left
 // out) and, unless forced, a minute has passed and enough of them are new.
+// DXC modules bb-hlsl kept since the last write, and whether its queue has
+// emptied since: a few hundred modules are less than the byte threshold, and a
+// start ended from outside (SIGTERM, a Steam stop) writes nothing at its exit,
+// so they are written on their own count - every 512, and when the queue empties.
+std::atomic<std::uint64_t> g_hlsl_unsaved{0};
+std::atomic<bool> g_hlsl_drained{false};
 bool save_due_locked(bool force) {
     if (!g_tc.dirty) return false;
     if (force) return true;
     if (std::chrono::steady_clock::now() - g_tc.saved < kSaveInterval) return false;
+    if (const std::uint64_t n = g_hlsl_unsaved.load(); n >= 512 || (n > 0 && g_hlsl_drained.load())) return true;
     const std::uint64_t fresh = g_tc.bytes > g_tc.saved_bytes ? g_tc.bytes - g_tc.saved_bytes : 0;
     return fresh >= std::max<std::uint64_t>(kSaveMinNew, g_tc.saved_bytes / 50);
 }
@@ -910,6 +917,7 @@ void hlsl_behind_thread() {
         w.words(spirv);
         w.str(why);
         store(job->key, w);
+        g_hlsl_unsaved.fetch_add(1, std::memory_order_relaxed);
         g_hlsl_behind.done.fetch_add(1, std::memory_order_relaxed);
         g_hlsl_behind.lane_done[lane].fetch_add(1, std::memory_order_relaxed);
         g_hlsl_behind.done_us.fetch_add(us_since(t0), std::memory_order_relaxed);
@@ -925,6 +933,7 @@ void hlsl_behind_thread() {
         }
         if (g_hlsl_behind.waiting == 0 && !running && !g_hlsl_behind.drained_logged) {
             g_hlsl_behind.drained_logged = true;
+            g_hlsl_drained.store(true);  // the next periodic save writes them
             host_log("render: HLSL: every stage met so far has its DXC module for the next start: %llu compiled on %d bb-hlsl thread%s in %.1f s of "
                      "their time, %.1f s after the first was queued (%llu waited %.1f s for the start's own compiles); %llu failed",
                      static_cast<unsigned long long>(g_hlsl_behind.done.load()), g_hlsl_behind.threads, g_hlsl_behind.threads == 1 ? "" : "s",
@@ -1362,6 +1371,8 @@ void translation_cache_save(const std::string& path, bool force) {
     {
         std::lock_guard<std::mutex> lk(g_tc.mu);
         if (!save_due_locked(force)) return;
+        g_hlsl_unsaved.store(0);
+        g_hlsl_drained.store(false);
         g_tc.dirty = false;
         g_tc.saved = std::chrono::steady_clock::now();
         fresh = g_tc.bytes > g_tc.saved_bytes ? g_tc.bytes - g_tc.saved_bytes : 0;
