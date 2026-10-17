@@ -735,6 +735,10 @@ void set_cache_insert(std::uint64_t key, const std::vector<std::uint64_t>& mater
 }
 }  // namespace
 
+void set_cache_drop_all_locked() {
+    if (!g_cached_sets.empty()) set_cache_flush();
+}
+
 void set_cache_forget_view_locked(VkImageView view) {
     auto it = g_cached_set_views.find(view);
     if (it == g_cached_set_views.end()) return;
@@ -14951,6 +14955,23 @@ bool tess_ls_pass_locked(const GpuDraw& d, TessDraw& t) {
         g_tess_lds_uses[g_tess_lds_next++ % kTessLdsUses] = {g_draw_rec_next, t.lds_address, bytes, t.hull ? t.window : 0u};
     }
     if (t.hull && !tess_hull_constants_locked(d, t)) return false;
+    if (!imports_whole()) {
+        // Window imports: the LS pass walks the page table for everything it
+        // reads and stores, so those windows (and the draw's indices) first.
+        const auto import_path = [&](const gcn::ResourcePath& path, bool pointer, std::uint64_t min_bytes) {
+            std::uint32_t v[4]{};
+            if (!resolve_resource(path, user, pointer ? 2 : 4, v)) return;
+            const std::uint64_t base = v[0] | (static_cast<std::uint64_t>(pointer ? v[1] : (v[1] & 0xff)) << 32);
+            const std::uint32_t stride = pointer ? 0 : (v[1] >> 16) & 0x3fff;
+            const std::uint64_t bytes = pointer ? 0 : stride ? std::uint64_t{v[2]} * stride : v[2];
+            if (base) import_windows(base, std::min<std::uint64_t>(std::max(bytes, min_bytes), 64ull << 20));
+        };
+        for (const gcn::TranslateResult::BufferRead& r : pl.meta.read_buffers) {
+            import_path(r.path, r.pointer, r.pointer ? (r.max_dw ? r.max_dw * 4ull : 64ull << 10) : 16);
+        }
+        for (const gcn::ResourcePath& p : pl.meta.store_buffers) import_path(p, false, 16);
+        if (d.index_va) import_windows(d.index_va, static_cast<std::uint64_t>(t.count) * (d.index_type == 1 ? 4 : 2) + 64);
+    }
 
     static thread_local StageImages images;
     prefetch_stage_images(pl.meta, user, images);

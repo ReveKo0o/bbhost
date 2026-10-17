@@ -122,7 +122,16 @@ of them binds, rather than through the page-table walk
 
 **Textures and memory.** The game's memory is shared with the GPU, as on the
 PS4: its GPU-visible parts (about 5 GB) are imported into Vulkan, because
-shaders that cannot be fully resolved read memory through a page table.
+shaders that cannot be fully resolved read memory through a page table. Over
+the 12-place tour the GPU touches about half of that, and only a few hundred
+MB in place; the rest it reads only as the source of a copy (texture
+detiling, the buffer shadow's mirrors). `BBHOST_IMPORT_WINDOWS=1` imports
+only what is used, a 16 MB window at a time when something first needs it or
+when the engine makes a resource there (on a thread of its own); an import
+over several windows replaces the ones it covers, so no page is imported
+twice, and a dispatch imports what its shader reads and stores. It is off by
+default: the work under way moves each of those uses off guest memory, and
+windows are then only the fallback for what is not moved yet.
 Textures are detiled on the GPU. A texture's image, a render target's and a
 copy's belong to the GX resource they were made for, by that resource's
 generation: GX's own calls change them - the resource's creation, upload and
@@ -388,6 +397,10 @@ the default, and nothing waits on DXC:
 - The completions the game waits on (GX's block pools and command arena, Map,
   query results) from the host's own submission timeline rather than labels,
   after which the PM4 command processor only orders work.
+- Guest memory off the GPU, the way the PC engine's resources are API objects
+  filled by copies: copy sources through staging, constants and rewritten
+  vertex data copied as recorded, compute shaders' buffers bound, the buffers
+  the GPU writes held by the host; the whole import then goes.
 - Editable source beyond replacing one stage's HLSL: edits read again while
   the game runs.
 

@@ -550,11 +550,21 @@ VkResult dmabuf_span(Chunk& c, std::uint64_t offset, std::uint64_t size) {
 }
 #endif
 
-// Imports [lo, hi) of direct-memory chunk `index` (offsets in the chunk) as a
-// new import of the chunk's. Earlier imports of the same bytes stay alive:
-// descriptor sets and recordings made with them keep working - they map the
-// same host pages.
-Chunk* import_span(std::uint32_t index, std::uint64_t lo, std::uint64_t hi) {
+// Which path asked for each import (the exit report's import line): a
+// binding or copy resolved through locate(), a device address (the GPU
+// untile, occlusion dumps), what a shader walks (import_windows: dispatches'
+// reads and stores, the LS pass, unbound constant buffers), the prefetch of a
+// GX resource's memory (bb-import), the whole spans.
+enum ImportWho { kIwBinding, kIwAddress, kIwWalk, kIwPrefetch, kIwSpan, kImportWhos };
+thread_local int t_import_who = kIwBinding;
+std::atomic<std::uint64_t> g_import_who_n[kImportWhos], g_import_who_bytes[kImportWhos];
+std::atomic<std::uint64_t> g_imports_retired{0}, g_import_retired_bytes{0};
+std::atomic<std::uint64_t> g_dispatch_read_imports{0}, g_dispatch_untraced{0};  // window imports of what dispatches read
+
+// [lo, hi) of direct-memory chunk `index` (offsets in the chunk; hi may run
+// past its end, into the next chunk's memory) as a new import, not yet in the
+// chunk's list: the driver's slow part, which needs no lock of ours.
+std::unique_ptr<Chunk> make_import(std::uint32_t index, std::uint64_t lo, std::uint64_t hi) {
     const std::uint64_t offset = index * kChunkBytes + lo;
     if (offset >= g.mirror_size || hi <= lo) {
         return nullptr;
@@ -588,11 +598,21 @@ Chunk* import_span(std::uint32_t index, std::uint64_t lo, std::uint64_t hi) {
     c->lo = lo;
     g_import_us.fetch_add(static_cast<std::uint64_t>(us), std::memory_order_relaxed);
     g_import_bytes.fetch_add(size, std::memory_order_relaxed);
+    const int who = t_import_who >= 0 && t_import_who < kImportWhos ? t_import_who : kIwBinding;
+    g_import_who_n[who].fetch_add(1, std::memory_order_relaxed);
+    g_import_who_bytes[who].fetch_add(size, std::memory_order_relaxed);
     if (g_imports_made.fetch_add(1, std::memory_order_relaxed) < 8 || size > (256ull << 20)) {
         host_log("gpu: dmem chunk %u: +%llu MiB, %llu MiB imported at device address 0x%llx in %lld us", index,
                  static_cast<unsigned long long>(lo >> 20), static_cast<unsigned long long>(size >> 20),
                  static_cast<unsigned long long>(c->address), static_cast<long long>(us));
     }
+    return c;
+}
+
+// The same, into the chunk's list of live imports.
+Chunk* import_span(std::uint32_t index, std::uint64_t lo, std::uint64_t hi) {
+    std::unique_ptr<Chunk> c = make_import(index, lo, hi);
+    if (!c) return nullptr;
     g.dmem[index].imports.push_back(std::move(c));
     return g.dmem[index].imports.back().get();
 }
@@ -718,35 +738,127 @@ std::string submit_merge_report() {
     return buf;
 }
 
-const Chunk* dmem_import(std::uint32_t index, std::uint64_t in, std::uint64_t bytes) {
+namespace {
+// How far an import of chunk `index` may run: to its span's end, or on past
+// the chunk's end into the next chunk's span by up to kChunkOverlap when that
+// span starts at the next chunk's beginning - a buffer the game placed across
+// the seam then lies in one import, as the whole spans' overlap gives (f26afe4).
+std::uint64_t span_reach(std::uint32_t index) {
+    const DmemChunk& d = g.dmem[index];
+    if (d.span_hi != kChunkBytes || index + 1 >= gcn::kDmemChunks) return d.span_hi;
+    const DmemChunk& n = g.dmem[index + 1];
+    if (n.span_hi <= n.span_lo || n.span_lo != 0) return d.span_hi;
+    return kChunkBytes + std::min<std::uint64_t>(n.span_hi, kChunkOverlap);
+}
+
+// A window import no window names any more: its pages are in the import that
+// replaced it (the window and page-table entries moved there), so it is let go
+// once the work recorded with it has run (the current slot's retirement). What
+// may name its buffer later than that goes first: a copy version's copy into
+// place, the cached descriptor sets (constant buffers in them, without push
+// descriptors - with them they are pushed per draw).
+void retire_import_locked(std::uint32_t index, Chunk* old) {
+    DmemChunk& d = g.dmem[index];
+    const auto it = std::find_if(d.imports.begin(), d.imports.end(), [&](const std::unique_ptr<Chunk>& p) { return p.get() == old; });
+    if (it == d.imports.end()) return;
+    if (copy_versions_name_buffer_locked(old->buffer)) copy_versions_put_in_place_locked(kCvRetired);
+    if (!cb_push_on()) set_cache_drop_all_locked();
+    g_imports_retired.fetch_add(1, std::memory_order_relaxed);
+    g_import_retired_bytes.fetch_add(old->size, std::memory_order_relaxed);
+    g.slots[g.slot].dead_imports.push_back(std::move(*old));
+    d.imports.erase(it);
+}
+
+// The windows of chunk `index` that import `c` covers name it from now on and
+// their guest pages point into it; the imports it replaced whole retire.
+void install_import_locked(std::uint32_t index, Chunk* c) {
+    DmemChunk& d = g.dmem[index];
+    const std::uint64_t end = std::min(c->lo + c->size, kChunkBytes);
+    if (end <= c->lo) return;
+    const std::uint32_t a = static_cast<std::uint32_t>(c->lo >> kImportWindowShift);
+    const std::uint32_t b = static_cast<std::uint32_t>((end - 1) >> kImportWindowShift);
+    Chunk* replaced[kImportWindows];
+    std::uint32_t nreplaced = 0;
+    for (std::uint32_t w = a; w <= b; ++w) {
+        Chunk* o = d.window[w];
+        if (o && o != c && std::find(replaced, replaced + nreplaced, o) == replaced + nreplaced) replaced[nreplaced++] = o;
+        d.window[w] = c;
+    }
+    map_import_pages_locked(index, *c, c->lo, end);
+    if (nreplaced) g_imports_merged.fetch_add(1, std::memory_order_relaxed);
+    for (std::uint32_t k = 0; k < nreplaced; ++k) {
+        if (std::find(std::begin(d.window), std::end(d.window), replaced[k]) == std::end(d.window)) retire_import_locked(index, replaced[k]);
+    }
+}
+}  // namespace
+
+const Chunk* dmem_import(std::uint32_t index, std::uint64_t in, std::uint64_t bytes, bool past_end) {
     if (index >= gcn::kDmemChunks) return nullptr;
     DmemChunk& d = g.dmem[index];
     if (!bytes) bytes = 1;
-    if (in >= kChunkBytes || bytes > kChunkBytes - in) return nullptr;
+    if (g_import_whole) {
+        // The whole spans (imported when the mappings are made): a range their
+        // windows do not cover lies outside every GPU-visible mapping.
+        if (in >= kChunkBytes || bytes > kChunkBytes - in) return nullptr;
+        const std::uint32_t w0 = static_cast<std::uint32_t>(in >> kImportWindowShift);
+        if (const Chunk* c = d.window[w0]; c && chunk_covers(*c, in, bytes)) return c;
+        if (in < d.span_lo || in + bytes > d.span_hi) return nullptr;  // not GPU-visible: the sink
+        const std::uint32_t w1 = static_cast<std::uint32_t>((in + bytes - 1) >> kImportWindowShift);
+        const std::uint64_t lo = std::max(d.span_lo, static_cast<std::uint64_t>(w0) << kImportWindowShift);
+        const std::uint64_t hi = std::min(d.span_hi, static_cast<std::uint64_t>(w1 + 1) << kImportWindowShift);
+        bool merged = false;
+        for (std::uint32_t w = w0; w <= w1; ++w) merged |= d.window[w] != nullptr;
+        Chunk* c = import_span(index, lo, hi);
+        if (!c) return nullptr;
+        if (merged) g_imports_merged.fetch_add(1, std::memory_order_relaxed);
+        for (std::uint32_t w = w0; w <= w1; ++w) {
+            // A window another import already held keeps its pages' entries.
+            if (!d.window[w]) {
+                const std::uint64_t wlo = std::max(lo, static_cast<std::uint64_t>(w) << kImportWindowShift);
+                const std::uint64_t whi = std::min(hi, static_cast<std::uint64_t>(w + 1) << kImportWindowShift);
+                map_import_pages_locked(index, *c, wlo, whi);
+            }
+            d.window[w] = c;
+        }
+        return c;
+    }
+    // Windows (BBHOST_IMPORT_WINDOWS=1): the whole windows the range touches,
+    // widened to the whole of every import over them, which it replaces.
+    // Past the chunk's end only for a caller that takes the seam's overlap
+    // (past_end: a binding, a device address); any other range - a mirror's
+    // pages above all, which end with the chunk (buffer_shadow.cpp phys_of) -
+    // stays inside the chunk, as with whole imports, also where an import over
+    // the seam would cover it: the mirror's page index ran past its pages,
+    // and its sparse page binds past the end of its buffer, which the driver
+    // refused with a lost device.
+    if (in >= kChunkBytes || (!past_end && bytes > kChunkBytes - in)) return nullptr;
     const std::uint32_t w0 = static_cast<std::uint32_t>(in >> kImportWindowShift);
     if (const Chunk* c = d.window[w0]; c && chunk_covers(*c, in, bytes)) return c;
-    if (in < d.span_lo || in + bytes > d.span_hi) return nullptr;  // not GPU-visible: the sink
-    const std::uint32_t w1 = static_cast<std::uint32_t>((in + bytes - 1) >> kImportWindowShift);
-    const std::uint64_t lo = std::max(d.span_lo, static_cast<std::uint64_t>(w0) << kImportWindowShift);
-    const std::uint64_t hi = std::min(d.span_hi, static_cast<std::uint64_t>(w1 + 1) << kImportWindowShift);
-    bool merged = false;
-    for (std::uint32_t w = w0; w <= w1; ++w) merged |= d.window[w] != nullptr;
+    const std::uint64_t reach = past_end ? span_reach(index) : std::min<std::uint64_t>(d.span_hi, kChunkBytes);
+    if (in < d.span_lo || in >= reach || bytes > reach - in) return nullptr;  // not GPU-visible: the sink
+    constexpr std::uint64_t kWindow = 1ull << kImportWindowShift;
+    std::uint64_t lo = std::max(d.span_lo, in & ~(kWindow - 1));
+    std::uint64_t hi = std::min(reach, ((in + bytes - 1) | (kWindow - 1)) + 1);
+    for (bool grew = true; grew;) {
+        grew = false;
+        const std::uint32_t a = static_cast<std::uint32_t>(lo >> kImportWindowShift);
+        const std::uint32_t b = static_cast<std::uint32_t>((std::min(hi, kChunkBytes) - 1) >> kImportWindowShift);
+        for (std::uint32_t w = a; w <= b; ++w) {
+            const Chunk* o = d.window[w];
+            if (!o) continue;
+            if (o->lo < lo) lo = o->lo, grew = true;
+            if (o->lo + o->size > hi) hi = o->lo + o->size, grew = true;
+        }
+    }
     Chunk* c = import_span(index, lo, hi);
     if (!c) return nullptr;
-    if (merged) g_imports_merged.fetch_add(1, std::memory_order_relaxed);
-    for (std::uint32_t w = w0; w <= w1; ++w) {
-        // A window another import already held keeps its pages' entries.
-        if (!d.window[w]) {
-            const std::uint64_t wlo = std::max(lo, static_cast<std::uint64_t>(w) << kImportWindowShift);
-            const std::uint64_t whi = std::min(hi, static_cast<std::uint64_t>(w + 1) << kImportWindowShift);
-            map_import_pages_locked(index, *c, wlo, whi);
-        }
-        d.window[w] = c;
-    }
+    install_import_locked(index, c);
     return c;
 }
 
 void import_windows(std::uint64_t va, std::uint64_t bytes) {
+    const int who = t_import_who;
+    t_import_who = kIwWalk;
     const std::uint64_t end = va + bytes;
     for (const GuestMapInfo& mi : g.maps) {
         if (!mi.dmem) continue;
@@ -757,7 +869,142 @@ void import_windows(std::uint64_t va, std::uint64_t bytes) {
             at += (1ull << kImportWindowShift) - (phys & ((1ull << kImportWindowShift) - 1));  // the next window
         }
     }
+    t_import_who = who;
 }
+
+bool imports_whole() { return g_import_whole; }
+
+// ---- import prefetch (window imports) ----
+// A GX resource made over GPU-visible direct memory is read by the GPU soon:
+// a texture is uploaded ahead of its first bind, a mesh is copied into the
+// buffer shadow's mirror at its first draw. Its windows are imported on a
+// thread of our own (bb-import) - the driver's slow part, pinning the pages
+// (~0.25 ms a MiB on the RTX 4070), without the renderer's lock, put in place
+// under it - instead of by the binding that first needs them, on the command
+// processor. A run of windows some binding imported meanwhile is dropped (an
+// import is never put over part of another: no page imported twice).
+// BBHOST_IMPORT_PREFETCH=0: imports at the first use only.
+namespace {
+const bool g_prefetch_on = [] {
+    const char* e = std::getenv("BBHOST_IMPORT_PREFETCH");
+    return !(e && e[0] == '0');
+}();
+struct PrefetchJob {
+    std::uint64_t va = 0, bytes = 0;
+};
+std::mutex g_pf_mu;
+std::condition_variable g_pf_cv;
+std::deque<PrefetchJob> g_pf_jobs;  // under g_pf_mu
+bool g_pf_started = false;          // under g_pf_mu
+std::atomic<std::uint64_t> g_pf_asked{0}, g_pf_known{0}, g_pf_checked{0}, g_pf_imports{0}, g_pf_bytes{0}, g_pf_raced{0},
+    g_pf_dropped{0};
+
+void prefetch_thread() {
+    host_thread_set_name("bb-import");
+    t_import_who = kIwPrefetch;
+    constexpr std::uint64_t kWindow = 1ull << kImportWindowShift;
+    // This thread's own view: the mappings (refreshed when they change) and
+    // the windows it has seen imported - an import is only ever replaced by a
+    // larger one, so a window once imported stays so.
+    std::vector<GuestMapInfo> maps;
+    std::uint64_t maps_gen = ~0ull;
+    std::uint64_t known[gcn::kDmemChunks] = {};      // imported (stays so)
+    std::uint64_t invisible[gcn::kDmemChunks] = {};  // outside every GPU-visible span (until the mappings change)
+    struct Run {
+        std::uint32_t chunk;
+        std::uint64_t lo, hi;
+    };
+    std::vector<Run> runs;
+    for (;;) {
+        PrefetchJob job;
+        {
+            std::unique_lock<std::mutex> lk(g_pf_mu);
+            g_pf_cv.wait(lk, [] { return !g_pf_jobs.empty(); });
+            job = g_pf_jobs.front();
+            g_pf_jobs.pop_front();
+        }
+        if (const std::uint64_t gen = hle_kernel_maps_generation(); gen != maps_gen) {
+            maps_gen = gen;
+            maps.clear();
+            hle_kernel_snapshot_maps(maps);
+            std::fill(std::begin(invisible), std::end(invisible), 0);
+        }
+        // The job's windows this thread has not seen imported.
+        bool unknown = false;
+        const std::uint64_t end = job.va + job.bytes;
+        for (const GuestMapInfo& mi : maps) {
+            if (!mi.dmem || mi.phys < 0) continue;
+            const std::uint64_t lo = std::max(job.va, mi.va), hi = std::min(end, mi.va + mi.len);
+            for (std::uint64_t at = lo; at < hi && !unknown;) {
+                const std::uint64_t phys = static_cast<std::uint64_t>(mi.phys) + (at - mi.va);
+                const std::uint64_t k = phys >> gcn::kDmemChunkShift;
+                const std::uint32_t w = static_cast<std::uint32_t>((phys & (kChunkBytes - 1)) >> kImportWindowShift);
+                unknown = k < gcn::kDmemChunks && !(((known[k] | invisible[k]) >> w) & 1);
+                at += kWindow - (phys & (kWindow - 1));
+            }
+        }
+        if (!unknown) {
+            g_pf_known.fetch_add(1, std::memory_order_relaxed);
+            continue;
+        }
+        g_pf_checked.fetch_add(1, std::memory_order_relaxed);
+        // Under the lock: which of those windows lie in a GPU-visible span and
+        // no import covers yet, as runs of adjacent windows.
+        runs.clear();
+        {
+            std::lock_guard<GpuMutex> lock(g.mu);
+            if (!g.ok || !rebuild_page_tables()) continue;
+            for (const GuestMapInfo& mi : g.maps) {
+                if (!mi.dmem || mi.phys < 0) continue;
+                const std::uint64_t lo = std::max(job.va, mi.va), hi = std::min(end, mi.va + mi.len);
+                for (std::uint64_t at = lo; at < hi;) {
+                    const std::uint64_t phys = static_cast<std::uint64_t>(mi.phys) + (at - mi.va);
+                    at += kWindow - (phys & (kWindow - 1));
+                    const std::uint64_t k = phys >> gcn::kDmemChunkShift;
+                    if (k >= gcn::kDmemChunks) continue;
+                    const DmemChunk& d = g.dmem[k];
+                    const std::uint64_t in = phys & (kChunkBytes - 1);
+                    const std::uint32_t w = static_cast<std::uint32_t>(in >> kImportWindowShift);
+                    const std::uint64_t wlo = std::max(d.span_lo, static_cast<std::uint64_t>(w) << kImportWindowShift);
+                    const std::uint64_t whi = std::min(d.span_hi, static_cast<std::uint64_t>(w + 1) << kImportWindowShift);
+                    if (wlo >= whi) {  // not GPU-visible
+                        invisible[k] |= 1ull << w;
+                        continue;
+                    }
+                    if (const Chunk* c = d.window[w]; c && chunk_covers(*c, wlo, whi - wlo)) {
+                        known[k] |= 1ull << w;
+                        continue;
+                    }
+                    if (d.window[w]) continue;  // partly imported: the binding that needs the rest widens over it
+                    if (!runs.empty() && runs.back().chunk == k && runs.back().hi == wlo) {
+                        runs.back().hi = whi;
+                    } else {
+                        runs.push_back({static_cast<std::uint32_t>(k), wlo, whi});
+                    }
+                }
+            }
+        }
+        for (const Run& r : runs) {
+            std::unique_ptr<Chunk> c = make_import(r.chunk, r.lo, r.hi);  // the slow part, unlocked
+            if (!c) continue;
+            std::lock_guard<GpuMutex> lock(g.mu);
+            DmemChunk& d = g.dmem[r.chunk];
+            bool taken = false;
+            for (std::uint64_t w = r.lo >> kImportWindowShift; w <= (r.hi - 1) >> kImportWindowShift; ++w) taken |= d.window[w] != nullptr;
+            if (taken) {
+                free_import(*c);  // nothing names it yet
+                g_pf_raced.fetch_add(1, std::memory_order_relaxed);
+                continue;
+            }
+            g_pf_imports.fetch_add(1, std::memory_order_relaxed);
+            g_pf_bytes.fetch_add(c->size, std::memory_order_relaxed);
+            d.imports.push_back(std::move(c));
+            install_import_locked(r.chunk, d.imports.back().get());
+            for (std::uint64_t w = r.lo >> kImportWindowShift; w <= (r.hi - 1) >> kImportWindowShift; ++w) known[r.chunk] |= 1ull << w;
+        }
+    }
+}
+}  // namespace
 
 namespace {
 
@@ -1384,9 +1631,12 @@ bool rebuild_page_tables() {
             if (overlap && hi == kChunkBytes && k + 1 < gcn::kDmemChunks && gpu_span(maps, k + 1, nlo, nhi) && nlo == 0) {
                 ext = kChunkBytes + std::min<std::uint64_t>(nhi, kChunkOverlap);
             }
+            const int who = t_import_who;
+            t_import_who = kIwSpan;
             if (Chunk* c = import_span(k, lo, ext)) {
                 for (std::uint64_t w = lo >> kImportWindowShift; w <= (hi - 1) >> kImportWindowShift; ++w) d.window[w] = c;
             }
+            t_import_who = who;
         }
     }
     for (const GuestMapInfo& mi : maps) {
@@ -1604,7 +1854,9 @@ Located located_in(const GuestMapInfo& mi, std::uint64_t va, std::uint64_t bytes
         const std::uint64_t phys = static_cast<std::uint64_t>(mi.phys) + off;
         const std::uint32_t chunk = static_cast<std::uint32_t>(phys >> gcn::kDmemChunkShift);
         const std::uint64_t in = phys & (kChunkBytes - 1);
-        const Chunk* c = dmem_import(chunk, in, std::min<std::uint64_t>({bytes, mi.len - off, kChunkBytes - in}));
+        // Window imports may run on across the seam into the next chunk (span_reach).
+        const std::uint64_t reach = g_import_whole ? kChunkBytes : span_reach(chunk);
+        const Chunk* c = dmem_import(chunk, in, std::min<std::uint64_t>({bytes, mi.len - off, reach > in ? reach - in : 1}), true);
         if (!c) return out;
         out.buffer = c->buffer;
         out.offset = in - c->lo;
@@ -4993,6 +5245,8 @@ void retire_slot_locked(int k) {
     vb_race_retired_locked(sl.serial);
     vkResetDescriptorPool(g.device, sl.pool, 0);
     sl.spare_sets.clear();
+    for (Chunk& c : sl.dead_imports) free_import(c);  // window imports a merged one replaced
+    sl.dead_imports.clear();
     for (DevBuffer& b : sl.garbage) {
         vkDestroyBuffer(g.device, b.buffer, nullptr);
         vkFreeMemory(g.device, b.memory, nullptr);
@@ -6132,6 +6386,22 @@ void retire_through_locked(std::uint64_t serial) {
 
 using namespace gpu;
 
+void host_gpu_import_prefetch(std::uint64_t va, std::uint64_t bytes) {
+    if (g_import_whole || !g_prefetch_on || !bytes) return;
+    std::lock_guard<std::mutex> lk(g_pf_mu);
+    g_pf_asked.fetch_add(1, std::memory_order_relaxed);
+    if (g_pf_jobs.size() >= 8192) {
+        g_pf_dropped.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    g_pf_jobs.push_back({va, bytes});
+    if (!g_pf_started) {
+        g_pf_started = true;
+        std::thread(prefetch_thread).detach();
+    }
+    g_pf_cv.notify_one();
+}
+
 bool host_gpu_init(const char* const* instance_exts, std::uint32_t n_exts, bool want_present) {
     std::lock_guard<GpuMutex> lock(g.mu);
     if (!g.tried) {
@@ -6729,6 +6999,16 @@ bool host_gpu_dispatch(const GpuDispatch& d_in) {
         };
         for (const gcn::BufferBinding& b : pl.meta.buffers) import_path(b.path, b.pointer, std::max<std::uint64_t>(b.max_dw * 4ull, 16));
         for (const gcn::ResourcePath& p : pl.meta.store_buffers) import_path(p, false, 16);
+        // What it reads through the page table (TranslateResult::read_buffers):
+        // a V#'s records, a pointer's dwords up to the highest a load reads
+        // (64 KiB when no load's offset is known).
+        for (const gcn::TranslateResult::BufferRead& r : pl.meta.read_buffers) {
+            import_path(r.path, r.pointer, r.pointer ? (r.max_dw ? r.max_dw * 4ull : 64ull << 10) : 16);
+        }
+        g_dispatch_read_imports.fetch_add(pl.meta.read_buffers.size(), std::memory_order_relaxed);
+        // A load or store whose base does not trace to user data reaches
+        // memory nothing here imports: counted, the fallback's own reason.
+        if (pl.meta.untraced_reads || pl.meta.untraced_stores) g_dispatch_untraced.fetch_add(1, std::memory_order_relaxed);
         // BBHOST_VB_RACE=1: what the dispatch reads and never stores to, as
         // the draws' constants are checked (render.cpp).
         if (vb_race_on()) {
@@ -7655,7 +7935,10 @@ VkDeviceAddress guest_device_address(std::uint64_t va, std::size_t bytes) {
             const std::uint64_t phys = static_cast<std::uint64_t>(mi.phys) + off;
             const std::uint64_t chunk = phys >> gcn::kDmemChunkShift;
             const std::uint64_t in = phys & (kChunkBytes - 1);
-            const Chunk* c = chunk < gcn::kDmemChunks ? dmem_import(static_cast<std::uint32_t>(chunk), in, bytes) : nullptr;
+            const int who = t_import_who;
+            t_import_who = kIwAddress;
+            const Chunk* c = chunk < gcn::kDmemChunks ? dmem_import(static_cast<std::uint32_t>(chunk), in, bytes, true) : nullptr;
+            t_import_who = who;
             return c ? c->address + (in - c->lo) : 0;
         }
         auto it = g.anon_imports.find(mi.va);
@@ -8155,6 +8438,13 @@ void copy_versions_put_in_place_locked(int why) {
     copy_versions_flush_locked();
 }
 
+bool copy_versions_name_buffer_locked(VkBuffer buffer) {
+    for (const CopyVersion& v : g_copy_versions) {
+        if (v.canon.buffer == buffer) return true;
+    }
+    return false;
+}
+
 int copy_version_lookup_locked(std::uint64_t base, std::uint64_t bytes, Located* out) {
     if (g_copy_versions.empty() || !bytes) return kCopyVersionNone;
     const CopyVersion* v = copy_version_over(base, bytes);
@@ -8281,8 +8571,8 @@ std::string copy_versions_report() {
                   "copy versions: %llu made (%llu read an earlier one), %llu bindings took one, %llu bindings across one's edge, "
                   "%llu copies refused (size %llu, surfaces %llu, targets %llu, not imported %llu, source %llu, other %llu); "
                   "%llu copies into place in %llu batches (%llu versions all overwritten by newer ones), of them early for a binding "
-                  "across an edge %llu, a page-table read %llu, a page-table pipeline %llu; %llu transfers waited for an earlier one in "
-                  "their batch",
+                  "across an edge %llu, a page-table read %llu, a page-table pipeline %llu, a retired import %llu; %llu transfers waited "
+                  "for an earlier one in their batch",
                   static_cast<ull>(g_cv_made.load()), static_cast<ull>(g_cv_from_version.load()), static_cast<ull>(g_cv_bound.load()),
                   static_cast<ull>(g_cv_straddled.load()), static_cast<ull>(g_cv_refused.load()), static_cast<ull>(g_cv_refused_why[kCvSize].load()),
                   static_cast<ull>(g_cv_refused_why[kCvSurfaces].load()), static_cast<ull>(g_cv_refused_why[kCvTarget].load()),
@@ -8290,7 +8580,7 @@ std::string copy_versions_report() {
                   static_cast<ull>(g_cv_refused_why[kCvOther].load()), static_cast<ull>(g_cv_copies.load()),
                   static_cast<ull>(g_cv_batches.load()), static_cast<ull>(g_cv_overwritten.load()), static_cast<ull>(g_cv_put[kCvStraddle].load()),
                   static_cast<ull>(g_cv_put[kCvPageTable].load()), static_cast<ull>(g_cv_put[kCvWalks].load()),
-                  static_cast<ull>(g_batch_orders.load()));
+                  static_cast<ull>(g_cv_put[kCvRetired].load()), static_cast<ull>(g_batch_orders.load()));
     return b;
 }
 }  // namespace gpu
@@ -8365,6 +8655,41 @@ void host_gpu_report() {
 
     if (!g.tried) {
         return;
+    }
+    {
+        // Guest memory the GPU reaches as imports: how much, made by what, and
+        // with window imports what replaced what and what the prefetch did.
+        std::uint64_t live = 0, flex = 0;
+        std::size_t nlive = 0;
+        {
+            std::lock_guard<GpuMutex> lock(g.mu);
+            for (const DmemChunk& d : g.dmem) {
+                for (const auto& c : d.imports) live += c->size;
+                nlive += d.imports.size();
+            }
+            for (const auto& kv : g.anon_imports) flex += kv.second.size;
+        }
+        using ull = unsigned long long;
+        const auto mib = [](const std::atomic<std::uint64_t>& v) { return static_cast<ull>(v.load() >> 20); };
+        host_log("gpu: guest memory imports (%s): %llu made, %llu MiB in %llu ms of the driver's time - bindings %llu (%llu MiB), device "
+                 "addresses %llu (%llu MiB), walks %llu (%llu MiB), prefetch %llu (%llu MiB), whole spans %llu (%llu MiB); %llu replaced "
+                 "others, %llu retired (%llu MiB); live %llu MiB in %zu imports, flexible %llu MiB",
+                 g_import_whole ? "whole spans" : "by window, BBHOST_IMPORT_WINDOWS=1", static_cast<ull>(g_imports_made.load()),
+                 mib(g_import_bytes), static_cast<ull>(g_import_us.load() / 1000), static_cast<ull>(g_import_who_n[kIwBinding].load()),
+                 mib(g_import_who_bytes[kIwBinding]), static_cast<ull>(g_import_who_n[kIwAddress].load()), mib(g_import_who_bytes[kIwAddress]),
+                 static_cast<ull>(g_import_who_n[kIwWalk].load()), mib(g_import_who_bytes[kIwWalk]),
+                 static_cast<ull>(g_import_who_n[kIwPrefetch].load()), mib(g_import_who_bytes[kIwPrefetch]),
+                 static_cast<ull>(g_import_who_n[kIwSpan].load()), mib(g_import_who_bytes[kIwSpan]), static_cast<ull>(g_imports_merged.load()),
+                 static_cast<ull>(g_imports_retired.load()), mib(g_import_retired_bytes), static_cast<ull>(live >> 20), nlive,
+                 static_cast<ull>(flex >> 20));
+        if (!g_import_whole) {
+            host_log("gpu: import prefetch: %llu asked, %llu already imported, %llu looked at, %llu imports made (%llu MiB), %llu dropped as a "
+                     "binding imported first, %llu not queued; dispatches: %llu reads imported, %llu with a base that does not trace "
+                     "(their walks reach what nothing imports for them)",
+                     static_cast<ull>(g_pf_asked.load()), static_cast<ull>(g_pf_known.load()), static_cast<ull>(g_pf_checked.load()),
+                     static_cast<ull>(g_pf_imports.load()), mib(g_pf_bytes), static_cast<ull>(g_pf_raced.load()), static_cast<ull>(g_pf_dropped.load()),
+                     static_cast<ull>(g_dispatch_read_imports.load()), static_cast<ull>(g_dispatch_untraced.load()));
+        }
     }
     {
         // Before the census lock: compute_lift_report takes g.mu, and a

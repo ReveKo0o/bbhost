@@ -112,19 +112,25 @@ inline bool chunk_covers(const Chunk& c, std::uint64_t in, std::uint64_t bytes) 
 }
 // Direct memory is imported a 16 MiB window at a time, when the GPU side
 // first resolves a range in it (a binding, a copy, an untile source, a mirror
-// page), and only inside the span the chunk's GPU-visible mappings cover
-// (gpu_span): the game's CPU-only heaps, the never-allocated tail and the GPU
-// heaps' untouched parts stay out of the driver's pinned memory - what
-// Windows counts as the process's shared GPU memory. A range across windows
-// gets one import of them all. Only with BBHOST_IMPORT_WINDOWS=1 for now (the
-// page-table walks the host does not resolve, gpu.cpp); otherwise each span
-// is imported whole when the mappings are made.
+// page, what a dispatch reads), and only inside the span the chunk's
+// GPU-visible mappings cover (gpu_span): the game's CPU-only heaps, the
+// never-allocated tail and the GPU heaps' untouched parts stay out of the
+// driver's pinned memory - what Windows counts as the process's shared GPU
+// memory. A range across windows gets one import of them all, widened to the
+// whole of every import it overlaps, which it replaces: those retire (their
+// windows and page-table entries move to the new one, and they are freed once
+// the work recorded with them has run), so no page of a chunk is imported
+// twice. An import may run on past its chunk's end into the next chunk's span
+// (kChunkOverlap), so a buffer across the seam lies in one import, as the
+// whole spans' overlap gives. Only with BBHOST_IMPORT_WINDOWS=1 (the counted
+// fallback of the native path, gpu.cpp); otherwise each span is imported whole
+// when the mappings are made.
 constexpr std::uint32_t kImportWindowShift = 24;
 constexpr std::uint32_t kImportWindows = 1u << (gcn::kDmemChunkShift - kImportWindowShift);  // per chunk
 struct DmemChunk {
     std::uint64_t span_lo = 0, span_hi = 0;      // what may be imported (gpu_span); empty: nothing
-    std::vector<std::unique_ptr<Chunk>> imports;  // made on demand, all kept while the game runs
-    Chunk* window[kImportWindows] = {};           // the import that covers each window, the latest made
+    std::vector<std::unique_ptr<Chunk>> imports;  // the live imports (retired ones go to a slot's dead_imports)
+    Chunk* window[kImportWindows] = {};           // the import that covers each window
 };
 // A plain device-addressable buffer (page tables, sink page).
 struct DevBuffer {
@@ -338,6 +344,7 @@ struct Gpu {
         std::uint64_t held_draws = 0, held_dispatches = 0, held_tess = 0, held_flip = 0;
         bool said_stuck = false;  // that line was written for this submission
         std::vector<DevBuffer> garbage;
+        std::vector<Chunk> dead_imports;  // window imports a merged one replaced (gpu.cpp retire_import_locked)
         std::vector<DevBuffer> staging_chunks;  // the upload staging chunks this slot's uploads are in, each once (Gpu::staging_users)
         std::vector<DevBuffer> scratch_chunks;  // the same for the device-local untile scratch (Gpu::scratch_users)
         // Images (with their memory and views) whose guest memory was
@@ -783,7 +790,12 @@ Located locate(std::uint64_t va, std::uint64_t bytes = 1);
 // The import of direct-memory chunk `chunk` holding [in, in + bytes) (offsets
 // in the chunk), made now when that lies in the chunk's GPU-visible span;
 // nullptr when it does not, or the import failed.
-const Chunk* dmem_import(std::uint32_t chunk, std::uint64_t in, std::uint64_t bytes);
+// With past_end (and window imports) the range may run on into the next
+// chunk's span by up to kChunkOverlap, as one import of this chunk's.
+const Chunk* dmem_import(std::uint32_t chunk, std::uint64_t in, std::uint64_t bytes, bool past_end = false);
+// Whether direct memory is imported whole (the default) rather than by window
+// on demand (BBHOST_IMPORT_WINDOWS=1).
+bool imports_whole();
 // The windows guest bytes [va, va + bytes) touch, each imported on its own if
 // it is not: for what the shaders reach through the page table, which needs
 // the pages mapped but no one buffer over them.
@@ -1383,8 +1395,11 @@ void copy_versions_pass_end_locked();
 // The copies into place now, the pass ended for them if one is open: a
 // binding across a version's edge, a page-table read over one, a pipeline
 // that walks the page table.
-enum { kCvStraddle, kCvPageTable, kCvWalks, kCvPutReasons };
+enum { kCvStraddle, kCvPageTable, kCvWalks, kCvRetired, kCvPutReasons };
 void copy_versions_put_in_place_locked(int why);
+// Whether a pending version's copy into place writes `buffer` (a window import
+// about to retire: its copies go into place first).
+bool copy_versions_name_buffer_locked(VkBuffer buffer);
 // A binding of [base, base + bytes) against the pending versions:
 // kCopyVersionInside (`out` is the copy to bind), kCopyVersionStraddles (it
 // covers part of one: put them in place first), or kCopyVersionNone.
@@ -1832,6 +1847,9 @@ VkDescriptorType params_descriptor_type();
 extern VkDescriptorBufferInfo g_params_desc;
 // A view is being let go: the cached sets that hold it are dropped. Under g.mu.
 void set_cache_forget_view_locked(VkImageView view);
+// Every cached set is dropped (a buffer they may name is being let go: a
+// retired window import, without push descriptors). Under g.mu.
+void set_cache_drop_all_locked();
 std::string set_cache_report();
 
 }  // namespace gpu

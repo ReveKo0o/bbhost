@@ -294,6 +294,17 @@ void register_holder(std::uint64_t key, std::uint64_t holder, Kind kind, bool in
     g_created_bytes[t].fetch_add(e.info.bytes, std::memory_order_relaxed);
     if (g_rate_log) note_rate(e.info.bytes);
     (void)kind;
+    // With window imports (BBHOST_IMPORT_WINDOWS=1) the memory of what the GPU
+    // reads soon is imported ahead, off the command processor: a texture (its
+    // upload follows), a vertex, index or unordered-access buffer (bind flags
+    // +0x3b; not a staging one). Nothing without window imports.
+    {
+        std::uint8_t bind = 0;
+        rd(holder + 0x3b, &bind);
+        const bool texture = e.info.type >= 2 && e.info.type <= 4;
+        const bool gpu_buffer = e.info.type == 1 && e.info.usage != 3 && (bind & 0x83);
+        if (e.info.memory && e.info.bytes && (texture || gpu_buffer)) host_gpu_import_prefetch(e.info.memory, e.info.bytes);
+    }
     if (key & kMemoryKey) key = kMemoryKey | e.info.memory;
     std::lock_guard<std::mutex> lk(g_mu);
     if (auto old = g_by_holder.find(key); old != g_by_holder.end()) {

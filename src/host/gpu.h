@@ -374,6 +374,10 @@ bool host_gpu_gds_counters();
 // before this point in the stream left (D3D11's CopyStructureCount).
 bool host_gpu_counter_copy(std::uint64_t dst, std::uint64_t src, std::size_t bytes);
 bool host_gpu_counter_fill(std::uint64_t dst, std::uint32_t value, std::size_t bytes);
+// A GX resource was made over [va, va + bytes): with window imports
+// (BBHOST_IMPORT_WINDOWS=1) its windows are imported ahead of their first
+// use on a thread of their own; nothing otherwise. Any thread, any lock.
+void host_gpu_import_prefetch(std::uint64_t va, std::uint64_t bytes);
 // A GX buffer copy reached as a copy token, handled as the compute copy
 // path handles a recognised copy shader: marks the destination's surfaces
 // dirty; when the source is a render target, copies its image into the
