@@ -55,7 +55,7 @@
 117006	Shadow Distance	How far sun and moon shadows reach. 0 is the game's own.
 117007	AO Strength	How dark corners and contact get. 5 is the game's own.
 117008	Fog	How thick the haze over distant streets is. 10 is the game's own.
-117009	HLSL Shaders	Requires a restart. On: the game's shaders as HLSL, compiled by DXC on this PC in the background and used from the next start. Off: the translator's own SPIR-V only. The pictures are the same.
+117009	HLSL Shaders	Requires a restart. On: shaders compiled from HLSL by DXC on this PC. Off: the translator's own.
 120020	PC Effects	
 120000	Bloom	The glow around bright light. 10 is the game's own.
 120001	Vignette	The darkened frame edges some areas use.
