@@ -18,6 +18,7 @@ void decomp_gx_query_token_add();      // gx/query_token.cpp: an occlusion query
 void decomp_gx_dead_packets_add();     // gx/dead_packets.cpp: the Gnm packet writers nothing reads
 void decomp_gx_labels_add();           // gx/labels.cpp: the Gnm label, wait, inline-data and predication writers
 void decomp_gx_dma_add();              // gx/dma.cpp: the Gnm DMA_DATA writer
+void decomp_gx_constant_engine_add();  // gx/constant_engine.cpp: the Gnm constant-engine writers
 void decomp_game_memcpy_add();         // memory/game_memcpy.cpp: the eboot's memcpy
 void decomp_ez_copy_add();             // memory/ez_copy.cpp: the streamed data's parallel copy
 void decomp_sfx_ribbons_add();         // sfx/ribbons.cpp: the effect ribbons' writers
@@ -38,6 +39,7 @@ void decomp_add_areas() {
     decomp_gx_dead_packets_add();
     decomp_gx_labels_add();
     decomp_gx_dma_add();
+    decomp_gx_constant_engine_add();
     decomp_game_memcpy_add();
     decomp_ez_copy_add();
     decomp_sfx_ribbons_add();

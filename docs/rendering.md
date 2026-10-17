@@ -48,8 +48,10 @@ constant update engine). GX's pipeline drains are barrier tokens: the CP's own
 writes after one go behind the work before it, with no label and no wait.
 Occlusion queries are tokens from GX's Begin and End, measured by the
 renderer's own queries. The packets nothing on the host reads - the cache
-flushes, the context registers, the shader prefetches - are not written at
-all (`BBHOST_CP_DEAD_PACKETS`). Clears and copies come as tokens from GX's own
+flushes, the context registers, the shader prefetches, the compute stage's
+registers (a dispatch token carries them, and a fallback writes them before
+its packet), the constant engine's - are not written at all
+(`BBHOST_CP_DEAD_PACKETS`). Clears and copies come as tokens from GX's own
 calls: a clear names its view, and is made as the next pass's load op, or as a
 transfer clear when something reads the image first.
 
