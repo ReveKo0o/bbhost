@@ -19,11 +19,13 @@
 #include "engine/loading.h"
 #include "engine/paramdef.h"
 #include "engine/params.h"
+#include "engine/patch_manifest.h"
 #include "bbhost/engine/symbols.hpp"
 #include "bbhost/sdk.hpp"
 #include "core/thunk.h"
 #include "guest_abi.h"
 #include "hle/fs.h"
+#include "host/ruleset.h"
 #include "host/updater.h"
 #include "host/window.h"
 #include "log.h"
@@ -1455,11 +1457,17 @@ std::string own_ruleset() {
         }
         parts.push_back(token);
     }
-    std::sort(parts.begin(), parts.end());
-    std::string out;
-    for (const std::string& t : parts) out += (out.empty() ? "" : ",") + t;
-    if (out.empty()) out = "vanilla";
-    if (!unseeded) cached = out;
+    // The patch manifests that change the game (debug dash, the rally window,
+    // bigger weapons, ...: engine/patch_manifest.h), one entry each. Final once
+    // the manifests have applied, so the rules are kept only from then on.
+    for (const std::string& name : patch_manifests_gameplay()) parts.push_back(patch_rule_token(name));
+    const std::string out = ruleset_join(parts);
+    if (!unseeded && patch_manifests_done()) cached = out;
+    static std::string logged;
+    if (out != logged) {
+        logged = out;
+        host_log("plugin: this session's online rules (X-BBHost-Ruleset): %s", out.c_str());
+    }
     return out;
 }
 

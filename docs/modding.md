@@ -87,6 +87,7 @@ eboot = "941f887a562aae054fac35af8cc8f27cf075f3d4cc2e029fb5ae2a663aaa5ae7"
 description = "the three company logos at startup are skipped"
 option = "startup.skip_intro"      # optional: a setting that switches it
 enabled = true                      # optional, default true; false: off until turned on
+gameplay = false                    # optional: true for a patch that changes the game (online rules)
 order = 49                          # optional: its place in the list it came from (later wins)
 # group = "analog-run-range"        # optional: variants of one patch, one on at a time
 
@@ -109,6 +110,13 @@ yields = ["other-patch"]            # optional: left alone while one of these is
 - Where a manifest changed a value bbhost's own frame-rate conversion also
   writes (a constant, a redirected load's), the conversion leaves it as the
   manifest wrote it and converts the rest.
+- `gameplay = true` marks a patch that changes the game rather than how it
+  looks or loads (how far the player runs, the rally window, a debug move).
+  While one is on, the session's online rules (`X-BBHost-Ruleset`, as for
+  gameplay plugins) carry `patch.<name>`, so the server keeps that player's
+  bloodstains, messages and statistics apart from vanilla players'. A mod's
+  patch that changes the game must say so; the log names the rules at start
+  (`plugin: this session's online rules`).
 - `kind = "code"` restores the page to read-only and executable afterwards;
   `"data"` leaves it writable.
 - `BBHOST_PATCHES=0` skips all manifests. The log has one line per file:
@@ -145,13 +153,13 @@ Shipped patches:
 | `hd-motion-blur-360p.toml`, `hd-motion-blur-4k.toml` | HD Motion Blur at 640x360 or 3840x2160, Kyo's patches (off by default; one at a time) |
 | `fxaa2-gs-dlaa-gs.toml` | FXAA2_GS + DLAA_GS, Kyo's patch: both YEBIS anti-aliasing filters (off by default) |
 | `glow-blur.toml` | Glow: force on + Blur 12.5/12.5/30, Kyo's patch (off by default) |
-| `rally-window.toml` | Rally Window 2x + Stacking (6 s before decay), Kyo's patch (off by default) |
+| `rally-window.toml` | Rally Window 2x + Stacking (6 s before decay), Kyo's patch (off by default; changes the game) |
 | `performance-v3-decals-on.toml`, `performance-v3-velomap.toml` | Performance Patch v3, Kyo's, in its Decals On and Velomap + Camera Blur variants (off by default; one at a time) |
-| `debug-dash.toml` | Restore Debug Dash (stagvant): L3 on and off, L2 up, L1 down, R2 through walls (off by default) |
-| `analog-run-range-10.toml` ... `-40.toml` | +10% to +40% analog run range, Kyo's (off by default; one at a time) |
-| `bigger-weapons-1-2x.toml` | Bigger Weapons 1.2x, Kyo's patch (off by default) |
-| `movement-roll-1-1x.toml` | Movement + Roll-Dodge 1.1x, Kyo's patch (off by default) |
-| `aerial-vectors-480.toml` | Aerial Vectors 1/480 fps, Kyo's patch: the momentum's per-frame value fixed at its 480 fps one (off by default; bbhost follows the frame time without it) |
+| `debug-dash.toml` | Restore Debug Dash (stagvant): L3 on and off, L2 up, L1 down, R2 through walls (off by default; changes the game) |
+| `analog-run-range-10.toml` ... `-40.toml` | +10% to +40% analog run range, Kyo's (off by default; one at a time; changes the game) |
+| `bigger-weapons-1-2x.toml` | Bigger Weapons 1.2x, Kyo's patch (off by default; changes the game) |
+| `movement-roll-1-1x.toml` | Movement + Roll-Dodge 1.1x, Kyo's patch (off by default; changes the game) |
+| `aerial-vectors-480.toml` | Aerial Vectors 1/480 fps, Kyo's patch: the momentum's per-frame value fixed at its 480 fps one (off by default; changes the game; bbhost follows the frame time without it) |
 
 Patches whose bytes depend on settings, and anything that needs a hook rather
 than fixed bytes, are written in code or as plugins.

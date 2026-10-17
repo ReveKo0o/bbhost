@@ -25,6 +25,13 @@
 // patches it steps aside for (`yields = ["other"]`): while one of them is on,
 // that site is neither checked nor written.
 //
+// `gameplay = true` marks a patch that changes the game (how far the player
+// runs, how long the rally window lasts, a debug move): while it is on, the
+// session's online rules carry "patch.<name>" (X-BBHost-Ruleset), so the
+// server keeps its bloodstains, messages and statistics apart from vanilla
+// ones, as it does for gameplay plugins. A patch without it is taken as not
+// changing the game (graphics, loading, the intro).
+//
 // `order = N` is the patch's place in the list it came from (Kyo's shadPS4
 // list): manifests apply in that order, then by name, each site checked
 // against the eboot's own bytes, so where two write the same bytes the later
@@ -47,8 +54,9 @@ void patch_manifests_apply(ElfImage* image);
 struct PatchListing {
     std::string path;  // the file it was read from
     std::string name, description, option, eboot, group;
-    bool enabled = true;  // its own [patch] enabled
-    int order = 0;        // its own [patch] order
+    bool enabled = true;   // its own [patch] enabled
+    bool gameplay = false; // its own [patch] gameplay: it changes the game
+    int order = 0;         // its own [patch] order
     std::string error;    // why it does not parse ("" when it does)
 };
 // Every manifest patch_manifests_apply would read, by file name, a later
@@ -66,3 +74,9 @@ bool patch_manifest_option_known(const std::string& option);
 // The host's own patches leave such bytes as the manifest wrote them rather
 // than refuse over them (engine/frame_rate.cpp).
 const char* patch_manifest_owner(std::uint64_t address, std::size_t n);
+// The applied manifests that change the game ([patch] gameplay = true), by name,
+// sorted: each puts patch_rule_token(name) in the session's online rules
+// (host/ruleset.h, host/plugins.cpp own_ruleset).
+std::vector<std::string> patch_manifests_gameplay();
+// Whether patch_manifests_apply has run: the list above is final after it.
+bool patch_manifests_done();

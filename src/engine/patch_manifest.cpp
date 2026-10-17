@@ -7,6 +7,7 @@
 #include "engine/addr.h"
 #include "gcn/container.h"
 #include "hle/fs.h"
+#include "host/ruleset.h"
 #include "host/settings.h"
 #include "log.h"
 
@@ -17,7 +18,9 @@
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <atomic>
 #include <map>
+#include <mutex>
 #include <set>
 #include <string>
 #include <vector>
@@ -38,6 +41,7 @@ struct Site {
 struct Manifest {
     std::string path, name, eboot, description, option, group;
     bool enabled = true;
+    bool gameplay = false;  // [patch] gameplay: changes the game (the session's online rules say so)
     int order = 0;  // [patch] order: its place in the list it came from (later wins)
     std::vector<Site> sites;
 };
@@ -46,6 +50,12 @@ struct Manifest {
 // the manifest each byte is now, and the eboot's own byte under it. A later
 // manifest's site is checked against those, so it may write over an earlier
 // one's bytes (patch_manifest_owner answers the host's own patches).
+// The applied manifests that change the game, by name (patch_manifests_gameplay),
+// and whether patch_manifests_apply has run.
+std::mutex g_gameplay_mu;
+std::vector<std::string> g_gameplay;  // under g_gameplay_mu
+std::atomic<bool> g_manifests_done{false};
+
 struct Written {
     std::string owner;
     std::uint8_t original = 0;
@@ -118,6 +128,8 @@ bool parse_manifest(const std::string& path, Manifest* m, std::string* err) {
     std::string en = get("patch.enabled");
     if (en.empty()) en = get("patch.default");
     m->enabled = en.empty() || en == "true" || en == "1";
+    const std::string gp = get("patch.gameplay");
+    m->gameplay = gp == "true" || gp == "1";
     if (m->name.empty() || m->eboot.empty()) {
         *err = "[patch] needs name and eboot";
         return false;
@@ -188,7 +200,9 @@ std::uint8_t original_byte(std::uint64_t address, std::uint8_t now) {
     return it == g_written.end() ? now : it->second.original;
 }
 
-void apply(ElfImage* image, const Manifest& m, const std::set<std::string>& on) {
+// Whether it applied: every site written, already as it writes it, or left to
+// a patch it yields to (false: refused, or a page could not be unprotected).
+bool apply(ElfImage* image, const Manifest& m, const std::set<std::string>& on) {
     GuestMemory& mem = image->mem;
     // Every site checked before any is written - against the eboot's own
     // bytes, under any an earlier manifest wrote: manifests apply in their
@@ -199,13 +213,13 @@ void apply(ElfImage* image, const Manifest& m, const std::set<std::string>& on) 
         if (s.address < kPreferredGuestSlide) {
             host_log("patch: %s refused: site %s address 0x%llx is below the image", m.name.c_str(), s.id.c_str(),
                      static_cast<unsigned long long>(s.address));
-            return;
+            return false;
         }
         const std::uint64_t off = s.address - kPreferredGuestSlide;
         if (off >= mem.size || s.expect.size() > mem.size - off) {
             host_log("patch: %s refused: site %s at 0x%llx is outside the image", m.name.c_str(), s.id.c_str(),
                      static_cast<unsigned long long>(s.address));
-            return;
+            return false;
         }
         const auto* p = static_cast<const std::uint8_t*>(guest_ptr(mem, mem.slide + off));
         // Already applied (the bytes are what the patch writes) is not a
@@ -215,7 +229,7 @@ void apply(ElfImage* image, const Manifest& m, const std::set<std::string>& on) 
             if (p[i] == s.expect[i] || p[i] == s.bytes[i] || original_byte(s.address + i, p[i]) == s.expect[i]) continue;
             host_log("patch: %s refused: unexpected bytes at 0x%llx (site %s)", m.name.c_str(),
                      static_cast<unsigned long long>(s.address), s.id.c_str());
-            return;
+            return false;
         }
     }
     int written = 0, stepped_aside = 0, already = 0;
@@ -239,7 +253,7 @@ void apply(ElfImage* image, const Manifest& m, const std::set<std::string>& on) 
         if (!ok) {
             host_log("patch: %s: cannot unprotect 0x%llx (site %s); the rest is left alone", m.name.c_str(),
                      static_cast<unsigned long long>(s.address), s.id.c_str());
-            return;
+            return false;
         }
         for (std::size_t i = 0; i < s.bytes.size(); ++i) {
             if (p[i] == s.bytes[i]) continue;
@@ -263,6 +277,7 @@ void apply(ElfImage* image, const Manifest& m, const std::set<std::string>& on) 
     if (!over.empty()) notes += " (over " + over + "'s bytes, as it comes after in the list)";
     host_log("patch: %s: %d of %zu sites written%s%s%s", m.name.c_str(), written, m.sites.size(), notes.c_str(),
              m.description.empty() ? "" : " - ", m.description.c_str());
+    return true;
 }
 
 // The directories manifests come from, in order: the package's, a build
@@ -361,6 +376,7 @@ std::vector<PatchListing> patch_manifests_list(const std::string& mods) {
             l.option = m.option;
             l.eboot = m.eboot;
             l.enabled = m.enabled;
+            l.gameplay = m.gameplay;
             l.group = m.group;
             l.order = m.order;
         }
@@ -374,7 +390,17 @@ const char* patch_manifest_owner(std::uint64_t address, std::size_t n) {
     return it != g_written.end() && it->first < address + n ? it->second.owner.c_str() : nullptr;
 }
 
+std::vector<std::string> patch_manifests_gameplay() {
+    std::lock_guard<std::mutex> lk(g_gameplay_mu);
+    return g_gameplay;
+}
+
+bool patch_manifests_done() { return g_manifests_done.load(std::memory_order_acquire); }
+
 void patch_manifests_apply(ElfImage* image) {
+    struct Done {
+        ~Done() { g_manifests_done.store(true, std::memory_order_release); }
+    } done;
     if (const char* e = std::getenv("BBHOST_PATCHES"); e && e[0] == '0') {
         host_log("patch: manifests off (BBHOST_PATCHES=0)");
         return;
@@ -446,5 +472,21 @@ void patch_manifests_apply(ElfImage* image) {
     }
     std::set<std::string> on;
     for (const Manifest& m : apply_list) on.insert(m.name);
-    for (const Manifest& m : apply_list) apply(image, m, on);
+    std::vector<std::string> gameplay;
+    for (const Manifest& m : apply_list) {
+        if (apply(image, m, on) && m.gameplay) gameplay.push_back(m.name);
+    }
+    std::sort(gameplay.begin(), gameplay.end());
+    if (!gameplay.empty()) {
+        std::string names, tokens;
+        for (const std::string& n : gameplay) {
+            names += (names.empty() ? "" : ", ") + n;
+            tokens += (tokens.empty() ? "" : ",") + patch_rule_token(n);
+        }
+        host_log("patch: %s change%s the game: the session's online rules carry %s, so the server keeps its bloodstains, "
+                 "messages and statistics apart from vanilla ones",
+                 names.c_str(), gameplay.size() == 1 ? "s" : "", tokens.c_str());
+    }
+    std::lock_guard<std::mutex> lk(g_gameplay_mu);
+    g_gameplay = std::move(gameplay);
 }

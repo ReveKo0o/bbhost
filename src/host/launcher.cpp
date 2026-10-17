@@ -472,6 +472,9 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
                                                                                  : patch_note(r);
                     if (!fixed && !r.p.enabled) why = "Off unless turned on here. " + why;
                     if (!fixed && !r.p.group.empty()) why = "One of the " + r.p.group + " variants: one is on at a time. " + why;
+                    if (!fixed && r.p.gameplay)
+                        why = "Changes the game: while it is on, your online rules say so, and the server keeps your bloodstains, "
+                              "messages and statistics apart from vanilla players'. " + why;
                     const std::string where = generic(fs::path(r.p.path).lexically_normal().string());
                     ImGui::TextDisabled("%s %s", why.c_str(), where.c_str());
                     ImGui::PopTextWrapPos();
