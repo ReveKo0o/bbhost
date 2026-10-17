@@ -1062,7 +1062,14 @@ extern "C" GUEST_ABI std::uint64_t gx_res_after(std::uint64_t result) {
         std::uint64_t data = 0, memory = 0;
         if (static_cast<std::uint32_t>(result) == 0 && p.out && rd(p.out, &data) && rd(p.extra + 0x98, &memory)) {
             (data == memory ? g_yebis_map_own : g_yebis_map_other).fetch_add(1, std::memory_order_relaxed);
-            if (memory != p.holder) g_yebis_renamed[kind].fetch_add(1, std::memory_order_relaxed);
+            if (memory != p.holder) {
+                g_yebis_renamed[kind].fetch_add(1, std::memory_order_relaxed);
+                // The census's: what YEBIS's ring hands out, as the shadow's hand-outs.
+                std::uint32_t size = 0, pitch = 0;
+                if (kind >= 2) rd(p.extra + 0x150, &size);
+                else if (rd(p.out + 8, &pitch)) size = pitch;
+                if (g_census) host_gpu_shadow_gx_handed(memory, size ? size : 0x10000, 3);
+            }
             if (g_yebis_map_logged.fetch_add(1, std::memory_order_relaxed) < 12)
                 host_log("gx-resources: YEBIS maps a kind-%u resource 0x%llx (type %llu): 0x%llx handed out, its memory 0x%llx (0x%llx before)", kind,
                          static_cast<unsigned long long>(p.extra), static_cast<unsigned long long>(p.type),

@@ -500,8 +500,9 @@ constexpr int kGxWrite = 0, kGxCreate = 8;  // a write; a GX resource made over 
 // What GX handed the CPU to write without a call to say when it is done
 // (host_gpu_shadow_gx_handed): a bit per 4 KiB of direct memory by physical
 // address - [kHandMap] a buffer Map's renamed copies, [kHandPool] the upload
-// pool's blocks and, with the census, [kHandRing] ring allocations.
-enum : unsigned { kHandMap = 0, kHandPool = 1, kHandRing = 2, kHandKinds = 3 };
+// pool's blocks and, with the census, [kHandRing] ring allocations and
+// [kHandYebis] the memory YEBIS's discard Maps rename its resources into.
+enum : unsigned { kHandMap = 0, kHandPool = 1, kHandRing = 2, kHandYebis = 3, kHandKinds = 4 };
 constexpr std::uint64_t kHand4k = (std::uint64_t{gcn::kDmemChunks} << gcn::kDmemChunkShift) >> 12;
 std::vector<std::uint64_t> g_hand_bits[kHandKinds];  // under g.mu, made at the first hand-out
 std::uint64_t g_hand_pages[kHandKinds] = {};         // 4 KiB pages marked
@@ -651,7 +652,7 @@ void mark_handed_locked(const GxWrite& w) {
             // A page a mirror holds is bound from host memory from now on:
             // GX hands its memory out to be rewritten, and says nothing of
             // when. Watched or told, it may already hold the old contents.
-            if (!g_shadow_handed || k == kHandRing) continue;
+            if (!g_shadow_handed || k == kHandRing || k == kHandYebis) continue;
             const std::uint64_t at = phys + a;
             Mirror& m = g_mirrors[at >> gcn::kDmemChunkShift];
             const std::uint32_t p = static_cast<std::uint32_t>((at & (kChunkBytes - 1)) >> kPageShift);
@@ -778,7 +779,8 @@ void drain_gx_writes_locked() {
 // nothing GX said), as owner * (kHandKinds + 1) + handed.
 constexpr unsigned kFaultHanders = kHandKinds + 1, kFaultOwners = 5, kFaultClasses = kFaultOwners * kFaultHanders;
 const char* const kFaultGxName[kFaultOwners] = {"GX buffers'", "a GX resource's in part", "YEBIS's", "Scaleform's", "nobody's"};
-const char* const kFaultHandName[kFaultHanders] = {"Maps hand out", "the upload pool hands out", "the ring hands out", "nothing GX hands out"};
+const char* const kFaultHandName[kFaultHanders] = {"Maps hand out", "the upload pool hands out", "the ring hands out", "YEBIS's discard Maps hand out",
+                                                    "nothing GX hands out"};
 std::uint64_t g_fault_census_seq = 0, g_fault_census_other = 0;
 std::uint64_t g_fault_class[kFaultClasses] = {};
 std::unordered_map<std::uint64_t, std::uint64_t> g_fault_writers[kFaultClasses];
@@ -800,7 +802,7 @@ void census_faults_locked() {
         std::uint64_t phys = 0, span = 0;
         const bool known = phys_at(page, phys, span);
         unsigned by = kHandKinds;
-        for (unsigned k : {kHandMap, kHandPool, kHandRing}) {
+        for (unsigned k : {kHandMap, kHandPool, kHandYebis, kHandRing}) {
             if (known && handed(k, phys)) {
                 by = k;
                 break;
@@ -838,10 +840,10 @@ std::string fault_census_text() {
     char buf[384];
     std::snprintf(buf, sizeof(buf),
                   " other pages' faults %llu; 4 KiB pages handed out: by Maps %llu (Maps in pool memory %llu, in ring memory %llu), by the "
-                  "upload pool %llu, by the ring %llu (GX resources made over handed-out memory %llu)",
+                  "upload pool %llu, by the ring and YEBIS's renames %llu (GX resources made over handed-out memory %llu)",
                   static_cast<unsigned long long>(g_fault_census_other), static_cast<unsigned long long>(g_hand_pages[kHandMap]),
                   static_cast<unsigned long long>(g_map_in_pool), static_cast<unsigned long long>(g_map_in_ring),
-                  static_cast<unsigned long long>(g_hand_pages[kHandPool]), static_cast<unsigned long long>(g_hand_pages[kHandRing]),
+                  static_cast<unsigned long long>(g_hand_pages[kHandPool]), static_cast<unsigned long long>(g_hand_pages[kHandRing] + g_hand_pages[kHandYebis]),
                   static_cast<unsigned long long>(g_made_over_handed));
     out += buf;
     return out;
@@ -2089,7 +2091,7 @@ void host_gpu_shadow_gx_handed(std::uint64_t va, std::size_t bytes, int kind) {
     if (!(g_shadow_gx || g_map_census) || !va || !bytes) return;
     // Hand-outs come in runs through the same pages (a ring, a renamed copy
     // made again): one record per span of 4 KiB pages a thread repeats.
-    thread_local std::uint64_t last_lo[kHandKinds] = {~0ull, ~0ull, ~0ull}, last_hi[kHandKinds] = {};
+    thread_local std::uint64_t last_lo[kHandKinds] = {~0ull, ~0ull, ~0ull, ~0ull}, last_hi[kHandKinds] = {};
     const unsigned k = static_cast<unsigned>(kind);
     if (k >= kHandKinds) return;
     const std::uint64_t lo = va & ~0xfffull, hi = (va + bytes + 0xfff) & ~0xfffull;

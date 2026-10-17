@@ -460,7 +460,8 @@ void host_gpu_shadow_gx_write(std::uint64_t va, std::size_t bytes);
 void host_gpu_shadow_gx_created(std::uint64_t va, std::size_t bytes);
 // Memory GX handed the CPU to write without a call to say when it is done:
 // a buffer Map's renamed copy (kind 0), an upload pool's block (1) or, under
-// BBHOST_RESOURCE_CENSUS, a ring allocation (2). Any thread, no lock held.
+// BBHOST_RESOURCE_CENSUS, a ring allocation (2) and the memory a YEBIS discard
+// Map renames a resource into (3). Any thread, no lock held.
 void host_gpu_shadow_gx_handed(std::uint64_t va, std::size_t bytes, int kind);
 // Copies `bytes` into the host-owned table ring the GPU page
 // table reaches and returns their guest address (0 when no ring could be
