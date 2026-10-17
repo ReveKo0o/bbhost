@@ -213,8 +213,16 @@ the default, and nothing waits on DXC:
   time left), failures by reason and the HLSL counts show as it runs; Cancel
   keeps what is done; the window stays live and Play waits for it. The run
   logs to `<data>/bbhost/shader-compile.log` and records its result in
-  `<data>/bbhost/shader-compile.txt`. Skipping it costs nothing: the
-  background path does the same over the first sessions.
+  `<data>/bbhost/shader-compile.txt`. On the RTX 4070 it takes ~60 s (3,281
+  shaders, 3,682 DXC modules, 16 workers). What it does not do is a first
+  session's first sight: the variants a draw makes (clip-discard pixel
+  shaders, vertex layouts, the eboot's own programs, the tessellation LS
+  pipelines) come from the pipeline manifest, which only earlier sessions
+  fill; a first tour after it built as many pipelines on arrival as a cold
+  start (25 vs 27-31). Its gain on a new install is a first session already on
+  DXC's modules with no compiling behind it (CPU ~385% against ~470%).
+  Skipping it costs nothing: the background path does the same over the first
+  sessions.
 - **Edited shaders.** `BBHOST_HLSL_DUMP=1` writes each module's HLSL to
   `<data>/bbhost/hlsl-dump/` (or `BBHOST_HLSL_DUMP=<dir>`), and an edited copy
   in `<data>/bbhost/shaders/` replaces that stage's module when it compiles,

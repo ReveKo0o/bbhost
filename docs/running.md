@@ -36,16 +36,20 @@ folder and the eboot (both are checked as you go), choose the online server
 and account if you want to play online, and press Play. The window writes the
 per-user `bbhost.toml` and starts the game. `bbhost --setup` opens it again.
 
-The game turns its shaders into HLSL and compiles them on your PC the first
-time it meets them, in the background, so you can play straight away; the
-first session may stutter a little more than later ones. To do all of it
-before playing - after installing or updating bbhost or your graphics driver -
-open the setup window's Shaders tab and press **Compile shaders now**. The tab
-shows whether the shader caches are up to date for this bbhost and this
-driver, and the compile's progress, time left and any failures; it can be
-cancelled, and what was compiled is kept. The same tab has the Shaders setting
-(HLSL, or Lifted for the translator's own shaders only). `bbhost
---compile-shaders` does the same from a terminal.
+The game turns its shaders into HLSL and compiles them on your PC in the
+background, so you can play straight away; the first session uses the
+translator's own shaders while that runs, and may stutter a little more than
+later ones the first time it meets each place. To compile before playing -
+after installing or updating bbhost or your graphics driver - open the setup
+window's Shaders tab and press **Compile shaders now**: every shader of the
+game's, and the pipelines your earlier sessions drew, then the first session
+needs no compiling in the background. (The few pipelines a place needs the
+first time you ever visit it are still built then.) The tab shows whether the
+shader caches are up to date for this bbhost and this driver, and the
+compile's progress, time left and any failures; it can be cancelled, and what
+was compiled is kept. The same tab has the Shaders setting (HLSL, or Lifted
+for the translator's own shaders only). `bbhost --compile-shaders` does the
+same from a terminal.
 
 Without a display (a headless run) bbhost writes a template config instead and
 tells you which paths to fill in.
