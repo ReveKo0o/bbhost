@@ -42,6 +42,8 @@ rem It takes 5 to 15 minutes. Send sweep-summary.txt and sweep-list.txt
 rem (set SWEEP_NAME=other first: other-summary.txt and other-list.txt).
 setlocal
 cd /d "%~dp0"
+rem The kit's folder, kept before shift moves the arguments (and the script's own name) along.
+set here=%~dp0
 if "%~1"=="" (
   echo usage: run-sweep.bat ^<game folder^>
   exit /b 2
@@ -53,7 +55,7 @@ gcn2hlsl.exe --sweep --app0 "%game%" --list %SWEEP_NAME%-list.txt %1 %2 %3 %4 > 
 set rc=%errorlevel%
 type %SWEEP_NAME%-summary.txt
 echo.
-echo exit %rc%: the summary is %~dp0%SWEEP_NAME%-summary.txt, every program in %~dp0%SWEEP_NAME%-list.txt
+echo exit %rc%: the summary is %here%%SWEEP_NAME%-summary.txt, every program in %here%%SWEEP_NAME%-list.txt
 exit /b %rc%
 EOF
     (cd "$out" && rm -f "$name.zip" && zip -qr "$name.zip" "$name")
