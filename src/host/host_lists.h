@@ -1,0 +1,71 @@
+// Host command lists: where each packet the command processor acts on begins
+// in the game's command buffers, recorded as it is written - the first step of
+// retiring the walk of those buffers (docs/rendering.md, "The command
+// processor"). A list belongs to a chunk of command buffer (what a Gnm command
+// buffer object writes into: GX's arena chunks, YEBIS's, Gnmx's and the
+// compute ring's buffers), found by the chunk's start - the object's +0x0 -
+// and holds, in the order written, each such packet's place in the chunk and
+// its opcode: our tokens, the labels, the waits, predication, the compute
+// ring's calls, data written inline. Data the shaders read in place, markers
+// and register packets nothing reads are not in it.
+//
+// BBHOST_HOST_LISTS: 0 (the default) records nothing. 2 (shadow) records the
+// lists, takes each submitted range's part of its list on the submitting
+// thread, and has the command processor compare it with what its walk of the
+// range meets - packet for packet, in order - counting agreements and every
+// disagreement by reason (the exit report). 1 is the handoff, where a covered
+// range runs from its list instead of its bytes.
+//
+// The recording side is leaf-safe (decomp leaves call it on the game's
+// threads, with the game's FS): no locks, no allocation, no host
+// thread-locals. One thread writes a chunk at a time - the command buffer
+// that holds it - and a range is taken from its list when it is submitted,
+// after it was written and before the chunk can be written again.
+#pragma once
+
+#include <cstddef>
+#include <cstdint>
+#include <vector>
+
+namespace host_lists {
+
+// BBHOST_HOST_LISTS, read before any of the game's code runs.
+extern const int g_mode;
+
+void note_slow(std::uint64_t cb, std::uint64_t va, std::uint32_t op);
+
+// A packet with opcode `op` written at `va` through the Gnm command buffer
+// object `cb` ({+0x0 the chunk's start, +0x8 its end, +0x10 the write
+// pointer}). Leaf-safe.
+inline void note(std::uint64_t cb, std::uint64_t va, std::uint32_t op) {
+    if (g_mode) note_slow(cb, va, op);
+}
+
+// Hosted: GX's command arena handed out the chunk at `chunk_va` (hle_gx_arena_acquire);
+// what its list held is gone.
+void chunk_handed_out(std::uint64_t chunk_va);
+
+// A submitted range's part of its list: each entry the packet's place from
+// the range's start in dwords << 8 | its opcode.
+struct Taken {
+    enum State : std::uint8_t { kNoList, kTaken, kOverflowed };
+    State state = kNoList;
+    std::vector<std::uint32_t> entries;
+};
+// Hosted, on the submitting thread: [va, va + bytes)'s part of its list.
+void take(std::uint64_t va, std::size_t bytes, Taken* out);
+
+// Hosted, on a command-processor thread (shadow): a top-level range's walk
+// begins - `walk_va` where the walker reads it (its copy), `taken` what the
+// list holds for it - and ends; an indirect buffer's walk inside it begins
+// and ends (taken from the callee's list there and then); each packet the
+// walk meets in between, at `va` where the walker reads it.
+void shadow_begin(const Taken* taken, std::uint64_t walk_va, std::size_t bytes);
+void shadow_push(std::uint64_t va, std::size_t bytes);
+void shadow_packet(std::uint64_t va, std::uint32_t op, const std::uint32_t* body, std::size_t n);
+void shadow_pop();
+void shadow_end();
+
+void report();
+
+}  // namespace host_lists

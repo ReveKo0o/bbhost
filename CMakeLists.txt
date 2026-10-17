@@ -146,6 +146,7 @@ add_executable(bbhost
   src/hle/video.cpp
   src/hle/gnm.cpp
   src/hle/gnm_exec.cpp
+  src/host/host_lists.cpp
   src/hle/gx_trace.cpp
   src/hle/audio.cpp
   src/hle/net.cpp
@@ -373,6 +374,8 @@ set(BBHOST_DECOMP_SOURCES
 )
 target_sources(bbhost PRIVATE ${BBHOST_DECOMP_SOURCES})
 set_source_files_properties(${BBHOST_DECOMP_SOURCES} PROPERTIES COMPILE_OPTIONS "-fno-stack-protector;-ffp-contract=off")
+# The host lists record from decomp leaves, on the game's threads with the game's FS.
+set_source_files_properties(src/host/host_lists.cpp PROPERTIES COMPILE_OPTIONS "-fno-stack-protector")
 # The follow camera's step is the game's own AVX, intrinsic for intrinsic
 # (every CPU that runs the eboot has AVX).
 set_property(SOURCE src/decomp/camera/follow_camera.cpp APPEND PROPERTY COMPILE_OPTIONS -mavx)
@@ -554,9 +557,16 @@ if(UNIX)
   bbhost_decomp_test(follow_camera SOURCES src/decomp/camera/follow_camera.cpp src/engine/mouse_camera_stubs.cpp ARGS 2000)
   bbhost_decomp_test(sfx_ribbons SOURCES src/core/write_watch.cpp)
   bbhost_decomp_test(adaptive_mutex)
-  bbhost_decomp_test(gx_drain_token)
+  bbhost_decomp_test(gx_drain_token SOURCES src/host/host_lists.cpp src/core/thunk.cpp src/core/portable.cpp src/hle/sysv_va.cpp src/host/main_wait.cpp)
   bbhost_decomp_test(gx_dead_packets SOURCES src/core/thunk.cpp src/core/portable.cpp src/hle/sysv_va.cpp src/host/main_wait.cpp)
-  bbhost_decomp_test(gx_labels SOURCES src/core/thunk.cpp src/core/portable.cpp src/hle/sysv_va.cpp src/host/main_wait.cpp)
+  bbhost_decomp_test(gx_labels SOURCES src/host/host_lists.cpp src/core/thunk.cpp src/core/portable.cpp src/hle/sysv_va.cpp src/host/main_wait.cpp)
+  # The host command lists without the game (tests/host_lists_test.cpp), in shadow mode.
+  add_executable(host_lists_test tests/host_lists_test.cpp src/core/portable.cpp)
+  target_include_directories(host_lists_test PRIVATE src include)
+  target_compile_options(host_lists_test PRIVATE -fno-stack-protector)
+  target_link_libraries(host_lists_test PRIVATE pthread)
+  add_test(NAME host_lists_test COMMAND host_lists_test)
+  set_tests_properties(host_lists_test PROPERTIES ENVIRONMENT "BBHOST_HOST_LISTS=2")
   # The engine's classes by the names they register (tools/class_catalog.cpp).
   add_executable(class_catalog tools/class_catalog.cpp src/decomp/insn.cpp)
   target_link_libraries(class_catalog PRIVATE eboot_kit)

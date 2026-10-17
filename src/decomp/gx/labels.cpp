@@ -1,9 +1,10 @@
-// Gnm's label, wait, inline-data and predication writers as our source
-// (docs/decomp.md). Nine small leaf methods of Gnm's command buffers through
-// which every completion the game asks the GPU for is written, and every wait
-// it makes the GPU do on one - GX's block pools and command arena, Map and
-// its queries, YEBIS's drains and compute utilities, Scaleform's fences, the
-// compute ring's retirement, the flip:
+// Gnm's label, wait, inline-data, predication and indirect-buffer writers as
+// our source (docs/decomp.md). Ten small leaf methods of Gnm's command
+// buffers through which every completion the game asks the GPU for is
+// written, every wait it makes the GPU do on one - GX's block pools and
+// command arena, Map and its queries, YEBIS's drains and compute utilities,
+// Scaleform's fences, the compute ring's retirement, the flip - and the
+// compute ring's calls of the command buffers it runs:
 //
 // - EVENT_WRITE_EOP (0x14778f0): a label written when the work before it has
 //   left the pipe - 4.4M a 12-place tour;
@@ -17,7 +18,9 @@
 // - WRITE_DATA (0x1473b80 to memory, 0x1473ce0 through L2 with a cache
 //   policy): dwords from the caller written inline - none in a tour;
 // - SET_PREDICATION on an occlusion result, and cleared (0x1477570,
-//   0x1477600), with the command buffer's predication flag - none in a tour.
+//   0x1477600), with the command buffer's predication flag - none in a tour;
+// - INDIRECT_BUFFER on the compute command buffer (0x148b330,
+//   GXComputeQueue::Submit's) - 79.
 //
 // Each is the game's function as source, instruction for instruction: the
 // same room check (the low 32 bits of the dwords left, against the packet's
@@ -26,9 +29,8 @@
 // write-pointer moves and the same return value (the packet's address, or for
 // WRITE_DATA with a payload the write pointer after it; the refill's result
 // when it gives nothing). They write the game's packets always: the command
-// processor walks them. As source, each is where a label or a wait becomes an
-// entry of the command buffer's host list (design: cpretire, phase B), with
-// the game's packet beside it for the walker as long as there is one.
+// processor walks them. Each also notes its packet in its chunk's host list
+// (host/host_lists.h; nothing unless BBHOST_HOST_LISTS is on).
 // tests/decomp/gx_labels_test.cpp checks them against the game's code on
 // generated inputs.
 //
@@ -44,6 +46,7 @@
 #include "core/thunk.h"
 #include "decomp/decomp.h"
 #include "decomp/guest.h"
+#include "host/host_lists.h"
 #include "log.h"
 
 #include <array>
@@ -67,6 +70,7 @@ enum Writer : std::size_t {
     kWriteDataL2,
     kSetPredication,
     kClearPredication,
+    kIndirectBuffer,
     kWriters
 };
 
@@ -94,6 +98,9 @@ const LabelWriter kTable[kWriters] = {
     // push rbp; mov rbp, rsp; push rbx, rax; mov rbx, rdi; mov rcx, [rbx+8]; mov rax, [rbx+0x10].
     {"gnm_clear_predication", 0x1477600, 17,
      {0x55, 0x48, 0x89, 0xe5, 0x53, 0x50, 0x48, 0x89, 0xfb, 0x48, 0x8b, 0x4b, 0x08, 0x48, 0x8b, 0x43, 0x10}, 3},
+    // push rbp; mov rbp, rsp; push r15, r14, rbx, rax; mov r14, rdx; mov r15, rsi.
+    {"gnm_dispatch_write_indirect_buffer", 0x148b330, 16,
+     {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x53, 0x50, 0x49, 0x89, 0xd6, 0x49, 0x89, 0xf7}, 4},
 };
 #undef PUSH6
 
@@ -141,6 +148,7 @@ inline u64 w_end_of_pipe(u64 cb, u32 event, u32 flags, u64 addr, u32 data_sel, u
     put(wp + 16, static_cast<u32>(value));
     put(wp + 20, static_cast<u32>(value >> 32));
     store<u64>(cb + 0x10, wp + 0x18);
+    host_lists::note(cb, wp, 0x47);
     return wp;
 }
 
@@ -167,6 +175,7 @@ inline u64 w_end_of_shader(u64 cb, u32 event, u64 addr, u32 value) {
     put(at + 12, hi);
     put(at + 16, value);
     store<u64>(cb + 0x10, load<u64>(cb + 0x10) + 0x14);
+    host_lists::note(cb, at, 0x48);
     return at;
 }
 
@@ -185,6 +194,7 @@ inline u64 w_release_mem(u64 cb, u32 event, u32 flags, u64 addr, u32 data_sel, u
     put(wp + 20, static_cast<u32>(value));
     put(wp + 24, static_cast<u32>(value >> 32));
     store<u64>(cb + 0x10, wp + 0x1c);
+    host_lists::note(cb, wp, 0x49);
     return wp;
 }
 
@@ -202,6 +212,7 @@ inline u64 w_wait(u64 cb, u64 addr, u32 mask, u32 function, u32 reference) {
     put(wp + 20, mask);
     put(wp + 24, 0xa);
     store<u64>(cb + 0x10, wp + 0x1c);
+    host_lists::note(cb, wp, 0x3c);
     return wp;
 }
 
@@ -238,6 +249,7 @@ inline u64 write_data(u64 cb, u64 dest, u64 src, u32 dwords, u32 control) {
     put(wp + 12, static_cast<u32>(dest >> 32));
     const u64 p = load<u64>(cb + 0x10);
     store<u64>(cb + 0x10, p + 0x10);
+    host_lists::note(cb, wp, 0x37);
     if (dwords == 0) return p;
     copy_payload(p + 0x10, src, dwords);
     const u64 end = p + 4 * static_cast<u64>(dwords - 1) + 0x14;
@@ -267,6 +279,22 @@ inline u64 w_set_predication(u64 cb, u64 block, u32 draw_if_visible, u32 hint) {
     put(wp + 4, static_cast<u32>(block) & 0xfffffff0u);
     put(wp + 8, ((hint & 1) << 8) | ((draw_if_visible & 1) << 12) | static_cast<u32>((block >> 32) & 0xff) | 0x10000u);
     store<u64>(cb + 0x10, wp + 12);
+    host_lists::note(cb, wp, 0x20);
+    return wp;
+}
+
+// INDIRECT_BUFFER on the compute command buffer: the callee's address (its
+// high 16 bits) and size in dwords (20 bits), valid, as the compute ring's
+// submissions call the command buffers they run (GXComputeQueue::Submit).
+inline u64 w_indirect_buffer(u64 cb, u64 addr, u32 dwords) {
+    u64 wp, failed;
+    if (!make_room(cb, 4, &wp, &failed)) return failed;
+    put(wp, 0xc0023f02u);
+    put(wp + 4, static_cast<u32>(addr));
+    put(wp + 8, static_cast<u32>((addr >> 32) & 0xffff));
+    put(wp + 12, (dwords & 0xfffff) | 0x1800000u);
+    store<u64>(cb + 0x10, wp + 0x10);
+    host_lists::note(cb, wp, 0x3f);
     return wp;
 }
 
@@ -278,6 +306,7 @@ inline u64 w_clear_predication(u64 cb) {
     store<u64>(wp, 0x00000000c0012000ull);
     put(wp + 8, 0);
     store<u64>(cb + 0x10, wp + 12);
+    host_lists::note(cb, wp, 0x20);
     return wp;
 }
 
@@ -309,6 +338,7 @@ DECOMP_LEAF u64 gnm_set_predication(u64 cb, u64 block, u32 draw_if_visible, u32 
     return w_set_predication(cb, block, draw_if_visible, hint);
 }
 DECOMP_LEAF u64 gnm_clear_predication(u64 cb) { return w_clear_predication(cb); }
+DECOMP_LEAF u64 gnm_dispatch_write_indirect_buffer(u64 cb, u64 addr, u32 dwords) { return w_indirect_buffer(cb, addr, dwords); }
 
 namespace {
 
@@ -334,6 +364,7 @@ u64 write_as_game(std::size_t i, const Args& a) {
         case kWriteDataL2: return w_write_data_l2(cb, a.r[1], a.r[2], d(3), d(4), d(5));
         case kSetPredication: return w_set_predication(cb, a.r[1], d(2), d(3));
         case kClearPredication: return w_clear_predication(cb);
+        case kIndirectBuffer: return w_indirect_buffer(cb, a.r[1], d(2));
         default: return 0;
     }
 }
@@ -374,6 +405,10 @@ u64 compare(std::size_t i, const Args& a) {
         (has_payload(i) && src < wp + bytes && wp < src + bytes)) {
         g_compare_alone.fetch_add(1, std::memory_order_relaxed);
         hle_call_guest_regs(&g);
+        // The packet the game's wrote, for the host list (it ends at the write
+        // pointer, wherever the refill put it).
+        const u64 after = load<u64>(cb + 0x10), packet = after - bytes;
+        if (after != wp && after >= bytes && (load<u32>(packet) >> 30) == 3) host_lists::note(cb, packet, (load<u32>(packet) >> 8) & 0xff);
         return g.ret;
     }
     u8 before[kCompareMax * 4], game[kCompareMax * 4];
@@ -455,6 +490,7 @@ void decomp_gx_labels_add() {
         reinterpret_cast<void*>(&gnm_write_data_inline_l2),
         reinterpret_cast<void*>(&gnm_set_predication),
         reinterpret_cast<void*>(&gnm_clear_predication),
+        reinterpret_cast<void*>(&gnm_dispatch_write_indirect_buffer),
     };
     static const std::array<void*, kWriters> kCompare = compare_table(std::make_index_sequence<kWriters>{});
     for (std::size_t i = 0; i < kWriters; ++i) {

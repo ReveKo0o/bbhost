@@ -100,7 +100,8 @@ Args random_args(std::size_t i) {
         case kEndOfShader: a.r[2] = random_u64(); break;
         case kWait:
         case kComputeWait: a.r[1] = random_u64(); break;
-        case kSetPredication: a.r[1] = random_u64(); break;
+        case kSetPredication:
+        case kIndirectBuffer: a.r[1] = random_u64(); break;
         case kWriteData:
         case kWriteDataL2: {
             a.r[1] = random_u64();
@@ -182,6 +183,7 @@ u64 call(std::size_t i, bool game, const Args& a) {
         case kWriteDataL2: return CALL((u64, u64, u64, u32, u32, u32), gnm_write_data_inline_l2, c, a.r[1], a.r[2], d(3), d(4), d(5));
         case kSetPredication: return CALL((u64, u64, u32, u32), gnm_set_predication, c, a.r[1], d(2), d(3));
         case kClearPredication: return CALL((u64), gnm_clear_predication, c);
+        case kIndirectBuffer: return CALL((u64, u64, u32), gnm_dispatch_write_indirect_buffer, c, a.r[1], d(2));
         default: return 0;
     }
 #undef CALL

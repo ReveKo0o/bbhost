@@ -19,6 +19,7 @@
 #include "core/thunk.h"
 #include "decomp/decomp.h"
 #include "decomp/gx/dead_packets.h"
+#include "host/host_lists.h"
 #include "engine/addr.h"
 #include "host/gpu.h"
 #include "engine/gx_resources.h"
@@ -1988,6 +1989,7 @@ std::uint64_t write_native_token(std::uint64_t ctx, std::uint32_t magic = kGxNat
     std::memcpy(reinterpret_cast<void*>(static_cast<std::uintptr_t>(cmd)), token, sizeof(token));
     const std::uint64_t next = cmd + sizeof(token);
     std::memcpy(reinterpret_cast<void*>(static_cast<std::uintptr_t>(cb + 0x10)), &next, sizeof(next));
+    host_lists::note(cb, cmd, 0x10);
     if (magic == kGxNativeMagic) g_native_tokens.add();
     return id;
 }
