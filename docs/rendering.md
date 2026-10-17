@@ -282,8 +282,8 @@ the default, and nothing waits on DXC:
     threads compile ~3,360 modules: ~435 s of their time, all done ~250 s
     after the first was queued (~60 s of that waiting for the start's own
     compiles). The process's CPU is ~470% against ~385% while they run, and
-    its memory up to ~0.6 GiB higher (the threads' heap, handed back to the
-    system when the queue empties).
+    its memory up to ~0.6 GiB higher; when the queue empties ~0.4 GiB of
+    DXC's heap goes back to the system (glibc's `malloc_trim`).
   - *The next start* takes DXC's module for every stage met before (~3,380;
     a few new ones keep the lift and compile behind). The pipeline manifest
     builds their pipelines at the start, though the driver has never seen
