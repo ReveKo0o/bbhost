@@ -109,6 +109,7 @@
 #include <bit>
 #include <cstdio>
 #include <cstring>
+#include <deque>
 #include <functional>
 #include <map>
 #include <set>
@@ -218,6 +219,11 @@ struct Region {
     Val rb_scc0;
     bool rb_scc_uniform0 = false, rb_scc_valid0 = true;
     std::set<int> rb_poisoned0, rb_in_mask0;
+    // A compute lift's region as a selection on the invocation's EXEC bit
+    // (Lifter::branch_region): an invocation whose bit is clear skips it, as
+    // GCN's wave skips it where no lane's is set. (The pixel lift's own branch
+    // on the pixel's bit is `branched` above, Lifter::region_branch_open.)
+    bool selected = false;
 };
 
 bool is_branch(const Inst& in) { return in.enc == Enc::SOPP && (in.op == 2 || (in.op >= 4 && in.op <= 9)); }
@@ -413,10 +419,12 @@ private:
         std::uint32_t join = 0;
     };
     std::vector<Construct> constructs;
+    std::deque<Construct> region_ifs;  // the branched regions' selections (open_region_arm), stable for Arm::c
     std::vector<std::uint32_t> threaded_joins;  // ifs of an else-if chain joined at the enclosing then arm's s_branch
     struct Arm {  // an open if
         Construct* c = nullptr;
         std::uint64_t seq = 0;
+        bool region = false;  // a branched region's selection (open_region_arm): its condition differs between lanes
         // VCC was a uniform condition ANDed with EXEC, at the start of the
         // region beginning here (0: the bit itself was uniform).
         std::uint32_t split_region = 0;
@@ -5120,6 +5128,65 @@ private:
     // An if on a scalar condition: a selection whose then arm runs where the
     // branch falls through. Every lane takes the same arm, so the arms are
     // plain structured control flow.
+    // A compute region as a selection (Region::branched): taken where the
+    // invocation's EXEC bit is set as the region begins, its join the
+    // region's end, where the registers it wrote become phis with their
+    // values from before it (close_arm, merge_arms). It is the same program:
+    // the region's writes are masked by that bit (so a skipping invocation
+    // keeps its old values either way), its scalar state is dead after it
+    // (close_region), and nothing in it needs the other invocations
+    // (branch_region). What it saves is the work GCN's waves save by skipping
+    // a region no lane needs.
+    std::size_t selected_regions = 0, region_merge_phis = 0;
+    bool branch_region(const Region& r) const {
+        if (!compute() || r.kill || r.disabled) return false;
+        for (std::size_t i = index_of(r.start); i < prog.insts.size() && prog.insts[i].offset < r.end; ++i) {
+            const Inst& in = prog.insts[i];
+            // Wave-wide operations, which GCN runs for the wave whatever EXEC
+            // holds: a barrier, a lane's rank, lane reads and writes.
+            if (in.enc == Enc::SOPP && in.op == 10) return false;
+            if (in.enc == Enc::VOP2 && (in.op == 1 || in.op == 2 || in.op == 35 || in.op == 36)) return false;
+            if (in.enc == Enc::VOP1 && in.op == 2) return false;
+            if (in.enc == Enc::VOP3 && (in.op == 0x101 || in.op == 0x102 || in.op == 0x123 || in.op == 0x124 || in.op == 0x182)) return false;
+            // A way out of a loop the region sits in (its back edge or an exit).
+            for (const Loop* l : open_loops) {
+                if (in.offset == l->latch || (loop_exits.count(in.offset) && innermost_loop(in.offset) == l)) return false;
+            }
+        }
+        return true;
+    }
+    void open_region_arm(Region& r, std::uint64_t seq) {
+        region_ifs.push_back({});
+        Construct& c = region_ifs.back();
+        c.branch = r.branch;
+        c.op = 8;  // s_cbranch_execz
+        c.else_start = c.join = r.end;
+        Arm a;
+        a.c = &c;
+        a.seq = seq;
+        a.region = true;
+        a.merge = m.fresh();
+        a.then_label = m.fresh();
+        a.else_label = m.fresh();
+        a.reg0 = reg;
+        a.lanes0 = lanes;
+        a.to_float0 = to_float;
+        a.to_word0 = to_word;
+        a.scc0 = scc_mask;
+        a.scc_uniform0 = scc_uniform;
+        a.scc_valid0 = scc_valid;
+        a.poisoned0 = poisoned;
+        a.in_mask0 = in_mask;
+        exact_open_arm();
+        const Val e = exec_lane();
+        const Id cond = e.constant ? m.const_bool(e.set) : e.id;
+        m.emit_void(spv::OpSelectionMerge, {a.merge, 0u});
+        m.emit_void(spv::OpBranchConditional, {cond, a.then_label, a.else_label});
+        cur_label = m.label(a.then_label);
+        arms.push_back(std::move(a));
+        r.selected = true;
+        ++selected_regions;
+    }
     void open_arm(Construct& c, std::uint64_t seq) {
         Arm a;
         a.c = &c;
@@ -5226,7 +5293,7 @@ private:
                 merged_lanes[k].helpers_clear = t->second.helpers_clear && e->second.helpers_clear;
                 if (t->second.content != e->second.content) merged_lanes[k] = new_content(merged_lanes[k]);
             } else {
-                phis.push_back({k, Kind::Lane, t->second.id, e->second.id, uniform(t->second) && uniform(e->second)});
+                phis.push_back({k, Kind::Lane, t->second.id, e->second.id, !a.region && uniform(t->second) && uniform(e->second)});
             }
         }
         std::set<int> keys;
@@ -5248,10 +5315,10 @@ private:
                 reject(key_name(k) + " holds a part of the append idiom on one arm of the if at " + hex_offset(a.c->branch) + " and joins");
                 return;
             }
-            phis.push_back({k, t.kind, t.id, t.kind == Kind::Float ? as_f(e) : as_u(e), uniform(t) && uniform(e)});
+            phis.push_back({k, t.kind, t.id, t.kind == Kind::Float ? as_f(e) : as_u(e), !a.region && uniform(t) && uniform(e)});
         }
         const bool scc_same = a.scc_valid1 && scc_valid && a.scc_uniform1 == scc_uniform && same(a.scc1v, scc_mask);
-        const bool scc_phi = !scc_same && a.scc_valid1 && scc_valid && a.scc_uniform1 && scc_uniform;
+        const bool scc_phi = !scc_same && !a.region && a.scc_valid1 && scc_valid && a.scc_uniform1 && scc_uniform;
         const Id else_end = cur_label;
         m.emit_void(spv::OpBranch, {a.merge});
         cur_label = m.label(a.merge);
@@ -5277,6 +5344,10 @@ private:
         lanes = std::move(merged_lanes);
         to_float = a.to_float0;
         to_word = a.to_word0;
+        if (a.region) {
+            region_merge_phis += phis.size();
+            return;  // close_region has said what the region is
+        }
         static const char* const kBranch[4] = {"s_cbranch_scc0", "s_cbranch_scc1", "s_cbranch_vccz", "s_cbranch_vccnz"};
         res.proof.push_back("if at " + hex_offset(a.c->branch) + " (" + kBranch[a.c->op - 4] + "): " + if_condition_proof(a) +
                             ", the same in every lane; " + (a.c->else_jump ? "then and else arms" : "a then arm") +
@@ -5309,6 +5380,10 @@ private:
         }
         to_float = a.to_float0;
         to_word = a.to_word0;
+        if (a.region) {
+            reject("the branched region at " + hex_offset(a.c->branch) + " leaves a loop");  // branch_region keeps loop exits out
+            return;
+        }
         static const char* const kBranch[4] = {"s_cbranch_scc0", "s_cbranch_scc1", "s_cbranch_vccz", "s_cbranch_vccnz"};
         res.proof.push_back("if at " + hex_offset(a.c->branch) + " (" + kBranch[a.c->op - 4] + "): " + if_condition_proof(a) +
                             ", the same in every lane; its " + (else_dead ? "else" : "then") + " arm leaves the loop, so the join at " +
@@ -5702,7 +5777,10 @@ private:
         for (int k : r.scalar_writes) names += (names.empty() ? "" : ", ") + key_name(k);
         std::string how;
         if (!r.kill) {
-            how = ": writes masked by EXEC at " + hex_offset(r.branch) + ", and EXEC set inside only within it";
+            how = ": writes masked by EXEC at " + hex_offset(r.branch) + ", and EXEC set inside only within it" +
+                  (r.selected ? std::string("; a selection on the invocation's EXEC bit there, skipped where it is clear as GCN's wave skips "
+                                            "the region where no lane's is")
+                              : std::string());
         } else if (r.quad_exact) {
             how = ": s_cbranch_scc0 at " + hex_offset(r.branch) + " tests the mask the region ANDs into EXEC and widens to whole quads; " +
                   exec_after + "; s_endpgm kills exactly the guard's clear pixels";
@@ -7206,11 +7284,16 @@ private:
                 Region& r = regions[next_region++];
                 if (!r.disabled) {
                     r.exec_in = r.exec_before;  // a kill region narrows it with its first instructions
+                    // A branched region's selection closes just after it
+                    // (close_region sees the body's end, then the merge).
+                    const bool branch = branch_region(r);
+                    const std::uint64_t arm_seq = branch ? ++seq : 0;
                     r.seq = ++seq;
                     r.in_mask0 = in_mask;
                     open_regions.push_back(&r);
                     if (lift_branch_on() && opt.stage == Stage::Pixel && open_loops.empty() && arms.empty() && region_branchable(r))
                         region_branch_open(r);
+                    if (branch) open_region_arm(r, arm_seq);
                 }
             }
             // A loop begins inside what is open here.

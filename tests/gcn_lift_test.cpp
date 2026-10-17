@@ -14,6 +14,7 @@
 
 #include <spirv-tools/libspirv.hpp>
 
+#include <algorithm>
 #include <array>
 #include <bit>
 #include <cmath>
@@ -4175,6 +4176,28 @@ void run() {
         const gcn::LiftResult r = lift(a);
         CHECK(lifted_valid(r, "early-out"));
         CHECK(proof_has(r, "s_cbranch_execnz"));
+    }
+    // An s_cbranch_execz region: a selection an invocation whose EXEC bit is
+    // clear skips - unless something in it needs the other invocations (a
+    // barrier), when every invocation runs it with its writes masked.
+    for (const bool barrier : {false, true}) {
+        Asm a;
+        a.vopc(kCmpGtI32, kC0 + 16, kV + 0);  // v_cmp_gt_i32 vcc, 16, v0
+        a.sop1(36 /* s_and_saveexec_b64 */, 6, kVcc);
+        const std::size_t skip = a.forward(kExecz);
+        if (barrier) a.sopp(kBarrier);
+        a.vop2(kVLshlrev, 2, kC0 + 2, 0);
+        a.store_offen(0, 2, 0);
+        a.land(skip);
+        a.sop1(kSMov64, kExec, 6);
+        a.endpgm();
+        const gcn::LiftResult r = lift(a);
+        CHECK(lifted_valid(r, barrier ? "region with a barrier" : "region"));
+        const bool branched = std::any_of(r.proof.begin(), r.proof.end(), [](const std::string& line) {
+            return line.find("a selection on the invocation's EXEC bit") != std::string::npos;
+        });
+        CHECK(branched == !barrier);
+        if (barrier) CHECK(proof_has(r, "1 s_barrier"));
     }
 }
 
