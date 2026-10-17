@@ -3453,9 +3453,20 @@ bool cs_buffers_on() {
     }();
     return on && g.cb_ssbo && g.cs_buffers_layout != VK_NULL_HANDLE;
 }
+// BBHOST_LIFT_CS_BUFFERS: a lifted compute program's variant with its buffers
+// pushed is the lift of its lean translation (on unless 0; 0: a lifted
+// program has none, and its dispatches walk the page table as before).
+bool cs_lift_buffers_on() {
+    static const bool on = [] {
+        const char* e = std::getenv("BBHOST_LIFT_CS_BUFFERS");
+        return !(e && e[0] == '0');
+    }();
+    return on;
+}
 // The variant's key for the optimizer (ComputeLean), beside its pipeline's.
 constexpr std::uint64_t kCsBuffersTag = 0xcb55b0f0e5000000ull;
-std::atomic<std::uint64_t> g_cs_lean_built{0}, g_cs_lean_none{0}, g_cs_lean_failed{0}, g_cs_lean_dispatches{0}, g_cs_lean_fallbacks{0};
+std::atomic<std::uint64_t> g_cs_lean_built{0}, g_cs_lean_none{0}, g_cs_lean_failed{0}, g_cs_lean_dispatches{0}, g_cs_lean_fallbacks{0},
+    g_cs_lean_lifted{0}, g_cs_lean_lift_refused{0};
 
 // `buffers`: the ComputeLean translation.
 gcn::TranslateOptions compute_options(std::uint32_t rsrc1, std::uint32_t rsrc2, const std::uint32_t* threads,
@@ -3490,10 +3501,11 @@ gcn::TranslateOptions compute_options(std::uint32_t rsrc1, std::uint32_t rsrc2, 
 // binds those from one list for either.
 std::shared_ptr<ComputeLean> build_compute_lean(const gcn::Program& prog, std::uint32_t rsrc1, std::uint32_t rsrc2, const std::uint32_t* threads,
                                                 const std::vector<std::pair<std::uint32_t, bool>>& dims, const std::vector<bool>& modes,
-                                                const gcn::TranslateResult& regular, std::uint64_t key, const std::string& name) {
-    if (!cs_buffers_on()) return nullptr;
+                                                const gcn::TranslateResult& regular, std::uint64_t key, const std::string& name, bool lift) {
+    if (!cs_buffers_on() || (lift && !cs_lift_buffers_on())) return nullptr;
     auto lean = std::make_shared<ComputeLean>();
-    lean->meta = translate_cached(prog, compute_options(rsrc1, rsrc2, threads, dims, modes, true));
+    const gcn::TranslateOptions lean_options = compute_options(rsrc1, rsrc2, threads, dims, modes, true);
+    lean->meta = translate_cached(prog, lean_options);
     const auto same = [&] {
         const gcn::TranslateResult& m = lean->meta;
         if (m.images.size() != regular.images.size() || m.samplers.size() != regular.samplers.size() || m.gds_counters != regular.gds_counters ||
@@ -3526,6 +3538,24 @@ std::shared_ptr<ComputeLean> build_compute_lean(const gcn::Program& prog, std::u
     } else if (!same()) {
         why = "images, samplers, counters or LDS differ";
     }
+    // A lifted program's variant is the lift of this translation, which reads
+    // what the translation binds from the pushed buffers and walks the rest
+    // as it does (gcn::lift_compute_shader); refused, the program has none and
+    // keeps its walking lift.
+    if (why.empty() && lift) {
+        hlsl_name_next(name);
+        gcn::LiftResult l = lift_compute_cached(prog, lean_options, lean->meta);
+        if (l.ok()) {
+            lean->meta.spirv = std::move(l.spirv);
+            lean->lifted = true;
+        } else {
+            if (g_cs_lean_lift_refused.fetch_add(1, std::memory_order_relaxed) < 16) {
+                host_log("gpu: compute shader %s: its lean translation's lift was refused (%s); its dispatches walk the page table", name.c_str(),
+                         l.rejections.empty() ? "no module" : l.rejections[0].c_str());
+            }
+            return nullptr;
+        }
+    }
     if (why.empty()) {
         if (const char* e = std::getenv("BBHOST_DUMP_SPIRV"); e && e[0] == '1') {
             host_mkdir("build/spv");
@@ -3534,23 +3564,38 @@ std::shared_ptr<ComputeLean> build_compute_lean(const gcn::Program& prog, std::u
                 std::fclose(f);
             }
         }
-        VkShaderModuleCreateInfo smci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
-        smci.codeSize = lean->meta.spirv.size() * 4;
-        smci.pCode = lean->meta.spirv.data();
-        if (vkCreateShaderModule(g.device, &smci, nullptr, &lean->module) != VK_SUCCESS) why = "shader module";
-    }
-    if (why.empty()) {
-        lean->pipeline = first_compute_pipeline(lean->module, key ^ kCsBuffersTag, name, lean->meta.spirv, lean->standin,
-                                                name + " (buffers pushed)", g.cs_buffers_layout);
-        if (!lean->pipeline) why = "pipeline";
+        // DXC's module of a lift (BBHOST_HLSL) the driver refuses: the lift's
+        // own, as pipeline_for does for the walking lift.
+        for (bool own = false;;) {
+            VkShaderModuleCreateInfo smci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+            smci.codeSize = lean->meta.spirv.size() * 4;
+            smci.pCode = lean->meta.spirv.data();
+            if (vkCreateShaderModule(g.device, &smci, nullptr, &lean->module) != VK_SUCCESS) {
+                lean->module = VK_NULL_HANDLE;
+                why = "shader module";
+            } else {
+                lean->pipeline = first_compute_pipeline(lean->module, key ^ kCsBuffersTag, name, lean->meta.spirv, lean->standin,
+                                                        name + " (buffers pushed)", g.cs_buffers_layout);
+                if (!lean->pipeline) why = "pipeline";
+            }
+            std::vector<std::uint32_t> lift;
+            if (why.empty() || !lean->lifted || own || !hlsl_lift_of(lean->meta.spirv, lift)) break;
+            if (lean->module) vkDestroyShaderModule(g.device, lean->module, nullptr);
+            lean->module = VK_NULL_HANDLE;
+            lean->meta.spirv = std::move(lift);
+            own = true;
+            why.clear();
+        }
     }
     if (!why.empty()) {
         if (g_cs_lean_failed.fetch_add(1, std::memory_order_relaxed) < 16) {
             host_log("gpu: compute shader %s: no variant with its buffers pushed (%s); its dispatches walk the page table", name.c_str(), why.c_str());
         }
+        if (lean->module) vkDestroyShaderModule(g.device, lean->module, nullptr);
         return nullptr;
     }
     g_cs_lean_built.fetch_add(1, std::memory_order_relaxed);
+    if (lean->lifted) g_cs_lean_lifted.fetch_add(1, std::memory_order_relaxed);
     return lean;
 }
 
@@ -4295,8 +4340,10 @@ ComputePipeline& pipeline_for(const GpuDispatch& d, std::uint64_t key, const std
         note_compute_lift(name, false, pl.lift_why);
     }
     // A lifted program runs its lift (render/next); ComputeLean, the translation
-    // with its buffers pushed, is the form a translated one runs in.
-    pl.lean = pl.lifted ? nullptr : build_compute_lean(prog, d.rsrc1, d.rsrc2, d.threads, dims, sampler_modes, pl.meta, key, name);
+    // with its buffers pushed, is the form a translated one runs in, and the
+    // lift of that translation a lifted one's (BBHOST_LIFT_CS_BUFFERS) - its
+    // walking lift when a buffer does not bind.
+    pl.lean = build_compute_lean(prog, d.rsrc1, d.rsrc2, d.threads, dims, sampler_modes, pl.meta, key, name, pl.lifted);
     const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
     g.translated.fetch_add(1);
     static const char* trace_name = std::getenv("BBHOST_TRACE_DISPATCH");
@@ -4477,7 +4524,7 @@ void precompile_compute(const std::string& name, const std::vector<std::uint8_t>
             why.clear();
         }
     }
-    if (why.empty() && !e.lifted) e.lean = build_compute_lean(prog, rsrc1, rsrc2, threads, dims, modes, e.meta, key, name);  // as in pipeline_for
+    if (why.empty()) e.lean = build_compute_lean(prog, rsrc1, rsrc2, threads, dims, modes, e.meta, key, name, e.lifted);  // as in pipeline_for
     e.us = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count());
     e.done = true;
     e.failed = !why.empty();
@@ -4533,9 +4580,11 @@ void compute_compiling_report() {
 
 void compute_precompile_report() {
     if (cs_buffers_on()) {
-        host_log("gpu: compute shaders with their buffers pushed (BBHOST_CS_BUFFERS): %llu built, %llu with none to push, %llu not built; "
-                 "dispatches %llu with them, %llu walking the page table because one did not bind",
-                 static_cast<unsigned long long>(g_cs_lean_built.load()), static_cast<unsigned long long>(g_cs_lean_none.load()),
+        host_log("gpu: compute shaders with their buffers pushed (BBHOST_CS_BUFFERS): %llu built (%llu of them lifts, BBHOST_LIFT_CS_BUFFERS; "
+                 "%llu lifts refused), %llu with none to push, %llu not built; dispatches %llu with them, %llu walking the page table because "
+                 "one did not bind",
+                 static_cast<unsigned long long>(g_cs_lean_built.load()), static_cast<unsigned long long>(g_cs_lean_lifted.load()),
+                 static_cast<unsigned long long>(g_cs_lean_lift_refused.load()), static_cast<unsigned long long>(g_cs_lean_none.load()),
                  static_cast<unsigned long long>(g_cs_lean_failed.load()), static_cast<unsigned long long>(g_cs_lean_dispatches.load()),
                  static_cast<unsigned long long>(g_cs_lean_fallbacks.load()));
     }

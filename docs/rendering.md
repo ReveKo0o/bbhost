@@ -115,10 +115,15 @@ from `v_mbcnt`) becomes one atomic add per invocation, so no compute lift
 needs subgroup operations. A barrier is accepted only where every invocation
 of the workgroup provably reaches it, and LDS, which no game compute shader
 uses, is refused. `BBHOST_LIFT_COMPUTE=0` keeps every compute shader
-translated. A translated compute shader reads its constant buffers, tables
-and typed loads through storage buffers its dispatch pushes, where every one
-of them binds, rather than through the page-table walk
-(`BBHOST_CS_BUFFERS=0`: the walk).
+translated. A compute shader reads its constant buffers, tables and typed
+loads through storage buffers its dispatch pushes, where every one of them
+binds, rather than through the page-table walk (`BBHOST_CS_BUFFERS=0`: the
+walk): a translated one as that variant of its translation, a lifted one as
+the lift of that translation, which reads what the translation binds from the
+same buffers and walks what it walks (`BBHOST_LIFT_CS_BUFFERS=0`: a lifted
+shader walks). `tools/lift_verify.py --stage cs --lean` replays dispatch
+captures in that form, both the translation and its lift against the walking
+translation, with their buffers bound from the captured pages.
 
 **Textures and memory.** The game's memory is shared with the GPU, as on the
 PS4: its GPU-visible parts (about 5 GB) are imported into Vulkan, because

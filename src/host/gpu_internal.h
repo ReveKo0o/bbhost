@@ -155,6 +155,7 @@ struct ComputeLean {
     VkPipeline pipeline = VK_NULL_HANDLE;
     bool standin = false;  // unoptimized, the optimized one queued (ComputePipeline::standin)
     std::uint64_t opt_seen = 0;
+    bool lifted = false;  // a lifted program's: the lift of the lean translation (gpu.cpp build_compute_lean)
 };
 
 struct ComputePipeline {
