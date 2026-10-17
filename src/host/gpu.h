@@ -614,6 +614,21 @@ void host_gpu_world_reached();
 // queued or running on the precompile workers; 0 otherwise (the window's
 // notice, host/window.cpp).
 std::size_t host_gpu_shader_backlog();
+// The setup window's "Compile shaders now" (host/shader_compile.h): a run
+// with no game that starts the device and compiles every shader the game's
+// bundles hold and the manifests name - translations, lifts, DXC's modules
+// and the driver's pipelines - into the caches, on the same workers the game
+// uses. Set before host_gpu_init.
+void host_gpu_set_compile_session(bool on);
+struct HostShaderCompileProgress {
+    std::uint64_t total = 0, done = 0, failed = 0;
+    bool listed = false, finished = false;
+    std::string reasons;  // one "why xN" a line
+};
+HostShaderCompileProgress host_gpu_compile_progress();
+void host_gpu_compile_cancel();
+// The device in use: "vendor:device:driver:pipelineCacheUUID name".
+std::string host_gpu_device_identity();
 std::string host_gpu_memory_budget_report();
 // Serialises queue use between the presenter and the executor.
 void host_gpu_lock();

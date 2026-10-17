@@ -5965,6 +5965,7 @@ void sweep_limit_update();
 // host_gpu_world_reached).
 std::atomic<bool> g_precompile_boost{true};
 std::atomic<Precompiler*> g_precompiler{nullptr};
+std::atomic<std::uint64_t> g_precompile_jobs_done{0};  // the compile session's progress
 const auto g_process_start = std::chrono::steady_clock::now();
 Precompiler& precompiler() {
     static Precompiler* const p = [] {
@@ -6056,6 +6057,7 @@ Precompiler& precompiler() {
                     } else {
                         precompile_ps(*w, job);
                     }
+                    g_precompile_jobs_done.fetch_add(1, std::memory_order_relaxed);
                     std::lock_guard<std::mutex> lk(w->mu);
                     if (--w->running[job.name] == 0) w->running.erase(job.name);
                     ++w->burst_jobs;
@@ -6990,6 +6992,7 @@ struct Sweeper {
 };
 Sweeper g_sweeper;
 std::atomic<bool> g_sweep_on{false};
+std::atomic<bool> g_sweep_cancel{false};  // compile_session_cancel
 int sweep_limit_now() {
     Precompiler* w = g_precompiler.load();
     const int boot = w ? w->boot : 1;
@@ -7016,10 +7019,14 @@ std::string sweep_stamp() {
 }
 void sweep_thread(int index) {
     host_thread_set_name("bb-sweep");
-    host_thread_background();
+    // The compile session (host_gpu_set_compile_session) is what the player
+    // asked for and waits on: its threads run at the normal priority, and what
+    // it compiles is the cache's whole purpose, so it is not bounded.
+    const bool session = g_compile_session.load();
+    if (!session) host_thread_background();
     t_pipeline_worker = true;
     hlsl_lane(kHlslLaneLater);
-    translation_cache_bounded(true);
+    translation_cache_bounded(!session);
     if (index == 0) {
         // The list, made here rather than at the device's start: reading the
         // bundles takes a moment.
@@ -7027,11 +7034,15 @@ void sweep_thread(int index) {
         // compiles them before a draw - then the bundles' (GX creates the
         // game's at the start, and compiles them then: what is left of them
         // is the debug bundle's).
-        const std::vector<BundleShader> own = eboot_shaders(g_sweeper.eboot_path);
-        const std::vector<BundleShader>& all = shader_bundles_list();
+        // The compile session takes the bundles the game creates its shaders
+        // from (not the debug menu's), and the eboot's own only through the
+        // manifests (what a draw has used): of its ~5,400 a tour draws ~80.
+        const std::vector<BundleShader> own = session ? std::vector<BundleShader>{} : eboot_shaders(g_sweeper.eboot_path);
+        std::vector<BundleShader> all = shader_bundles_list();
+        if (session) all.erase(std::remove_if(all.begin(), all.end(), [](const BundleShader& b) { return b.debug; }), all.end());
         std::deque<PrecompileJob> jobs;
         std::unordered_set<std::string> listed;
-        for (const std::vector<BundleShader>* set : {&own, &all}) {
+        for (const std::vector<BundleShader>* set : {&own, static_cast<const std::vector<BundleShader>*>(&all)}) {
             for (const int type : {4, 2, 1}) {  // compute first (few, slow to compile), then pixel, then vertex
                 for (const BundleShader& b : *set) {
                     if (b.type != type || !listed.insert(b.name).second) continue;
@@ -7121,9 +7132,12 @@ void shader_sweep_start(const std::string& stamp_path, const std::string& eboot_
     // room for few draws. The pipeline and stage manifests cover what a draw
     // needed, from the second start on.
     const char* e = std::getenv("BBHOST_SHADER_SWEEP");
-    if (!(e && (e[0] == '1' || e[0] == '2'))) return;
-    const bool force = e[0] == '2';
-    if (!precompile_enabled() || !use_pipeline_library() || stamp_path.empty()) {
+    const bool session = g_compile_session.load();
+    if (!session && !(e && (e[0] == '1' || e[0] == '2'))) return;
+    const bool force = session || e[0] == '2';
+    // Without pipeline libraries the compile session still makes every stage:
+    // translations, lifts and DXC's modules, for the caches.
+    if (!precompile_enabled() || (!use_pipeline_library() && !session) || stamp_path.empty()) {
         if (force) host_log("render: shader sweep: not without pipeline libraries and the shader caches");
         return;
     }
@@ -7156,6 +7170,40 @@ void note_sweep_hit(std::uint64_t key) {
     if (g_sweep_stats.keys.count(key)) g_sweep_stats.draw_hits.fetch_add(1, std::memory_order_relaxed);
 }
 }  // namespace
+
+// The compile session's progress (host_gpu_compile_progress): the sweep's
+// shaders and the precompile workers' jobs (the manifests' stages and
+// pipelines, run before the sweep's), done and in all.
+void compile_session_progress(std::uint64_t& total, std::uint64_t& done, std::uint64_t& failed, bool& listed, bool& finished,
+                              std::string& reasons) {
+    const std::uint64_t pre_done = g_precompile_jobs_done.load();
+    const std::uint64_t pre_left = precompile_backlog();
+    std::uint64_t sweep_total = 0, sweep_left = 0;
+    bool sweep_finished = false;
+    {
+        std::lock_guard<std::mutex> lk(g_sweeper.mu);
+        listed = g_sweeper.listed;
+        sweep_total = g_sweeper.total;
+        sweep_left = g_sweeper.jobs.size() + static_cast<std::size_t>(g_sweeper.running);
+        sweep_finished = g_sweeper.listed && sweep_left == 0;
+    }
+    total = sweep_total + pre_done + pre_left;
+    // What the sweep finished (a cancel drops the rest without doing it).
+    const std::uint64_t sweep_did = g_sweep_stats.done.load() + g_sweep_stats.skipped.load() + g_sweep_stats.failed.load();
+    done = std::min(sweep_did, sweep_total) + pre_done;
+    (void)sweep_left;
+    failed = g_sweep_stats.failed.load();
+    finished = (sweep_finished || !g_sweep_on.load()) && pre_left == 0;
+    std::lock_guard<std::mutex> lk(g_sweep_stats.mu);
+    for (const auto& [why, n] : g_sweep_stats.fail_reasons) reasons += why + " x" + std::to_string(n) + "\n";
+}
+// Cancel: what the sweep has not begun is dropped; what runs ends.
+void compile_session_cancel() {
+    g_sweep_cancel.store(true);
+    std::lock_guard<std::mutex> lk(g_sweeper.mu);
+    g_sweeper.jobs.clear();
+    g_sweeper.cv.notify_all();
+}
 
 // What the sweep has left, while the title or a loading screen is up (the
 // "Building shaders" line); 0 in game, where it goes on on one thread.

@@ -20,6 +20,7 @@ struct BundleShader {
     std::string name;  // "%08x", the footer's hash
     int type = 0;      // Shdr type: 1 vertex, 2 pixel, 4 compute (others are listed too)
     std::shared_ptr<const std::vector<std::uint8_t>> container;
+    bool debug = false;  // from the debug menu's bundle
 };
 
 // Reads the bundles once, on the first call (the others wait for it); false

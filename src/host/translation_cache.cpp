@@ -818,6 +818,10 @@ std::atomic<int> g_hlsl_setting{-1};
 }  // namespace
 
 void hlsl_set_setting(bool hlsl) { g_hlsl_setting.store(hlsl ? 2 : 0); }
+namespace {
+std::atomic<bool> g_hlsl_inline{false};
+}  // namespace
+void hlsl_set_inline(bool on) { g_hlsl_inline.store(on); }
 
 int hlsl_mode() {
     // Decided once, at the first lift: BBHOST_HLSL wins (0 lift only, 1 compile
@@ -1121,7 +1125,7 @@ void hlsl_stage(gcn::LiftResult& l, const Key* lift_key, const gcn::TranslateOpt
         g_hlsl.cached.fetch_add(1, std::memory_order_relaxed);
         // BBHOST_HLSL_DUMP: the source of a module the cache had, too.
         if (!spirv.empty() && hlsl_dump_dir()) hlsl_dump(l.spirv, gcn::emit_hlsl(l.spirv, hopt));
-    } else if (hlsl_mode() == 2) {
+    } else if (hlsl_mode() == 2 && !g_hlsl_inline.load(std::memory_order_relaxed)) {
         // Behind the game: never compiled on the thread that needs the stage.
         // Before the cache is loaded (or with it off) there is nowhere to keep
         // the module for the next start, so the lift's is all there is.
@@ -1151,6 +1155,13 @@ void hlsl_stage(gcn::LiftResult& l, const Key* lift_key, const gcn::TranslateOpt
 }
 }  // namespace
 
+void hlsl_counts(std::uint64_t& taken, std::uint64_t& compiled, std::uint64_t& kept, std::string& reasons) {
+    taken = g_hlsl.taken.load();
+    compiled = g_hlsl.compiled.load();
+    kept = g_hlsl.kept.load();
+    std::lock_guard<std::mutex> lk(g_hlsl.mu);
+    for (const auto& [why, n] : g_hlsl.reasons) reasons += why + " x" + std::to_string(n) + "\n";
+}
 void hlsl_lane(int lane) { t_hlsl_lane = lane; }
 int hlsl_lane_now() { return t_hlsl_lane; }
 void hlsl_set_busy_probe(bool (*busy)()) { g_hlsl_busy.store(busy); }

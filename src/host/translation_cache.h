@@ -84,6 +84,12 @@ int hlsl_mode();
 // The Shaders setting, read before the first lift: HLSL (true) or the lift
 // alone. BBHOST_HLSL wins over it.
 void hlsl_set_setting(bool hlsl);
+// The compile session (host_gpu_set_compile_session): the missing modules are
+// compiled where the stage is made, at once, not behind the game.
+void hlsl_set_inline(bool on);
+// For the session's report: stages that took DXC's module, compiled now, and
+// kept the lift, with the reasons ("why xN" a line).
+void hlsl_counts(std::uint64_t& taken, std::uint64_t& compiled, std::uint64_t& kept, std::string& reasons);
 // The calling thread's lane for the modules it meets (bb-hlsl takes the
 // lowest first; within one, in the order met): a draw's (the default), the
 // manifests' replays of what earlier starts drew, GX's creation of every

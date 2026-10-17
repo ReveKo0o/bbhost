@@ -87,4 +87,8 @@ std::string host_gpu_memory_budget_report() { return {}; }
 void host_gpu_set_loading(bool) {}
 void host_gpu_world_reached() {}
 std::size_t host_gpu_shader_backlog() { return 0; }
+void host_gpu_set_compile_session(bool) {}
+HostShaderCompileProgress host_gpu_compile_progress() { return {}; }
+void host_gpu_compile_cancel() {}
+std::string host_gpu_device_identity() { return {}; }
 int host_gpu_stream_selftest(int) { return 2; }  // no Vulkan: nothing to test

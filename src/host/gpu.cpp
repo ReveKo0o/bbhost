@@ -7668,6 +7668,27 @@ void host_gpu_set_loading(bool loading) {
 }
 
 void host_gpu_world_reached() { gpu::precompile_set_world_reached(); }
+void host_gpu_set_compile_session(bool on) {
+    gpu::g_compile_session.store(on);
+    gpu::hlsl_set_inline(on);
+}
+HostShaderCompileProgress host_gpu_compile_progress() {
+    HostShaderCompileProgress p;
+    gpu::compile_session_progress(p.total, p.done, p.failed, p.listed, p.finished, p.reasons);
+    return p;
+}
+void host_gpu_compile_cancel() { gpu::compile_session_cancel(); }
+std::string host_gpu_device_identity() {
+    using namespace gpu;
+    if (!g.phys) return {};
+    VkPhysicalDeviceProperties props{};
+    vkGetPhysicalDeviceProperties(g.phys, &props);
+    char uuid[2 * VK_UUID_SIZE + 1] = {};
+    for (std::uint32_t k = 0; k < VK_UUID_SIZE; ++k) std::snprintf(uuid + 2 * k, 3, "%02x", props.pipelineCacheUUID[k]);
+    char buf[384];
+    std::snprintf(buf, sizeof(buf), "%08x:%08x:%08x:%s %s", props.vendorID, props.deviceID, props.driverVersion, uuid, props.deviceName);
+    return buf;
+}
 std::size_t host_gpu_shader_backlog() {
     return (gpu::translation_cache_cold() ? gpu::precompile_backlog() : 0) + gpu::shader_sweep_left();
 }

@@ -63,6 +63,7 @@ void read_bundles() {
             BundleShader s;
             s.name = name;
             s.type = shader_container_type(e.data.data(), e.data.size());
+            s.debug = std::strstr(b, "debug") != nullptr;
             s.container = std::make_shared<const std::vector<std::uint8_t>>(std::move(e.data));
             g_bundles.by_name.emplace(name, g_bundles.list.size());
             g_bundles.list.push_back(std::move(s));

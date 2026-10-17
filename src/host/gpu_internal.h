@@ -617,6 +617,12 @@ std::string pipeline_manifest_path();
 // into the caches at the first start for this translator and device, the
 // stamp at `stamp_path` (<data root>/bbhost/shader-sweep.txt) saying it ran.
 void shader_sweep_start(const std::string& stamp_path, const std::string& eboot_path);
+// The compile session (host_gpu_set_compile_session): set before the device
+// starts; the sweep then takes the bundles' shaders at once, in full.
+inline std::atomic<bool> g_compile_session{false};
+void compile_session_progress(std::uint64_t& total, std::uint64_t& done, std::uint64_t& failed, bool& listed, bool& finished,
+                              std::string& reasons);
+void compile_session_cancel();
 // What it has left while the title or a loading screen is up (else 0).
 std::size_t shader_sweep_left();
 // render.cpp: the precompile workers run on half the hardware threads until

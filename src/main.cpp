@@ -25,6 +25,7 @@
 #include "host/updater.h"
 #if defined(BBHOST_HAVE_SDL3)
 #include "host/launcher.h"
+#include "host/shader_compile.h"
 #include "host/plugin_ui.h"
 #endif
 #include "host/settings.h"
@@ -912,6 +913,14 @@ int main(int argc, char** argv) {
             std::_Exit(rc);  // the recorder and submission threads run on: no static destructors under them
         }
     }
+#if defined(BBHOST_HAVE_SDL3)
+    // The setup window's "Compile shaders now" starts bbhost again with
+    // --compile-shaders (host/shader_compile.h): no window, no game.
+    const bool compile_session = shader_compile_take_flag(argc, argv);
+    shader_compile_set_args(argc, argv);
+#else
+    const bool compile_session = false;
+#endif
     HostConfig cfg;
     std::string err;
     if (!config_load(argc, argv, &cfg, &err)) {
@@ -932,7 +941,7 @@ int main(int argc, char** argv) {
         // seen yet (or plugins.show_settings): it opens on the Plugins tab.
         const std::string help = config_setup_help(cfg);
         const bool plugins_tab = !cfg.headless && help.empty() && !cfg.setup_requested && plugin_ui_wants_attention();
-        if (!cfg.headless && (cfg.setup_requested || cfg.setup_always || !help.empty() || plugins_tab)) {
+        if (!compile_session && !cfg.headless && (cfg.setup_requested || cfg.setup_always || !help.empty() || plugins_tab)) {
             std::string reason = help.substr(0, help.find('\n'));
             if (reason.rfind("bbhost: ", 0) == 0) reason = reason.substr(8);
             if (launcher_run(cfg, reason, plugins_tab) == LauncherResult::Quit) return help.empty() ? 0 : 2;
@@ -956,7 +965,7 @@ int main(int argc, char** argv) {
     // Updates (host/updater.h): an older build's update leftover removed, a
     // release build's check begun on a thread of its own (not in a headless
     // run, nor when the setup window has checked).
-    updater::start();
+    if (!compile_session) updater::start();
     const char* eboot = cfg.eboot.c_str();
     // Text entry defaults to typing in the window (the PC equivalent of the
     // PS4 on-screen keyboard); player.ime = "auto" answers with player.name
@@ -1007,6 +1016,13 @@ int main(int argc, char** argv) {
     hle_fs_set_roots(cfg.app0.c_str(), cfg.data.empty() ? nullptr : cfg.data.c_str(),
                      cfg.tmp.empty() ? nullptr : cfg.tmp.c_str(), eboot,
                      cfg.mods.empty() ? nullptr : cfg.mods.c_str());
+#if defined(BBHOST_HAVE_SDL3)
+    if (compile_session) {
+        const int rc = shader_compile_session();
+        std::fflush(nullptr);
+        std::_Exit(rc);  // the GPU's threads run on: no static destructors under them
+    }
+#endif
     plugins_load();  // before the HLE table is bound: a plugin may replace an import
     if (host_settings().debug_camera && plugins_active("debug_menu"))
         host_log("debug camera: on with the debug menu - its LOAD TEST and DUNGEON MOVEMAP TEST crash the game "
