@@ -845,6 +845,11 @@ std::string untile_gpu_report();
 // next read copy it again, or - written by the GPU - bind it from the import.
 bool buffer_shadow_on();  // BBHOST_BUFFER_SHADOW, else on except on an integrated GPU or with tight memory
 void shadow_locate_locked(std::uint64_t va, std::uint64_t bytes, Located& loc);
+// The same without a host location first: true, `out` the mirror, when the
+// mirrors serve [va, va+bytes) whole (copying what they must); false when it
+// is read from host memory (an import). Window imports bind meshes this way,
+// so their memory needs no import (its copies come through staging).
+bool shadow_mirror_locked(std::uint64_t va, std::uint64_t bytes, Located& out);
 // A copy of [va, va+bytes) - `loc`, its import, which the mirrors keep in host
 // memory - made for one draw in device memory, in the same uploads; `loc`
 // becomes the copy. False, `loc` unchanged, for a range past 1 MiB, one the

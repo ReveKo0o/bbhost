@@ -12231,10 +12231,21 @@ bool plan_vertex_input(const std::vector<std::uint32_t>& fetch_words, std::uint6
         // In one of the draw's CPU-written windows (YEBIS, host_gpu_draw_window):
         // the copy taken as the draw records, never the ring slot, which the
         // CPU may rewrite for a draw sixteen on before this one runs.
-        bool windowed = false;
+        bool windowed = false, mirrored = false;
         if (version != kCopyVersionInside) {
             windowed = !t_draw_windows.empty() && draw_window_locked(va, need, loc);
-            if (!windowed) loc = locate(va, need);
+            if (!windowed && !imports_whole()) {
+                // Window imports: the record from the buffer shadow's mirror
+                // when it serves it whole (its pages copied through staging),
+                // so mesh data needs no import; an import only otherwise.
+                const std::uint64_t record_bytes = w[2] ? static_cast<std::uint64_t>(w[2]) * stride : fe.offset + bytes;
+                Located m;
+                if (record_bytes >= fe.offset + bytes && shadow_mirror_locked(va - fe.offset, record_bytes, m)) {
+                    loc = {m.buffer, m.offset + fe.offset, m.avail - fe.offset};
+                    mirrored = true;
+                }
+            }
+            if (!windowed && !mirrored) loc = locate(va, need);
         }
         if (g_import_audit) audit_range(va, need, kUseMirror);
         if (!loc.buffer || loc.avail < need) {
@@ -12279,7 +12290,9 @@ bool plan_vertex_input(const std::vector<std::uint32_t>& fetch_words, std::uint6
                 return read_bytes_memo;
             };
             bool in_place = false;
-            if (windowed) {
+            if (mirrored) {
+                ns.whole = {loc.buffer, loc.offset - fe.offset, record_bytes};  // the mirror already (window imports)
+            } else if (windowed) {
                 bump(g_vertex_window_records);
             } else if (loc.offset >= fe.offset && loc.avail + fe.offset >= record_bytes) {
                 ns.whole = {loc.buffer, loc.offset - fe.offset, record_bytes};
@@ -18180,7 +18193,8 @@ static bool draw_impl(const GpuDraw& d) {
         const std::uint64_t index_bytes = static_cast<std::uint64_t>(d.index_count) * (d.index_type == 1 ? 4 : 2);
         Located loc;
         const int version = copy_version_lookup_locked(d.index_va, index_bytes, &loc);  // a straddle ended the pass above
-        if (version != kCopyVersionInside) {
+        // (Window imports: the mirror first, so the indices need no import.)
+        if (version != kCopyVersionInside && (imports_whole() || d.indirect_va || !shadow_mirror_locked(d.index_va, index_bytes, loc))) {
             loc = locate(d.index_va, index_bytes);
             if (!d.indirect_va) shadow_locate_locked(d.index_va, index_bytes, loc);
         }

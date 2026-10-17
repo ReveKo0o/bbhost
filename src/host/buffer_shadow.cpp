@@ -45,6 +45,7 @@
 
 #include "core/write_watch.h"
 #include "engine/gx_resources.h"
+#include "host/copy_runs.h"
 #include "host/gpu_internal.h"
 #include "log.h"
 
@@ -187,6 +188,8 @@ int g_upload_slot = -1;  // the slot whose upload buffer is recording, or -1
 std::size_t g_last_map = 0;  // g.maps index of the last hit
 
 std::atomic<std::uint64_t> g_hits{0}, g_uploads{0}, g_upload_bytes{0}, g_dynamic{0}, g_imports{0}, g_gpu_written{0};
+std::atomic<std::uint64_t> g_staged_pages{0};  // window imports: page copies taken through upload staging
+std::atomic<std::uint64_t> g_staged_pending{0};  // ... and pages left in host memory for a GPU write still to land
 std::uint64_t g_page_checks = 0, g_invalid_cp = 0, g_invalid_gpu = 0;
 std::uint64_t g_span_hist[6] = {};  // calls by pages spanned: 1, 2-4, 5-16, 17-64, 65-256, more
 
@@ -221,7 +224,11 @@ bool phys_of(std::uint64_t va, std::uint64_t bytes, std::uint32_t& chunk, std::u
     off = phys & (kChunkBytes - 1);
     if (map_lo) *map_lo = mi.va;
     if (map_hi) *map_hi = mi.va + mi.len;
-    return chunk < gcn::kDmemChunks && dmem_import(chunk, off, bytes) != nullptr;
+    if (chunk >= gcn::kDmemChunks) return false;
+    // Window imports: the mirrors' copies come from upload staging (below), so
+    // the range needs no import, only to lie in a GPU-visible span.
+    if (!imports_whole()) return off >= g.dmem[chunk].span_lo && off + bytes <= g.dmem[chunk].span_hi;
+    return dmem_import(chunk, off, bytes) != nullptr;
 }
 
 // Whether the mirrors may take another `bytes` of video memory now: within
@@ -611,17 +618,23 @@ void shadow_locate_locked(std::uint64_t va, std::uint64_t bytes, Located& loc) {
         }
         arm_run(run, p);
     }
-    // Pages to copy, as runs, from the import that holds them all.
-    const Chunk* source = dmem_import(chunk, static_cast<std::uint64_t>(p0) << kPageShift, static_cast<std::uint64_t>(p1 - p0 + 1) << kPageShift);
-    if (!source) {
+    // Pages to copy, as runs, from the import that holds them all - or, with
+    // window imports, each page copied into upload staging here (after its
+    // write watch is armed) and from there into the mirror: no import of it.
+    const bool staged = !imports_whole();
+    const Chunk* source = staged ? nullptr
+                                 : dmem_import(chunk, static_cast<std::uint64_t>(p0) << kPageShift,
+                                               static_cast<std::uint64_t>(p1 - p0 + 1) << kPageShift);
+    if (!staged && !source) {
         bump(g_imports);
         return;
     }
+    VkBuffer src_buffer = source ? source->buffer : VK_NULL_HANDLE;
     VkBufferCopy regions[16];
     std::uint32_t n_regions = 0;
     VkCommandBuffer cmd = VK_NULL_HANDLE;
     auto flush = [&] {
-        if (n_regions) vkCmdCopyBuffer(cmd, source->buffer, m->buffer, n_regions, regions);
+        if (n_regions) vkCmdCopyBuffer(cmd, src_buffer, m->buffer, n_regions, regions);
         n_regions = 0;
     };
     for (std::uint32_t p = p0; p <= p1; ++p) {
@@ -635,6 +648,18 @@ void shadow_locate_locked(std::uint64_t va, std::uint64_t bytes, Located& loc) {
         // Written by the GPU in this recording: a copy now would run before
         // that write. In a later recording the copy is ordered after it.
         if (!pg.valid && pg.gpu_written == stamp) {
+            flush();
+            bump(g_imports);
+            return;
+        }
+        // With window imports the page's copy is the CPU's, taken now: a GPU
+        // write still to land on it - an earlier submission's copy-back, fill
+        // or stores the GPU has not run yet - would be missed, and the page
+        // kept as valid with what it held before. From an import the GPU's
+        // copy runs after that write, in queue order; staged, the page stays
+        // in host memory until the write has landed.
+        if (staged && !pg.valid && gpu_writes_pending_locked(page_va, kPageBytes)) {
+            bump(g_staged_pending);
             flush();
             bump(g_imports);
             return;
@@ -679,6 +704,28 @@ void shadow_locate_locked(std::uint64_t va, std::uint64_t bytes, Located& loc) {
             pg.alias_watch = WriteWatch{};
             pg.alias_va = 0;
             return;
+        }
+        VkDeviceSize staged_at = 0;  // the page's copy in staging (window imports)
+        if (staged) {
+            DevBuffer sb;
+            if (!acquire_staging_locked(sb, kPageBytes, staged_at)) {
+                pg.watch = WriteWatch{};
+                pg.alias_watch = WriteWatch{};
+                pg.alias_va = 0;
+                if (pg.window_uploads) --pg.window_uploads;
+                flush();
+                bump(g_imports);
+                return;
+            }
+            std::memcpy(sb.map,  // the placement's own map (staged_at is its offset in the buffer, for the copy)
+                        static_cast<const std::uint8_t*>(g.mirror) + static_cast<std::uint64_t>(chunk) * kChunkBytes +
+                            (static_cast<std::uint64_t>(p) << kPageShift),
+                        kPageBytes);
+            if (sb.buffer != src_buffer) {
+                flush();
+                src_buffer = sb.buffer;
+            }
+            bump(g_staged_pages);
         }
         pg.va = lo;
         pg.bytes = hi - lo;
@@ -737,10 +784,15 @@ void shadow_locate_locked(std::uint64_t va, std::uint64_t bytes, Located& loc) {
             m->resident[p >> 6] |= 1ull << (p & 63);
             ++m->resident_pages;
         }
-        // The source is that import, which starts at the chunk's byte lo.
-        const VkDeviceSize src = at - source->lo;
-        if (n_regions && regions[n_regions - 1].srcOffset + regions[n_regions - 1].size == src) {
-            regions[n_regions - 1].size += kPageBytes;
+        // The source is that import, which starts at the chunk's byte lo, or
+        // the page's copy in staging. A run grows only where both ends meet
+        // (copy_runs.h): the staged copies follow one another in staging
+        // across the valid pages skipped between them, and grown on the
+        // source alone a page's copy landed on the page after the last one
+        // copied - a valid page overwritten, its own left as it was: the
+        // Dream's meshes drew from the wrong bytes.
+        const VkDeviceSize src = staged ? staged_at : at - source->lo;
+        if (n_regions && copy_run_extends(regions[n_regions - 1], src, at, kPageBytes)) {
         } else {
             if (n_regions == 16) flush();
             regions[n_regions++] = {src, at, kPageBytes};
@@ -762,6 +814,17 @@ void shadow_locate_locked(std::uint64_t va, std::uint64_t bytes, Located& loc) {
 // next one, so `valid + checked-this-recording + written` is a page whose
 // mirror the GPU will read stale. Pure: `write_watch_dirty` only memoises a
 // clean answer, and a written watch stays written until it is armed again.
+bool shadow_mirror_locked(std::uint64_t va, std::uint64_t bytes, Located& out) {
+    if (!buffer_shadow_on() || !bytes || !g.sink.buffer) return false;
+    // A stand-in host location: shadow_locate_locked replaces it with the
+    // mirror when the mirror serves the range, and leaves it otherwise.
+    Located probe{g.sink.buffer, 0, bytes};
+    shadow_locate_locked(va, bytes, probe);
+    if (probe.buffer == g.sink.buffer) return false;
+    out = probe;
+    return true;
+}
+
 bool shadow_stage_locked(std::uint64_t va, std::uint64_t bytes, Located& loc) {
     if (!buffer_shadow_on() || !bytes || !loc.buffer || loc.avail < bytes) return false;
     if (bytes > kStageMaxBytes) {
@@ -1479,6 +1542,12 @@ std::string shadow_report() {
         char v[96];
         std::snprintf(v, sizeof(v), "; verified %llu, stale %llu", static_cast<unsigned long long>(g_verify_checked),
                       static_cast<unsigned long long>(g_verify_stale));
+        std::strncat(buf, v, sizeof(buf) - std::strlen(buf) - 1);
+    }
+    if (const std::uint64_t staged = g_staged_pages.load()) {
+        char v[160];
+        std::snprintf(v, sizeof(v), "; %llu page copies through staging (window imports), %llu pages waiting for a GPU write",
+                      static_cast<unsigned long long>(staged), static_cast<unsigned long long>(g_staged_pending.load()));
         std::strncat(buf, v, sizeof(buf) - std::strlen(buf) - 1);
     }
     char h[160];
