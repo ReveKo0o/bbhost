@@ -118,16 +118,19 @@ int shader_compile_session() {
     }
     const std::string device = host_gpu_device_identity();
     say("device " + device);
-    // "cancel" on stdin, or stdin closing (the setup window gone), ends it
-    // early: what has not begun is dropped, what has is written.
+    // "cancel" on stdin ends it early: what has not begun is dropped, what
+    // has is written. Stdin closing does not (a run from a script with no
+    // input goes to its end; the setup window sends "cancel" when it closes).
     static std::atomic<bool> cancelled{false};
     std::thread([] {
         std::string line;
         while (std::getline(std::cin, line)) {
-            if (line.rfind("cancel", 0) == 0) break;
+            if (line.rfind("cancel", 0) == 0) {
+                cancelled.store(true);
+                host_gpu_compile_cancel();
+                return;
+            }
         }
-        cancelled.store(true);
-        host_gpu_compile_cancel();
     }).detach();
     const auto t0 = std::chrono::steady_clock::now();
     const auto seconds = [&] { return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(); };

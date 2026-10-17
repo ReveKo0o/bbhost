@@ -7060,6 +7060,7 @@ void sweep_thread(int index) {
                  "compile into the caches", static_cast<std::size_t>(g_sweep_stats.eboot.load()), shader_bundles_summary().c_str(), jobs.size());
         {
             std::lock_guard<std::mutex> lk(g_sweeper.mu);
+            if (g_sweep_cancel.load()) jobs.clear();  // cancelled before the list was made
             g_sweeper.total = jobs.size();
             g_sweeper.jobs = std::move(jobs);
             g_sweeper.listed = true;
