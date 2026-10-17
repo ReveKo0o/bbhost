@@ -169,6 +169,15 @@ std::atomic<std::uint64_t> g_destroyed{0}, g_destroyed_unknown{0}, g_replaced_ho
 std::atomic<std::uint64_t> g_released_under_holder{0}, g_release_events{0}, g_protected{0}, g_protect_events{0};
 std::atomic<std::uint64_t> g_maps[5][5] = {};  // [resource type][map type]
 std::atomic<std::uint64_t> g_map_unknown{0}, g_map_moved{0};
+// Where a buffer's Map that succeeded hands the CPU its writes, by map type:
+// [0] the buffer's own memory, [1] another live GX buffer's, [2] a live GX
+// texture's, [3] no live resource's; and the maps that failed.
+std::atomic<std::uint64_t> g_map_where[5][4] = {}, g_map_failed[5] = {};
+std::atomic<int> g_map_where_logged{0};
+// BBHOST_RESOURCE_CENSUS=1: the ring allocator is hooked too, and what it
+// hands out told to the buffer shadow's census (host_gpu_shadow_gx_handed).
+bool g_census = false;
+std::atomic<std::uint64_t> g_ring_calls{0}, g_ring_bytes{0}, g_pool_calls{0}, g_pool_bytes{0};
 std::atomic<std::uint64_t> g_lookups{0}, g_lookup_hits{0};
 std::atomic<std::uint64_t> g_peak_live{0};
 // New resources made over part of a live one's memory: [old type][new type].
@@ -538,7 +547,33 @@ void note_map(std::uint64_t holder, std::uint64_t type, std::uint64_t mapped_out
             texture_memory = e.info.memory;
             texture_bytes = e.info.bytes;
         }
-        if (e.info.type == 1) buffer_bytes = e.info.bytes;
+        if (e.info.type == 1) {
+            buffer_bytes = e.info.bytes;
+            if (result != 0 || !mapped) {
+                g_map_failed[mt].fetch_add(1, std::memory_order_relaxed);
+            } else {
+                unsigned where = 3;
+                std::uint32_t other_bytes = 0;
+                std::uint8_t other_bind = 0;
+                if (mapped >= e.info.memory && mapped < e.info.memory + e.info.bytes) {
+                    where = 0;
+                } else if (auto c = g_by_memory.upper_bound(mapped); c != g_by_memory.begin()) {
+                    --c;
+                    if (auto h = g_by_holder.find(c->second); h != g_by_holder.end() && h->second.info.alive &&
+                                                              mapped < h->second.info.memory + h->second.info.bytes) {
+                        where = h->second.info.type == 1 ? 1 : 2;
+                        other_bytes = h->second.info.bytes;
+                        other_bind = h->second.info.bind;
+                    }
+                }
+                g_map_where[mt][where].fetch_add(1, std::memory_order_relaxed);
+                if (where != 3 && g_map_where_logged.fetch_add(1, std::memory_order_relaxed) < 6) {
+                    host_log("gx-resources: a map (type %u) of a %u-byte buffer at 0x%llx hands out 0x%llx, in %s (%u bytes, bind 0x%x)",
+                             mt, e.info.bytes, static_cast<unsigned long long>(e.info.memory), static_cast<unsigned long long>(mapped),
+                             where == 0 ? "its own memory" : where == 1 ? "another live buffer" : "a live texture", other_bytes, other_bind);
+                }
+            }
+        }
     }
     // A buffer mapped: the CPU writes the range the caller got next - a
     // renamed copy, which GX copies back to the buffer's own memory on the
@@ -625,7 +660,7 @@ GUEST_ABI std::int64_t pool_hook(std::uint64_t, const std::uint64_t* saved) {
     return 0;
 }
 
-// The ring allocator (trace only): rsi = out*, rcx = bytes.
+// The ring allocator (trace and census only): rsi = out*, rcx = bytes.
 GUEST_ABI std::int64_t ring_hook(std::uint64_t, const std::uint64_t* saved) {
     Pending p{saved[6], kMapCall, saved[4], 0, 0};
     p.ring = true;
@@ -745,11 +780,24 @@ extern "C" GUEST_ABI std::uint64_t gx_res_after(std::uint64_t result) {
                      static_cast<std::uint32_t>(result));
     }
     if (p.kind == kMapCall) {
-        if (!p.ring) note_map(p.holder, p.type, p.out, static_cast<std::uint32_t>(result));
+        if (!p.ring) {
+            note_map(p.holder, p.type, p.out, static_cast<std::uint32_t>(result));
+        } else if (g_census) {
+            std::uint64_t ptr = 0;
+            if (p.out && rd(p.out, &ptr) && ptr && p.ring_bytes) {
+                g_ring_calls.fetch_add(1, std::memory_order_relaxed);
+                g_ring_bytes.fetch_add(p.ring_bytes, std::memory_order_relaxed);
+                host_gpu_shadow_gx_handed(ptr, p.ring_bytes, 2);
+            }
+        }
         if (g_trace) trace_map(p);
     } else if (p.kind == kPoolCall) {
         std::uint64_t block = 0;
-        if (result && p.type && rd(result + 8, &block) && block) host_gpu_shadow_gx_handed(block, p.type, 1);
+        if (result && p.type && rd(result + 8, &block) && block) {
+            g_pool_calls.fetch_add(1, std::memory_order_relaxed);
+            g_pool_bytes.fetch_add(p.type, std::memory_order_relaxed);
+            host_gpu_shadow_gx_handed(block, p.type, 1);
+        }
     } else if (p.kind == kObject) {
         std::uint64_t object = 0;
         if (p.out && rd(p.out, &object) && object) {
@@ -884,14 +932,18 @@ void gx_resources_install(ElfImage* image) {
     if (g_tex_ahead) hook(kTsharpBuild1D, kTsharpBuildPrologue, sizeof(kTsharpBuildPrologue), reinterpret_cast<void*>(&tsharp_hook), 0);
     dtor1d(kTex1dDelete);
     dtor1d(kTex1dDestroy);
-    if (g_trace) hook(kRing, kRingPrologue, sizeof(kRingPrologue), reinterpret_cast<void*>(&ring_hook), 0);
+    g_census = [] {
+        const char* e = std::getenv("BBHOST_RESOURCE_CENSUS");
+        return e && e[0] == '1';
+    }();
+    if (g_trace || g_census) hook(kRing, kRingPrologue, sizeof(kRingPrologue), reinterpret_cast<void*>(&ring_hook), 0);
     // The pool's blocks are memory the buffer shadow binds from host memory
     // (it is rewritten every frame or so) unless BBHOST_SHADOW_GX=0.
     const bool shadow_gx = [] {
         const char* e = std::getenv("BBHOST_SHADOW_GX");
         return !(e && e[0] == '0');
     }();
-    if (shadow_gx) hook(kPoolBlock, kPoolBlockPrologue, sizeof(kPoolBlockPrologue), reinterpret_cast<void*>(&pool_hook), 0);
+    if (g_census || shadow_gx) hook(kPoolBlock, kPoolBlockPrologue, sizeof(kPoolBlockPrologue), reinterpret_cast<void*>(&pool_hook), 0);
     hook(kCreateInputLayout, kInputLayoutPrologue, sizeof(kInputLayoutPrologue), reinterpret_cast<void*>(&object_create_hook), 0);
     hook(kCreateRtv, kPrologue58, sizeof(kPrologue58), reinterpret_cast<void*>(&view_create_hook), 1);
     hook(kCreateDsv, kDsvPrologue, sizeof(kDsvPrologue), reinterpret_cast<void*>(&view_create_hook), 2);
@@ -1187,6 +1239,22 @@ void gx_resources_report() {
     host_log("gx-resources: Map by resource and type%s unknown holders %llu, memory moved by a map %llu; lookups %llu (%llu hits)",
              maps.empty() ? " none;" : maps.c_str(), static_cast<ull>(g_map_unknown.load()), static_cast<ull>(g_map_moved.load()),
              static_cast<ull>(g_lookups.load()), static_cast<ull>(g_lookup_hits.load()));
+    {
+        std::string where;
+        for (unsigned m = 0; m < 5; ++m) {
+            ull w[4], sum = g_map_failed[m].load();
+            for (unsigned k = 0; k < 4; ++k) sum += w[k] = g_map_where[m][k].load();
+            if (!sum) continue;
+            char buf[200];
+            std::snprintf(buf, sizeof(buf), " type %u: its own memory %llu, another buffer's %llu, a texture's %llu, no resource's %llu, failed %llu;",
+                          m, w[0], w[1], w[2], w[3], static_cast<ull>(g_map_failed[m].load()));
+            where += buf;
+        }
+        host_log("gx-resources: where a buffer's Map hands the CPU its writes:%s ring allocations seen %llu (%llu MiB), upload pool "
+                 "blocks %llu (%llu MiB)",
+                 where.empty() ? " none;" : where.c_str(), static_cast<ull>(g_ring_calls.load()), static_cast<ull>(g_ring_bytes.load() >> 20),
+                 static_cast<ull>(g_pool_calls.load()), static_cast<ull>(g_pool_bytes.load() >> 20));
+    }
     {
         std::string ov;
         for (unsigned a = 0; a < 5; ++a) {

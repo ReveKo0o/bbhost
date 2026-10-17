@@ -500,15 +500,17 @@ constexpr int kGxWrite = 0, kGxCreate = 8;  // a write; a GX resource made over 
 // What GX handed the CPU to write without a call to say when it is done
 // (host_gpu_shadow_gx_handed): a bit per 4 KiB of direct memory by physical
 // address - [kHandMap] a buffer Map's renamed copies, [kHandPool] the upload
-// pool's blocks.
-enum : unsigned { kHandMap = 0, kHandPool = 1, kHandKinds = 2 };
+// pool's blocks and, with the census, [kHandRing] ring allocations.
+enum : unsigned { kHandMap = 0, kHandPool = 1, kHandRing = 2, kHandKinds = 3 };
 constexpr std::uint64_t kHand4k = (std::uint64_t{gcn::kDmemChunks} << gcn::kDmemChunkShift) >> 12;
 std::vector<std::uint64_t> g_hand_bits[kHandKinds];  // under g.mu, made at the first hand-out
 std::uint64_t g_hand_pages[kHandKinds] = {};         // 4 KiB pages marked
+std::uint64_t g_map_in_pool = 0, g_map_in_ring = 0;  // Map hand-outs whose first page the pool / ring had handed out
 std::uint64_t g_handed_dynamic = 0;                  // mirror pages bound from host memory for a hand-out over them
 std::uint64_t g_made_over_handed = 0;                // GX resources made over memory GX had handed out
 // Whether GX handed out any of the 64 KiB page p of chunk `chunk` (the 16
-// bits of one word): a Map's copies or the pool's blocks.
+// bits of one word): a Map's copies or the pool's blocks. The ring's are the
+// census's alone, so the census does not change what it counts.
 bool page_handed(std::uint32_t chunk, std::uint32_t p) {
     const std::uint64_t i = ((std::uint64_t{chunk} << gcn::kDmemChunkShift) | (std::uint64_t{p} << kPageShift)) >> 12;
     if (i >= kHand4k) return false;
@@ -518,6 +520,10 @@ bool page_handed(std::uint32_t chunk, std::uint32_t p) {
     return false;
 }
 std::atomic<std::uint64_t> g_hand_dropped{0};  // hand-outs the full queue had no room for
+bool handed(unsigned k, std::uint64_t phys) {
+    const std::uint64_t i = phys >> 12;
+    return i < kHand4k && !g_hand_bits[k].empty() && (g_hand_bits[k][i >> 6] >> (i & 63) & 1);
+}
 std::mutex g_gx_writes_mu;
 std::vector<GxWrite> g_gx_writes;  // under g_gx_writes_mu
 std::atomic<bool> g_gx_writes_pending{false}, g_gx_writes_overflow{false};
@@ -619,6 +625,13 @@ void mark_handed_locked(const GxWrite& w) {
     const unsigned k = static_cast<unsigned>(w.kind - 1);
     if (k >= kHandKinds) return;
     if (g_hand_bits[k].empty()) g_hand_bits[k].assign(kHand4k / 64, 0);
+    if (k == kHandMap) {
+        std::uint64_t phys = 0, span = 0;
+        if (phys_at(w.va, phys, span)) {
+            g_map_in_pool += handed(kHandPool, phys);
+            g_map_in_ring += handed(kHandRing, phys);
+        }
+    }
     std::uint64_t va = w.va & ~0xfffull;
     const std::uint64_t end = w.va + w.bytes;
     while (va < end) {
@@ -638,7 +651,7 @@ void mark_handed_locked(const GxWrite& w) {
             // A page a mirror holds is bound from host memory from now on:
             // GX hands its memory out to be rewritten, and says nothing of
             // when. Watched or told, it may already hold the old contents.
-            if (!g_shadow_handed) continue;
+            if (!g_shadow_handed || k == kHandRing) continue;
             const std::uint64_t at = phys + a;
             Mirror& m = g_mirrors[at >> gcn::kDmemChunkShift];
             const std::uint32_t p = static_cast<std::uint32_t>((at & (kChunkBytes - 1)) >> kPageShift);
@@ -700,6 +713,7 @@ void drain_gx_writes_locked() {
     for (const GxWrite& w : writes) {
         if (w.kind == kGxCreate) {
             clear_handed_locked(w);
+            if (!g_shadow_gx) continue;
         } else if (w.kind != kGxWrite) {
             mark_handed_locked(w);
             continue;
@@ -752,6 +766,80 @@ void drain_gx_writes_locked() {
             va += seg;
         }
     }
+}
+
+// BBHOST_RESOURCE_CENSUS=1: the write faults on mirror pages, by what GX says
+// of the 4 KiB page each hit, and the writers behind each kind - whether GX's
+// calls could tell the mirrors of the writes the watch now catches. Taken at
+// each report from the faults since the last (the ring holds 16384).
+// A fault's class: what GX covers its 4 KiB with (buffers whole, a resource in
+// part, nothing) times what handed it out (a Map, the upload pool, the ring,
+// nothing GX said), as gx * kHandKinds+1 + handed.
+constexpr unsigned kFaultHanders = kHandKinds + 1, kFaultClasses = 3 * kFaultHanders;
+const char* const kFaultGxName[3] = {"GX buffers'", "a GX resource's in part", "no GX resource's"};
+const char* const kFaultHandName[kFaultHanders] = {"Maps hand out", "the upload pool hands out", "the ring hands out", "nothing GX hands out"};
+std::uint64_t g_fault_census_seq = 0, g_fault_census_other = 0;
+std::uint64_t g_fault_class[kFaultClasses] = {};
+std::unordered_map<std::uint64_t, std::uint64_t> g_fault_writers[kFaultClasses];
+
+void census_faults_locked() {
+    if (!g_map_census) return;
+    constexpr int kMax = 16384;
+    static std::vector<std::uint64_t> addrs(kMax), pcs(kMax);
+    static std::vector<std::uint8_t> owners(kMax);
+    std::uint64_t newest = g_fault_census_seq;
+    const int n = write_watch_faults_since(g_fault_census_seq, addrs.data(), pcs.data(), owners.data(), kMax, &newest);
+    g_fault_census_seq = newest;
+    for (int i = 0; i < n; ++i) {
+        if (!(owners[i] & kWatchOwnerMirror)) {
+            ++g_fault_census_other;
+            continue;
+        }
+        const std::uint64_t page = addrs[i] & ~0xfffull;
+        std::uint64_t phys = 0, span = 0;
+        const bool known = phys_at(page, phys, span);
+        unsigned by = kHandKinds;
+        for (unsigned k : {kHandMap, kHandPool, kHandRing}) {
+            if (known && handed(k, phys)) {
+                by = k;
+                break;
+            }
+        }
+        const unsigned gx = gx_buffers_cover(page, 0x1000) ? 0 : gx_resource_overlapping(page, 0x1000, nullptr) ? 1 : 2;
+        const unsigned c = gx * kFaultHanders + by;
+        ++g_fault_class[c];
+        auto& w = g_fault_writers[c];
+        if (w.size() < 4096 || w.count(pcs[i])) ++w[pcs[i]];
+    }
+}
+
+std::string fault_census_text() {
+    std::string out = "; write faults on mirror pages by what GX says of their 4 KiB (BBHOST_RESOURCE_CENSUS):";
+    for (unsigned c = 0; c < kFaultClasses; ++c) {
+        if (!g_fault_class[c]) continue;
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> top(g_fault_writers[c].begin(), g_fault_writers[c].end());
+        std::sort(top.begin(), top.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
+        char buf[160];
+        std::snprintf(buf, sizeof(buf), " %s memory %s %llu", kFaultGxName[c / kFaultHanders], kFaultHandName[c % kFaultHanders],
+                      static_cast<unsigned long long>(g_fault_class[c]));
+        out += buf;
+        for (std::size_t k = 0; k < top.size() && k < 4; ++k) {
+            std::snprintf(buf, sizeof(buf), "%s0x%llx x%llu", k ? ", " : " (", static_cast<unsigned long long>(top[k].first ? gx_guest_to_bn(top[k].first) : 0),
+                          static_cast<unsigned long long>(top[k].second));
+            out += buf;
+        }
+        out += top.empty() ? ";" : ");";
+    }
+    char buf[384];
+    std::snprintf(buf, sizeof(buf),
+                  " other pages' faults %llu; 4 KiB pages handed out: by Maps %llu (Maps in pool memory %llu, in ring memory %llu), by the "
+                  "upload pool %llu, by the ring %llu (GX resources made over handed-out memory %llu)",
+                  static_cast<unsigned long long>(g_fault_census_other), static_cast<unsigned long long>(g_hand_pages[kHandMap]),
+                  static_cast<unsigned long long>(g_map_in_pool), static_cast<unsigned long long>(g_map_in_ring),
+                  static_cast<unsigned long long>(g_hand_pages[kHandPool]), static_cast<unsigned long long>(g_hand_pages[kHandRing]),
+                  static_cast<unsigned long long>(g_made_over_handed));
+    out += buf;
+    return out;
 }
 
 }  // namespace
@@ -1946,6 +2034,9 @@ std::string shadow_report() {
         }
     }
     if (g_map_census) {
+        drain_gx_writes_locked();
+        census_faults_locked();
+        out += fault_census_text();
         char mc[200];
         std::snprintf(mc, sizeof(mc), "; pages the write watch found written: a GX write explains %llu, on a GX resource it does not %llu, on none %llu",
                       static_cast<unsigned long long>(g_written_by_gx.load()), static_cast<unsigned long long>(g_written_not_gx.load()),
@@ -1977,8 +2068,8 @@ void host_gpu_shadow_gx_write(std::uint64_t va, std::size_t bytes) {
 
 void host_gpu_shadow_gx_created(std::uint64_t va, std::size_t bytes) {
     using namespace gpu;
-    if (!g_shadow_gx || !va || !bytes) return;
-    g_gx_records.fetch_add(1, std::memory_order_relaxed);
+    if (!(g_shadow_gx || g_map_census) || !va || !bytes) return;
+    if (g_shadow_gx) g_gx_records.fetch_add(1, std::memory_order_relaxed);
     std::lock_guard<std::mutex> lk(g_gx_writes_mu);
     if (g_gx_writes.size() >= kGxWritesMax) {
         g_gx_writes_overflow.store(true, std::memory_order_release);
@@ -1990,10 +2081,10 @@ void host_gpu_shadow_gx_created(std::uint64_t va, std::size_t bytes) {
 
 void host_gpu_shadow_gx_handed(std::uint64_t va, std::size_t bytes, int kind) {
     using namespace gpu;
-    if (!g_shadow_gx || !va || !bytes) return;
+    if (!(g_shadow_gx || g_map_census) || !va || !bytes) return;
     // Hand-outs come in runs through the same pages (a ring, a renamed copy
     // made again): one record per span of 4 KiB pages a thread repeats.
-    thread_local std::uint64_t last_lo[kHandKinds] = {~0ull, ~0ull}, last_hi[kHandKinds] = {};
+    thread_local std::uint64_t last_lo[kHandKinds] = {~0ull, ~0ull, ~0ull}, last_hi[kHandKinds] = {};
     const unsigned k = static_cast<unsigned>(kind);
     if (k >= kHandKinds) return;
     const std::uint64_t lo = va & ~0xfffull, hi = (va + bytes + 0xfff) & ~0xfffull;
