@@ -4115,6 +4115,81 @@ Asm append(bool misuse) {
     return a;
 }
 
+// The decorations a lifted module gives its storage-buffer variables: how
+// many carry DescriptorSet `set` and how many Binding `binding`.
+std::size_t decorated(const std::vector<std::uint32_t>& spv, std::uint32_t decoration, std::uint32_t value) {
+    std::size_t n = 0;
+    for (std::size_t i = 5; i < spv.size();) {
+        const std::uint32_t len = spv[i] >> 16;
+        if (!len) break;
+        if ((spv[i] & 0xffff) == 71 /* OpDecorate */ && len == 4 && spv[i + 2] == decoration && spv[i + 3] == value) ++n;
+        i += len;
+    }
+    return n;
+}
+
+// A lean reference (ComputeLean: cb_ssbo, cb_no_fallback, its buffers in set
+// 1): the lift reads what the reference bound from that storage buffer and
+// walks the rest as the reference does; a store at the V#'s base plus a
+// constant goes through the written binding; with a page-table fallback in
+// the reference the lift refuses.
+gcn::TranslateOptions lean(gcn::TranslateOptions o) {
+    o.cb_ssbo = true;
+    o.cb_no_fallback = true;
+    o.cb_descriptor_set = 1;
+    return o;
+}
+void lean_reference() {
+    {
+        Asm a;
+        a.w.push_back(0xc2040100u);  // s_buffer_load_dword s8, s[0:3], 0x0
+        a.waitcnt();
+        a.vop1(kVMov, 1, 8);  // v_mov_b32 v1, s8
+        a.vop2(kVLshlrev, 2, kC0 + 2, 0);
+        a.store_offen(1, 2, 0);  // at a VGPR offset: walked
+        a.endpgm();
+        const gcn::TranslateOptions o = lean(options());
+        const gcn::Program p = gcn::decode(a.w.data(), a.w.size());
+        const gcn::TranslateResult ref = gcn::translate(p, o);
+        CHECK(ref.ok());
+        CHECK(ref.buffers.size() == 1);
+        CHECK(ref.buffer_at.count(0) == 1);
+        const gcn::LiftResult r = gcn::lift_compute_shader(p, o, ref);
+        CHECK(lifted_valid(r, "lean reference"));
+        CHECK(proof_has(r, "1 scalar and typed loads read from the storage buffer the reference binds"));
+        CHECK(proof_has(r, "reaches it: 0 scalar loads, 0 buffer loads"));  // nothing more read through the page table
+        CHECK(proof_has(r, "1 buffer stores and"));                           // the walked store
+        if (!ref.buffers.empty()) {
+            CHECK(decorated(r.spirv, 34 /* DescriptorSet */, 1) >= 1);
+            CHECK(decorated(r.spirv, 33 /* Binding */, ref.buffers[0].binding) >= 1);
+        }
+        gcn::TranslateOptions f = o;
+        f.cb_no_fallback = false;
+        CHECK(rejected_with(gcn::lift_compute_shader(p, f, gcn::translate(p, f)), "page-table fallback"));
+    }
+    {
+        Asm a;
+        a.vop1(kVMov, 1, kC0 + 5);                                // v_mov_b32 v1, 5
+        a.w.push_back(0xe0000000u | 28u << 18 | 4u);              // buffer_store_dword v1, off, s[0:3], 0 offset:4
+        a.w.push_back(0u | 1u << 8 | 0u << 16 | 128u << 24);
+        a.endpgm();
+        const gcn::TranslateOptions o = lean(options());
+        const gcn::Program p = gcn::decode(a.w.data(), a.w.size());
+        const gcn::TranslateResult ref = gcn::translate(p, o);
+        CHECK(ref.ok());
+        CHECK(ref.buffers.size() == 1 && ref.buffers[0].written);
+        const gcn::LiftResult r = gcn::lift_compute_shader(p, o, ref);
+        CHECK(lifted_valid(r, "lean reference, bound store"));
+        CHECK(proof_has(r, "1 buffer stores through its written binding"));
+        CHECK(proof_has(r, "0 buffer stores and"));  // none through the page table
+        // The walking reference walks it, and the lift with it.
+        const gcn::TranslateResult walk = gcn::translate(p, options());
+        const gcn::LiftResult w = gcn::lift_compute_shader(p, options(), walk);
+        CHECK(lifted_valid(w, "walking reference, the same store"));
+        CHECK(proof_has(w, "1 buffer stores and"));
+    }
+}
+
 void run() {
     {
         const gcn::LiftResult r = lift(exec_loop(false));
@@ -4199,6 +4274,7 @@ void run() {
         CHECK(branched == !barrier);
         if (barrier) CHECK(proof_has(r, "1 s_barrier"));
     }
+    lean_reference();
 }
 
 }  // namespace compute

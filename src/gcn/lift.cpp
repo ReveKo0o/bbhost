@@ -524,10 +524,14 @@ private:
                                                : "only pixel and vertex shaders are lifted");
         }
         if (compute()) {
-            // The reference reads every buffer through the page table (the
-            // renderer binds no buffer for a dispatch): the lift reads them the
-            // same way, so it binds what the reference binds.
-            if (opt.cb_ssbo) reject("a compute reference with constant buffers bound (cb_ssbo) is not lifted: the lift reads memory as a dispatch's translation does");
+            // The lift reads memory as its reference does, so it binds what the
+            // reference binds: a dispatch's translation walks the page table for
+            // every buffer; its lean one (ComputeLean: cb_ssbo, cb_no_fallback)
+            // reads the accesses it bound (TranslateResult::buffer_at) from
+            // their storage buffers and walks the rest, and so does the lift.
+            if (opt.cb_ssbo && !opt.cb_no_fallback) {
+                reject("a compute reference with constant buffers bound and a page-table fallback (cb_ssbo without cb_no_fallback) is not lifted");
+            }
             if (opt.fetch || !opt.vertex_input.empty()) reject("a compute stage with vertex inputs");
             if (!ref.ok()) reject("the reference translation failed");
             if (!prog.errors.empty()) reject("the program has decode errors");
@@ -2989,8 +2993,13 @@ private:
                 reject(std::string(mnemonic(in) ? mnemonic(in) : "a scalar memory instruction") + " is not lifted");
                 return;
             }
-            guest_scalar_load(in, count);
-            return;
+            // A load the lean reference bound reads its storage buffer (below);
+            // one it walks, the page table, as it does.
+            if (!opt.cb_ssbo || !ref.buffer_at.count(in.offset)) {
+                guest_scalar_load(in, count);
+                return;
+            }
+            ++cs_bound_loads;
         }
         const auto site = ref.buffer_at.find(in.offset);
         if (count && site == ref.buffer_at.end()) return descriptor_load(in, count);
@@ -3138,7 +3147,11 @@ private:
     // element at dword (offset12 + soffset) / 4 + index * stride / 4, decoded
     // by its static format, with the identity select (gcn::tbuffer_dst_sel).
     void mtbuf(const Inst& in) {
-        if (compute()) return guest_mtbuf(in);
+        if (compute()) {
+            // Only a typed load the lean reference bound reads a binding.
+            if (!opt.cb_ssbo || in.op >= 4 || !ref.buffer_at.count(in.offset)) return guest_mtbuf(in);
+            ++cs_bound_loads;
+        }
         if (in.op >= 4) {
             reject(std::string(mnemonic(in)) + " is not lifted");
             return;
@@ -3194,6 +3207,47 @@ private:
         ++buffer_loads;
     }
 
+    // buffer_store_dword* a compute shader's lean reference makes through a
+    // binding (translate.cpp store_bound): dword (soffset + offset12) >> 2 + k
+    // of the V#'s binding, each written where it is inside the V#'s range in
+    // dwords (StageParams::cb_stride) and the invocation's EXEC bit is set, as
+    // the reference's exec_guard and range check have it. A dispatch has no
+    // helper invocations, and a store in a loop runs in each iteration the
+    // invocation runs, as the guest stores do.
+    std::size_t cs_bound_loads = 0, cs_bound_stores = 0;
+    void bound_store_cs(const Inst& in, std::uint32_t index) {
+        if (index >= buffer_vars.size() || !ref.buffers[index].written) {
+            reject(std::string(mnemonic(in)) + " is not a store the reference makes through a binding");
+            return;
+        }
+        if (in.idxen || in.offen || in.addr64) {
+            reject(std::string(mnemonic(in)) + ": the reference's bound store has another shape");
+            return;
+        }
+        const int n = in.op == 28 ? 1 : in.op == 29 ? 2 : in.op == 30 ? 4 : 3;
+        const Id first = shift(spv::OpShiftRightLogical, ibin(spv::OpIAdd, cu(in.offset12), as_u(read(in.soffset, in))), cu(2));
+        const Id bias = cb_bias(index);
+        const Id range_dw = params_load(stride_loads, 5, index);
+        std::vector<Id> vals;
+        for (int k = 0; k < n; ++k) vals.push_back(as_u(value(256 + in.vdata + k)));
+        if (!res.rejections.empty()) return;
+        where_exec(exec_lane(), [&] {
+            for (int k = 0; k < n; ++k) {
+                const Id at = ibin(spv::OpIAdd, first, cu(static_cast<std::uint32_t>(k)));
+                const Id in_range = m.emit(spv::OpULessThan, t_bool, {at, range_dw});
+                const Id l_store = m.fresh(), l_merge = m.fresh();
+                m.emit_void(spv::OpSelectionMerge, {l_merge, 0u});
+                m.emit_void(spv::OpBranchConditional, {in_range, l_store, l_merge});
+                m.label(l_store);
+                m.store(m.access_chain(p_ssbo_u32, buffer_vars[index], {cu(0), ibin(spv::OpIAdd, bias, at)}), vals[static_cast<std::size_t>(k)]);
+                m.emit_void(spv::OpBranch, {l_merge});
+                cur_label = m.label(l_merge);
+            }
+        });
+        note += " stored";
+        ++cs_bound_stores;
+    }
+
     // buffer_store_dword* the reference makes through a binding (translate.cpp
     // store_bound): dword (soffset + offset12) >> 2 + k of the V#'s binding,
     // written where it is inside the V#'s range in dwords (StageParams::
@@ -3203,7 +3257,11 @@ private:
     // runs once per invocation where the translation's runs.
     std::size_t buffer_stores = 0;
     void mubuf(const Inst& in) {
-        if (compute()) return guest_mubuf(in);
+        if (compute()) {
+            const auto site = ref.buffer_at.find(in.offset);
+            if (!opt.cb_ssbo || in.op < 28 || in.op > 31 || site == ref.buffer_at.end()) return guest_mubuf(in);
+            return bound_store_cs(in, site->second);
+        }
         if (in.op < 28 || in.op > 31) {
             reject(std::string(mnemonic(in)) + " is not lifted");
             return;
@@ -7514,8 +7572,16 @@ private:
             std::snprintf(wg, sizeof(wg), "%ux%ux%u", opt.cs_threads[0], opt.cs_threads[1], opt.cs_threads[2]);
             head.push_back(std::string("a dispatch's compute shader: one invocation a lane of GCN's wave (workgroup ") + wg +
                            "), the workgroup id and local id where the reference places them; no workgroup memory (LDS)");
-            head.push_back("guest memory through the page table at StageParams::l1_table, as the reference reaches it: " + std::to_string(buffer_loads) +
-                           " scalar loads, " + std::to_string(guest_loads) + " buffer loads (dwords in one page with one walk), " +
+            if (cs_bound_loads || cs_bound_stores) {
+                head.push_back("the lean reference's bindings (ComputeLean): " + std::to_string(cs_bound_loads) +
+                               " scalar and typed loads read from the storage buffer the reference binds at that instruction, " +
+                               std::to_string(cs_bound_stores) +
+                               " buffer stores through its written binding, each dword inside the V#'s range in dwords and where the invocation's "
+                               "EXEC bit is set");
+            }
+            head.push_back("guest memory through the page table at StageParams::l1_table, as the reference reaches it: " +
+                           std::to_string(buffer_loads - cs_bound_loads) + " scalar loads, " + std::to_string(guest_loads) +
+                           " buffer loads (dwords in one page with one walk), " +
                            std::to_string(guest_stores) + " buffer stores and " + std::to_string(guest_atomics) + " atomics and " +
                            std::to_string(image_stores) +
                            " image stores where the invocation's EXEC bit is set; a load every lane makes at one address is one value for "
