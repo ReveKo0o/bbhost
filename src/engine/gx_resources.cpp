@@ -294,16 +294,14 @@ void register_holder(std::uint64_t key, std::uint64_t holder, Kind kind, bool in
     g_created_bytes[t].fetch_add(e.info.bytes, std::memory_order_relaxed);
     if (g_rate_log) note_rate(e.info.bytes);
     (void)kind;
-    // With window imports (BBHOST_IMPORT_WINDOWS=1) the memory of what the GPU
-    // reads soon is imported ahead, off the command processor: a texture (its
-    // upload follows), a vertex, index or unordered-access buffer (bind flags
-    // +0x3b; not a staging one). Nothing without window imports.
-    {
+    // With window imports (BBHOST_IMPORT_WINDOWS=1) the memory of a buffer the
+    // GPU reads in place soon is imported ahead, off the command processor;
+    // gpu.cpp picks which by its usage and D3D11 bind flags (+0x3b). Nothing
+    // without window imports.
+    if (e.info.type == 1 && e.info.memory && e.info.bytes) {
         std::uint8_t bind = 0;
         rd(holder + 0x3b, &bind);
-        const bool texture = e.info.type >= 2 && e.info.type <= 4;
-        const bool gpu_buffer = e.info.type == 1 && e.info.usage != 3 && (bind & 0x83);
-        if (e.info.memory && e.info.bytes && (texture || gpu_buffer)) host_gpu_import_prefetch(e.info.memory, e.info.bytes);
+        host_gpu_import_prefetch(e.info.memory, e.info.bytes, e.info.usage, bind);
     }
     if (key & kMemoryKey) key = kMemoryKey | e.info.memory;
     std::lock_guard<std::mutex> lk(g_mu);

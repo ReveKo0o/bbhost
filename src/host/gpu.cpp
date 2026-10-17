@@ -875,10 +875,9 @@ void import_windows(std::uint64_t va, std::uint64_t bytes) {
 bool imports_whole() { return g_import_whole; }
 
 // ---- import prefetch (window imports) ----
-// A GX resource made over GPU-visible direct memory is read by the GPU soon:
-// a texture is uploaded ahead of its first bind, a mesh is copied into the
-// buffer shadow's mirror at its first draw. Its windows are imported on a
-// thread of our own (bb-import) - the driver's slow part, pinning the pages
+// A GX buffer made over GPU-visible direct memory that the GPU reads in place
+// (host_gpu_import_prefetch says which) is read soon after. Its windows are
+// imported on a thread of our own (bb-import) - the driver's slow part, pinning the pages
 // (~0.25 ms a MiB on the RTX 4070), without the renderer's lock, put in place
 // under it - instead of by the binding that first needs them, on the command
 // processor. A run of windows some binding imported meanwhile is dropped (an
@@ -6386,8 +6385,16 @@ void retire_through_locked(std::uint64_t serial) {
 
 using namespace gpu;
 
-void host_gpu_import_prefetch(std::uint64_t va, std::uint64_t bytes) {
-    if (g_import_whole || !g_prefetch_on || !bytes) return;
+void host_gpu_import_prefetch(std::uint64_t va, std::uint64_t bytes, std::uint8_t usage, std::uint8_t bind) {
+    if (g_import_whole || !g_prefetch_on || !bytes || usage == 3 /* STAGING */) return;
+    // What the GPU reads in place: an unordered-access buffer (bind 0x80: what
+    // compute writes, particles), a dynamic one (usage 2: rings the game
+    // rewrites, bound from host memory). A vertex or index buffer (bind 0x1,
+    // 0x2) only without the buffer shadow - with it the mirror serves meshes,
+    // their pages copied through staging. Textures never: their uploads go
+    // through staging too.
+    const bool in_place = (bind & 0x80) || usage == 2 || ((bind & 0x3) && !buffer_shadow_on());
+    if (!in_place) return;
     std::lock_guard<std::mutex> lk(g_pf_mu);
     g_pf_asked.fetch_add(1, std::memory_order_relaxed);
     if (g_pf_jobs.size() >= 8192) {
