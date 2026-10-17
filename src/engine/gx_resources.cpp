@@ -132,6 +132,10 @@ constexpr std::uint8_t kYebisCreate13Prologue[17] = {BB_PUSH6, 0x50, 0x4d, 0x89,
 constexpr std::uint8_t kYebisCreateBufferPrologue[17] = {BB_PUSH6, 0x50, 0x49, 0x89, 0xce};  // push rax; mov r14, rcx
 constexpr std::uint8_t kYebisMapPrologue[20] = {BB_PUSH6, 0x48, 0x81, 0xec, 0x98, 0x00, 0x00, 0x00};
 constexpr std::uint8_t kYebisUpdatePrologue[20] = {BB_PUSH6, 0x48, 0x81, 0xec, 0x58, 0x01, 0x00, 0x00};
+// Unmap (slot 15) is a thunk: mov rdi, [rdi + 0xaa0]; mov esi, 0x38; xor edx, edx; xor ecx, ecx; jmp
+// - a cache-flush command; the writes after Map went to the memory itself.
+constexpr std::uint64_t kYebisUnmap = 0x15d99c0;
+constexpr std::uint8_t kYebisUnmapPrologue[16] = {0x48, 0x8b, 0xbf, 0xa0, 0x0a, 0x00, 0x00, 0xbe, 0x38, 0x00, 0x00, 0x00, 0x31, 0xd2, 0x31, 0xc9};
 // Scaleform's PS4 Texture::Initialize (0x7a1d30, slot 2 of vtable 0x55bbf20;
 // its prologue is kPrologue58's): true when it made the hardware texture, an
 // array (+0x60) of +0x45 planes of 0x58 bytes - size (+0), T# (+4), memory
@@ -146,7 +150,7 @@ constexpr std::uint8_t kDtorHead[9] = {0x55, 0x48, 0x89, 0xe5, 0x53, 0x50, 0x48,
 
 enum Kind : std::uint8_t {
     kBuffer = 1, kTexture = 2, kTexture3D = 3, kMapCall = 4, kTsharp = 5, kResource1D = 6, kObject = 7, kPoolCall = 8,
-    kYebisCreate = 9, kYebisMapCall = 10, kScaleformInit = 11
+    kYebisCreate = 9, kYebisMapCall = 10, kScaleformInit = 11, kYebisUpdateCall = 12
 };
 
 struct Pending {
@@ -218,6 +222,12 @@ std::atomic<std::uint64_t> g_yebis_made[5] = {}, g_yebis_made_bytes[5] = {}, g_y
 std::atomic<std::uint64_t> g_yebis_rt{0}, g_yebis_depth{0}, g_yebis_destroyed{0}, g_yebis_destroyed_unknown{0};
 std::atomic<std::uint64_t> g_yebis_maps[5][6] = {}, g_yebis_map_own{0}, g_yebis_map_other{0}, g_yebis_updates[5] = {};
 std::atomic<int> g_yebis_logged[5] = {}, g_yebis_map_logged{0};
+// BBHOST_RES_YEBIS=1: YEBIS's 2D textures are registered as resources from
+// its creator and destructor (key kYebisKey | the object), and its Map,
+// Unmap and UpdateSubresource of one tell the texture cache it was written.
+bool g_res_yebis = false;
+constexpr std::uint64_t kYebisKey = 0x4000000000000000ull;
+std::atomic<std::uint64_t> g_yebis_registered{0}, g_yebis_unregistered{0}, g_yebis_told{0};
 // Scaleform's textures (census): initialized, their planes and bytes, failed.
 std::atomic<std::uint64_t> g_sf_inits{0}, g_sf_planes{0}, g_sf_bytes{0}, g_sf_failed{0};
 std::atomic<int> g_sf_logged{0};
@@ -334,6 +344,8 @@ void note_rate(std::uint32_t bytes) {
     g_rate_bytes += bytes;
 }
 
+void register_entry(std::uint64_t key, Entry& e);
+
 void register_holder(std::uint64_t key, std::uint64_t holder, Kind kind, bool initial_data) {
     if (!holder) return;
     Entry e;
@@ -367,6 +379,12 @@ void register_holder(std::uint64_t key, std::uint64_t holder, Kind kind, bool in
         host_gpu_import_prefetch(e.info.memory, e.info.bytes, e.info.usage, bind);
     }
     if (key & kMemoryKey) key = kMemoryKey | e.info.memory;
+    register_entry(key, e);
+}
+
+// The registry takes a resource under `key`: indexed by its memory, a live
+// one there before it dead as far as the memory goes, the mirrors told.
+void register_entry(std::uint64_t key, Entry& e) {
     std::lock_guard<std::mutex> lk(g_mu);
     if (auto old = g_by_holder.find(key); old != g_by_holder.end()) {
         // The holder's address reused before its destructor was seen.
@@ -725,10 +743,39 @@ std::uint32_t yebis_kind(std::uint64_t object) {
     return kind;
 }
 GUEST_ABI std::int64_t yebis_update_hook(std::uint64_t, const std::uint64_t* saved) {
-    g_yebis_updates[yebis_kind(saved[4])].fetch_add(1, std::memory_order_relaxed);
+    Pending p{saved[6], kYebisUpdateCall, 0, 0, 0};
+    p.extra = saved[4];
+    t_pending.push_back(p);
+    const_cast<std::uint64_t*>(saved)[6] = reinterpret_cast<std::uint64_t>(&gx_res_ret);
+    return 0;
+}
+// A registered YEBIS texture was written by the CPU (BBHOST_RES_YEBIS): its
+// write sequence moves and the texture cache uploads it again at its next use.
+void yebis_written(std::uint64_t object) {
+    if (!g_res_yebis || !object) return;
+    std::uint64_t memory = 0;
+    std::uint32_t bytes = 0;
+    {
+        std::lock_guard<std::mutex> lk(g_mu);
+        auto it = g_by_holder.find(kYebisKey | object);
+        if (it == g_by_holder.end() || !it->second.info.alive) return;
+        memory = it->second.info.memory;
+        bytes = it->second.info.bytes;
+        it->second.info.write_seq = g_write_seq.fetch_add(1, std::memory_order_relaxed) + 1;
+    }
+    g_yebis_told.fetch_add(1, std::memory_order_relaxed);
+    if (memory && bytes) host_gpu_texture_written(memory, bytes);
+}
+GUEST_ABI std::int64_t yebis_unmap_hook(std::uint64_t, const std::uint64_t* saved) {
+    yebis_written(saved[4]);
     return 0;
 }
 GUEST_ABI std::int64_t yebis_tex2d_dtor_hook(std::uint64_t, const std::uint64_t* saved) {
+    if (g_res_yebis) {
+        unregister_holder(kYebisKey | saved[5]);
+        g_yebis_unregistered.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (!g_census) return 0;
     std::lock_guard<std::mutex> lk(g_mu);
     auto it = g_yebis_by_object.find(saved[5]);
     if (it == g_yebis_by_object.end()) {
@@ -771,6 +818,29 @@ void note_scaleform_texture(std::uint64_t texture) {
         std::lock_guard<std::mutex> lk(g_mu);
         g_yebis_by_memory[memory] = YebisObject{texture, size, 8};
     }
+}
+
+// A YEBIS 2D texture as a resource of the registry's (BBHOST_RES_YEBIS): its
+// memory and size, a new generation, D3D11's usage and bind flags.
+void register_yebis_2d(std::uint64_t object, bool initial_data) {
+    Entry e;
+    e.holder = kYebisKey | object;
+    e.created_flip = hle_video_flip_count();
+    e.info.created_flip = e.created_flip;
+    std::uint32_t bytes = 0, d[11] = {};
+    if (!rd(object + 0x98, &e.info.memory) || !rd(object + 0x150, &bytes) ||
+        !host_read_safe(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(object + 0x188)), d, sizeof(d)) || !e.info.memory || !bytes)
+        return;
+    e.info.bytes = bytes;
+    e.info.type = 3;
+    e.info.usage = static_cast<std::uint8_t>(d[7]);
+    e.info.bind = static_cast<std::uint8_t>(d[8]);
+    e.info.gen = g_gen_next.fetch_add(1, std::memory_order_relaxed);
+    e.info.created_submit = hle_gnm_submitted_total();
+    e.info.initial_data = initial_data;
+    e.info.write_seq = initial_data ? g_write_seq.fetch_add(1, std::memory_order_relaxed) + 1 : 0;
+    g_yebis_registered.fetch_add(1, std::memory_order_relaxed);
+    register_entry(kYebisKey | object, e);
 }
 
 // What YEBIS's device made: its memory, size, kind and (2D) description.
@@ -956,14 +1026,19 @@ extern "C" GUEST_ABI std::uint64_t gx_res_after(std::uint64_t result) {
         const std::uint32_t what = static_cast<std::uint32_t>(p.extra);
         std::uint64_t object = 0;
         if (static_cast<std::uint32_t>(result) == 0 && p.out && rd(p.out, &object) && object) {
-            note_yebis_created(object, what, p.holder, p.type != 0);
+            if (g_census) note_yebis_created(object, what, p.holder, p.type != 0);
+            if (g_res_yebis && what == 3) register_yebis_2d(object, p.type != 0);
         } else {
             g_yebis_failed[what].fetch_add(1, std::memory_order_relaxed);
         }
     } else if (p.kind == kScaleformInit) {
         if (result & 0xff) note_scaleform_texture(p.holder);
         else g_sf_failed.fetch_add(1, std::memory_order_relaxed);
+    } else if (p.kind == kYebisUpdateCall) {
+        g_yebis_updates[yebis_kind(p.extra)].fetch_add(1, std::memory_order_relaxed);
+        yebis_written(p.extra);
     } else if (p.kind == kYebisMapCall) {
+        if (static_cast<std::uint32_t>(result) == 0) yebis_written(p.extra);
         const std::uint32_t kind = yebis_kind(p.extra);
         g_yebis_maps[kind][p.type < 6 ? p.type : 0].fetch_add(1, std::memory_order_relaxed);
         std::uint64_t data = 0, memory = 0;
@@ -1120,7 +1195,12 @@ void gx_resources_install(ElfImage* image) {
         return e && e[0] == '1';
     }();
     if (g_trace || g_census) hook(kRing, kRingPrologue, sizeof(kRingPrologue), reinterpret_cast<void*>(&ring_hook), 0);
-    if (g_census) {
+    g_res_yebis = [] {
+        const char* e = std::getenv("BBHOST_RES_YEBIS");
+        return e && e[0] == '1';
+    }();
+    if (g_census || g_res_yebis) {
+        if (g_res_yebis) hook(kYebisUnmap, kYebisUnmapPrologue, sizeof(kYebisUnmapPrologue), reinterpret_cast<void*>(&yebis_unmap_hook), 0);
         hook(kYebisCreate2D, kYebisCreate2DPrologue, sizeof(kYebisCreate2DPrologue), reinterpret_cast<void*>(&yebis_create_hook<3>), 0);
         hook(kYebisCreate1D, kYebisCreate13Prologue, sizeof(kYebisCreate13Prologue), reinterpret_cast<void*>(&yebis_create_hook<2>), 0);
         hook(kYebisCreate3D, kYebisCreate13Prologue, sizeof(kYebisCreate13Prologue), reinterpret_cast<void*>(&yebis_create_hook<4>), 0);
@@ -1129,7 +1209,7 @@ void gx_resources_install(ElfImage* image) {
         hook(kYebisMap, kYebisMapPrologue, sizeof(kYebisMapPrologue), reinterpret_cast<void*>(&yebis_map_hook), 0);
         hook(kYebisUpdate, kYebisUpdatePrologue, sizeof(kYebisUpdatePrologue), reinterpret_cast<void*>(&yebis_update_hook), 0);
         dtor_with(kYebisTex2DDelete, kYebisTex2DVtable, reinterpret_cast<void*>(&yebis_tex2d_dtor_hook));
-        hook(kScaleformTexInit, kPrologue58, sizeof(kPrologue58), reinterpret_cast<void*>(&scaleform_init_hook), 0);
+        if (g_census) hook(kScaleformTexInit, kPrologue58, sizeof(kPrologue58), reinterpret_cast<void*>(&scaleform_init_hook), 0);
     }
     // The pool's blocks are memory the buffer shadow binds from host memory
     // (it is rewritten every frame or so) unless BBHOST_SHADOW_GX=0.
@@ -1486,6 +1566,9 @@ void gx_resources_report() {
             live = g_yebis_by_memory.size();
             for (const auto& [m, o] : g_yebis_by_memory) live_bytes += o.bytes;
         }
+        if (g_res_yebis)
+            host_log("gx-resources: YEBIS's 2D textures as resources (BBHOST_RES_YEBIS): registered %llu, destroyed %llu, told of CPU writes %llu",
+                     static_cast<ull>(g_yebis_registered.load()), static_cast<ull>(g_yebis_unregistered.load()), static_cast<ull>(g_yebis_told.load()));
         host_log("gx-resources: Scaleform's textures initialized %llu (%llu planes, %llu MiB), failed %llu", static_cast<ull>(g_sf_inits.load()),
                  static_cast<ull>(g_sf_planes.load()), static_cast<ull>(g_sf_bytes.load() >> 20), static_cast<ull>(g_sf_failed.load()));
         host_log("gx-resources: YEBIS's own device made%s 2D render targets %llu, depth %llu; 2D destroyed %llu (%llu it had not seen made); live "
