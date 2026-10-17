@@ -290,7 +290,8 @@ the default, and nothing waits on DXC:
     those modules, and no pipeline is built during play.
   - *From then on* every stage is DXC's: every frame within the runs' own
     noise at all twelve places (24 of 24), the frame rate the same, nothing
-    compiled.
+    compiled. Against the same build with `BBHOST_HLSL=0` the GPU is busy
+    2-5% less at five places (DXC's optimized code) and more at none.
   Compute dispatches take DXC's modules too.
 - **A driver that refuses DXC's module.** A pipeline the driver will not
   build from DXC's modules is built again from the lifts' own: a graphics
