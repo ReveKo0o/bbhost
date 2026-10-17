@@ -11323,9 +11323,19 @@ void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t
             version = kCopyVersionNone;
         }
         bool in_window = false;  // loc is a window's copy (a capture reads its guest bytes)
+        // Window imports (BBHOST_IMPORT_WINDOWS=1): memory the game writes on
+        // the CPU, which the draw takes as a snapshot copied as it records
+        // (BBHOST_CB_SNAPSHOT, below), is read by the CPU alone - no import.
+        static const bool snapshots_on = [] {
+            const char* e = std::getenv("BBHOST_CB_SNAPSHOT");
+            return !(e && e[0] == '0');
+        }();
+        bool copy_only = false;
         if (outcome == kUnmapped && version == kCopyVersionNone &&
             (b.written || t_draw_windows.empty() || !(in_window = draw_window_locked(base, bytes, loc)))) {
-            loc = locate(base, std::min<std::uint64_t>(bytes, g.ssbo_max_range ? g.ssbo_max_range : bytes));
+            copy_only = !imports_whole() && snapshots_on && !b.written && bytes && bytes <= (1u << 20) &&
+                        !gpu_writes_pending_locked(base, bytes) && hle_kernel_va_mapped(base, bytes);
+            if (!copy_only) loc = locate(base, std::min<std::uint64_t>(bytes, g.ssbo_max_range ? g.ssbo_max_range : bytes));
         }
         if (g_import_audit && base) audit_range(base, bytes, loc.buffer && loc.avail >= bytes ? kUseBound : kUsePageTable);
         if (resolved && !base && bytes <= g.sink.size) {  // a null V#'s stride does not matter: every read lands in the sink page
@@ -11337,9 +11347,12 @@ void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t
             params.cb_valid |= 1u << i;
             params.cb_bias_dw[i] = 0;
             outcome = kBound;
-        } else if (loc.buffer) {
-            const VkDeviceSize start = exact ? loc.offset : loc.offset & ~(g.ssbo_align - 1);
-            const VkDeviceSize bias = loc.offset - start;
+        } else if (loc.buffer || copy_only) {
+            // (copy_only: no import - the snapshot below copies the guest bytes;
+            // the base's place in an alignment step is the binding's would-be bias.)
+            const VkDeviceSize binding_off = loc.buffer ? loc.offset : (base & (g.ssbo_align - 1));
+            const VkDeviceSize start = exact ? binding_off : binding_off & ~(g.ssbo_align - 1);
+            const VkDeviceSize bias = binding_off - start;
             outcome = kTooLong;
             // BBHOST_CB_ALIGN16=1: refuse a binding whose base is not a whole
             // number of vec4s into the bound range, and let it take the page
