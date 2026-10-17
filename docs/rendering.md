@@ -169,20 +169,58 @@ A draw whose setup the lifter hasn't seen still falls back to the translator. Th
 | Pixel and vertex shaders lifted | done |
 | Tessellation lifted, mesh hulls native | done |
 | Compute shaders lifted | done |
-| HLSL: the lifted SPIR-V printed as HLSL and compiled with DXC to SPIR-V for Vulkan; checked byte-exact against the direct path before players switch | behind a switch, off by default (below) |
-| Shaders as editable source, generated on the player's machine from their own game files (never shipped) | after HLSL |
+| HLSL: the lifted SPIR-V printed as HLSL and compiled with DXC to SPIR-V for Vulkan on the player's machine | on by default, compiled behind the game (below) |
+| Shaders as editable source, generated on the player's machine from their own game files (never shipped) | a first slice: edited HLSL replaces a stage's module (below) |
 | D3D12 (Shader Model 6) from the same HLSL, if ever wanted; D3D11 is not planned, since it lacks the quad operations 703 programs use | later, optional |
 
 ## HLSL
 
-With `BBHOST_HLSL=1` every lift is printed as HLSL (`src/gcn/hlsl.cpp`) and
-compiled by DXC to SPIR-V for Vulkan, and the stage takes DXC's module where
-it declares the lift's interface and keeps its operations; anything else
-keeps the lift's SPIR-V, counted by reason in the exit report. With
-`BBHOST_HLSL=2` a stage whose module is not in the translation cache yet
-keeps the lift for this start while two `bb-hlsl` threads compile it for the
-next, so switching costs the game no stall. The switch is off by default
-until the path is shown equal to the direct one in game.
+Every lift is printed as HLSL (`src/gcn/hlsl.cpp`) and compiled by DXC to
+SPIR-V for Vulkan on the player's machine, and the stage takes DXC's module
+where it declares the lift's interface and keeps its operations; anything
+else keeps the lift's SPIR-V, counted by reason in the exit report. This is
+the default, and nothing waits on DXC:
+
+- **A start uses what is ready.** A stage takes DXC's module when the
+  translation cache has it, and the lift's otherwise. The first start after
+  an install or an update is the lift's throughout.
+- **DXC compiles behind the game.** The modules a start did not have are
+  compiled by `bb-hlsl` threads (two; one on a machine with fewer than eight
+  hardware threads; `BBHOST_HLSL_THREADS`) at the lowest priority, after the
+  start's own shader compiles, and kept in the translation cache. Their order
+  follows the pipeline manifest: what this start's draws took, then what the
+  manifests replay (what earlier starts drew, the most recent first), then
+  what GX created but nothing drew yet, then predictions and the opt-in
+  sweep. A stage a draw takes moves to the front.
+- **The switch is at the next start.** A pipeline is never rebuilt live to
+  swap a module: the frames are the same either way, and a rebuild would be
+  a driver compile in the middle of play. The next start takes DXC's
+  modules, and its precompile builds their pipelines from the manifests
+  before the world is drawn.
+- **The off switch.** The Shaders setting (F10, under Graphics; HLSL or
+  Lifted; `video.shaders` in `bbhost.toml`) applies at the next start.
+  `BBHOST_HLSL=0` is the lift alone, `=1` compiles each module at its first
+  use (the start waits for DXC: for checks), `=2` is the default; the
+  variable wins over the setting.
+- **Compiling up front.** The setup window's Shaders tab shows whether the
+  caches were made by this bbhost's translator and for this GPU and driver,
+  what the last compile did, and has **Compile shaders now**: bbhost starts
+  itself again with `--compile-shaders`, a run with no game and no window
+  that starts the GPU and compiles every shader in the game's bundles (the
+  debug menu's aside) and every stage and pipeline the manifests name -
+  translations, lifts, DXC's modules and the driver's pipelines - into the
+  same caches, on the game's own precompile workers. Progress (N of M, the
+  time left), failures by reason and the HLSL counts show as it runs; Cancel
+  keeps what is done; the window stays live and Play waits for it. The run
+  logs to `<data>/bbhost/shader-compile.log` and records its result in
+  `<data>/bbhost/shader-compile.txt`. Skipping it costs nothing: the
+  background path does the same over the first sessions.
+- **Edited shaders.** `BBHOST_HLSL_DUMP=1` writes each module's HLSL to
+  `<data>/bbhost/hlsl-dump/` (or `BBHOST_HLSL_DUMP=<dir>`), and an edited copy
+  in `<data>/bbhost/shaders/` replaces that stage's module when it compiles,
+  declares the lift's interface and validates ([modding.md](modding.md#shaders)).
+  The source is generated from the player's own game files and stays on
+  their machine; none is committed or shipped.
 
 - **What the HLSL is.** The lifter's SPIR-V stays the shader's IR of record:
   typed values in structured control flow. The printer reads it back and
@@ -229,16 +267,23 @@ until the path is shown equal to the direct one in game.
   module.
 - **In game.** At the title screen, every lift through DXC, the frames equal
   the direct path's except the animated menu highlight, which differs between
-  any two runs. At three places in the world (Central Yharnam, Cathedral
-  Ward, the Forbidden Woods' tessellated meshes), two passes each way: every
-  frame, the frame rate and the GPU time within the runs' own noise; no lift
-  kept, no draw failure, no device loss. A cold start compiles ~2,500
-  modules at the title (~440 s of worker time; with 16 workers the
-  precompile ends 10-25 s later) and stalls up to ~0.7 s on arriving
-  somewhere new; warm, nothing is compiled and starts and arrivals are the
-  direct path's. With `BBHOST_HLSL=2` the first start is as fast as the
-  direct path's and the next takes what it compiled. Compute dispatches take
-  DXC's modules too.
+  any two runs. The default, on twelve places of a save that reaches the Old
+  Hunters areas (an RTX 4070 at 60 fps; two rounds against the lift alone):
+  - *A first start* (no caches) draws with the lift's modules throughout,
+    and its first-sight hitches are the lift's. Meanwhile two `bb-hlsl`
+    threads compile ~3,360 modules: ~435 s of their time, all done ~250 s
+    after the first was queued (~60 s of that waiting for the start's own
+    compiles). The process's CPU is ~470% against ~385% while they run, and
+    its memory up to ~0.6 GiB higher (the threads' heap, handed back to the
+    system when the queue empties).
+  - *The next start* takes DXC's module for every stage met before (~3,380;
+    a few new ones keep the lift and compile behind). The pipeline manifest
+    builds their pipelines at the start, though the driver has never seen
+    those modules, and no pipeline is built during play.
+  - *From then on* every stage is DXC's: every frame within the runs' own
+    noise at all twelve places (24 of 24), the frame rate the same, nothing
+    compiled.
+  Compute dispatches take DXC's modules too.
 - **A driver that refuses DXC's module.** A pipeline the driver will not
   build from DXC's modules is built again from the lifts' own: a graphics
   pipeline whole or from its libraries, the native hulls' included, and a
@@ -282,9 +327,12 @@ until the path is shown equal to the direct one in game.
 - The completions the game waits on (GX's block pools and command arena, Map,
   query results) from the host's own submission timeline rather than labels,
   after which the PM4 command processor only orders work.
-- The HLSL path checked on Windows and the Steam Deck with DXC in the kits,
-  before it can be the default; then shaders as editable source (the table
-  above).
+- The HLSL default checked in game on Windows and the Steam Deck (the
+  driver sweeps there accepted every module), and whether a device that rounds
+  halves toward zero itself (the Deck's RADV) keeps that or takes the exact
+  integer form (`BBHOST_HALF_NATIVE=0`), measured on the Deck.
+- Editable source beyond replacing one stage's HLSL: edits read again while
+  the game runs, and names that survive a translator update.
 
 ## Tools
 
