@@ -362,8 +362,25 @@ DECOMP_LEAF u64 gnm_set_predication(u64 cb, u64 block, u32 draw_if_visible, u32 
 }
 DECOMP_LEAF u64 gnm_clear_predication(u64 cb) { return w_clear_predication(cb); }
 DECOMP_LEAF u64 gnm_dispatch_write_indirect_buffer(u64 cb, u64 addr, u32 dwords) { return w_indirect_buffer(cb, addr, dwords); }
-DECOMP_LEAF u64 gnm_increment_de_counter(u64 cb) { return w_counter(cb, 0x00000000c0008500ull, 0x85); }
-DECOMP_LEAF u64 gnm_wait_on_ce_counter(u64 cb) { return w_counter(cb, 0x00000001c0008600ull, 0x86); }
+// The counters pace the draw engine against a constant engine that writes
+// nothing when nothing dumps its RAM (decomp/gx/constant_engine.cpp): then
+// they write nothing either (gnm_ce_configure sets it).
+u8 g_ce_counters_dead = 0;
+std::atomic<u64> g_ce_counters_skipped{0};
+DECOMP_LEAF u64 gnm_increment_de_counter(u64 cb) {
+    if (g_ce_counters_dead) {
+        g_ce_counters_skipped.fetch_add(1, std::memory_order_relaxed);
+        return load<u64>(cb + 0x10);
+    }
+    return w_counter(cb, 0x00000000c0008500ull, 0x85);
+}
+DECOMP_LEAF u64 gnm_wait_on_ce_counter(u64 cb) {
+    if (g_ce_counters_dead) {
+        g_ce_counters_skipped.fetch_add(1, std::memory_order_relaxed);
+        return load<u64>(cb + 0x10);
+    }
+    return w_counter(cb, 0x00000001c0008600ull, 0x86);
+}
 
 namespace {
 
@@ -495,8 +512,12 @@ void report() {
                  "alone (the refill served them, or a payload too large or under the packet)",
                  compared, static_cast<ull>(g_compare_alone.load()));
     } else {
-        host_log("decomp: Gnm label, wait and predication writers: %zu of %zu ours, writing the game's packets", ours,
-                 static_cast<std::size_t>(kWriters));
+        host_log("decomp: Gnm label, wait and predication writers: %zu of %zu ours, writing the game's packets%s", ours,
+                 static_cast<std::size_t>(kWriters),
+                 g_ce_counters_dead ? (std::string("; the draw engine's counter steps not written with the constant engine's: ") +
+                                       std::to_string(g_ce_counters_skipped.load()))
+                                          .c_str()
+                                    : "");
     }
 }
 

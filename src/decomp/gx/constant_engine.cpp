@@ -289,7 +289,11 @@ void report() {
 
 }  // namespace
 
-void gnm_ce_configure(bool dead) { g_dead = dead ? 1 : 0; }
+extern u8 g_ce_counters_dead;  // decomp/gx/labels.cpp: the draw engine's side of the counters
+void gnm_ce_configure(bool dead) {
+    g_dead = dead ? 1 : 0;
+    g_ce_counters_dead = g_dead;
+}
 
 void decomp_gx_constant_engine_add() {
     if (const char* e = std::getenv("BBHOST_CP_WRITERS"); e && e[0] == '1') return;

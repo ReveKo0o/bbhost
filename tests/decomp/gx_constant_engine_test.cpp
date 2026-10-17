@@ -13,6 +13,9 @@
 // 1.09 eboot.
 #include "decomp/gx/constant_engine.cpp"
 
+// decomp/gx/labels.cpp's, which gnm_ce_configure sets with the constant engine.
+u8 g_ce_counters_dead = 0;
+
 #include "eboot_kit.h"
 
 #include <cstdio>

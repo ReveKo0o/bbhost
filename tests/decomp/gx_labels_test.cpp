@@ -216,6 +216,17 @@ int run(std::size_t i, int cases) {
 
         // Ours, through its entry on the list - and the same function as the
         // compare runs it, from the registers.
+        // The draw engine's counters with the constant engine off: nothing
+        // written, no room asked for, the write pointer returned.
+        if (i == kIncrementDeCounter || i == kWaitOnCeCounter) {
+            g_mem = g_saved;
+            g_calls.clear();
+            g_ce_counters_dead = 1;
+            const u64 r = call(i, false, a);
+            g_ce_counters_dead = 0;
+            if (r != load<u64>(cb() + 0x10) || std::memcmp(&g_mem, &g_saved, sizeof g_mem) != 0 || !g_calls.empty())
+                fail(i, t, "a counter written with the constant engine off");
+        }
         for (int how = 0; how < 2; ++how) {
             g_mem = g_saved;
             g_calls.clear();
