@@ -62,6 +62,10 @@ void gx_resources_install(ElfImage* image);
 std::uint64_t gx_resources_create_failures();
 // The live resource whose memory covers [va, va + bytes), if any.
 bool gx_resource_at(std::uint64_t va, std::size_t bytes, GxResourceInfo* out);
+// Whether live GX buffers (type 1) cover every byte of [va, va + bytes): the
+// CPU writes such memory through GX's Map or a creation with data, which the
+// buffer shadow's mirrors are told of (host_gpu_shadow_gx_write).
+bool gx_buffers_cover(std::uint64_t va, std::uint64_t bytes);
 // The first live resource whose memory overlaps [va, va + bytes) at all, if
 // any (the census of surfaces no resource covers whole).
 bool gx_resource_overlapping(std::uint64_t va, std::size_t bytes, GxResourceInfo* out);

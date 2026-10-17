@@ -450,6 +450,18 @@ void host_gpu_texture_retire(std::uint64_t base, std::size_t bytes, std::uint64_
 // GX mapped the texture whose memory is [base, base + bytes) for the CPU to
 // write: its surfaces upload it again at their next use.
 void host_gpu_texture_written(std::uint64_t base, std::size_t bytes);
+// A CPU write GX makes over a buffer's memory - a creation's initial data -
+// or memory that stops being a buffer's: the buffer shadow invalidates the
+// mirror pages over it (they are not write-watched when GX buffers cover
+// them). Any thread, no lock held.
+void host_gpu_shadow_gx_write(std::uint64_t va, std::size_t bytes);
+// A GX resource was made over [va, va + bytes): a write as above, and memory
+// GX no longer hands out to be rewritten. Any thread, no lock held.
+void host_gpu_shadow_gx_created(std::uint64_t va, std::size_t bytes);
+// Memory GX handed the CPU to write without a call to say when it is done:
+// a buffer Map's renamed copy (kind 0) or an upload pool's block (1). Any
+// thread, no lock held.
+void host_gpu_shadow_gx_handed(std::uint64_t va, std::size_t bytes, int kind);
 // Copies `bytes` into the host-owned table ring the GPU page
 // table reaches and returns their guest address (0 when no ring could be
 // mapped); a draw token's user data points at tables placed here.

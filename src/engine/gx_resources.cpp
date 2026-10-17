@@ -8,9 +8,11 @@
 //             returns, so the hook swaps the return address for gx_res_ret,
 //             which reads *out and registers it.
 //   Map       0x2569c30 (ctx, ?, holder, subresource, type, mapped*): a CPU
-//             write is coming. Type 1/2 write the memory in place after a
-//             GPU wait, 3 appends into a renamed copy, 4 discards - the
-//             holder's memory may move, so the return hook re-reads +0x20.
+//             write is coming. Type 1/2 return the memory itself after a GPU
+//             wait; for a buffer, 3 hands out a new renamed copy from the
+//             context's allocator (0x2ad0d30) and 4 the copy the context
+//             renamed it to last (0x2ad0ff0; error 4 when there is none) -
+//             the return hook re-reads +0x20 all the same.
 //   shaders   the four shader creators (hooked by gx_trace.cpp) and the
 //             input-layout creator 0x25657a0 - (ctx, object** out, ...):
 //             the object gets an id at the return.
@@ -78,6 +80,15 @@ constexpr std::uint8_t kSamplerPrologue[16] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x5
 constexpr std::uint8_t kInputLayoutPrologue[15] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56,
                                                    0x41, 0x54, 0x53, 0x48, 0x83, 0xec, 0x70};
 constexpr std::uint64_t kRing = 0x2adb1b0;  // the dynamic ring allocator: (ring, out*, ctx, bytes) -> *out
+// The upload pool's block source: (allocator, bytes = 0x10000) -> a block
+// whose memory is at +8. Its one caller is the context's upload pool
+// 0x2aaddc0 (pool, ctx, bytes), which carves allocations of up to 64 KiB out
+// of these blocks for UpdateSubresource's dynamic copies (0x2aadb90) and some
+// 200 sites of the draw-state code.
+constexpr std::uint64_t kPoolBlock = 0x2aa9d50;
+// push rbp; mov rbp, rsp; push r15; push r14; push rbx; push rax; mov r14, rsi; mov rbx, rdi
+constexpr std::uint8_t kPoolBlockPrologue[16] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56,
+                                                 0x53, 0x50, 0x49, 0x89, 0xf6, 0x48, 0x89, 0xfb};
 constexpr std::uint64_t kBufferRelease = 0x256d690;
 constexpr std::uint64_t kTexDelete = 0x256d1a0, kTexDestroy = 0x256d1e0, kTexVtable = 0x575f3e0;
 constexpr std::uint64_t kTex3dDelete = 0x256d310, kTex3dDestroy = 0x256d350, kTex3dVtable = 0x575f400;
@@ -110,7 +121,7 @@ constexpr std::uint8_t kBufferReleasePrologue[16] = {0x55, 0x48, 0x89, 0xe5, 0x4
 // push rbp; mov rbp, rsp; push rbx; push rax; mov rbx, rdi; lea rax, [rip + vtable]
 constexpr std::uint8_t kDtorHead[9] = {0x55, 0x48, 0x89, 0xe5, 0x53, 0x50, 0x48, 0x89, 0xfb};
 
-enum Kind : std::uint8_t { kBuffer = 1, kTexture = 2, kTexture3D = 3, kMapCall = 4, kTsharp = 5, kResource1D = 6, kObject = 7 };
+enum Kind : std::uint8_t { kBuffer = 1, kTexture = 2, kTexture3D = 3, kMapCall = 4, kTsharp = 5, kResource1D = 6, kObject = 7, kPoolCall = 8 };
 
 struct Pending {
     std::uint64_t ret;
@@ -353,6 +364,14 @@ void register_holder(std::uint64_t key, std::uint64_t holder, Kind kind, bool in
     g_by_holder.emplace(key, e);
     const std::uint64_t live = g_by_memory.size();
     if (live > g_peak_live.load(std::memory_order_relaxed)) g_peak_live.store(live, std::memory_order_relaxed);
+    // A resource made: with data, its creator copied the data in before
+    // returning, a CPU write the buffer shadow's mirrors are told of rather
+    // than finding through the write watch; without, its memory is a
+    // resource's from now on - not memory GX hands out any more, if it was -
+    // and a mirror page over it decides again whether it needs watching
+    // (host_gpu_shadow_gx_created takes a lock of its own, never the
+    // registry's).
+    if (e.info.memory && e.info.bytes) host_gpu_shadow_gx_created(e.info.memory, e.info.bytes);
 }
 
 // Textures made ahead of their first bind are made on a thread of their own,
@@ -474,16 +493,26 @@ void unregister_holder(std::uint64_t holder) {
         g_by_holder.erase(it);
     }
     retire_memory(memory, bytes, gen);
-    if (buffer_memory && buffer_bytes) release_pages(buffer_memory, buffer_bytes);
+    if (buffer_memory && buffer_bytes) {
+        release_pages(buffer_memory, buffer_bytes);
+        // The buffer's memory is no longer a buffer's: whatever writes it next
+        // may not tell the mirrors, so their pages over it are copied again -
+        // and decide again whether to be watched - before they are read.
+        host_gpu_shadow_gx_write(buffer_memory, buffer_bytes);
+    }
 }
 
 // A Map on the holder: the resource is about to be written by the CPU. Its
 // memory may have been renamed (type 3/4): re-read +0x20 and re-index.
-void note_map(std::uint64_t holder, std::uint64_t type) {
+void note_map(std::uint64_t holder, std::uint64_t type, std::uint64_t mapped_out, std::uint32_t result) {
     std::uint64_t memory = 0;
     rd(holder + 0x20, &memory);
+    std::uint64_t mapped = 0;
+    if (result == 0 && mapped_out) rd(mapped_out, &mapped);
     std::uint64_t texture_memory = 0;
     std::uint32_t texture_bytes = 0;
+    std::uint32_t buffer_bytes = 0, moved_bytes = 0;
+    std::uint64_t moved_from = 0;
     {
         std::lock_guard<std::mutex> lk(g_mu);
         auto it = g_by_holder.find(holder);
@@ -497,6 +526,10 @@ void note_map(std::uint64_t holder, std::uint64_t type) {
         e.info.write_seq = g_write_seq.fetch_add(1, std::memory_order_relaxed) + 1;
         if (memory && memory != e.info.memory) {
             g_map_moved.fetch_add(1, std::memory_order_relaxed);
+            if (e.info.type == 1) {
+                moved_from = e.info.memory;
+                moved_bytes = e.info.bytes;
+            }
             if (auto m = g_by_memory.find(e.info.memory); m != g_by_memory.end() && m->second == holder) g_by_memory.erase(m);
             e.info.memory = memory;
             g_by_memory[memory] = holder;
@@ -505,7 +538,16 @@ void note_map(std::uint64_t holder, std::uint64_t type) {
             texture_memory = e.info.memory;
             texture_bytes = e.info.bytes;
         }
+        if (e.info.type == 1) buffer_bytes = e.info.bytes;
     }
+    // A buffer mapped: the CPU writes the range the caller got next - a
+    // renamed copy, which GX copies back to the buffer's own memory on the
+    // GPU when the rename resolves (the buffer shadow sees that copy as a GPU
+    // write). The copy's memory is handed out again and again: the buffer
+    // shadow is told so (it is written without a call to say when).
+    if (buffer_bytes && mapped) host_gpu_shadow_gx_handed(mapped, buffer_bytes, 0);
+    // A discard moved the buffer: the memory it leaves is no buffer's now.
+    if (moved_from && moved_bytes) host_gpu_shadow_gx_write(moved_from, moved_bytes);
     // A texture mapped (none is, in any run so far): the CPU writes it next,
     // and its image is no longer what its memory holds - the texture cache,
     // which does not watch a GX resource's memory, is told (host textures).
@@ -572,6 +614,13 @@ GUEST_ABI std::int64_t map_hook(std::uint64_t, const std::uint64_t* saved) {
 // The T# builder: rsi = the T# out.
 GUEST_ABI std::int64_t tsharp_hook(std::uint64_t, const std::uint64_t* saved) {
     t_pending.push_back({saved[6], kTsharp, saved[4], 0, 0});
+    const_cast<std::uint64_t*>(saved)[6] = reinterpret_cast<std::uint64_t>(&gx_res_ret);
+    return 0;
+}
+
+// The upload pool's block source: rsi = bytes, the block comes back in rax.
+GUEST_ABI std::int64_t pool_hook(std::uint64_t, const std::uint64_t* saved) {
+    t_pending.push_back({saved[6], kPoolCall, 0, 0, saved[4]});
     const_cast<std::uint64_t*>(saved)[6] = reinterpret_cast<std::uint64_t>(&gx_res_ret);
     return 0;
 }
@@ -696,8 +745,11 @@ extern "C" GUEST_ABI std::uint64_t gx_res_after(std::uint64_t result) {
                      static_cast<std::uint32_t>(result));
     }
     if (p.kind == kMapCall) {
-        if (!p.ring) note_map(p.holder, p.type);
+        if (!p.ring) note_map(p.holder, p.type, p.out, static_cast<std::uint32_t>(result));
         if (g_trace) trace_map(p);
+    } else if (p.kind == kPoolCall) {
+        std::uint64_t block = 0;
+        if (result && p.type && rd(result + 8, &block) && block) host_gpu_shadow_gx_handed(block, p.type, 1);
     } else if (p.kind == kObject) {
         std::uint64_t object = 0;
         if (p.out && rd(p.out, &object) && object) {
@@ -833,6 +885,13 @@ void gx_resources_install(ElfImage* image) {
     dtor1d(kTex1dDelete);
     dtor1d(kTex1dDestroy);
     if (g_trace) hook(kRing, kRingPrologue, sizeof(kRingPrologue), reinterpret_cast<void*>(&ring_hook), 0);
+    // The pool's blocks are memory the buffer shadow binds from host memory
+    // (it is rewritten every frame or so) unless BBHOST_SHADOW_GX=0.
+    const bool shadow_gx = [] {
+        const char* e = std::getenv("BBHOST_SHADOW_GX");
+        return !(e && e[0] == '0');
+    }();
+    if (shadow_gx) hook(kPoolBlock, kPoolBlockPrologue, sizeof(kPoolBlockPrologue), reinterpret_cast<void*>(&pool_hook), 0);
     hook(kCreateInputLayout, kInputLayoutPrologue, sizeof(kInputLayoutPrologue), reinterpret_cast<void*>(&object_create_hook), 0);
     hook(kCreateRtv, kPrologue58, sizeof(kPrologue58), reinterpret_cast<void*>(&view_create_hook), 1);
     hook(kCreateDsv, kDsvPrologue, sizeof(kDsvPrologue), reinterpret_cast<void*>(&view_create_hook), 2);
@@ -968,6 +1027,10 @@ void gx_resources_memory_released(std::uint64_t va, std::size_t len) {
         }
     }
     retire_memory(va, static_cast<std::uint32_t>(std::min<std::size_t>(len, 0xffffffffu)), 0);
+    // The mirrors keep pages by their physical memory, which this range no
+    // longer names: they hear of it as a write, and a range their map of the
+    // guest's mappings no longer has copies every told page again.
+    if (n) host_gpu_shadow_gx_write(va, len);
     if (n) {
         g_released_under_holder.fetch_add(n, std::memory_order_relaxed);
         if (g_release_events.fetch_add(1, std::memory_order_relaxed) < 6) {
@@ -990,6 +1053,23 @@ bool gx_resource_at(std::uint64_t va, std::size_t bytes, GxResourceInfo* out) {
     g_lookup_hits.fetch_add(1, std::memory_order_relaxed);
     if (out) *out = r;
     return true;
+}
+
+bool gx_buffers_cover(std::uint64_t va, std::uint64_t bytes) {
+    if (!bytes) return false;
+    std::lock_guard<std::mutex> lk(g_mu);
+    auto it = g_by_memory.upper_bound(va);
+    if (it == g_by_memory.begin()) return false;
+    --it;
+    std::uint64_t covered = va;
+    for (; it != g_by_memory.end() && it->first <= covered; ++it) {
+        auto h = g_by_holder.find(it->second);
+        if (h == g_by_holder.end() || !h->second.info.alive || h->second.info.type != 1) return false;
+        const GxResourceInfo& r = h->second.info;
+        if (r.memory + r.bytes > covered) covered = r.memory + r.bytes;
+        if (covered >= va + bytes) return true;
+    }
+    return false;
 }
 
 bool gx_resource_by_holder(std::uint64_t holder, GxResourceInfo* out) {

@@ -84,6 +84,9 @@ std::string host_gpu_occlusion_report() { return {}; }
 std::string host_gpu_image_heap_report() { return {}; }
 void host_gpu_resources_report() {}
 void host_gpu_texture_written(std::uint64_t, std::size_t) {}
+void host_gpu_shadow_gx_write(std::uint64_t, std::size_t) {}
+void host_gpu_shadow_gx_created(std::uint64_t, std::size_t) {}
+void host_gpu_shadow_gx_handed(std::uint64_t, std::size_t, int) {}
 std::string host_gpu_target_copy_report() { return {}; }
 std::string host_gpu_ps_wave_report() { return {}; }
 std::string host_gpu_memory_budget_report() { return {}; }
