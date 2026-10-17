@@ -3257,9 +3257,15 @@ private:
         Id first = cu(static_cast<std::uint32_t>(off / 4));
         Id index_ok = 0;
         if (in.idxen) {
-            const Id stride_dw = shift(spv::OpShiftRightLogical, stride_value(index), cu(2));
-            const Id vindex = as_u(value(256 + va++));
-            first = ibin(spv::OpIAdd, first, ibin(spv::OpIMul, vindex, stride_dw));
+            const Val vi = value(256 + va++);
+            const Id vindex = as_u(vi);
+            // An index the lift knows is 0 adds nothing: no stride is read
+            // (DXC would drop the stride's specialization constant, which
+            // the HLSL path's interface check then misses).
+            if (!vi.constant || vi.bits != 0) {
+                const Id stride_dw = shift(spv::OpShiftRightLogical, stride_value(index), cu(2));
+                first = ibin(spv::OpIAdd, first, ibin(spv::OpIMul, vindex, stride_dw));
+            }
             index_ok = m.emit(spv::OpULessThan, t_bool, {vindex, as_u(read(static_cast<std::uint16_t>(in.srsrc + 2), in))});
         }
         if (in.offen) first = ibin(spv::OpIAdd, first, shift(spv::OpShiftRightLogical, as_u(value(256 + va)), cu(2)));

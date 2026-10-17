@@ -796,7 +796,7 @@ private:
         }
         for (const Ins* ip : all_ins) {
             const Ins& in = *ip;
-            if (in.op == spv::OpStore || in.op == spv::OpAtomicStore) {
+            if (in.op == spv::OpStore || in.op == spv::OpAtomicStore || in.op == spv::OpAtomicIAdd) {  // an atomic add writes it too
                 if (const std::uint32_t root = pointer_root(in.a.at(0)); root && type(type(var_type.at(root)).elem).k == TK::Struct &&
                                                                             type(var_type.at(root)).sc == spv::ScStorageBuffer) {
                     written_buffers.insert(root);
