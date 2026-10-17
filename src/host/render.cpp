@@ -4464,6 +4464,14 @@ void recipe_note_build(GfxPipeline& pl, const DrawState& s, const std::vector<st
     }
     pl.recipe = std::move(r);
 }
+// BBHOST_LOG_NEW_RECIPES=1: each pipeline the manifest had no recipe for, as
+// it is recorded - what tools/full_tour.py counts per map and stop (a test
+// switch; the line is not written otherwise).
+const bool g_log_new_recipes = [] {
+    const char* e = std::getenv("BBHOST_LOG_NEW_RECIPES");
+    return e && e[0] == '1';
+}();
+
 // A pipeline was created (not from a recipe): its recipe joins the manifest,
 // or the one there counts this start's use.
 void recipe_note_created(GfxPipeline& pl, std::uint64_t key) {
@@ -4475,8 +4483,13 @@ void recipe_note_created(GfxPipeline& pl, std::uint64_t key) {
         pl.recipe->uses = 1;
         pl.recipe->last_run = g_pmanifest.run;
         pl.recipe->order = g_pmanifest.next_order.fetch_add(1, std::memory_order_relaxed);
-        g_pmanifest.recorded.fetch_add(1, std::memory_order_relaxed);
+        const std::uint64_t n = g_pmanifest.recorded.fetch_add(1, std::memory_order_relaxed) + 1;
         g_pmanifest.dirty = true;
+        if (g_log_new_recipes) {
+            host_log("render: pipeline manifest: new recipe %016llx %s+%s%s (%llu in this run) at flip %llu", static_cast<unsigned long long>(key),
+                     pl.recipe->vs_name.c_str(), pl.recipe->ps_name.c_str(), recipe_tessellated(pl.recipe->s) ? " tessellated" : "",
+                     static_cast<unsigned long long>(n), static_cast<unsigned long long>(hle_video_flip_count()));
+        }
     } else {
         pl.recipe = it->second;  // a later relink's specialization goes to the kept one
         if (it->second->last_run != g_pmanifest.run) {

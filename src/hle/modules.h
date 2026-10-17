@@ -147,6 +147,10 @@ void hle_gnm_find_writes(std::uint64_t va, std::uint64_t bytes, std::uint64_t va
 void hle_video_finish_flip(int handle, int buffer, std::int64_t arg, bool recorded = false);
 std::uint64_t hle_video_flip_count();
 std::uint64_t hle_video_last_tick_ns();  // steady-clock ns of the last vblank tick (diagnostics)
+// A test harness asked the run to end as BBHOST_EXIT_SECONDS ends one (the
+// `exit` request of BBHOST_TEST_REQUESTS): the exit reports and the cache
+// saves, then the process ends. main.cpp's pump checks it.
+bool hle_video_test_exit_requested();
 // Since the last call, for the 300-flip report: how late the vblank clock's
 // ticks woke, and how long flips took from queued to shown and to completed.
 std::string hle_video_pacing_window();

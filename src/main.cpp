@@ -151,7 +151,8 @@ void run_guest_start(GuestStart fn, void* argv, bool windowed) {
                 *static_cast<volatile int*>(nullptr) = 1;
             }
             if ((exit_flip && hle_video_flip_count() >= exit_flip) ||
-                (exit_seconds > 0 && std::chrono::duration<double>(std::chrono::steady_clock::now() - run_start).count() >= exit_seconds)) {
+                (exit_seconds > 0 && std::chrono::duration<double>(std::chrono::steady_clock::now() - run_start).count() >= exit_seconds) ||
+                hle_video_test_exit_requested()) {
                 // The guest keeps running while this prints; the window is
                 // not stopped (that waits for the GPU lock the command
                 // processor may hold), the process just ends.

@@ -240,6 +240,8 @@ const bool g_present_on_arrival = [] {
 //   menutap <button> [<ms>]  the same, only while one of the game's menus has the
 //                         input - the way through the title that cannot press
 //                         anything in the world, however late it arrives
+//   exit                  end the run as BBHOST_EXIT_SECONDS does (the exit
+//                         reports, then the caches saved): a harness's tour is done
 // A thread of its own (bb-test-req) reads the folder ten times a second and
 // queues what it finds; the flips carry the queue out. Read on the flip, the
 // folder held the flip clock whenever the file system was slow to answer: on
@@ -250,6 +252,7 @@ struct TestRequest {
 };
 std::mutex g_test_req_mu;
 std::deque<TestRequest> g_test_reqs;  // under g_test_req_mu
+std::atomic<bool> g_test_exit{false};  // an `exit` request came
 
 void test_requests_read(const std::string& dir) {
     namespace fs = std::filesystem;
@@ -306,6 +309,9 @@ void test_requests(std::uint64_t display_va, std::uint64_t count) {
         } else if (verb == "f12") {
             host_log("test: F12 capture %s asked for at flip %llu", arg.empty() ? "-" : arg.c_str(), static_cast<unsigned long long>(count));
             host_gpu_request_dump();
+        } else if (verb == "exit") {
+            host_log("test: exit asked for at flip %llu", static_cast<unsigned long long>(count));
+            g_test_exit.store(true);
         } else if (verb == "capture" && !arg.empty()) {
             const int n = std::atoi(arg.c_str());
             host_gpu_capture_arm(n, arg2.c_str());
@@ -956,6 +962,7 @@ void hle_video_set_picture(unsigned w, unsigned h) {
 
 std::uint64_t hle_video_flip_count() { return g_flips_done.load(); }
 std::uint64_t hle_video_last_tick_ns() { return g_last_tick_ns.load(std::memory_order_relaxed); }
+bool hle_video_test_exit_requested() { return g_test_exit.load(std::memory_order_relaxed); }
 
 std::string hle_video_pacing_window() {
     const auto take = [](std::atomic<std::uint64_t>& a) { return a.exchange(0, std::memory_order_relaxed); };
