@@ -1307,6 +1307,7 @@ void keep_params(const std::string& name, const gcn::StageParams& params, int st
 }
 std::atomic<std::uint64_t> g_cb_realigned{0}, g_cb_realigned_bytes{0};
 std::atomic<std::uint64_t> g_cb_snapshots{0};  // of them, memory the game writes on the CPU (BBHOST_CB_SNAPSHOT)
+std::atomic<std::uint64_t> g_cb_snapshots_shared{0};  // bindings that took an earlier snapshot of the recording (BBHOST_CB_SNAPSHOT_DEDUPE)
 const bool g_trace = [] {
     const char* e = std::getenv("BBHOST_TRACE_RENDER");
     return e && e[0] == '1';
@@ -9653,7 +9654,40 @@ void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t
             // (A snapshot's range was located in imported memory: mapped.)
             if (realign && bytes && bytes <= (1u << 20) && (snapshot || hle_kernel_va_mapped(base, bytes))) {
                 if (!scratch.buffer) create_upload_buffer(scratch, kScratch, "the constant-buffer copies' ring");
-                if (scratch.map) {
+                // The same buffer snapshotted again within one recording - a
+                // command buffer, the walk of one submission of the game's -
+                // binds the copy its first snapshot made: the game wrote the
+                // frame's values before it submitted, and on the console every
+                // draw of the submission reads the memory as it stands when the
+                // GPU runs it, so all of them see one state. (Copying again
+                // could only pick up the next frame's values, which the game
+                // may already be writing.) Whole-ring snapshots only - not the
+                // pushed ones (`exact`), each bound where its own copy is; the
+                // copy stays where it is for the rest of the lap (segment_serial).
+                // BBHOST_CB_SNAPSHOT_DEDUPE=0: each binding copies its own.
+                static const bool dedupe = [] {
+                    const char* e = std::getenv("BBHOST_CB_SNAPSHOT_DEDUPE");
+                    return !(e && e[0] == '0');
+                }();
+                struct SnapMemo {
+                    std::uint64_t base = 0, bytes = 0, at = 0, serial = ~0ull, lap = 0;
+                };
+                static SnapMemo snap_memo[1024];
+                SnapMemo* memo = nullptr;
+                // Pushed (`exact`), each draw's ranges go into the command
+                // buffer anyway: the snapshot is bound where it is.
+                const bool whole_ring = !exact && snapshot && g.ssbo_max_range >= kScratch;
+                if (dedupe && whole_ring && scratch.map) {
+                    memo = &snap_memo[((base >> 4) ^ (base >> 14)) & 1023];
+                    if (memo->base == base && memo->serial == g.record_serial && memo->lap == scratch_lap && memo->bytes >= bytes) {
+                        info = VkDescriptorBufferInfo{scratch.buffer, 0, kScratch};
+                        params.cb_valid |= 1u << i;
+                        params.cb_bias_dw[i] = static_cast<std::uint32_t>(memo->at / 4);
+                        outcome = kBound;
+                        if (host_tooling()) bump(g_cb_snapshots_shared);
+                    }
+                }
+                if (scratch.map && outcome != kBound) {
                     // The ring is write-combined memory: a copy whose last line
                     // is partly written leaves that line in a write-combining
                     // buffer, flushed in pieces at the next store fence (the
@@ -9692,9 +9726,8 @@ void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t
                     // own offset, every snapshot was a descriptor set never
                     // seen before - written for each draw, 17% of the frame
                     // rate GPU-bound.
-                    // Pushed (`exact`), each draw's ranges go into the command
-                    // buffer anyway: the snapshot is bound where it is.
-                    const bool whole = !exact && snapshot && g.ssbo_max_range >= kScratch;
+                    const bool whole = whole_ring;
+                    if (memo) *memo = SnapMemo{base, bytes, at, g.record_serial, scratch_lap};
                     info = whole ? VkDescriptorBufferInfo{scratch.buffer, 0, kScratch} : VkDescriptorBufferInfo{scratch.buffer, at, bytes};
                     params.cb_valid |= 1u << i;
                     params.cb_bias_dw[i] = whole ? static_cast<std::uint32_t>(at / 4) : 0;
@@ -9801,6 +9834,8 @@ void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t
                      static_cast<unsigned long long>(g_cb_realigned.load()),
                      static_cast<unsigned long long>(g_cb_realigned_bytes.load() >> 20),
                      static_cast<unsigned long long>(g_sf_cb_snapshots.load()), static_cast<unsigned long long>(g_cb_snapshots.load()));
+            host_log("render:   %llu of those snapshots bound the copy an earlier binding of the same recording made (BBHOST_CB_SNAPSHOT_DEDUPE)",
+                     static_cast<unsigned long long>(g_cb_snapshots_shared.load()));
         }
     }
 }
