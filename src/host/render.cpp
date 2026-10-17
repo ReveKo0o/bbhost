@@ -12217,8 +12217,24 @@ bool plan_vertex_input(const std::vector<std::uint32_t>& fetch_words, std::uint6
     struct RecordShadow {
         const std::uint32_t* w;
         Located whole;
+        bool snapped = false;  // whole is the record's snapshot (shadow_snapshot_locked)
     } shadows[16];
     std::size_t n_shadows = 0;
+    // The bytes the draw reads of record `w` (its stride, its whole extent
+    // `record_bytes`): up to its last vertex's furthest element, the whole
+    // extent when the last vertex is not known.
+    const auto draw_read_bytes = [&](const std::uint32_t* w, std::uint32_t stride, std::uint64_t record_bytes) -> std::uint64_t {
+        if (std::int64_t last = 0; draw_last_vertex(last)) {
+            std::uint64_t elem_end = 0;
+            for (std::size_t k = 0; k < n; ++k) {
+                const std::uint32_t* wk = o.vtx_rec[els[k].slot];
+                if (((o.vtx_valid >> els[k].slot) & 1) && std::memcmp(wk, w, 12) == 0)
+                    elem_end = std::max<std::uint64_t>(elem_end, els[k].offset + vertex_format_bytes((wk[3] >> 15) & 0xf));
+            }
+            return std::min(record_bytes, static_cast<std::uint64_t>(last) * stride + elem_end);
+        }
+        return record_bytes;
+    };
     for (std::size_t e = 0; e < n; ++e) {
         const FetchElement& fe = els[e];
         if (!((o.vtx_valid >> fe.slot) & 1)) {
@@ -12244,21 +12260,39 @@ bool plan_vertex_input(const std::vector<std::uint32_t>& fetch_words, std::uint6
         // In one of the draw's CPU-written windows (YEBIS, host_gpu_draw_window):
         // the copy taken as the draw records, never the ring slot, which the
         // CPU may rewrite for a draw sixteen on before this one runs.
-        bool windowed = false, mirrored = false;
+        bool windowed = false, mirrored = false, snapped = false;
+        Located snap;  // snapped: the record's snapshot
         if (version != kCopyVersionInside) {
             windowed = !t_draw_windows.empty() && draw_window_locked(va, need, loc);
             if (!windowed && !imports_whole()) {
                 // Window imports: the record from the buffer shadow's mirror
                 // when it serves it whole (its pages copied through staging),
-                // so mesh data needs no import; an import only otherwise.
+                // so mesh data needs no import; on pages the game rewrites,
+                // its snapshot - the CPU's copy of what the draw reads, made
+                // as it records (shadow_snapshot_locked), which the record's
+                // other elements share - so no import either; an import only
+                // otherwise.
                 const std::uint64_t record_bytes = w[2] ? static_cast<std::uint64_t>(w[2]) * stride : fe.offset + bytes;
                 Located m;
                 if (record_bytes >= fe.offset + bytes && shadow_mirror_locked(va - fe.offset, record_bytes, m)) {
                     loc = {m.buffer, m.offset + fe.offset, m.avail - fe.offset};
                     mirrored = true;
+                } else if (version == kCopyVersionNone && record_bytes >= fe.offset + bytes) {
+                    const RecordShadow* had = nullptr;
+                    for (std::size_t k = 0; k < n_shadows; ++k) {
+                        if (std::memcmp(shadows[k].w, w, 12) == 0) had = &shadows[k];
+                    }
+                    if (had ? had->snapped
+                            : shadow_snapshot_maybe_locked(va - fe.offset, record_bytes) &&
+                                  shadow_snapshot_locked(va - fe.offset, draw_read_bytes(w, stride, record_bytes), snap)) {
+                        if (had) snap = had->whole;
+                        // (avail: the draw reads no further than the snapshot holds)
+                        loc = {snap.buffer, snap.offset + fe.offset, need};
+                        snapped = true;
+                    }
                 }
             }
-            if (!windowed && !mirrored) loc = locate(va, need);
+            if (!windowed && !mirrored && !snapped) loc = locate(va, need);
         }
         if (g_import_audit) audit_range(va, need, kUseMirror);
         if (!loc.buffer || loc.avail < need) {
@@ -12291,20 +12325,16 @@ bool plan_vertex_input(const std::vector<std::uint32_t>& fetch_words, std::uint6
             const auto read_bytes = [&]() -> std::uint64_t {
                 if (read_known) return read_bytes_memo;
                 read_known = true;
-                if (std::int64_t last = 0; draw_last_vertex(last)) {
-                    std::uint64_t elem_end = 0;
-                    for (std::size_t k = 0; k < n; ++k) {
-                        const std::uint32_t* wk = o.vtx_rec[els[k].slot];
-                        if (((o.vtx_valid >> els[k].slot) & 1) && std::memcmp(wk, w, 12) == 0)
-                            elem_end = std::max<std::uint64_t>(elem_end, els[k].offset + vertex_format_bytes((wk[3] >> 15) & 0xf));
-                    }
-                    read_bytes_memo = std::min(record_bytes, static_cast<std::uint64_t>(last) * stride + elem_end);
-                }
+                read_bytes_memo = draw_read_bytes(w, stride, record_bytes);
                 return read_bytes_memo;
             };
             bool in_place = false;
             if (mirrored) {
                 ns.whole = {loc.buffer, loc.offset - fe.offset, record_bytes};  // the mirror already (window imports)
+            } else if (snapped) {
+                ns.whole = snap;  // the snapshot already (window imports)
+                ns.snapped = true;
+                bump(g_vertex_snapshot_records);
             } else if (windowed) {
                 bump(g_vertex_window_records);
             } else if (loc.offset >= fe.offset && loc.avail + fe.offset >= record_bytes) {
