@@ -224,7 +224,9 @@ bool phys_of(std::uint64_t va, std::uint64_t bytes, std::uint32_t& chunk, std::u
     off = phys & (kChunkBytes - 1);
     if (map_lo) *map_lo = mi.va;
     if (map_hi) *map_hi = mi.va + mi.len;
-    if (chunk >= gcn::kDmemChunks) return false;
+    // One chunk's mirror holds its pages and no others: a range past the
+    // chunk's end is no mirror's (its pages would index past the mirror's).
+    if (chunk >= gcn::kDmemChunks || off + bytes > kChunkBytes) return false;
     // Window imports: the mirrors' copies come from upload staging (below), so
     // the range needs no import, only to lie in a GPU-visible span.
     if (!imports_whole()) return off >= g.dmem[chunk].span_lo && off + bytes <= g.dmem[chunk].span_hi;
@@ -534,6 +536,9 @@ void shadow_locate_locked(std::uint64_t va, std::uint64_t bytes, Located& loc) {
     const std::uint64_t stamp = g.record_serial + 1;
     const std::uint32_t p0 = static_cast<std::uint32_t>(off >> kPageShift);
     const std::uint32_t p1 = static_cast<std::uint32_t>((off + bytes - 1) >> kPageShift);
+    // (Never past the mirror's pages: a copy or a sparse bind there runs past
+    // the end of its buffer.)
+    if (p1 >= m->pages.size()) return;
     {
         const std::uint32_t span = p1 - p0 + 1;
         ++g_span_hist[span == 1 ? 0 : span <= 4 ? 1 : span <= 16 ? 2 : span <= 64 ? 3 : span <= 256 ? 4 : 5];
