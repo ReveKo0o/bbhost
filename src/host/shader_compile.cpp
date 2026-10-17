@@ -256,7 +256,8 @@ ShaderCacheState shader_cache_state(const std::string& data, const std::vector<s
 
 ShaderCompileJob::~ShaderCompileJob() {
     cancel();
-    if (thread_.joinable()) thread_.join();
+    if (thread_.joinable()) thread_.join();  // the child writes what it has done first
+    if (proc_) SDL_DestroyProcess(static_cast<SDL_Process*>(proc_));
 }
 
 bool ShaderCompileJob::start(std::string& error) {
