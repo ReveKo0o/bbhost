@@ -19,6 +19,7 @@
 #include "core/thunk.h"
 #include "decomp/decomp.h"
 #include "decomp/gx/dead_packets.h"
+#include "decomp/gx/dma.h"
 #include "host/host_lists.h"
 #include "engine/addr.h"
 #include "host/gpu.h"
@@ -6227,7 +6228,7 @@ void hle_gx_trace_arm(GuestMemory* mem) {
     int hooked = 0;
     for (std::uint64_t id = 0; id < kKinds; ++id) {
         if (id == kUpdateSubresource && !g_trace && !g_gx_cost_enabled && !g_watch_update && !g_upload_census) continue;
-        if (id == kEmitDma && !g_cp_census_hooks) continue;
+        if (id == kEmitDma && (!g_cp_census_hooks || gnm_dma_placed())) continue;  // ours notes its callers itself
         if (id == kCopyStructureCount && !g_count_copies) continue;
         if (id == kYebisDispatch && !g_yebis_dispatch) continue;
         const Hook& h = kHooks[id];
@@ -6331,32 +6332,21 @@ void hle_gx_trace_arm(GuestMemory* mem) {
     }
     // BBHOST_GX_TOKEN_COUNTERS=2: the counters ride in the dispatch tokens, so
     // the DMA_DATA moves through GDS around a counting dispatch are not
-    // written - the commit's load (0x2acc30f) and the post's store (0x2acd08c)
-    // are each one call of the DMA writer 0x1473e60 whose result nothing reads,
-    // and become a five-byte NOP. Only with every compute-commit dispatch a
-    // token with its records (the defaults), which is what carries them.
-    if (g_token_counters == 2 && g_native_dispatch == 2 && g_native == 2 && g_backend == 1 && g_ds_records_mode && !g_cp_writers) {
-        struct CallSite {
-            std::uint64_t va;
-            std::uint8_t call[5];
-        };
-        static constexpr CallSite kGdsMoves[] = {{0x2acc30f, {0xe8, 0x4c, 0x7b, 0x9a, 0xfe}}, {0x2acd08c, {0xe8, 0xcf, 0x6d, 0x9a, 0xfe}}};
-        int nopped = 0;
-        for (const CallSite& s : kGdsMoves) {
-            const std::uint64_t va = g_slide + (s.va - kPreferredGuestSlide);
-            if (va < mem->slide || va + 5 > mem->slide + mem->size) continue;
-            auto* p = static_cast<std::uint8_t*>(guest_ptr(*mem, va));
-            if (std::memcmp(p, s.call, 5) != 0) continue;
-            const std::uint64_t lo = va & ~0xfffull, hi = (va + 5 + 0xfff) & ~0xfffull;
-            if (!guest_protect_rwx(mem, lo, hi - lo)) continue;
-            static constexpr std::uint8_t kNop5[5] = {0x0f, 0x1f, 0x44, 0x00, 0x00};
-            std::memcpy(p, kNop5, 5);
-            guest_protect_rx(mem, lo, hi - lo);
-            ++nopped;
+    // written - the commit's load and the post's store, each one call of the
+    // DMA writer whose result nothing reads, which is ours
+    // (decomp/gx/dma.cpp) and writes nothing for those two callers. Only with
+    // every compute-commit dispatch a token with its records (the defaults),
+    // which is what carries them. With the CP census, the writer notes each
+    // packet's caller for it.
+    {
+        const bool gds_dead = g_token_counters == 2 && g_native_dispatch == 2 && g_native == 2 && g_backend == 1 && g_ds_records_mode;
+        gnm_dma_configure(gds_dead, g_cp_census_hooks);
+        g_gds_moves_nopped = gds_dead && gnm_dma_placed();
+        if (gds_dead) {
+            host_log("gx: GPU particle counters in the dispatch tokens: the 2 moves through GDS %s (BBHOST_GX_TOKEN_COUNTERS=1 writes "
+                     "them and checks the tokens against them)",
+                     g_gds_moves_nopped ? "not written (the DMA writer is ours)" : "written: the DMA writer is the game's");
         }
-        host_log("gx: GPU particle counters in the dispatch tokens: %d of 2 moves through GDS not written (BBHOST_GX_TOKEN_COUNTERS=1 "
-                 "writes them and checks the tokens against them)", nopped);
-        g_gds_moves_nopped = nopped == 2;
     }
     g_active = hooked > 0;
     host_log("gx: %d of %d hooks armed; trace %s (flips %llu-%llu), backend mode %d", hooked, static_cast<int>(kKinds),
@@ -7720,12 +7710,14 @@ void hle_gx_native_release() {
     }
 }
 std::uint64_t hle_gx_emitter_caller(std::uint64_t packet_va) {
-    std::lock_guard<std::mutex> lk(g_mu);
-    for (std::uint64_t d = 0; d <= 64; d += 4) {
-        const auto it = g_by_packet.find(packet_va - d);
-        if (it != g_by_packet.end()) return bn(it->second.ret);
+    {
+        std::lock_guard<std::mutex> lk(g_mu);
+        for (std::uint64_t d = 0; d <= 64; d += 4) {
+            const auto it = g_by_packet.find(packet_va - d);
+            if (it != g_by_packet.end()) return bn(it->second.ret);
+        }
     }
-    return 0;
+    return gnm_dma_caller(packet_va);  // a DMA_DATA packet from our writer
 }
 
 void hle_gx_trace_dispatch(std::uint32_t op, std::uint64_t packet_va, std::uint32_t x, std::uint32_t cs_lo) {
