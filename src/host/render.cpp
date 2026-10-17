@@ -2799,6 +2799,17 @@ std::uint32_t vertex_format_bytes(std::uint32_t dfmt) {
         default: return 4;
     }
 }
+// The packing (gcn::VertexElement::packed) an attribute's format says its
+// element arrives in: the R16, R32 or R32G32 UINT format pack_vertex_input
+// gives an element of 8- or 16-bit components, where one component a channel
+// is R8G8, R8G8B8A8, R16G16 or R16G16B16A16 (vertex_format); 0 otherwise.
+std::uint32_t vertex_packing_of(std::uint32_t w3, VkFormat format) {
+    const std::uint32_t dfmt = (w3 >> 15) & 0xf, bits = gcn::vertex_packed_bits(dfmt);
+    if (!bits) return 0;
+    const std::uint32_t bytes = vertex_format_bytes(dfmt);  // 2, 4 or 8
+    const VkFormat packed = bytes == 2 ? VK_FORMAT_R16_UINT : bytes == 4 ? VK_FORMAT_R32_UINT : VK_FORMAT_R32G32_UINT;
+    return format == packed ? bits : 0;
+}
 
 // Vulkan vertex input for one GX draw: the translator's elements,
 // the pipeline's bindings and attributes (attribute n is element n, at
@@ -7442,6 +7453,14 @@ bool read(Reader& in, PipelineRecipe& rc) {
         a.binding = r.u32();
         a.format = static_cast<VkFormat>(r.u32());
         a.offset = r.u32();
+    }
+    // The file keeps no VertexElement::packed; the attribute's format says it
+    // (vertex_packing_of). Without it a pipeline whose elements arrived packed
+    // was made again at the start with their descriptors unpacked - the relink's
+    // specialization included - so its vertex shader took the packed dwords
+    // one component a channel: every such draw's vertices torn apart.
+    for (const VkVertexInputAttributeDescription& a : vi.attributes) {
+        if (a.location < vi.elements.size()) vi.elements[a.location].packed = vertex_packing_of(vi.elements[a.location].w3, a.format);
     }
     pod(r, vi.hash);
     pod(r, rc.spec_w3);
