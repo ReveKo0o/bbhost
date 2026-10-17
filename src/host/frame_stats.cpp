@@ -225,8 +225,11 @@ void frame_stats_on_flip() {
     const GpuBusy gpu_now = host_gpu_busy();
     if (gpu_now.on && s.gpu.on) {
         const double ms = static_cast<double>(gpu_now.busy_ns - s.gpu.busy_ns) / 1e6 / secs;
-        char gb[96];
-        std::snprintf(gb, sizeof(gb), "; gpu busy %.0f ms/s (%.0f%%)", ms, ms / 10.0);
+        // The buffer shadow's uploads part of it, after it so the patterns
+        // reading `gpu busy N ms/s` still hold.
+        const double up = static_cast<double>(gpu_now.upload_ns - s.gpu.upload_ns) / 1e6 / secs;
+        char gb[128];
+        std::snprintf(gb, sizeof(gb), "; gpu busy %.0f ms/s (%.0f%%); gpu uploads %.0f ms/s", ms, ms / 10.0, up);
         gpu = gb;
     }
     s.gpu = gpu_now;

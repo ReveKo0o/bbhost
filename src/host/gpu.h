@@ -680,6 +680,7 @@ struct GpuBusy {
     std::uint64_t busy_ns = 0;     // the union over both
     std::uint64_t game_ns = 0;     // the game's command buffers alone (their own union)
     std::uint64_t present_ns = 0;  // the presenter's alone
+    std::uint64_t upload_ns = 0;   // the buffer shadow's uploads ahead of the game's command buffers
     std::uint64_t cmdbufs = 0, presents = 0;
 };
 GpuBusy host_gpu_busy();
