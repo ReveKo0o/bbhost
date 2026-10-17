@@ -10,6 +10,7 @@
 #include "host/shaders/gpu_stall.spv.h"
 #include "host/shader_bundles.h"
 #include "host/translation_cache.h"
+#include "host/options.h"
 
 #include "gcn/container.h"
 #include "gcn/half.h"
@@ -2820,6 +2821,10 @@ bool init_locked() {
     // Before g.ok: the precompile workers wait for it, and their first
     // translations look in the cache. After the device's features went to the
     // translator above (they are part of every key).
+    // The Shaders setting (host/options.cpp), before the first lift decides
+    // the HLSL path's mode; BBHOST_HLSL wins over it.
+    hlsl_set_setting(host_opt_index("shaders") != 1);
+    if (const char* root = hle_fs_data_root(); root && *root) hlsl_set_folders(std::string(root) + "/bbhost");
     translation_cache_load(translation_cache_path());
     g.ok = true;
     start_submit_thread();

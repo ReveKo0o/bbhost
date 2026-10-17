@@ -24,6 +24,7 @@
 
 std::uint32_t host_thread_id() { return 1; }
 void host_thread_set_name(const char*) {}
+void host_thread_background() {}
 
 using namespace gpu;
 

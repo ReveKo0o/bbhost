@@ -3173,6 +3173,7 @@ std::shared_ptr<const CachedStage> cached_stage(std::uint64_t key) {
 }
 
 void cache_stage(std::uint64_t key, const gcn::TranslateResult& meta, VkShaderModule module, bool lifted) {
+    if (lifted) hlsl_tag_stage(key);  // the lift just made on this thread, if its DXC module waits
     auto entry = std::make_shared<CachedStage>();
     entry->meta = meta;
     entry->module = module;
@@ -4930,6 +4931,7 @@ GfxPipeline& build_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const std::
             pl.ps.module = ps_hit->module;
             if (!t_pipeline_worker) g_pl_stage_repeats.fetch_add(1, std::memory_order_relaxed);
             if (!t_replaying) manifest_note_hit(ps_key);
+            if (!t_replaying && !t_pipeline_worker && ps_hit->lifted) hlsl_note_drawn(ps_key);
             if (!t_replaying && note_precompile_hit(ps_key) && g_precompile_check && !ps_lift) {
                 const gcn::Program p = gcn::decode(ps_words.data(), ps_words.size());
                 check_precompiled_stage("PS", ps_name, ps_hit->meta, gcn::translate(p, ps_translate_options(ps_in)));
@@ -5089,6 +5091,7 @@ GfxPipeline& build_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const std::
         pl.vs.module = vs_hit->module;
         if (!t_pipeline_worker) g_pl_stage_repeats.fetch_add(1, std::memory_order_relaxed);
         if (!t_replaying) manifest_note_hit(vs_key);
+        if (!t_replaying && !t_pipeline_worker && vs_hit->lifted) hlsl_note_drawn(vs_key);
         if (!t_replaying && note_vs_precompile_hit(vs_key) && g_precompile_check && !vs_decomp && !ds_lift && !ds_native) {
             const gcn::Program p = gcn::decode(vs_words.data(), vs_words.size());
             check_precompiled_stage("VS", vs_name, vs_hit->meta, gcn::translate(p, vs_translate_options(vs_in, nullptr)));
@@ -5987,6 +5990,12 @@ Precompiler& precompiler() {
         }
         host_log("render: precompile workers: %d until the first in-game frame and while loading, %d in game "
                  "(BBHOST_PRECOMPILE_BOOT_THREADS, BBHOST_PRECOMPILE_THREADS)", w->boot, w->steady);
+        hlsl_set_busy_probe([]() -> bool {
+            Precompiler* p = g_precompiler.load();
+            if (!p) return false;
+            std::lock_guard<std::mutex> lk(p->mu);
+            return !p->jobs.empty() || !p->running.empty();
+        });
         for (int i = 0; i < w->boot; ++i) {
             std::thread([w, i] {
                 t_pipeline_worker = true;
@@ -6029,6 +6038,11 @@ Precompiler& precompiler() {
                         }
                     }
                     while (!g.ok) std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                    // The HLSL compiles behind the game take what earlier
+                    // starts drew before what GX only created.
+                    hlsl_lane(job.type == 7 || job.type == 8 || job.type == 0 ? kHlslLaneManifest
+                              : job.twin || job.sweep                         ? kHlslLaneLater
+                                                                              : kHlslLaneCreated);
                     if (job.type == 4) {
                         precompile_compute(job.name, job.container, job.flip);
                     } else if (job.type == 1) {
@@ -7004,6 +7018,7 @@ void sweep_thread(int index) {
     host_thread_set_name("bb-sweep");
     host_thread_background();
     t_pipeline_worker = true;
+    hlsl_lane(kHlslLaneLater);
     translation_cache_bounded(true);
     if (index == 0) {
         // The list, made here rather than at the device's start: reading the
