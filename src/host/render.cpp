@@ -11092,6 +11092,10 @@ void render_orphans_locked(OrphanImages out[2]) {
             } else {
                 ++out[k].n;
                 out[k].bytes += r.memory.size;
+                if (gx_yebis_at(base, span)) {
+                    ++out[k].yebis;
+                    out[k].yebis_bytes += r.memory.size;
+                }
             }
         }
     }

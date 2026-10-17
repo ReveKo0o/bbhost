@@ -69,6 +69,9 @@ bool gx_buffers_cover(std::uint64_t va, std::uint64_t bytes);
 // The first live resource whose memory overlaps [va, va + bytes) at all, if
 // any (the census of surfaces no resource covers whole).
 bool gx_resource_overlapping(std::uint64_t va, std::size_t bytes, GxResourceInfo* out);
+// BBHOST_RESOURCE_CENSUS=1: whether a live texture or buffer YEBIS's own
+// device made (not GX's) holds any of [va, va + bytes); false without the census.
+bool gx_yebis_at(std::uint64_t va, std::size_t bytes);
 // The registry's write sequence now (bumped by every creation with data and
 // every Map), and the latest of the live resources overlapping [va, va +
 // bytes) (0: none overlaps) - whether GX wrote any of them since a moment

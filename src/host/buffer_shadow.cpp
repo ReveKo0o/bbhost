@@ -772,11 +772,12 @@ void drain_gx_writes_locked() {
 // of the 4 KiB page each hit, and the writers behind each kind - whether GX's
 // calls could tell the mirrors of the writes the watch now catches. Taken at
 // each report from the faults since the last (the ring holds 16384).
-// A fault's class: what GX covers its 4 KiB with (buffers whole, a resource in
-// part, nothing) times what handed it out (a Map, the upload pool, the ring,
-// nothing GX said), as gx * kHandKinds+1 + handed.
-constexpr unsigned kFaultHanders = kHandKinds + 1, kFaultClasses = 3 * kFaultHanders;
-const char* const kFaultGxName[3] = {"GX buffers'", "a GX resource's in part", "no GX resource's"};
+// A fault's class: what covers its 4 KiB (GX buffers whole, a GX resource in
+// part, a texture or buffer of YEBIS's own device, nothing) times what handed
+// it out (a Map, the upload pool, the ring, nothing GX said), as
+// owner * (kHandKinds + 1) + handed.
+constexpr unsigned kFaultHanders = kHandKinds + 1, kFaultOwners = 4, kFaultClasses = kFaultOwners * kFaultHanders;
+const char* const kFaultGxName[kFaultOwners] = {"GX buffers'", "a GX resource's in part", "YEBIS's", "no GX or YEBIS resource's"};
 const char* const kFaultHandName[kFaultHanders] = {"Maps hand out", "the upload pool hands out", "the ring hands out", "nothing GX hands out"};
 std::uint64_t g_fault_census_seq = 0, g_fault_census_other = 0;
 std::uint64_t g_fault_class[kFaultClasses] = {};
@@ -805,7 +806,10 @@ void census_faults_locked() {
                 break;
             }
         }
-        const unsigned gx = gx_buffers_cover(page, 0x1000) ? 0 : gx_resource_overlapping(page, 0x1000, nullptr) ? 1 : 2;
+        const unsigned gx = gx_buffers_cover(page, 0x1000)                 ? 0
+                            : gx_resource_overlapping(page, 0x1000, nullptr) ? 1
+                            : gx_yebis_at(page, 0x1000)                      ? 2
+                                                                             : 3;
         const unsigned c = gx * kFaultHanders + by;
         ++g_fault_class[c];
         auto& w = g_fault_writers[c];

@@ -4430,6 +4430,10 @@ std::string textures_census_window_locked() {
             } else {
                 ++o.n;
                 o.bytes += sf.memory.size;
+                if (gx_yebis_at(sf.base, span)) {
+                    ++o.yebis;
+                    o.yebis_bytes += sf.memory.size;
+                }
             }
         }
         char l3[600];
@@ -4452,6 +4456,14 @@ std::string textures_census_window_locked() {
                       static_cast<ull>(rt[1].gone_bytes >> 20), static_cast<ull>(tex[0].gone), static_cast<ull>(tex[0].gone_bytes >> 20),
                       static_cast<ull>(tex[1].gone), static_cast<ull>(tex[1].gone_bytes >> 20));
         out += std::string("\n  ") + l4;
+        char l5[300];
+        std::snprintf(l5, sizeof(l5),
+                      "resources: of those on memory no GX resource holds, on YEBIS's own textures and buffers: targets %llu (%llu MiB), snapshots "
+                      "%llu (%llu MiB), shader-written textures %llu (%llu MiB), other textures %llu (%llu MiB)",
+                      static_cast<ull>(rt[0].yebis), static_cast<ull>(rt[0].yebis_bytes >> 20), static_cast<ull>(rt[1].yebis),
+                      static_cast<ull>(rt[1].yebis_bytes >> 20), static_cast<ull>(tex[0].yebis), static_cast<ull>(tex[0].yebis_bytes >> 20),
+                      static_cast<ull>(tex[1].yebis), static_cast<ull>(tex[1].yebis_bytes >> 20));
+        out += std::string("\n  ") + l5;
     }
     return out;
 }

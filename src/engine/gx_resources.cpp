@@ -114,6 +114,24 @@ constexpr std::uint8_t kCreate1DPrologue[20] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x
 constexpr std::uint8_t kPrologue58[17] = {BB_PUSH6, 0x48, 0x83, 0xec, 0x58};  // the three creators and Map
 constexpr std::uint8_t kRingPrologue[17] = {BB_PUSH6, 0x48, 0x83, 0xec, 0x28};
 constexpr std::uint8_t kDsvPrologue[17] = {BB_PUSH6, 0x48, 0x83, 0xec, 0x68};  // the render-target view creator's is kPrologue58
+// YEBIS's own D3D11-shaped device and context (vtables 0x5708810 / 0x570a380),
+// which keep its textures and buffers out of GX: CreateTexture2D (slot 5 ->
+// 0x15df570(device, device, initial data, desc, 0, out)), CreateTexture1D /
+// 3D (0x15dea90 / 0x15e1750, the same arguments), CreateBuffer (slot 3 ->
+// 0x15ecb70(device, initial data, desc, out)), Map (0x15d92c0(ctx, resource,
+// subresource, type, flags, mapped*)), UpdateSubresource (0x15d8d70(ctx,
+// resource, subresource, box, data, ...)) and the 2D texture's deleting
+// destructor (0x2e4b090, vtable 0x570bbf0). An object keeps its memory at
+// +0x98, its kind at +0x80 (3 a 2D texture, written by the creator; 2D's
+// size at +0x150 and its D3D11 description from +0x188). Census only
+// (BBHOST_RESOURCE_CENSUS=1) for now.
+constexpr std::uint64_t kYebisCreate2D = 0x15df570, kYebisCreate1D = 0x15dea90, kYebisCreate3D = 0x15e1750, kYebisCreateBuffer = 0x15ecb70;
+constexpr std::uint64_t kYebisMap = 0x15d92c0, kYebisUpdate = 0x15d8d70, kYebisTex2DDelete = 0x2e4b090, kYebisTex2DVtable = 0x570bbf0;
+constexpr std::uint8_t kYebisCreate2DPrologue[17] = {BB_PUSH6, 0x48, 0x83, 0xec, 0x18};      // sub rsp, 0x18
+constexpr std::uint8_t kYebisCreate13Prologue[17] = {BB_PUSH6, 0x50, 0x4d, 0x89, 0xce};      // push rax; mov r14, r9
+constexpr std::uint8_t kYebisCreateBufferPrologue[17] = {BB_PUSH6, 0x50, 0x49, 0x89, 0xce};  // push rax; mov r14, rcx
+constexpr std::uint8_t kYebisMapPrologue[20] = {BB_PUSH6, 0x48, 0x81, 0xec, 0x98, 0x00, 0x00, 0x00};
+constexpr std::uint8_t kYebisUpdatePrologue[20] = {BB_PUSH6, 0x48, 0x81, 0xec, 0x58, 0x01, 0x00, 0x00};
 #undef BB_PUSH6
 // push rbp; mov rbp, rsp; push r15; push r14; push rbx; push rax; mov r14, rdi; mov rdi, [r14]
 constexpr std::uint8_t kBufferReleasePrologue[16] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56,
@@ -121,7 +139,10 @@ constexpr std::uint8_t kBufferReleasePrologue[16] = {0x55, 0x48, 0x89, 0xe5, 0x4
 // push rbp; mov rbp, rsp; push rbx; push rax; mov rbx, rdi; lea rax, [rip + vtable]
 constexpr std::uint8_t kDtorHead[9] = {0x55, 0x48, 0x89, 0xe5, 0x53, 0x50, 0x48, 0x89, 0xfb};
 
-enum Kind : std::uint8_t { kBuffer = 1, kTexture = 2, kTexture3D = 3, kMapCall = 4, kTsharp = 5, kResource1D = 6, kObject = 7, kPoolCall = 8 };
+enum Kind : std::uint8_t {
+    kBuffer = 1, kTexture = 2, kTexture3D = 3, kMapCall = 4, kTsharp = 5, kResource1D = 6, kObject = 7, kPoolCall = 8,
+    kYebisCreate = 9, kYebisMapCall = 10
+};
 
 struct Pending {
     std::uint64_t ret;
@@ -131,6 +152,7 @@ struct Pending {
     std::uint64_t type;     // Map: the map type; creators: initial data pointer
     bool ring = false;
     std::uint64_t ring_bytes = 0;
+    std::uint64_t extra = 0;  // YEBIS: what was created (1 buffer, 2 1D, 3 2D, 4 3D); its Map's resource
 };
 // Creators that returned an error (0 is success; 9 an allocation that failed):
 // a render target that did not fit is the one live_resolution.cpp watches for.
@@ -178,6 +200,19 @@ std::atomic<int> g_map_where_logged{0};
 // hands out told to the buffer shadow's census (host_gpu_shadow_gx_handed).
 bool g_census = false;
 std::atomic<std::uint64_t> g_ring_calls{0}, g_ring_bytes{0}, g_pool_calls{0}, g_pool_bytes{0};
+// The census of YEBIS's own textures and buffers: what its device made, by
+// kind ([1] buffers, [2] 1D, [3] 2D, [4] 3D), and the live ones by memory
+// (under g_mu) for the buffer shadow's and the texture cache's censuses.
+struct YebisObject {
+    std::uint64_t object = 0, bytes = 0;
+    std::uint32_t kind = 0;
+};
+std::map<std::uint64_t, YebisObject> g_yebis_by_memory;     // under g_mu
+std::unordered_map<std::uint64_t, std::uint64_t> g_yebis_by_object;  // object -> memory, under g_mu
+std::atomic<std::uint64_t> g_yebis_made[5] = {}, g_yebis_made_bytes[5] = {}, g_yebis_made_data[5] = {}, g_yebis_failed[5] = {};
+std::atomic<std::uint64_t> g_yebis_rt{0}, g_yebis_depth{0}, g_yebis_destroyed{0}, g_yebis_destroyed_unknown{0};
+std::atomic<std::uint64_t> g_yebis_maps[5][6] = {}, g_yebis_map_own{0}, g_yebis_map_other{0}, g_yebis_updates[5] = {};
+std::atomic<int> g_yebis_logged[5] = {}, g_yebis_map_logged{0};
 std::atomic<std::uint64_t> g_lookups{0}, g_lookup_hits{0};
 std::atomic<std::uint64_t> g_peak_live{0};
 // New resources made over part of a live one's memory: [old type][new type].
@@ -660,6 +695,92 @@ GUEST_ABI std::int64_t pool_hook(std::uint64_t, const std::uint64_t* saved) {
     return 0;
 }
 
+// YEBIS's device's creators (census): the object comes back through `out`.
+template <std::uint64_t What>
+GUEST_ABI std::int64_t yebis_create_hook(std::uint64_t, const std::uint64_t* saved) {
+    Pending p{saved[6], kYebisCreate, What == 1 ? saved[2] : saved[0], What == 1 ? saved[3] : saved[2], What == 1 ? saved[4] : saved[3]};
+    p.extra = What;
+    t_pending.push_back(p);
+    const_cast<std::uint64_t*>(saved)[6] = reinterpret_cast<std::uint64_t>(&gx_res_ret);
+    return 0;
+}
+GUEST_ABI std::int64_t yebis_map_hook(std::uint64_t, const std::uint64_t* saved) {
+    Pending p{saved[6], kYebisMapCall, saved[0], 0, saved[2]};
+    p.extra = saved[4];
+    t_pending.push_back(p);
+    const_cast<std::uint64_t*>(saved)[6] = reinterpret_cast<std::uint64_t>(&gx_res_ret);
+    return 0;
+}
+std::uint32_t yebis_kind(std::uint64_t object) {
+    std::uint32_t kind = 0;
+    if (!object || !rd(object + 0x80, &kind) || kind > 4) return 0;
+    return kind;
+}
+GUEST_ABI std::int64_t yebis_update_hook(std::uint64_t, const std::uint64_t* saved) {
+    g_yebis_updates[yebis_kind(saved[4])].fetch_add(1, std::memory_order_relaxed);
+    return 0;
+}
+GUEST_ABI std::int64_t yebis_tex2d_dtor_hook(std::uint64_t, const std::uint64_t* saved) {
+    std::lock_guard<std::mutex> lk(g_mu);
+    auto it = g_yebis_by_object.find(saved[5]);
+    if (it == g_yebis_by_object.end()) {
+        g_yebis_destroyed_unknown.fetch_add(1, std::memory_order_relaxed);
+        return 0;
+    }
+    g_yebis_destroyed.fetch_add(1, std::memory_order_relaxed);
+    if (auto m = g_yebis_by_memory.find(it->second); m != g_yebis_by_memory.end() && m->second.object == saved[5]) g_yebis_by_memory.erase(m);
+    g_yebis_by_object.erase(it);
+    return 0;
+}
+
+// What YEBIS's device made: its memory, size, kind and (2D) description.
+void note_yebis_created(std::uint64_t object, std::uint32_t what, std::uint64_t desc, bool data) {
+    std::uint64_t memory = 0;
+    rd(object + 0x98, &memory);
+    std::uint64_t bytes = 0;
+    std::uint32_t d[11] = {};  // 2D: width height mips array format samples quality usage bind cpu misc
+    if (what == 3) {
+        std::uint32_t b = 0;
+        rd(object + 0x150, &b);
+        bytes = b;
+        host_read_safe(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(object + 0x188)), d, sizeof(d));
+        if (d[8] & 0x20) g_yebis_rt.fetch_add(1, std::memory_order_relaxed);
+        if (d[8] & 0x40) g_yebis_depth.fetch_add(1, std::memory_order_relaxed);
+    } else if (what == 1) {
+        std::uint32_t b = 0;
+        rd(desc, &b);  // D3D11_BUFFER_DESC.ByteWidth
+        bytes = b;
+        host_read_safe(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(desc)), d, 6 * sizeof(std::uint32_t));
+    }
+    g_yebis_made[what].fetch_add(1, std::memory_order_relaxed);
+    g_yebis_made_bytes[what].fetch_add(bytes, std::memory_order_relaxed);
+    if (data) g_yebis_made_data[what].fetch_add(1, std::memory_order_relaxed);
+    if (g_yebis_logged[what].fetch_add(1, std::memory_order_relaxed) < (what == 3 ? 24 : 6)) {
+        if (what == 3) {
+            host_log("gx-resources: YEBIS made a %ux%u 2D texture (mips %u, array %u, format %u, samples %u, usage %u, bind 0x%x, cpu 0x%x, "
+                     "misc 0x%x%s): object 0x%llx, memory 0x%llx, %llu bytes",
+                     d[0], d[1], d[2], d[3], d[4], d[5], d[7], d[8], d[9], d[10], data ? ", with data" : "", static_cast<unsigned long long>(object),
+                     static_cast<unsigned long long>(memory), static_cast<unsigned long long>(bytes));
+        } else {
+            std::uint64_t f[12] = {};  // the object's fields from +0x80, to place what the census does not know yet
+            host_read_safe(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(object + 0x80)), f, sizeof(f));
+            host_log("gx-resources: YEBIS made a %s (desc %08x %08x %08x %08x %08x %08x%s): object 0x%llx, memory 0x%llx; +0x80.. %llx %llx %llx "
+                     "%llx %llx %llx %llx %llx %llx %llx %llx %llx",
+                     what == 1 ? "buffer" : what == 2 ? "1D texture" : "3D texture", d[0], d[1], d[2], d[3], d[4], d[5], data ? ", with data" : "",
+                     static_cast<unsigned long long>(object), static_cast<unsigned long long>(memory), static_cast<unsigned long long>(f[0]),
+                     static_cast<unsigned long long>(f[1]), static_cast<unsigned long long>(f[2]), static_cast<unsigned long long>(f[3]),
+                     static_cast<unsigned long long>(f[4]), static_cast<unsigned long long>(f[5]), static_cast<unsigned long long>(f[6]),
+                     static_cast<unsigned long long>(f[7]), static_cast<unsigned long long>(f[8]), static_cast<unsigned long long>(f[9]),
+                     static_cast<unsigned long long>(f[10]), static_cast<unsigned long long>(f[11]));
+        }
+    }
+    if (!memory || !bytes) return;
+    std::lock_guard<std::mutex> lk(g_mu);
+    if (auto old = g_yebis_by_object.find(object); old != g_yebis_by_object.end()) g_yebis_by_memory.erase(old->second);
+    g_yebis_by_memory[memory] = YebisObject{object, bytes, what};
+    g_yebis_by_object[object] = memory;
+}
+
 // The ring allocator (trace and census only): rsi = out*, rcx = bytes.
 GUEST_ABI std::int64_t ring_hook(std::uint64_t, const std::uint64_t* saved) {
     Pending p{saved[6], kMapCall, saved[4], 0, 0};
@@ -791,6 +912,25 @@ extern "C" GUEST_ABI std::uint64_t gx_res_after(std::uint64_t result) {
             }
         }
         if (g_trace) trace_map(p);
+    } else if (p.kind == kYebisCreate) {
+        const std::uint32_t what = static_cast<std::uint32_t>(p.extra);
+        std::uint64_t object = 0;
+        if (static_cast<std::uint32_t>(result) == 0 && p.out && rd(p.out, &object) && object) {
+            note_yebis_created(object, what, p.holder, p.type != 0);
+        } else {
+            g_yebis_failed[what].fetch_add(1, std::memory_order_relaxed);
+        }
+    } else if (p.kind == kYebisMapCall) {
+        const std::uint32_t kind = yebis_kind(p.extra);
+        g_yebis_maps[kind][p.type < 6 ? p.type : 0].fetch_add(1, std::memory_order_relaxed);
+        std::uint64_t data = 0, memory = 0;
+        if (static_cast<std::uint32_t>(result) == 0 && p.out && rd(p.out, &data) && rd(p.extra + 0x98, &memory)) {
+            (data == memory ? g_yebis_map_own : g_yebis_map_other).fetch_add(1, std::memory_order_relaxed);
+            if (g_yebis_map_logged.fetch_add(1, std::memory_order_relaxed) < 8)
+                host_log("gx-resources: YEBIS maps a kind-%u resource 0x%llx (type %llu): 0x%llx handed out, its memory 0x%llx", kind,
+                         static_cast<unsigned long long>(p.extra), static_cast<unsigned long long>(p.type),
+                         static_cast<unsigned long long>(data), static_cast<unsigned long long>(memory));
+        }
     } else if (p.kind == kPoolCall) {
         std::uint64_t block = 0;
         if (result && p.type && rd(result + 8, &block) && block) {
@@ -937,6 +1077,16 @@ void gx_resources_install(ElfImage* image) {
         return e && e[0] == '1';
     }();
     if (g_trace || g_census) hook(kRing, kRingPrologue, sizeof(kRingPrologue), reinterpret_cast<void*>(&ring_hook), 0);
+    if (g_census) {
+        hook(kYebisCreate2D, kYebisCreate2DPrologue, sizeof(kYebisCreate2DPrologue), reinterpret_cast<void*>(&yebis_create_hook<3>), 0);
+        hook(kYebisCreate1D, kYebisCreate13Prologue, sizeof(kYebisCreate13Prologue), reinterpret_cast<void*>(&yebis_create_hook<2>), 0);
+        hook(kYebisCreate3D, kYebisCreate13Prologue, sizeof(kYebisCreate13Prologue), reinterpret_cast<void*>(&yebis_create_hook<4>), 0);
+        hook(kYebisCreateBuffer, kYebisCreateBufferPrologue, sizeof(kYebisCreateBufferPrologue), reinterpret_cast<void*>(&yebis_create_hook<1>),
+             0);
+        hook(kYebisMap, kYebisMapPrologue, sizeof(kYebisMapPrologue), reinterpret_cast<void*>(&yebis_map_hook), 0);
+        hook(kYebisUpdate, kYebisUpdatePrologue, sizeof(kYebisUpdatePrologue), reinterpret_cast<void*>(&yebis_update_hook), 0);
+        dtor_with(kYebisTex2DDelete, kYebisTex2DVtable, reinterpret_cast<void*>(&yebis_tex2d_dtor_hook));
+    }
     // The pool's blocks are memory the buffer shadow binds from host memory
     // (it is rewritten every frame or so) unless BBHOST_SHADOW_GX=0.
     const bool shadow_gx = [] {
@@ -1141,6 +1291,16 @@ bool gx_view_resource(std::uint64_t view, GxResourceInfo* out) {
     return view && rd(view + 0x08, &holder) && gx_resource_by_holder(holder, out);
 }
 
+bool gx_yebis_at(std::uint64_t va, std::size_t bytes) {
+    if (!bytes) return false;
+    std::lock_guard<std::mutex> lk(g_mu);
+    if (g_yebis_by_memory.empty()) return false;
+    auto it = g_yebis_by_memory.upper_bound(va + bytes - 1);
+    if (it == g_yebis_by_memory.begin()) return false;
+    --it;
+    return it->first + it->second.bytes > va;
+}
+
 bool gx_resource_overlapping(std::uint64_t va, std::size_t bytes, GxResourceInfo* out) {
     if (!bytes) return false;
     std::lock_guard<std::mutex> lk(g_mu);
@@ -1254,6 +1414,39 @@ void gx_resources_report() {
                  "blocks %llu (%llu MiB)",
                  where.empty() ? " none;" : where.c_str(), static_cast<ull>(g_ring_calls.load()), static_cast<ull>(g_ring_bytes.load() >> 20),
                  static_cast<ull>(g_pool_calls.load()), static_cast<ull>(g_pool_bytes.load() >> 20));
+        static const char* const kYebisKind[5] = {"other", "buffers", "1D textures", "2D textures", "3D textures"};
+        std::string made, maps;
+        for (unsigned k = 1; k < 5; ++k) {
+            char buf[200];
+            if (g_yebis_made[k].load() || g_yebis_failed[k].load()) {
+                std::snprintf(buf, sizeof(buf), " %s %llu (%llu MiB, %llu with data, %llu failed);", kYebisKind[k], static_cast<ull>(g_yebis_made[k].load()),
+                              static_cast<ull>(g_yebis_made_bytes[k].load() >> 20), static_cast<ull>(g_yebis_made_data[k].load()),
+                              static_cast<ull>(g_yebis_failed[k].load()));
+                made += buf;
+            }
+        }
+        for (unsigned k = 0; k < 5; ++k) {
+            ull n[6], sum = 0;
+            for (unsigned t = 0; t < 6; ++t) sum += n[t] = g_yebis_maps[k][t].load();
+            if (!sum && !g_yebis_updates[k].load()) continue;
+            char buf[200];
+            std::snprintf(buf, sizeof(buf), " %s: Map types 1-5 %llu/%llu/%llu/%llu/%llu, UpdateSubresource %llu;", kYebisKind[k], n[1], n[2], n[3], n[4], n[5],
+                          static_cast<ull>(g_yebis_updates[k].load()));
+            maps += buf;
+        }
+        std::size_t live = 0;
+        std::uint64_t live_bytes = 0;
+        {
+            std::lock_guard<std::mutex> lk(g_mu);
+            live = g_yebis_by_memory.size();
+            for (const auto& [m, o] : g_yebis_by_memory) live_bytes += o.bytes;
+        }
+        host_log("gx-resources: YEBIS's own device made%s 2D render targets %llu, depth %llu; 2D destroyed %llu (%llu it had not seen made); live "
+                 "%zu (%llu MiB); by resource:%s Map's pointer its memory %llu, elsewhere %llu",
+                 made.empty() ? " nothing;" : made.c_str(), static_cast<ull>(g_yebis_rt.load()), static_cast<ull>(g_yebis_depth.load()),
+                 static_cast<ull>(g_yebis_destroyed.load()), static_cast<ull>(g_yebis_destroyed_unknown.load()), live,
+                 static_cast<ull>(live_bytes >> 20), maps.empty() ? " none;" : maps.c_str(), static_cast<ull>(g_yebis_map_own.load()),
+                 static_cast<ull>(g_yebis_map_other.load()));
     }
     {
         std::string ov;
