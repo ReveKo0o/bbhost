@@ -6019,6 +6019,19 @@ Precompiler& precompiler() {
         host_log("render: precompile workers: %d until the first in-game frame and while loading, %d in game "
                  "(BBHOST_PRECOMPILE_BOOT_THREADS, BBHOST_PRECOMPILE_THREADS)", w->boot, w->steady);
         hlsl_set_busy_probe([]() -> bool {
+            // On an integrated GPU, whose chip and power budget the CPU
+            // shares (the Steam Deck), compiling beside the world cost ~2 fps
+            // and a long frame almost every second of it (the GPU's clock fell
+            // from ~1.4 to ~1.17 GHz): there bb-hlsl compiles only before the
+            // first in-game frame and on loading screens.
+            // BBHOST_HLSL_IN_WORLD=1 lets it run in the world on any GPU, =0
+            // holds it there on any.
+            static const bool in_world = [] {
+                const char* e = std::getenv("BBHOST_HLSL_IN_WORLD");
+                if (e && (e[0] == '0' || e[0] == '1') && !e[1]) return e[0] == '1';
+                return !g.integrated;
+            }();
+            if (!in_world && !g_precompile_boost.load()) return true;
             Precompiler* p = g_precompiler.load();
             if (!p) return false;
             std::lock_guard<std::mutex> lk(p->mu);

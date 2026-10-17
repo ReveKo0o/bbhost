@@ -201,7 +201,12 @@ the default, and nothing waits on DXC:
 - **DXC compiles behind the game.** The modules a start did not have are
   compiled by `bb-hlsl` threads (two; one on a machine with fewer than eight
   hardware threads; `BBHOST_HLSL_THREADS`) at the lowest priority, after the
-  start's own shader compiles, and kept in the translation cache. Their order
+  start's own shader compiles, and kept in the translation cache. On an
+  integrated GPU, which shares the CPU's chip and power budget (the Steam
+  Deck), they compile only before the first in-game frame and on loading
+  screens: beside the world they cost the Deck ~2 fps and a long frame almost
+  every second (`BBHOST_HLSL_IN_WORLD=1` lets them run in the world on any
+  GPU, `=0` holds them there on any). Their order
   follows the pipeline manifest: what this start's draws took, then what the
   manifests replay (what earlier starts drew, the most recent first), then
   what GX created but nothing drew yet, then predictions and the opt-in

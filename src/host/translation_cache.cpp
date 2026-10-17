@@ -998,7 +998,8 @@ void hlsl_behind_thread() {
             }
         }
         // Behind the start's own compiles: while the precompile workers have
-        // work, the cores are theirs.
+        // work, the cores are theirs (and on an integrated GPU, while the world
+        // is drawn: render.cpp's probe).
         if (bool (*busy)() = g_hlsl_busy.load()) {
             const auto g0 = std::chrono::steady_clock::now();
             while (busy()) std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -1059,7 +1060,7 @@ void hlsl_behind_thread() {
         static std::atomic<int> drained_logs{0};
         if (drained_logs.fetch_add(1) < 3) {
             host_log("render: HLSL: every stage met so far has its DXC module for the next start: %llu compiled on %d bb-hlsl thread%s in %.1f s of "
-                     "their time, %.1f s after the first was queued (%llu waited %.1f s for the start's own compiles); %llu failed; %.0f MiB of "
+                     "their time, %.1f s after the first was queued (%llu waited %.1f s, held back by the start's own compiles or the world); %llu failed; %.0f MiB of "
                      "DXC's heap handed back to the system",
                      static_cast<unsigned long long>(g_hlsl_behind.done.load()), g_hlsl_behind.threads, g_hlsl_behind.threads == 1 ? "" : "s",
                      g_hlsl_behind.done_us.load() / 1e6,
@@ -1605,8 +1606,8 @@ void translation_cache_report() {
             }
             char b[400];
             std::snprintf(b, sizeof(b), "; %llu kept the lift for this start, their modules compiled on bb-hlsl for the next (%llu done in %.1f s - "
-                                        "drawn %llu, manifests %llu, created %llu, later %llu; %llu moved up a lane; %.1f s waiting for the start's "
-                                        "compiles - %llu of them failed, %zu waiting)",
+                                        "drawn %llu, manifests %llu, created %llu, later %llu; %llu moved up a lane; %.1f s held back by the start's "
+                                        "compiles or the world - %llu of them failed, %zu waiting)",
                           static_cast<unsigned long long>(g_hlsl_behind.deferred.load()), static_cast<unsigned long long>(g_hlsl_behind.done.load()),
                           g_hlsl_behind.done_us.load() / 1e6, static_cast<unsigned long long>(g_hlsl_behind.lane_done[0].load()),
                           static_cast<unsigned long long>(g_hlsl_behind.lane_done[1].load()),
