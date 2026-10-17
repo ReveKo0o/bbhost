@@ -115,7 +115,10 @@ from `v_mbcnt`) becomes one atomic add per invocation, so no compute lift
 needs subgroup operations. A barrier is accepted only where every invocation
 of the workgroup provably reaches it, and LDS, which no game compute shader
 uses, is refused. `BBHOST_LIFT_COMPUTE=0` keeps every compute shader
-translated.
+translated. A translated compute shader reads its constant buffers, tables
+and typed loads through storage buffers its dispatch pushes, where every one
+of them binds, rather than through the page-table walk
+(`BBHOST_CS_BUFFERS=0`: the walk).
 
 **Textures and memory.** The game's memory is shared with the GPU, as on the
 PS4: its GPU-visible parts (about 5 GB) are imported into Vulkan, because
