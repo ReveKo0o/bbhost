@@ -7160,8 +7160,12 @@ void shader_sweep_start(const std::string& stamp_path, const std::string& eboot_
     }
     g_sweep_on.store(true);
     sweep_limit_update();
-    host_log("render: shader sweep: the eboot's own shaders and the bundles' into the caches, on %d bb-sweep threads at the lowest "
-             "priority (one in game), behind the precompile workers (BBHOST_SHADER_SWEEP)", threads);
+    if (session)
+        host_log("render: shader sweep (the compile session): the bundles' shaders into the caches, on %d bb-sweep threads, behind the "
+                 "precompile workers' manifests", threads);
+    else
+        host_log("render: shader sweep: the eboot's own shaders and the bundles' into the caches, on %d bb-sweep threads at the lowest "
+                 "priority (one in game), behind the precompile workers (BBHOST_SHADER_SWEEP)", threads);
     for (int i = 0; i < threads; ++i) std::thread(sweep_thread, i).detach();
 }
 namespace {
