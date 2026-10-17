@@ -221,6 +221,7 @@ std::unordered_map<std::uint64_t, std::uint64_t> g_yebis_by_object;  // object -
 std::atomic<std::uint64_t> g_yebis_made[5] = {}, g_yebis_made_bytes[5] = {}, g_yebis_made_data[5] = {}, g_yebis_failed[5] = {};
 std::atomic<std::uint64_t> g_yebis_rt{0}, g_yebis_depth{0}, g_yebis_destroyed{0}, g_yebis_destroyed_unknown{0};
 std::atomic<std::uint64_t> g_yebis_maps[5][6] = {}, g_yebis_map_own{0}, g_yebis_map_other{0}, g_yebis_updates[5] = {};
+std::atomic<std::uint64_t> g_yebis_renamed[5] = {};  // Maps that moved the resource's memory, by kind
 std::atomic<int> g_yebis_logged[5] = {}, g_yebis_map_logged{0};
 // BBHOST_RES_YEBIS=1: YEBIS's 2D textures are registered as resources from
 // its creator and destructor (key kYebisKey | the object), and its Map,
@@ -731,7 +732,12 @@ GUEST_ABI std::int64_t yebis_create_hook(std::uint64_t, const std::uint64_t* sav
     return 0;
 }
 GUEST_ABI std::int64_t yebis_map_hook(std::uint64_t, const std::uint64_t* saved) {
-    Pending p{saved[6], kYebisMapCall, saved[0], 0, saved[2]};
+    // The resource's memory before the Map: a discard (type 4) renames it -
+    // new memory from YEBIS's ring (ctx + 0x3458 + 0x120, 0x15e5950) at
+    // +0x90 and +0x98, the T# (+0xc4) and its views' rebased.
+    std::uint64_t before = 0;
+    rd(saved[4] + 0x98, &before);
+    Pending p{saved[6], kYebisMapCall, saved[0], before, saved[2]};
     p.extra = saved[4];
     t_pending.push_back(p);
     const_cast<std::uint64_t*>(saved)[6] = reinterpret_cast<std::uint64_t>(&gx_res_ret);
@@ -751,17 +757,29 @@ GUEST_ABI std::int64_t yebis_update_hook(std::uint64_t, const std::uint64_t* sav
 }
 // A registered YEBIS texture was written by the CPU (BBHOST_RES_YEBIS): its
 // write sequence moves and the texture cache uploads it again at its next use.
-void yebis_written(std::uint64_t object) {
+// After a Map its memory is read again: a discard renames it (YEBIS's Map
+// hands out new memory from its ring and rebases the T#), and the registry
+// follows, as it does a GX holder's.
+void yebis_written(std::uint64_t object, bool after_map = false) {
     if (!g_res_yebis || !object) return;
-    std::uint64_t memory = 0;
+    std::uint64_t memory = 0, now = 0;
     std::uint32_t bytes = 0;
+    if (after_map) rd(object + 0x98, &now);
     {
         std::lock_guard<std::mutex> lk(g_mu);
-        auto it = g_by_holder.find(kYebisKey | object);
+        const std::uint64_t key = kYebisKey | object;
+        auto it = g_by_holder.find(key);
         if (it == g_by_holder.end() || !it->second.info.alive) return;
-        memory = it->second.info.memory;
-        bytes = it->second.info.bytes;
-        it->second.info.write_seq = g_write_seq.fetch_add(1, std::memory_order_relaxed) + 1;
+        Entry& e = it->second;
+        if (now && now != e.info.memory) {
+            g_map_moved.fetch_add(1, std::memory_order_relaxed);
+            if (auto m = g_by_memory.find(e.info.memory); m != g_by_memory.end() && m->second == key) g_by_memory.erase(m);
+            e.info.memory = now;
+            g_by_memory[now] = key;
+        }
+        memory = e.info.memory;
+        bytes = e.info.bytes;
+        e.info.write_seq = g_write_seq.fetch_add(1, std::memory_order_relaxed) + 1;
     }
     g_yebis_told.fetch_add(1, std::memory_order_relaxed);
     if (memory && bytes) host_gpu_texture_written(memory, bytes);
@@ -1038,16 +1056,17 @@ extern "C" GUEST_ABI std::uint64_t gx_res_after(std::uint64_t result) {
         g_yebis_updates[yebis_kind(p.extra)].fetch_add(1, std::memory_order_relaxed);
         yebis_written(p.extra);
     } else if (p.kind == kYebisMapCall) {
-        if (static_cast<std::uint32_t>(result) == 0) yebis_written(p.extra);
+        if (static_cast<std::uint32_t>(result) == 0) yebis_written(p.extra, true);
         const std::uint32_t kind = yebis_kind(p.extra);
         g_yebis_maps[kind][p.type < 6 ? p.type : 0].fetch_add(1, std::memory_order_relaxed);
         std::uint64_t data = 0, memory = 0;
         if (static_cast<std::uint32_t>(result) == 0 && p.out && rd(p.out, &data) && rd(p.extra + 0x98, &memory)) {
             (data == memory ? g_yebis_map_own : g_yebis_map_other).fetch_add(1, std::memory_order_relaxed);
-            if (g_yebis_map_logged.fetch_add(1, std::memory_order_relaxed) < 8)
-                host_log("gx-resources: YEBIS maps a kind-%u resource 0x%llx (type %llu): 0x%llx handed out, its memory 0x%llx", kind,
+            if (memory != p.holder) g_yebis_renamed[kind].fetch_add(1, std::memory_order_relaxed);
+            if (g_yebis_map_logged.fetch_add(1, std::memory_order_relaxed) < 12)
+                host_log("gx-resources: YEBIS maps a kind-%u resource 0x%llx (type %llu): 0x%llx handed out, its memory 0x%llx (0x%llx before)", kind,
                          static_cast<unsigned long long>(p.extra), static_cast<unsigned long long>(p.type),
-                         static_cast<unsigned long long>(data), static_cast<unsigned long long>(memory));
+                         static_cast<unsigned long long>(data), static_cast<unsigned long long>(memory), static_cast<unsigned long long>(p.holder));
         }
     } else if (p.kind == kPoolCall) {
         std::uint64_t block = 0;
@@ -1555,8 +1574,8 @@ void gx_resources_report() {
             for (unsigned t = 0; t < 6; ++t) sum += n[t] = g_yebis_maps[k][t].load();
             if (!sum && !g_yebis_updates[k].load()) continue;
             char buf[200];
-            std::snprintf(buf, sizeof(buf), " %s: Map types 1-5 %llu/%llu/%llu/%llu/%llu, UpdateSubresource %llu;", kYebisKind[k], n[1], n[2], n[3], n[4], n[5],
-                          static_cast<ull>(g_yebis_updates[k].load()));
+            std::snprintf(buf, sizeof(buf), " %s: Map types 1-5 %llu/%llu/%llu/%llu/%llu (memory moved %llu), UpdateSubresource %llu;", kYebisKind[k], n[1],
+                          n[2], n[3], n[4], n[5], static_cast<ull>(g_yebis_renamed[k].load()), static_cast<ull>(g_yebis_updates[k].load()));
             maps += buf;
         }
         std::size_t live = 0;
