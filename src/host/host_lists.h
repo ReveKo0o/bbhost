@@ -13,8 +13,9 @@
 // lists, takes each submitted range's part of its list on the submitting
 // thread, and has the command processor compare it with what its walk of the
 // range meets - packet for packet, in order - counting agreements and every
-// disagreement by reason (the exit report). 1 is the handoff, where a covered
-// range runs from its list instead of its bytes.
+// disagreement by reason (the exit report). 1 is the handoff: a range goes to
+// the command processor as the packets its list holds, instead of all its
+// bytes (hand_over). 3 records only (the recording's own cost).
 //
 // The recording side is leaf-safe (decomp leaves call it on the game's
 // threads, with the game's FS): no locks, no allocation, no host
@@ -54,6 +55,15 @@ struct Taken {
 };
 // Hosted, on the submitting thread: [va, va + bytes)'s part of its list.
 void take(std::uint64_t va, std::size_t bytes, Taken* out);
+
+// The handoff (BBHOST_HOST_LISTS=1), on the submitting thread: the range as
+// the packets its list holds, each copied whole from its header, in order,
+// into `out` - what the command processor walks in place of the range. False,
+// counted by reason, when the range is to be walked as before: no list, a
+// list that filled up, a packet past the range's end, or (the proof,
+// BBHOST_HOST_LISTS_PROVE=1, a check: every header of the range read and
+// matched against the list) a packet the list does not account for.
+bool hand_over(std::uint64_t va, std::size_t bytes, const Taken& taken, std::vector<std::uint8_t>* out);
 
 // Hosted, on a command-processor thread (shadow): a top-level range's walk
 // begins - `walk_va` where the walker reads it (its copy), `taken` what the

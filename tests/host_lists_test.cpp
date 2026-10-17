@@ -271,6 +271,57 @@ int main() {
         CHECK(seen().differed == s0.differed + 1);
     }
 
+    // The handoff: the range as its listed packets, copied whole in order;
+    // walked as before without a list, past a full one, with a packet past
+    // the range's end, or (the proof) with a packet the list does not
+    // account for.
+    {
+        Buffer b(4096);
+        b.put(0, 0x10, 4, kGxNativeMagic);   // token
+        b.put(4, 0x10, 6, 0x68750001u);      // marker
+        b.put(10, 0x47, 6);                  // label
+        b.put(16, 0x76, 3);                  // SET_SH_REG
+        b.put(19, 0x3c, 7);                  // wait
+        b.chunk[26] = 0x80000000u;           // a type-2 filler
+        b.note(0, 0x10);
+        b.note(10, 0x47);
+        b.note(19, 0x3c);
+        Taken t;
+        take(b.at(0), 27 * 4, &t);
+        std::vector<std::uint8_t> out;
+        CHECK(hand_over(b.at(0), 27 * 4, t, &out));
+        std::vector<std::uint8_t> want;
+        for (const auto& [dw, len] : {std::pair{0, 4}, std::pair{10, 6}, std::pair{19, 7}}) {
+            const auto* p = reinterpret_cast<const std::uint8_t*>(&b.chunk[dw]);
+            want.insert(want.end(), p, p + len * 4);
+        }
+        CHECK(out == want);
+        g_prove = true;
+        CHECK(hand_over(b.at(0), 27 * 4, t, &out) && out == want);
+        // A token the list does not have: the proof refuses the range.
+        b.put(26, 0x10, 4, kGxCopyMagic);
+        Taken t2;
+        take(b.at(0), 30 * 4, &t2);
+        const u64 proof = g_hand_refused[kHrProof].load();
+        CHECK(!hand_over(b.at(0), 30 * 4, t2, &out) && g_hand_refused[kHrProof].load() == proof + 1);
+        // Listed where nothing is read (the marker): refused too.
+        Buffer c(256);
+        c.put(0, 0x10, 6, 0x68750002u);
+        c.note(0, 0x10);
+        take(c.at(0), 6 * 4, &t2);
+        CHECK(!hand_over(c.at(0), 6 * 4, t2, &out));
+        g_prove = false;
+        // Without the proof, the list is trusted; a packet past the end is not.
+        take(b.at(0), 22 * 4, &t2);  // ends inside the wait at 19
+        const u64 past = g_hand_refused[kHrPastEnd].load();
+        CHECK(!hand_over(b.at(0), 22 * 4, t2, &out) && g_hand_refused[kHrPastEnd].load() == past + 1);
+        Taken none;
+        CHECK(!hand_over(b.at(0), 64, none, &out));
+        Taken full;
+        full.state = Taken::kOverflowed;
+        CHECK(!hand_over(b.at(0), 64, full, &out));
+    }
+
     // What the walk acts on, by packet.
     {
         const std::uint32_t token[] = {kGxNativeMagic, 0, 0}, marker[] = {0x68750002u}, zpass[] = {57u | (1u << 8), 0, 0},

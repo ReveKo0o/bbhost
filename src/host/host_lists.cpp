@@ -281,6 +281,83 @@ void take(u64 va, std::size_t bytes, Taken* out) {
     out->state = Taken::kTaken;
 }
 
+namespace {
+
+// The handoff's counts (hand_over), and why a range was walked instead.
+enum HandRefusal { kHrNoList, kHrOverflowed, kHrPastEnd, kHrProof, kHrRefusals };
+const char* const kHrName[kHrRefusals] = {"no list (a chunk with no packet recorded)", "a list that filled up", "a packet past the range's end",
+                                          "the proof found a packet the list does not account for"};
+std::atomic<u64> g_hand_ranges{0}, g_hand_bytes_in{0}, g_hand_bytes_out{0}, g_hand_refused[kHrRefusals] = {}, g_hand_proof_op[256] = {};
+
+bool g_prove = [] {
+    const char* e = std::getenv("BBHOST_HOST_LISTS_PROVE");
+    return e && e[0] == '1';
+}();
+
+u32 dword_at(u64 va) {
+    u32 v;
+    std::memcpy(&v, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(va)), 4);
+    return v;
+}
+
+// The proof: the range's headers, walked as the command processor walks them
+// (type-3 packets by their counts, anything else a dword), against the list:
+// each packet it acts on listed at its place, nothing else listed.
+bool proven(u64 va, std::size_t bytes, const Taken& t) {
+    const std::size_t dwords = bytes / 4;
+    std::size_t e = 0;
+    for (std::size_t k = 0; k < dwords;) {
+        const u32 hdr = dword_at(va + k * 4);
+        if ((hdr >> 30) != 3) {
+            ++k;
+            continue;
+        }
+        const u32 op = (hdr >> 8) & 0xff;
+        const std::size_t len = 2 + ((hdr >> 16) & 0x3fff);
+        if (k + len > dwords) return false;
+        u32 body[1] = {len > 1 ? dword_at(va + k * 4 + 4) : 0};
+        const bool listed = e < t.entries.size() && (t.entries[e] >> 8) == k;
+        if (carried(op, body, len - 1)) {
+            if (!listed || (t.entries[e] & 0xff) != op) {
+                g_hand_proof_op[op].fetch_add(1, std::memory_order_relaxed);
+                return false;
+            }
+            ++e;
+        } else if (listed) {
+            g_hand_proof_op[op].fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+        k += len;
+    }
+    return e == t.entries.size();
+}
+
+}  // namespace
+
+bool hand_over(u64 va, std::size_t bytes, const Taken& t, std::vector<std::uint8_t>* out) {
+    const auto refuse = [](HandRefusal why) {
+        g_hand_refused[why].fetch_add(1, std::memory_order_relaxed);
+        return false;
+    };
+    if (t.state == Taken::kNoList) return refuse(kHrNoList);
+    if (t.state == Taken::kOverflowed) return refuse(kHrOverflowed);
+    if (g_prove && !proven(va, bytes, t)) return refuse(kHrProof);
+    out->clear();
+    const u64 end = va + bytes;
+    for (const u32 e : t.entries) {
+        const u64 at = va + static_cast<u64>(e >> 8) * 4;
+        const u32 hdr = dword_at(at);
+        const std::size_t len = 4 * (2 + ((hdr >> 16) & 0x3fff));
+        if (at + len > end) return refuse(kHrPastEnd);
+        const auto* p = reinterpret_cast<const std::uint8_t*>(static_cast<std::uintptr_t>(at));
+        out->insert(out->end(), p, p + len);
+    }
+    g_hand_ranges.fetch_add(1, std::memory_order_relaxed);
+    g_hand_bytes_in.fetch_add(bytes, std::memory_order_relaxed);
+    g_hand_bytes_out.fetch_add(out->size(), std::memory_order_relaxed);
+    return true;
+}
+
 void shadow_begin(const Taken* taken, u64 walk_va, std::size_t bytes) {
     t_depth = 0;
     Frame& f = t_frames[0];
@@ -385,7 +462,6 @@ void report() {
              "dropped when taken (BBHOST_HOST_LISTS=%d)",
              regions, static_cast<double>(g_pool_used.load()) * 4 / (1 << 20), static_cast<ull>(g_unkeyed.load()),
              static_cast<ull>(g_unrecorded.load()), static_cast<ull>(g_overflowed.load()), static_cast<ull>(g_stale.load()), g_mode);
-    if (g_mode != 2) return;
     const auto by_op = [](const std::atomic<u64>* v) {
         std::string s;
         for (int op = 0; op < 256; ++op) {
@@ -397,6 +473,19 @@ void report() {
         }
         return s.empty() ? std::string(" none") : s;
     };
+    if (g_mode == 1) {
+        std::string why;
+        for (int k = 0; k < kHrRefusals; ++k) {
+            if (const u64 v = g_hand_refused[k].load()) why += std::string(why.empty() ? " " : "; ") + kHrName[k] + " " + std::to_string(v);
+        }
+        host_log("host-lists (handoff): %llu submitted ranges went to the command processor as their lists' packets (%.1f MiB of command "
+                 "buffer as %.1f MiB); walked as before:%s%s%s",
+                 static_cast<ull>(g_hand_ranges.load()), static_cast<double>(g_hand_bytes_in.load()) / (1 << 20),
+                 static_cast<double>(g_hand_bytes_out.load()) / (1 << 20), why.empty() ? " none" : why.c_str(),
+                 g_prove ? "; the packets the proof refused ranges by:" : "", g_prove ? by_op(g_hand_proof_op).c_str() : "");
+        return;
+    }
+    if (g_mode != 2) return;
     host_log("host-lists (shadow): %llu submitted ranges (%.1f MiB) walked, %llu covered by their lists (%.1f MiB); not: %llu with no "
              "list, %llu over a full list, %llu where the list and the walk differ; indirect buffers inside them %llu, %llu covered",
              static_cast<ull>(g.ranges.load()), static_cast<double>(g.bytes.load()) / (1 << 20), static_cast<ull>(g.covered.load()),

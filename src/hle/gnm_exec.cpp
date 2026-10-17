@@ -3006,7 +3006,37 @@ void hle_gnm_submit_async(int queue_id, const std::vector<std::pair<const void*,
             if (cbs[k].first && cbs[k].second >= 4) host_lists::take(reinterpret_cast<std::uintptr_t>(cbs[k].first), cbs[k].second, &lists[k]);
         }
     }
-    if (copy_cbs) {
+    if (copy_cbs && host_lists::g_mode == 1 && !g_cp_census) {
+        // BBHOST_HOST_LISTS=1 (the handoff): each range as the packets its
+        // host list holds - our tokens, the labels, the waits, the calls -
+        // copied out in order, instead of all its bytes; the data and markers
+        // between them stay behind. A range without a list it can trust
+        // (host_lists::hand_over says why) is copied whole and walked as
+        // before. Not with the census, which maps what it walks back to the
+        // game's buffers.
+        Job job;
+        job.guest = cbs;
+        host_lists::Taken taken;
+        for (std::size_t k = 0; k < cbs.size(); ++k) {
+            const auto& cb = cbs[k];
+            if (cb.first && cb.second >= 4) {
+                const std::uint64_t va = reinterpret_cast<std::uintptr_t>(cb.first);
+                std::vector<std::uint8_t> packets;
+                host_lists::take(va, cb.second, &taken);
+                if (host_lists::hand_over(va, cb.second, taken, &packets)) {
+                    job.owned.push_back(std::move(packets));
+                    job.cbs.emplace_back(job.owned.back().data(), job.owned.back().size());
+                    job.guest[k].first = nullptr;  // not the game's bytes: nothing to compare after the walk
+                    continue;
+                }
+            }
+            const std::vector<std::pair<const void*, std::size_t>> one{cb};
+            job.cbs.push_back(snapshot_cbs(one, job.owned)[0]);
+        }
+        job.ce_cbs = snapshot_cbs(ce_cbs, job.owned);
+        job.done = std::move(done);
+        q->jobs.push_back(std::move(job));
+    } else if (copy_cbs) {
         Job job;
         job.cbs = snapshot_cbs(cbs, job.owned);
         job.ce_cbs = snapshot_cbs(ce_cbs, job.owned);
