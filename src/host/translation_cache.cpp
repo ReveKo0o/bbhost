@@ -13,6 +13,10 @@
 
 #include <zlib.h>
 
+#if defined(__GLIBC__) && !defined(_WIN32)
+#include <malloc.h>
+#endif
+
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -926,27 +930,55 @@ void hlsl_behind_thread() {
         g_hlsl_behind.lane_done[lane].fetch_add(1, std::memory_order_relaxed);
         g_hlsl_behind.done_us.fetch_add(us_since(t0), std::memory_order_relaxed);
         if (spirv.empty()) g_hlsl_behind.failed.fetch_add(1, std::memory_order_relaxed);
-        std::lock_guard<std::mutex> lk(g_hlsl_behind.mu);
-        g_hlsl_behind.seen[job->key] = HlslBehind::kDone;
-        bool running = false;
-        for (const auto& [k, s] : g_hlsl_behind.seen) {
-            if (s == HlslBehind::kRunning) {
-                running = true;
-                break;
+        bool drained = false;
+        {
+            std::lock_guard<std::mutex> lk(g_hlsl_behind.mu);
+            g_hlsl_behind.seen[job->key] = HlslBehind::kDone;
+            bool running = false;
+            for (const auto& [k, st] : g_hlsl_behind.seen) {
+                if (st == HlslBehind::kRunning) {
+                    running = true;
+                    break;
+                }
+            }
+            if (g_hlsl_behind.waiting == 0 && !running && !g_hlsl_behind.drained_logged) {
+                g_hlsl_behind.drained_logged = true;
+                g_hlsl_drained.store(true);  // the next periodic save writes them
+                drained = true;
             }
         }
-        if (g_hlsl_behind.waiting == 0 && !running && !g_hlsl_behind.drained_logged) {
-            g_hlsl_behind.drained_logged = true;
-            g_hlsl_drained.store(true);  // the next periodic save writes them
-            // Logged the first few times: later ones are a few stages a new place brought.
-            static int drained_logs = 0;
-            if (++drained_logs <= 3) host_log("render: HLSL: every stage met so far has its DXC module for the next start: %llu compiled on %d bb-hlsl thread%s in %.1f s of "
-                     "their time, %.1f s after the first was queued (%llu waited %.1f s for the start's own compiles); %llu failed",
+        job.reset();
+        if (!drained) continue;
+        // DXC's heap on these threads stays with them (glibc keeps a thread's
+        // arena): handed back to the system each time the queue empties, out
+        // of the queue's lock.
+        long trimmed_kib = 0;
+#if defined(__GLIBC__) && !defined(_WIN32)
+        {
+            const auto rss_kib = [] {
+                long pages = 0, rss = 0;
+                if (FILE* f = std::fopen("/proc/self/statm", "r")) {
+                    if (std::fscanf(f, "%ld %ld", &pages, &rss) != 2) rss = 0;
+                    std::fclose(f);
+                }
+                return rss * (sysconf(_SC_PAGESIZE) / 1024);
+            };
+            const long before = rss_kib();
+            malloc_trim(0);
+            trimmed_kib = before - rss_kib();
+        }
+#endif
+        // Logged the first few times: later ones are a few stages a new place brought.
+        static std::atomic<int> drained_logs{0};
+        if (drained_logs.fetch_add(1) < 3) {
+            host_log("render: HLSL: every stage met so far has its DXC module for the next start: %llu compiled on %d bb-hlsl thread%s in %.1f s of "
+                     "their time, %.1f s after the first was queued (%llu waited %.1f s for the start's own compiles); %llu failed; %.0f MiB of "
+                     "DXC's heap handed back to the system",
                      static_cast<unsigned long long>(g_hlsl_behind.done.load()), g_hlsl_behind.threads, g_hlsl_behind.threads == 1 ? "" : "s",
                      g_hlsl_behind.done_us.load() / 1e6,
                      std::chrono::duration<double>(std::chrono::steady_clock::now() - g_hlsl_behind.first).count(),
                      static_cast<unsigned long long>(g_hlsl_behind.done.load()), g_hlsl_behind.gated_ms.load() / 1e3,
-                     static_cast<unsigned long long>(g_hlsl_behind.failed.load()));
+                     static_cast<unsigned long long>(g_hlsl_behind.failed.load()), trimmed_kib > 0 ? trimmed_kib / 1024.0 : 0.0);
         }
     }
 }
