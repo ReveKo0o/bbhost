@@ -147,6 +147,7 @@ add_executable(bbhost
   src/hle/gnm.cpp
   src/hle/gnm_exec.cpp
   src/host/host_lists.cpp
+  src/host/cb_proof.cpp
   src/hle/gx_trace.cpp
   src/hle/audio.cpp
   src/hle/net.cpp
@@ -571,6 +572,12 @@ if(UNIX)
   target_link_libraries(host_lists_test PRIVATE pthread)
   add_test(NAME host_lists_test COMMAND host_lists_test)
   set_tests_properties(host_lists_test PROPERTIES ENVIRONMENT "BBHOST_HOST_LISTS=2")
+  # The constant-buffer proof's copies and compares without the game (tests/cb_proof_test.cpp).
+  add_executable(cb_proof_test tests/cb_proof_test.cpp)
+  target_include_directories(cb_proof_test PRIVATE src include)
+  target_link_libraries(cb_proof_test PRIVATE pthread)
+  add_test(NAME cb_proof_test COMMAND cb_proof_test)
+  set_tests_properties(cb_proof_test PROPERTIES ENVIRONMENT "BBHOST_CB_RECORD_PROOF=1")
   # The engine's classes by the names they register (tools/class_catalog.cpp).
   add_executable(class_catalog tools/class_catalog.cpp src/decomp/insn.cpp)
   target_link_libraries(class_catalog PRIVATE eboot_kit)

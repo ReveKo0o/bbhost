@@ -1136,6 +1136,12 @@ void gpu_writes_note_locked(std::uint64_t va, std::uint64_t bytes);
 bool gpu_writes_pending_locked(std::uint64_t va, std::uint64_t bytes);
 // Whether a GPU write over [va, va+bytes) was recorded in recording `serial` or later.
 bool gpu_wrote_since_locked(std::uint64_t va, std::uint64_t bytes, std::uint64_t serial);
+// The newest recording whose GPU writes the tables above have let go of
+// (they keep only writes still to land when they fill): gpu_wrote_since_locked
+// cannot answer for a serial at or before it.
+std::uint64_t gpu_writes_dropped_locked();
+// g.completed_submits as last stored, for readers without the lock (gpu.cpp).
+extern std::atomic<std::uint64_t> g_completed_submits_seen;
 extern std::uint64_t g_draw_rec_next;
 
 // A compute shader's pipeline at its first use, with or without the driver's

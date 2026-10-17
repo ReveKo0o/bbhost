@@ -21,6 +21,7 @@
 #include "decomp/gx/constant_engine.h"
 #include "decomp/gx/dead_packets.h"
 #include "decomp/gx/dma.h"
+#include "host/cb_proof.h"
 #include "host/host_lists.h"
 #include "engine/addr.h"
 #include "host/gpu.h"
@@ -1705,6 +1706,7 @@ GxRecordsPtr snapshot_records(const GxRec& r) {
     // The objects sit in a few heaps: the last mapped range one was found in
     // answers the next one without the kernel's map list.
     std::uint64_t mapped_lo = 0, mapped_hi = 0, readable_lo = 0, readable_hi = 0;
+    std::uint64_t proof_lo = 0, proof_hi = 0;  // BBHOST_CB_RECORD_PROOF: the buffers' memory, the same way
     const auto object = [&](std::uint64_t slot_va, std::uint64_t bytes) -> std::uint64_t {
         const std::uint64_t obj = rd64(slot_va);
         if (!obj) return 0;
@@ -1815,6 +1817,30 @@ GxRecordsPtr snapshot_records(const GxRec& r) {
             s.obj_cb_set |= 1u << cbs[i].j;
         }
         stamp.to(kCostRecCb);
+        // BBHOST_CB_RECORD_PROOF: each buffer's bytes as they are at the call,
+        // which the command processor compares with what it binds
+        // (host/cb_proof.h). The buffer object says what it is: a dynamic
+        // one (+0x3b bit 2) read through this context's renamed copy or at
+        // its own address (+0x20), else a static buffer (type +0x38 == 1).
+        if (cb_proof::g_on) {
+            const std::uint64_t flip = hle_video_flip_count(), completed = host_gpu_completed_submits_seen();
+            for (int i = 0; i < ncb; ++i) {
+                const std::uint64_t obj = cbs[i].key - 0x18, addr = cbs[i].addr;
+                const std::uint32_t bytes = std::min<std::uint32_t>(((cbs[i].size + 15) >> 4) * 16, cb_proof::kMaxCopy);
+                if (!addr || !bytes || !((addr >= proof_lo && addr + bytes <= proof_hi) || hle_kernel_va_mapped_in(addr, bytes, &proof_lo, &proof_hi)))
+                    continue;
+                std::uint8_t type = 0, flags = 0;
+                safe_read(obj + 0x38, &type, 1);
+                safe_read(obj + 0x3b, &flags, 1);
+                const cb_proof::Kind kind = (flags & 4) ? (addr != rd64(obj + 0x20) ? cb_proof::kRenamed : cb_proof::kDynamicOwn)
+                                            : type == 1 ? cb_proof::kStatic
+                                                        : cb_proof::kOtherObject;
+                if (const std::uint64_t h = cb_proof::record(addr, bytes, kind, flip, completed, obj)) {
+                    s.cb_proof[cbs[i].j] = h;
+                    s.cb_proofed = static_cast<std::uint16_t>(s.cb_proofed | (1u << cbs[i].j));
+                }
+            }
+        }
         // BBHOST_GX_COST: the constant buffers' contents at the call.
         if (hash_cbs) {
             for (int j = 0; j < 14; ++j) {
@@ -4652,6 +4678,7 @@ bool snapshot_cs_records(std::uint64_t ctx, GxStageRecords& s, CsRecordsMiss* wh
     s.compute = true;
     s.ndesc = 0;
     s.cb_hashed = 0;
+    s.cb_proofed = 0;
     s.obj_tex_set = 0;
     s.obj_smp_set = 0;
     s.obj_cb_set = 0;

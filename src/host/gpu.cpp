@@ -5336,6 +5336,7 @@ void retire_slot_locked(int k) {
     // Fences on one queue complete in submission order, so every CP write
     // recorded into this submission or an earlier one is in memory now.
     g.completed_submits = std::max(g.completed_submits, sl.serial + 1);
+    g_completed_submits_seen.store(g.completed_submits, std::memory_order_relaxed);
     for (auto it = g.pending_writes.begin(); it != g.pending_writes.end();) {
         it = it->second.serial < g.completed_submits ? g.pending_writes.erase(it) : std::next(it);
     }
@@ -8139,6 +8140,9 @@ std::uint64_t host_gpu_completed_submits() {
     std::lock_guard<GpuMutex> lock(g.mu);
     return g.completed_submits;
 }
+
+std::atomic<std::uint64_t> gpu::g_completed_submits_seen{0};
+std::uint64_t host_gpu_completed_submits_seen() { return gpu::g_completed_submits_seen.load(std::memory_order_relaxed); }
 
 
 // A host-GPU write whose destination covers a command-arena chunk's marker

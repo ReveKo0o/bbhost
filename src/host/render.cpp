@@ -13,6 +13,7 @@
 #include "host/tess_lds.h"
 #include "host/translation_cache.h"
 
+#include "host/cb_proof.h"
 #include "host/draw_capture.h"
 #include "gcn/container.h"
 #include "gcn/lift.h"
@@ -9892,6 +9893,7 @@ std::string render_fill_stats() {
 
 void render_report() {
     host_log("%s", gx_state_report().c_str());
+    cb_proof::report();
     if (const std::string b = bindless_report(); !b.empty()) host_log("render: %s", b.c_str());
     if (g_binding_plans) {
         host_log("render: GX stages whose user data was not built (the no-fallback variant touches none, every binding from the "
@@ -11346,6 +11348,35 @@ bool draw_window_locked(std::uint64_t base, std::uint64_t bytes, Located& out) {
     return false;
 }
 
+// BBHOST_CB_RECORD_PROOF (host/cb_proof.h): the bytes a binding is about to
+// be copied from or read in place, against the copy its draw's records took at
+// the GX call - for the bindings that come from the records' constant-buffer
+// slots; the rest are counted as having none - and whether a GPU write still
+// to complete at the call was noted on the range since. Nothing bound changes.
+void cb_proof_binding(const GxStageRecords* gx, const GxStagePlan* plan, std::size_t i, std::uint64_t base, std::uint64_t bytes,
+                      cb_proof::Path path) {
+    if (!gx) {
+        cb_proof::note_uncopied(path, false, t_snapshot_cbs);
+        return;
+    }
+    const GxBindingPlan* p = plan && i < plan->buffers.size() ? &plan->buffers[i] : nullptr;
+    if (!p || p->source != GxBindingPlan::kCb || p->slot >= 14 || !((gx->cb_proofed >> p->slot) & 1)) {
+        cb_proof::note_uncopied(path, true, false);
+        return;
+    }
+    cb_proof::Difference diff;
+    const cb_proof::Outcome o = cb_proof::check(gx->cb_proof[p->slot], base, bytes, path, &diff);
+    if (o != cb_proof::kSame && o != cb_proof::kChanged) return;
+    // A GPU write noted on the range that had not completed by the call -
+    // recorded in a submission at or past the ones completed then - or the
+    // tables having let go of writes that recent, when they cannot say.
+    const bool since_call = gpu_wrote_since_locked(base, bytes, diff.completed);
+    const bool dropped_since = !since_call && gpu_writes_dropped_locked() >= diff.completed;
+    // (latest() answers 0 for a page with none: ask from submission 1.)
+    const bool any = since_call || (o == cb_proof::kChanged && gpu_wrote_since_locked(base, bytes, 1));
+    cb_proof::note_result(diff, o, path, t_draw_pipeline, hle_video_flip_count(), since_call, dropped_since, any, base, bytes);
+}
+
 // TranslateOptions::cb_ssbo: bind each constant buffer the shader reads
 // through a storage buffer over the V#'s imported memory. The range starts at
 // the V# base aligned down to minStorageBufferOffsetAlignment and the shader
@@ -11518,6 +11549,16 @@ void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t
                 !gpu_writes_pending_locked(base, bytes)) {
                 realign = snapshot = true;
                 if (host_tooling()) bump(g_cb_snapshots);
+            }
+            if (cb_proof::g_on) {
+                const cb_proof::Path path = b.written                         ? cb_proof::kPathStored
+                                            : in_window                       ? cb_proof::kPathWindow
+                                            : version != kCopyVersionNone     ? cb_proof::kPathVersion
+                                            : snapshot                        ? cb_proof::kPathSnapshot
+                                            : realign                         ? cb_proof::kPathRealigned
+                                            : gpu_writes_pending_locked(base, bytes) ? cb_proof::kPathGpuPending
+                                                                              : cb_proof::kPathInPlace;
+                cb_proof_binding(gx, plan, i, base, bytes, path);
             }
             if (glitch_watching_draw()) {
                 glitch_watch_read_locked(base, bytes);

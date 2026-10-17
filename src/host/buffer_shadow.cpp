@@ -1104,6 +1104,9 @@ public:
         const Slot& s = slots_[find(page + 1)];
         return s.key ? s.serial : 0;
     }
+    // The newest serial a rebuild let go of (landed writes leave the table):
+    // latest() cannot answer for a recording at or before it.
+    std::uint64_t dropped() const { return dropped_; }
 
 private:
     struct Slot {
@@ -1111,6 +1114,7 @@ private:
     };
     std::vector<Slot> slots_;
     std::size_t used_ = 0;
+    std::uint64_t dropped_ = 0;
     unsigned bits_ = 10;
     std::size_t find(std::uint64_t key) const {
         const std::size_t mask = slots_.size() - 1;
@@ -1127,7 +1131,11 @@ private:
         slots_.assign(std::size_t{1} << bits_, Slot{});
         used_ = 0;
         for (const Slot& s : old) {
-            if (!s.key || s.serial < g.completed_submits) continue;
+            if (!s.key) continue;
+            if (s.serial < g.completed_submits) {
+                dropped_ = std::max(dropped_, s.serial);
+                continue;
+            }
             slots_[find(s.key)] = s;
             ++used_;
         }
@@ -1158,6 +1166,8 @@ bool gpu_writes_pending_locked(std::uint64_t va, std::uint64_t bytes) {
     }
     return false;
 }
+
+std::uint64_t gpu_writes_dropped_locked() { return std::max(g_gpu_write_pages.dropped(), g_gpu_write_small.dropped()); }
 
 bool gpu_wrote_since_locked(std::uint64_t va, std::uint64_t bytes, std::uint64_t serial) {
     if (!bytes) return false;

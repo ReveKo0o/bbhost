@@ -196,6 +196,8 @@ struct alignas(64) GxStageRecords {
     // BBHOST_GX_COST: which constant buffers' contents were hashed at the call
     // (cb_hash).
     std::uint16_t cb_hashed = 0;
+    // BBHOST_CB_RECORD_PROOF: which were copied at the call (cb_proof).
+    std::uint16_t cb_proofed = 0;
     // The shader object's resource masks (+0x0, +0x8, +0x10), which give the
     // commit's tables their slot ranges: textures 0-63 and 64-127; sampler
     // caches in bits 0-15, constant buffers 16-35, samplers 36-51.
@@ -243,6 +245,9 @@ struct alignas(64) GxStageRecords {
     // record (engine/gx_resources.h; 0 when not registered). A view's T# never
     // changes after it is made, so the id stands for the record.
     std::uint32_t obj_tex_id[64];
+    // BBHOST_CB_RECORD_PROOF: each obj_cb buffer's copy taken at the call
+    // (host/cb_proof.h handles), valid by cb_proofed.
+    std::uint64_t cb_proof[14];
 };
 static_assert(offsetof(GxStageRecords, desc) <= 64, "what the constructor clears is one line");
 struct GxDrawRecords {
@@ -362,6 +367,9 @@ bool host_gpu_writes_pending(std::uint64_t va, std::size_t bytes);
 // Submissions whose fence has retired, in order (trails the GPU: a write may be
 // in memory before this passes its serial).
 std::uint64_t host_gpu_completed_submits();
+// The same without the GPU lock, as last stored (it may trail by a retirement):
+// for a recording thread that must not wait on the renderer.
+std::uint64_t host_gpu_completed_submits_seen();
 // BBHOST_ARENA_WATCH: logs where va resolves and which recent deferred writes carried value.
 void host_gpu_explain_value(std::uint64_t va, std::uint64_t value);
 bool host_gpu_mem_fill(std::uint64_t va, std::uint32_t value, std::size_t bytes);
