@@ -858,6 +858,9 @@ struct TexturePrep {
     std::size_t total_src = 0, total_dst = 0;
     std::uint64_t content_hash = 0, exact_hash = 0;
     bool hash_only = false;     // the GPU untiles this upload; the prep only hashes the source
+    // Window imports (BBHOST_IMPORT_WINDOWS=1): the tiled bytes copied here as
+    // well, the GPU untile's source in place of an import of guest memory.
+    std::uint8_t* src_copy = nullptr;
     std::atomic<int> state{0};  // 0 queued, 1 running, 2 done; changed under PrepPool's mutex
 };
 
@@ -895,6 +898,7 @@ void upload_hashes(TexturePrep& p) {
 void run_prep(TexturePrep& p) {
     auto t0 = std::chrono::steady_clock::now();
     bool untiled = true;
+    if (p.src_copy) std::memcpy(p.src_copy, p.src, p.total_src);
     if (p.hash_only) {
         upload_hashes(p);
         return;
@@ -1046,6 +1050,7 @@ const bool g_untile_vram = [] {
     return !(e && e[0] == '0');
 }();
 std::atomic<std::uint64_t> g_untiled_vram{0}, g_untiled_vram_bytes{0};
+std::atomic<std::uint64_t> g_staged_src_pending{0};  // window imports: sources read through their import, a GPU write pending
 std::atomic<std::uint64_t> g_gpu_untiled{0}, g_gpu_untiled_bytes{0}, g_gpu_untile_declined{0};
 
 // The passes that untile `sf` on the GPU into `dst`, or false when a level
@@ -1147,9 +1152,25 @@ bool upload_surface(Surface& sf, VkImageAspectFlags aspect, bool first) {
     const std::uint64_t vram_src_span = (sf.total_src + 255) & ~std::uint64_t{255};
     std::vector<UntileGpuPass> passes;
     bool in_vram = false;
+    // Window imports (BBHOST_IMPORT_WINDOWS=1): the tiled bytes reach the GPU
+    // through upload staging, copied by the prep pass (which reads them for
+    // its hashes anyway; the submission waits for it), not through an import
+    // of guest memory; without the device-local route the CPU untiles. Not
+    // while a GPU write is still to land on them (a copy-back the GPU has not
+    // run yet): the CPU's copy would miss it, where the import is read after
+    // it in queue order - such a source goes through its import as before.
+    const bool staged_src = !imports_whole() && !gpu_writes_pending_locked(sf.base, sf.total_src);
+    if (!imports_whole() && !staged_src) g_staged_src_pending.fetch_add(1, std::memory_order_relaxed);
+    DevBuffer src_stage;
+    VkDeviceSize src_stage_off = 0;
     if (g_gpu_untile == 1 && g_untile_vram && !g_untile_check && sf.base != tex_probe_base() && untile_gpu_available_locked() &&
-        guest_device_address(sf.base, sf.total_src)) {
-        vram_src = locate(sf.base, sf.total_src);
+        (staged_src || guest_device_address(sf.base, sf.total_src))) {
+        if (staged_src) {
+            vram_src = acquire_staging_locked(src_stage, sf.total_src, src_stage_off) ? Located{src_stage.buffer, src_stage_off, sf.total_src}
+                                                                                      : Located{};
+        } else {
+            vram_src = locate(sf.base, sf.total_src);
+        }
         if (vram_src.buffer && vram_src.avail >= sf.total_src && acquire_scratch_locked(vram, vram_src_span + sf.total_dst, vram_off)) {
             in_vram = gpu_untile_plan(sf, vram.address + vram_off + vram_src_span, passes, vram.address + vram_off);
             if (!in_vram) passes.clear();
@@ -1169,10 +1190,12 @@ bool upload_surface(Surface& sf, VkImageAspectFlags aspect, bool first) {
     prep->tiling = sf.tiling;
     prep->total_src = sf.total_src;
     prep->total_dst = sf.total_dst;
+    if (in_vram && staged_src) prep->src_copy = static_cast<std::uint8_t*>(src_stage.map);  // (the map is the placement's own)
     // On the GPU where it can: the prep only hashes the source, off this
-    // thread, and nothing waits for it before the submission.
-    const bool on_gpu = in_vram || (g_gpu_untile && !g_untile_check && sf.base != tex_probe_base() && untile_gpu_available_locked() &&
-                                    gpu_untile_plan(sf, staging.address + staging_offset, passes));
+    // thread, and nothing waits for it before the submission - unless it
+    // also copies the source into staging (window imports).
+    const bool on_gpu = in_vram || (!staged_src && g_gpu_untile && !g_untile_check && sf.base != tex_probe_base() &&
+                                    untile_gpu_available_locked() && gpu_untile_plan(sf, staging.address + staging_offset, passes));
     if (g_gpu_untile && !on_gpu) g_gpu_untile_declined.fetch_add(1, std::memory_order_relaxed);
     DevBuffer cpu_copy;  // BBHOST_GPU_UNTILE=2: the CPU's untile of the same upload, compared later
     if (on_gpu && g_gpu_untile == 2) {
@@ -1191,6 +1214,7 @@ bool upload_surface(Surface& sf, VkImageAspectFlags aspect, bool first) {
         if (!cpu_copy.map) {
             prep->hash_only = true;
             PrepPool::get().submit(prep);
+            if (prep->src_copy) g_batch_preps.push_back(prep);  // the staged source is read by this submission
             sf.prep = prep;
         }
     } else
@@ -4562,6 +4586,11 @@ void textures_report() {
                  g_gpu_untile, static_cast<unsigned long long>(g_gpu_untiled.load()), static_cast<unsigned long long>(g_gpu_untiled_bytes.load() >> 20),
                  static_cast<unsigned long long>(g_gpu_untile_declined.load()), static_cast<unsigned long long>(g_untiled_vram.load()),
                  static_cast<unsigned long long>(g_untiled_vram_bytes.load() >> 20), untile_gpu_report().c_str());
+    }
+    if (!imports_whole()) {
+        host_log("texture: window imports: tiled sources copied through upload staging, but %llu with a GPU write still to land on "
+                 "them read through their import",
+                 static_cast<unsigned long long>(g_staged_src_pending.load()));
     }
     {
         // Who takes the faults still in the ring (the last 16384), as Binary
