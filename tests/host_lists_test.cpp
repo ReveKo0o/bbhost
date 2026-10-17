@@ -145,11 +145,19 @@ int main() {
         walk(b, 0, 34, t);
         const Seen s2 = seen();
         CHECK(s2.differed == s1.differed + 1 && s2.covered == s1.covered);
-        // Noted where there is a packet nothing reads (the marker): differs.
+        // Noted where there is a packet nothing reads (the marker): the take
+        // drops it (a NOP that is no token), and the walk is covered.
         b.note(4, 0x10);
         take(b.at(4), 6 * 4, &t);
-        CHECK(entries(t) == (std::vector<std::uint32_t>{e(0, 0x10)}));
+        CHECK(t.state == Taken::kTaken && t.entries.empty());
         walk(b, 4, 10, t);
+        CHECK(seen().differed == s2.differed && seen().covered == s2.covered + 1);
+        // A list that names a marker anyway (as an earlier round's would):
+        // the walk differs.
+        Taken named;
+        named.state = Taken::kTaken;
+        named.entries = {e(0, 0x10)};
+        walk(b, 4, 10, named);
         CHECK(seen().differed == s2.differed + 1);
     }
 
@@ -180,6 +188,15 @@ int main() {
         const u64 stale = g_stale.load();
         take(b.at(0), 100 * 4, &t);
         CHECK(entries(t) == (std::vector<std::uint32_t>{e(10, 0x47)}) && g_stale.load() == stale + 1);
+        // A NOP entry whose packet is a NOP but no longer a token (a marker
+        // written over it): dropped; a two-dword barrier token is kept.
+        b.put(50, 0x10, 4, kGxNativeMagic);
+        b.note(50, 0x10);
+        b.put(54, 0x10, 2, kGxBarrierMagic);
+        b.note(54, 0x10);
+        b.put(50, 0x10, 4, 0x68750001u);
+        take(b.at(0), 100 * 4, &t);
+        CHECK(entries(t) == (std::vector<std::uint32_t>{e(10, 0x47), e(54, 0x10)}) && g_stale.load() == stale + 3);
     }
 
     // A chunk's segments: the command buffer's start moves to each one's
@@ -346,12 +363,13 @@ int main() {
         take(b.at(0), 30 * 4, &t2);
         const u64 proof = g_hand_refused[kHrProof].load();
         CHECK(!hand_over(b.at(0), 30 * 4, t2, &out) && g_hand_refused[kHrProof].load() == proof + 1);
-        // Listed where nothing is read (the marker): refused too.
+        // A list naming a marker (nothing reads it): refused too.
         Buffer c(256);
         c.put(0, 0x10, 6, 0x68750002u);
-        c.note(0, 0x10);
-        take(c.at(0), 6 * 4, &t2);
-        CHECK(!hand_over(c.at(0), 6 * 4, t2, &out));
+        Taken marker;
+        marker.state = Taken::kTaken;
+        marker.entries = {e(0, 0x10)};
+        CHECK(!hand_over(c.at(0), 6 * 4, marker, &out));
         g_prove = false;
         // Without the proof, the list is trusted; a packet past the end is not.
         take(b.at(0), 22 * 4, &t2);  // ends inside the wait at 19

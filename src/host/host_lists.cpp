@@ -276,11 +276,13 @@ void take(u64 va, std::size_t bytes, Taken* out) {
     const u32* e = r->entry;
     std::size_t i = static_cast<std::size_t>(std::lower_bound(e, e + n, lo << 8) - e);
     for (; i < n && (e[i] >> 8) < hi; ++i) {
-        // The packet's header still there: an entry left from a chunk's
-        // earlier round that its new round wrote no packet over is not.
-        u32 hdr;
-        std::memcpy(&hdr, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(base + static_cast<u64>(e[i] >> 8) * 4)), 4);
-        if ((hdr >> 30) != 3 || ((hdr >> 8) & 0xff) != (e[i] & 0xff)) {
+        // The packet still there - its header, and for a NOP a token's magic:
+        // an entry left from a chunk's earlier round that its new round wrote
+        // no such packet over is not.
+        u32 head[2];
+        std::memcpy(head, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(base + static_cast<u64>(e[i] >> 8) * 4)), 8);
+        const u32 hdr = head[0];
+        if ((hdr >> 30) != 3 || ((hdr >> 8) & 0xff) != (e[i] & 0xff) || !carried(e[i] & 0xff, head + 1, ((hdr >> 16) & 0x3fff) + 1)) {
             g_stale.fetch_add(1, std::memory_order_relaxed);
             continue;
         }
