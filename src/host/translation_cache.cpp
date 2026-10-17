@@ -652,6 +652,15 @@ const char* hlsl_dump_dir() {
     std::lock_guard<std::mutex> lk(g_hlsl_dump_mu);
     return g_hlsl_dump_default.empty() ? nullptr : g_hlsl_dump_default.c_str();  // set once at device start, never changed after
 }
+std::atomic<std::string (*)(const std::string&)> g_hlsl_name_lookup{nullptr};
+// The program's name for a header: its bundle entry's beside the GX name.
+std::string hlsl_title(const std::string& name) {
+    if (name.empty()) return name;
+    if (auto lookup = g_hlsl_name_lookup.load()) {
+        if (const std::string file = lookup(name); !file.empty()) return file + " (" + name + ")";
+    }
+    return name;
+}
 std::string hlsl_dump(const std::vector<std::uint32_t>& lifted, const gcn::HlslResult& h) {
     const char* dir = hlsl_dump_dir();
     if (!dir) return {};
@@ -670,7 +679,9 @@ std::string hlsl_dump(const std::vector<std::uint32_t>& lifted, const gcn::HlslR
 }
 // Prints, compiles and checks one lifted module: DXC's SPIR-V, or empty with `why`.
 std::vector<std::uint32_t> hlsl_compile(const std::vector<std::uint32_t>& lifted, const gcn::HlslOptions& hopt, const Dxc& dxc, std::string& why) {
-    const gcn::HlslResult h = gcn::emit_hlsl(lifted, hopt);
+    gcn::HlslOptions titled = hopt;  // a dump's header names the program by its bundle entry too
+    if (hlsl_dump_dir()) titled.title = hlsl_title(hopt.title);
+    const gcn::HlslResult h = gcn::emit_hlsl(lifted, titled);
     const std::string dumped = hlsl_dump(lifted, h);
     // The first few failures in full, with where they were dumped.
     const auto log_failure = [&](const std::string& what) {
@@ -854,6 +865,7 @@ namespace {
 // then predictions and the opt-in sweep (kHlslLaneLater). A stage met again
 // from a lane before its own moves up to it.
 thread_local int t_hlsl_lane = kHlslLaneDrawn;
+thread_local std::string t_hlsl_name;  // hlsl_name_next
 constexpr int kLanes = 4;
 struct HlslBehind {
     struct Job {
@@ -1096,6 +1108,16 @@ bool hlsl_override(const std::vector<std::uint32_t>& lifted, const gcn::HlslOpti
         }
         if (!why.empty()) spirv.clear();
     }
+    {
+        // Two threads can meet the same stage at once: the first result is
+        // kept, counted and logged; the other takes it.
+        std::lock_guard<std::mutex> lk(g_hlsl_overrides.mu);
+        const auto [it, fresh] = g_hlsl_overrides.compiled.try_emplace(hash, spirv);
+        if (!fresh) {
+            out = it->second;
+            return !out.empty();
+        }
+    }
     if (spirv.empty()) {
         g_hlsl_overrides.refused.fetch_add(1, std::memory_order_relaxed);
         host_log("render: HLSL override %s refused, the stage keeps its own module: %s", file.c_str(), why.c_str());
@@ -1103,16 +1125,17 @@ bool hlsl_override(const std::vector<std::uint32_t>& lifted, const gcn::HlslOpti
         g_hlsl_overrides.taken.fetch_add(1, std::memory_order_relaxed);
         host_log("render: HLSL override %s compiled and taken (%zu words)", file.c_str(), spirv.size());
     }
-    std::lock_guard<std::mutex> lk(g_hlsl_overrides.mu);
-    g_hlsl_overrides.compiled[hash] = spirv;
     out = std::move(spirv);
     return !out.empty();
 }
 
 void hlsl_stage(gcn::LiftResult& l, const Key* lift_key, const gcn::TranslateOptions* to) {
     t_last_deferred = nullptr;
+    std::string name = std::move(t_hlsl_name);  // taken by this lift, whatever happens to it
+    t_hlsl_name.clear();
     if (!hlsl_on() || !l.ok()) return;
     gcn::HlslOptions hopt;
+    hopt.title = std::move(name);
     if (to) {
         hopt.tess_quads = to->tess_quads;
         hopt.tess_spacing = to->tess_spacing;
@@ -1158,7 +1181,11 @@ void hlsl_stage(gcn::LiftResult& l, const Key* lift_key, const gcn::TranslateOpt
     if (found) {
         g_hlsl.cached.fetch_add(1, std::memory_order_relaxed);
         // BBHOST_HLSL_DUMP: the source of a module the cache had, too.
-        if (!spirv.empty() && hlsl_dump_dir()) hlsl_dump(l.spirv, gcn::emit_hlsl(l.spirv, hopt));
+        if (!spirv.empty() && hlsl_dump_dir()) {
+            gcn::HlslOptions titled = hopt;
+            titled.title = hlsl_title(hopt.title);
+            hlsl_dump(l.spirv, gcn::emit_hlsl(l.spirv, titled));
+        }
     } else if (hlsl_mode() == 2 && !g_hlsl_inline.load(std::memory_order_relaxed)) {
         // Behind the game: never compiled on the thread that needs the stage.
         // Before the cache is loaded (or with it off) there is nowhere to keep
@@ -1197,6 +1224,8 @@ void hlsl_counts(std::uint64_t& taken, std::uint64_t& compiled, std::uint64_t& k
     for (const auto& [why, n] : g_hlsl.reasons) reasons += why + " x" + std::to_string(n) + "\n";
 }
 void hlsl_lane(int lane) { t_hlsl_lane = lane; }
+void hlsl_name_next(std::string name) { t_hlsl_name = std::move(name); }
+void hlsl_set_name_lookup(std::string (*lookup)(const std::string& name)) { g_hlsl_name_lookup.store(lookup); }
 int hlsl_lane_now() { return t_hlsl_lane; }
 void hlsl_set_busy_probe(bool (*busy)()) { g_hlsl_busy.store(busy); }
 
@@ -1504,7 +1533,7 @@ void translation_cache_report() {
         }
         if (g_hlsl_overrides.any.load()) {
             char b[160];
-            std::snprintf(b, sizeof(b), "; edited HLSL (shaders/): %llu taken, %llu refused",
+            std::snprintf(b, sizeof(b), "; edited HLSL (shaders/): %llu files taken, %llu refused",
                           static_cast<unsigned long long>(g_hlsl_overrides.taken.load()),
                           static_cast<unsigned long long>(g_hlsl_overrides.refused.load()));
             behind += b;

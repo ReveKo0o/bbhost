@@ -21,6 +21,7 @@ struct BundleShader {
     int type = 0;      // Shdr type: 1 vertex, 2 pixel, 4 compute (others are listed too)
     std::shared_ptr<const std::vector<std::uint8_t>> container;
     bool debug = false;  // from the debug menu's bundle
+    std::string file;    // the bundle entry's own name ("...\\GXFlver_Sword_Gbuf_[A].ppo")
 };
 
 // Reads the bundles once, on the first call (the others wait for it); false
@@ -32,6 +33,9 @@ std::shared_ptr<const std::vector<std::uint8_t>> shader_bundle_container(const s
 // Every shader in the bundles, once each by name, in the bundles' order (the
 // debug bundle last).
 const std::vector<BundleShader>& shader_bundles_list();
+// The bundle entry's file name for the shader GX names `name` (its base name,
+// "GXFlver_Sword_Gbuf_[A].ppo"), or "" (also before the bundles are read).
+std::string shader_bundle_file_name(const std::string& name);
 // For the report: "N shaders in M bundles (x MiB), read in y ms", or why not.
 std::string shader_bundles_summary();
 

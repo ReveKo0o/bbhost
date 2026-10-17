@@ -76,7 +76,13 @@ that HLSL and have the game use your version.
    shader the game uses is saved to `<data>/bbhost/hlsl-dump/` as
    `<hash>.<stage>.hlsl`, for example `7de085b59d21219a.ps.hlsl` (a pixel
    shader). The stages are `ps`, `vs`, `hs`, `ds` and `cs`. Beside each file
-   is the lift it came from (`.lift.spv`).
+   is the lift it came from (`.lift.spv`). Each file's first line names the
+   shader: its name in the game's shader bundles and GX's name for it, for
+   example `// GXGuiShader_Tex.ppo (6d921b0b)`. The game's own built-in
+   shaders (the menus' Scaleform, YEBIS) have only GX's name. So
+   `grep -l GXFlver_Sword <data>/bbhost/hlsl-dump/*.hlsl` finds the weapon
+   shaders. A file is written the first time the game compiles or loads that
+   shader, so play through the places you want first.
 2. Copy the files you want to change into `<data>/bbhost/shaders/`. Keep
    each file's name, and edit the copy.
 3. Start the game. The log lists the edited files it found (`render: HLSL

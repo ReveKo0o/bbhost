@@ -97,6 +97,13 @@ void hlsl_counts(std::uint64_t& taken, std::uint64_t& compiled, std::uint64_t& k
 enum HlslLane { kHlslLaneDrawn = 0, kHlslLaneManifest = 1, kHlslLaneCreated = 2, kHlslLaneLater = 3 };
 void hlsl_lane(int lane);
 int hlsl_lane_now();
+// The program the calling thread's next lift is made from (its GX name, or
+// the eboot's footer hash): the dump's and an edited file's header names it,
+// so a modder finds a shader by name. Taken by that lift.
+void hlsl_name_next(std::string name);
+// gpu.cpp's: a GX name's bundle entry ("GXFlver_Sword_Gbuf_[A].ppo"), for the
+// dump's header; read only when a dump or an edited file is printed.
+void hlsl_set_name_lookup(std::string (*lookup)(const std::string& name));
 // render.cpp's stage cache: the stage `stage_key` holds the lift this thread
 // met last, whose DXC module waits behind the game; and a draw took that
 // stage, so its module goes to the front.

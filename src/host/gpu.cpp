@@ -2825,6 +2825,7 @@ bool init_locked() {
     // the HLSL path's mode; BBHOST_HLSL wins over it.
     hlsl_set_setting(host_opt_index("shaders") != 1);
     if (const char* root = hle_fs_data_root(); root && *root) hlsl_set_folders(std::string(root) + "/bbhost");
+    hlsl_set_name_lookup(&shader_bundle_file_name);
     translation_cache_load(translation_cache_path());
     g.ok = true;
     start_submit_thread();
@@ -3364,6 +3365,7 @@ void apply_compute_lift(const gcn::Program& prog, const gcn::TranslateOptions& o
         note_compute_lift(name, false, why);
         return;
     }
+    hlsl_name_next(name);
     gcn::LiftResult l = lift_compute_cached(prog, o, meta);
     if (l.ok()) {
         meta.spirv = std::move(l.spirv);

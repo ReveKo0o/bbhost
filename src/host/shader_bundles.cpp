@@ -64,6 +64,7 @@ void read_bundles() {
             s.name = name;
             s.type = shader_container_type(e.data.data(), e.data.size());
             s.debug = std::strstr(b, "debug") != nullptr;
+            s.file = e.name.substr(e.name.find_last_of("\\/") == std::string::npos ? 0 : e.name.find_last_of("\\/") + 1);
             s.container = std::make_shared<const std::vector<std::uint8_t>>(std::move(e.data));
             g_bundles.by_name.emplace(name, g_bundles.list.size());
             g_bundles.list.push_back(std::move(s));
@@ -114,6 +115,12 @@ std::shared_ptr<const std::vector<std::uint8_t>> shader_bundle_container(const s
     if (!shader_bundles_load()) return nullptr;
     const auto it = g_bundles.by_name.find(name);
     return it == g_bundles.by_name.end() ? nullptr : g_bundles.list[it->second].container;
+}
+
+std::string shader_bundle_file_name(const std::string& name) {
+    if (!shader_bundles_load()) return {};
+    const auto it = g_bundles.by_name.find(name);
+    return it == g_bundles.by_name.end() ? std::string() : g_bundles.list[it->second].file;
 }
 
 const std::vector<BundleShader>& shader_bundles_list() {

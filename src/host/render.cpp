@@ -4764,6 +4764,7 @@ bool build_tess_native_stages(GfxPipeline& pl, const DrawState& s, const VertexI
         tl.attr_vec4s = s.tess_constants[0] / 16;
         tl.own_params = true;
         tl.params_binding = kTessNativeLsParams;
+        hlsl_name_next(ls->name);
         gcn::LiftResult lifted = lift_tess_cached(TranslationUse::kLiftLs, prog, o, ref, tl);
         const bool first = tess_native_first(ls->name);
         if (!lifted.ok()) {
@@ -4821,6 +4822,7 @@ bool build_tess_native_stages(GfxPipeline& pl, const DrawState& s, const VertexI
         gcn::TessLift tl = tess_native_lift(s, s.tess_cb[1]);
         tl.own_params = true;
         tl.params_binding = kTessNativeHsParams;
+        hlsl_name_next(hs->name);
         gcn::LiftResult lifted = lift_tess_cached(TranslationUse::kLiftHull, prog, o, ref, tl);
         const bool first = tess_native_first(hs->name);
         if (!lifted.ok()) {
@@ -4974,6 +4976,7 @@ GfxPipeline& build_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const std::
             // its typed lift. The lift declares the translation's bindings, so the
             // descriptor sets are unchanged; a rejection keeps the translation.
             if (ps_lift) {
+                hlsl_name_next(ps_name);
                 gcn::LiftResult lifted = lift_cached(false, ps_prog, po, pl.ps.meta());
                 // BBHOST_LIFT_LISTING=<PS>[,<PS>...]: its lift's listing (the
                 // program with each write's typed value, regions marked) in
@@ -5131,6 +5134,7 @@ GfxPipeline& build_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const std::
         // checks the outputs), so layouts and linkage are unchanged; a rejection
         // keeps the translation.
         if (vs_decomp) {
+            hlsl_name_next(vs_name);
             gcn::LiftResult lifted = lift_cached(true, vs_prog, vo, pl.vs.meta());
             name_stage(lifted, pl.vs.meta(), vs_name);
             static std::mutex logged_mu;  // no-fallback variants build on the pipeline workers
@@ -5153,6 +5157,7 @@ GfxPipeline& build_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const std::
         if (ds_lift) {
             gcn::TessLift tl;
             tl.attr_vec4s = s.tess_attr_vec4s;
+            hlsl_name_next(vs_name);
             gcn::LiftResult lifted = lift_tess_cached(TranslationUse::kLiftDomain, vs_prog, vo, pl.vs.meta(), tl);
             name_stage(lifted, pl.vs.meta(), vs_name);
             static std::mutex logged_mu;
@@ -5176,6 +5181,7 @@ GfxPipeline& build_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const std::
         if (ds_native) {
             // The window's control points and patch constants as the control
             // stage's outputs (gcn::lift_domain_shader, TessLift::window).
+            hlsl_name_next(vs_name);
             gcn::LiftResult lifted = lift_tess_cached(TranslationUse::kLiftDomain, vs_prog, vo, pl.vs.meta(), tess_native_lift(s, s.tess_cb[0]));
             if (!lifted.ok()) return fail("native hull pipeline: domain shader " + vs_name + " not lifted: " + lifted.rejections[0]);
             name_stage(lifted, pl.vs.meta(), vs_name);
@@ -5246,6 +5252,7 @@ GfxPipeline& build_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const std::
                 const gcn::TranslateResult ref = translate_cached(prog, vo);
                 gcn::TessLift tl;
                 tl.attr_vec4s = s.tess_attr_vec4s;
+                hlsl_name_next(ls->name);
                 gcn::LiftResult lifted = ref.ok() ? lift_tess_cached(TranslationUse::kLiftLs, prog, vo, ref, tl) : gcn::LiftResult{};
                 static std::mutex logged_mu;
                 static std::set<std::string> logged;
@@ -5274,6 +5281,7 @@ GfxPipeline& build_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const std::
                     vo4.cb_binding_base = kTessNativeLsBuffers;
                     vo4.cb_bias_zero = false;  // a set of its own, not pushed: the biases stay
                     const gcn::TranslateResult ref4 = translate_cached(prog, vo4);
+                    hlsl_name_next(ls->name);
                     gcn::LiftResult lifted4 = ref4.ok() ? lift_tess_cached(TranslationUse::kLiftLs, prog, vo4, ref4, tl) : gcn::LiftResult{};
                     if (lifted4.ok() && ref4.images.empty() && ref4.samplers.empty()) {
                         name_stage(lifted4, ref4, ls->name);
@@ -6554,6 +6562,7 @@ void precompile_ps(Precompiler& w, const PrecompileJob& job) {
         if (!stage.meta().ok()) return give_up(translation_error_kind(stage.meta().errors[0]));
         note_ps_early_tests(code.words, stage.meta().spirv);
         if (lift) {
+            hlsl_name_next(job.name);
             gcn::LiftResult lifted = lift_cached(false, prog, options, stage.meta());
             name_stage(lifted, stage.meta(), job.name);
             if (lifted.ok()) {
@@ -6699,6 +6708,7 @@ void precompile_manifest(const ManifestStage& m) {
             const gcn::TranslateOptions options = ps_translate_options(m.ps_inputs());
             stage.fresh() = translate_cached(prog, options);
             if (stage.meta().ok() && m.lift) {
+                hlsl_name_next(m.name);
                 gcn::LiftResult lifted = lift_cached(false, prog, options, stage.meta());
                 name_stage(lifted, stage.meta(), m.name);
                 if (lifted.ok()) {
@@ -6713,6 +6723,7 @@ void precompile_manifest(const ManifestStage& m) {
             if (stage.meta().ok() && m.lift) {
                 gcn::TessLift tl;
                 tl.attr_vec4s = m.tess_attr_vec4s;
+                hlsl_name_next(m.name);
                 gcn::LiftResult lifted = m.tess_hw ? lift_tess_cached(TranslationUse::kLiftDomain, prog, options, stage.meta(), tl)
                                                    : lift_cached(true, prog, options, stage.meta());
                 name_stage(lifted, stage.meta(), m.name);
@@ -6865,6 +6876,7 @@ void precompile_vs(Precompiler& w, const PrecompileJob& job) {
             // The lift runs here as well, so a shader compiled at creation is the
             // same stage the draw wants and is not thrown away for it.
             if (lift) {
+                hlsl_name_next(job.name);
                 gcn::LiftResult lifted = lift_cached(true, prog, options, stage.meta());
                 name_stage(lifted, stage.meta(), job.name);
                 if (lifted.ok()) {
