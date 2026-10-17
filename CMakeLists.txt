@@ -365,6 +365,7 @@ set(BBHOST_DECOMP_SOURCES
   src/decomp/gx/drain_token.cpp
   src/decomp/gx/query_token.cpp
   src/decomp/gx/dead_packets.cpp
+  src/decomp/gx/labels.cpp
   src/decomp/memory/game_memcpy.cpp
   src/decomp/memory/ez_copy.cpp
   src/decomp/sfx/ribbons.cpp
@@ -555,6 +556,7 @@ if(UNIX)
   bbhost_decomp_test(adaptive_mutex)
   bbhost_decomp_test(gx_drain_token)
   bbhost_decomp_test(gx_dead_packets SOURCES src/core/thunk.cpp src/core/portable.cpp src/hle/sysv_va.cpp src/host/main_wait.cpp)
+  bbhost_decomp_test(gx_labels SOURCES src/core/thunk.cpp src/core/portable.cpp src/hle/sysv_va.cpp src/host/main_wait.cpp)
   # The engine's classes by the names they register (tools/class_catalog.cpp).
   add_executable(class_catalog tools/class_catalog.cpp src/decomp/insn.cpp)
   target_link_libraries(class_catalog PRIVATE eboot_kit)
