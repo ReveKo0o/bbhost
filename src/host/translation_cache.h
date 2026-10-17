@@ -33,7 +33,8 @@ namespace gpu {
 // the resource paths a compile at creation offers it), so its entry keeps no
 // SPIR-V and the result has none, taken from the cache or not. The lifts'
 // entries are kept under uses of their own (lift_cached).
-enum class TranslationUse : std::uint8_t { kStage = 0, kPaths = 1, kLiftPixel = 2, kLiftVertex = 3, kLiftLs = 4, kLiftDomain = 5, kLiftHull = 6 };
+enum class TranslationUse : std::uint8_t { kStage = 0, kPaths = 1, kLiftPixel = 2, kLiftVertex = 3, kLiftLs = 4, kLiftDomain = 5, kLiftHull = 6,
+                                           kLiftCompute = 7 };
 
 // gcn::translate through the cache.
 gcn::TranslateResult translate_cached(const gcn::Program& prog, const gcn::TranslateOptions& o,
@@ -44,6 +45,9 @@ gcn::TranslateResult translate_cached(const gcn::Program& prog, const gcn::Trans
 // from the cache has its SPIR-V and rejections, not its proof or listing,
 // which no caller reads.
 gcn::LiftResult lift_cached(bool vertex, const gcn::Program& prog, const gcn::TranslateOptions& o, const gcn::TranslateResult& reference);
+// gcn::lift_compute_shader through the cache, the same way: `reference` is
+// translate_cached(prog, o)'s result, the dispatch's translation.
+gcn::LiftResult lift_compute_cached(const gcn::Program& prog, const gcn::TranslateOptions& o, const gcn::TranslateResult& reference);
 // A tessellation stage's lift (gcn::lift_ls_shader for kLiftLs,
 // gcn::lift_hull_shader for kLiftHull, gcn::lift_domain_shader for
 // kLiftDomain) the same way, keyed on its TessLift too.

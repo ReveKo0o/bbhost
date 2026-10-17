@@ -402,6 +402,8 @@ struct GpuStats {
     // The draws on the host's tessellator (DrawTess): all of them, and those
     // whose evaluation, vertex and control stages ran lifted.
     std::uint64_t draws_tess[6];
+    // Dispatches that ran a shader, and of them those that ran its typed lift.
+    std::uint64_t shader_dispatches, lifted_dispatches;
 };
 // A draw on the host's tessellator: counted, and by which of its stages ran as
 // typed lifts (BBHOST_LIFT_TESS) - the domain shader as the evaluation stage,

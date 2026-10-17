@@ -118,6 +118,11 @@ void log_detail(const GpuStats& was, const GpuStats& now, const std::vector<doub
                  static_cast<unsigned long long>(ts[kDrawTessLsLifted]), static_cast<unsigned long long>(ts[kDrawTessHullLifted]),
                  static_cast<unsigned long long>(ts[kDrawTessAllLifted]), static_cast<unsigned long long>(ts[kDrawTessNative]));
     }
+    if (const std::uint64_t n = now.shader_dispatches - was.shader_dispatches) {
+        const std::uint64_t lifted = now.lifted_dispatches - was.lifted_dispatches;
+        host_log("frame detail: dispatches %llu: lifted %llu, translated %llu", static_cast<unsigned long long>(n),
+                 static_cast<unsigned long long>(lifted), static_cast<unsigned long long>(n - lifted));
+    }
     constexpr std::size_t kPerLine = 100;  // 100 x " 16.67": well inside host_log's 1 KiB
     for (std::size_t at = 0; at < intervals_ms.size(); at += kPerLine) {
         std::string line;

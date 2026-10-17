@@ -40,7 +40,7 @@ static_assert(sizeof(gcn::VertexElement) == 20, "a new VertexElement field: add 
 // (A lift's proof, listing, wave-operation counts and engine names are not
 // kept: the names are put on after the cache (render.cpp name_stage), the rest
 // is diagnostics.)
-static_assert(sizeof(gcn::LiftResult) == 288, "a new LiftResult field: add it to the lift's entry (write_lift, read_lift)");
+static_assert(sizeof(gcn::LiftResult) == 296, "a new LiftResult field: add it to the lift's entry (write_lift, read_lift)");
 #endif
 
 constexpr std::uint32_t kMagic = 0x43544242;  // "BBTC"
@@ -555,6 +555,12 @@ gcn::LiftResult lift_cached(bool vertex, const gcn::Program& prog, const gcn::Tr
     };
     if (!g_tc.ready.load(std::memory_order_acquire) || !g_tc.on) return lift();
     return lift_through_cache(key_for(prog, o, vertex ? TranslationUse::kLiftVertex : TranslationUse::kLiftPixel), lift);
+}
+
+gcn::LiftResult lift_compute_cached(const gcn::Program& prog, const gcn::TranslateOptions& o, const gcn::TranslateResult& reference) {
+    const auto lift = [&] { return gcn::lift_compute_shader(prog, o, reference); };
+    if (!g_tc.ready.load(std::memory_order_acquire) || !g_tc.on) return lift();
+    return lift_through_cache(key_for(prog, o, TranslationUse::kLiftCompute), lift);
 }
 
 gcn::LiftResult lift_tess_cached(TranslationUse use, const gcn::Program& prog, const gcn::TranslateOptions& o, const gcn::TranslateResult& reference,

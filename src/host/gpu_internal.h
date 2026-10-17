@@ -191,6 +191,12 @@ struct ComputePipeline {
     int img_src_sgpr = -1;       // the source V#'s user SGPR, for buffer_to_image
     bool untraced_stores_logged = false;
     bool gds_overlap_checked = false;     // GDS counters: whether a V# of the program covers a counter word, looked at once
+    // Its module is the program's typed lift (gcn::lift_compute_shader,
+    // BBHOST_LIFT_COMPUTE), not its translation; otherwise why not (empty:
+    // not asked for), and the dispatches that ran it (under g.mu).
+    bool lifted = false;
+    std::string lift_why;
+    std::uint64_t dispatches = 0;
 };
 
 // Guest VA -> (VkBuffer, offset) for index buffers.
@@ -486,6 +492,9 @@ struct Gpu {
     std::map<std::uint64_t, ComputePipeline> pipelines;
     // Stats
     std::atomic<std::uint64_t> dispatches{0}, failures{0}, translated{0}, dummy_images{0};
+    // Dispatches that ran a shader (not a recognised fill or copy), and of
+    // them those whose module was the program's typed lift.
+    std::atomic<std::uint64_t> shader_dispatches{0}, lifted_dispatches{0};
     std::atomic<std::uint64_t> transfer_batches{0};  // barrier pairs the transfers above needed
     std::atomic<std::uint64_t> rt_replacements{0};   // render targets re-created (each idles the device)
     std::atomic<std::uint64_t> draws{0}, draw_failures{0}, gfx_pipelines{0};

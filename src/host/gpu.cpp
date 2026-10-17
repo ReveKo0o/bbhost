@@ -3110,6 +3110,52 @@ std::shared_ptr<ComputeLean> build_compute_lean(const gcn::Program& prog, std::u
     return lean;
 }
 
+// BBHOST_LIFT_COMPUTE: compute shaders run as their typed lifts
+// (gcn::lift_compute_shader) - on by default, 0 keeps every compute shader
+// translated (an A/B switch). A program also needs BBHOST_DECOMP to select it
+// ("all", the default; 0 none; a list of program hashes), as the pixel and
+// vertex lifts do (render.cpp decomp_selects). The lift binds what the
+// translation binds - the params block, its images and samplers, the GDS
+// counters - so the dispatch's descriptor set is the same either way; a
+// program the lifter refuses keeps its translation, and the exit report
+// counts those by reason.
+bool compute_lift_selects(const std::string& name) {
+    static const bool on = [] {
+        const char* e = std::getenv("BBHOST_LIFT_COMPUTE");
+        return !(e && e[0] == '0');
+    }();
+    static const std::pair<bool, std::set<std::string>> selection = [] {
+        std::pair<bool, std::set<std::string>> s{true, {}};
+        const char* e = std::getenv("BBHOST_DECOMP");
+        if (!e || !*e || std::strcmp(e, "all") == 0) return s;
+        s.first = false;
+        if (std::strcmp(e, "0") == 0 || std::strcmp(e, "1") == 0) return s;  // 1: the pilot pixel shader alone
+        std::string list(e);
+        for (std::size_t at = 0; at <= list.size();) {
+            const std::size_t comma = std::min(list.find(',', at), list.size());
+            if (comma > at) s.second.insert(list.substr(at, comma - at));
+            at = comma + 1;
+        }
+        return s;
+    }();
+    return on && (selection.first || selection.second.count(name) != 0);
+}
+// The program's lift in place of its translation's SPIR-V, when selected and
+// accepted; `lifted` and `why` (the first rejection, or empty) say which.
+void apply_compute_lift(const gcn::Program& prog, const gcn::TranslateOptions& o, gcn::TranslateResult& meta, const std::string& name, bool& lifted,
+                        std::string& why) {
+    lifted = false;
+    why.clear();
+    if (!meta.ok() || !compute_lift_selects(name)) return;
+    gcn::LiftResult l = lift_compute_cached(prog, o, meta);
+    if (l.ok()) {
+        meta.spirv = std::move(l.spirv);
+        lifted = true;
+        return;
+    }
+    why = l.rejections.empty() ? std::string("no module") : l.rejections[0];
+}
+
 struct PrecompiledCompute {
     struct Entry {
         bool done = false, failed = false;  // failed: nothing to take (a failed build, taken, or claimed by a dispatch)
@@ -3119,6 +3165,8 @@ struct PrecompiledCompute {
         VkPipeline pipeline = VK_NULL_HANDLE;
         bool standin = false;  // unoptimized, the optimized one queued (first_compute_pipeline)
         std::shared_ptr<ComputeLean> lean;  // build_compute_lean
+        bool lifted = false;   // ComputePipeline::lifted, lift_why
+        std::string lift_why;
         std::uint64_t us = 0;  // translation and compile
     };
     enum State { kQueued, kCompiling, kDone, kFailed };
@@ -3625,6 +3673,8 @@ Precompiled take_precompiled_compute(std::uint64_t key, const GpuDispatch& d, co
     pl.pipeline = e.pipeline;
     pl.standin = e.standin;
     pl.lean = std::move(e.lean);
+    pl.lifted = e.lifted;
+    pl.lift_why = std::move(e.lift_why);
     e.failed = true;  // taken
     g_cs_pre.taken += 1;
     if (e.us >= 100000 || waited) {
@@ -3700,9 +3750,10 @@ ComputePipeline& pipeline_for(const GpuDispatch& d, std::uint64_t key, const std
         pl.failed = true;
         return pl;
     }
+    apply_compute_lift(prog, o, pl.meta, name, pl.lifted, pl.lift_why);
     if (const char* e = std::getenv("BBHOST_DUMP_SPIRV"); e && e[0] == '1') {
         host_mkdir("build/spv");
-        const std::string path = "build/spv/" + name + "-cs.spv";
+        const std::string path = "build/spv/" + name + (pl.lifted ? "-cs-lifted.spv" : "-cs.spv");
         if (FILE* f = std::fopen(path.c_str(), "wb")) {
             std::fwrite(pl.meta.spirv.data(), 4, pl.meta.spirv.size(), f);
             std::fclose(f);
@@ -3724,7 +3775,9 @@ ComputePipeline& pipeline_for(const GpuDispatch& d, std::uint64_t key, const std
         pl.failed = true;
         return pl;
     }
-    pl.lean = build_compute_lean(prog, d.rsrc1, d.rsrc2, d.threads, dims, sampler_modes, pl.meta, key, name);
+    // A lifted program runs its lift (render/next); ComputeLean, the translation
+    // with its buffers pushed, is the form a translated one runs in.
+    pl.lean = pl.lifted ? nullptr : build_compute_lean(prog, d.rsrc1, d.rsrc2, d.threads, dims, sampler_modes, pl.meta, key, name);
     const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
     g.translated.fetch_add(1);
     static const char* trace_name = std::getenv("BBHOST_TRACE_DISPATCH");
@@ -3825,12 +3878,14 @@ void precompile_compute(const std::string& name, const std::vector<std::uint8_t>
     // From here every way out marks the entry done: a dispatch may be waiting on it.
     PrecompiledCompute::Entry e;
     std::string why;
-    e.meta = translate_cached(prog, compute_options(rsrc1, rsrc2, threads, dims, modes));
+    const gcn::TranslateOptions co = compute_options(rsrc1, rsrc2, threads, dims, modes);
+    e.meta = translate_cached(prog, co);
     if (!e.meta.ok()) why = "translation: " + e.meta.errors[0];
+    if (why.empty()) apply_compute_lift(prog, co, e.meta, name, e.lifted, e.lift_why);
     if (why.empty()) {
         if (const char* env = std::getenv("BBHOST_DUMP_SPIRV"); env && env[0] == '1') {
             host_mkdir("build/spv");
-            const std::string path = "build/spv/" + name + "-cs.spv";
+            const std::string path = "build/spv/" + name + (e.lifted ? "-cs-lifted.spv" : "-cs.spv");
             if (FILE* f = std::fopen(path.c_str(), "wb")) {
                 std::fwrite(e.meta.spirv.data(), 4, e.meta.spirv.size(), f);
                 std::fclose(f);
@@ -3863,7 +3918,7 @@ void precompile_compute(const std::string& name, const std::vector<std::uint8_t>
         e.pipeline = first_compute_pipeline(e.module, key, name, e.meta.spirv, e.standin, name);
         if (!e.pipeline) why = "pipeline";
     }
-    if (why.empty()) e.lean = build_compute_lean(prog, rsrc1, rsrc2, threads, dims, modes, e.meta, key, name);
+    if (why.empty() && !e.lifted) e.lean = build_compute_lean(prog, rsrc1, rsrc2, threads, dims, modes, e.meta, key, name);  // as in pipeline_for
     e.us = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count());
     e.done = true;
     e.failed = !why.empty();
@@ -5847,6 +5902,8 @@ GpuStats host_gpu_stats() {
     for (int i = 0; i < kVsWhyCount; ++i) st.draws_vs_why[i] = g.draws_vs_why[i].load(std::memory_order_relaxed);
     for (int i = 0; i < kDrawTessCount; ++i) st.draws_tess[i] = g.draws_tess[i].load(std::memory_order_relaxed);
     for (int i = 0; i < 16; ++i) st.draw_fail_why[i] = g.draw_fail_why[i].load(std::memory_order_relaxed);
+    st.shader_dispatches = g.shader_dispatches.load(std::memory_order_relaxed);
+    st.lifted_dispatches = g.lifted_dispatches.load(std::memory_order_relaxed);
     return st;
 }
 
@@ -6018,6 +6075,43 @@ struct DispatchStamp {
         at = now;
     }
 };
+// The compute shaders by how they ran (BBHOST_LIFT_COMPUTE): programs and
+// dispatches lifted, and the rest by why their lift was refused, or not asked
+// for. Takes g.mu (the pipelines' counts).
+std::string compute_lift_report() {
+    std::lock_guard<GpuMutex> lock(g.mu);
+    std::map<std::string, std::pair<std::set<std::string>, std::uint64_t>> why;  // reason -> programs, dispatches
+    std::set<std::string> programs, lifted;
+    std::uint64_t dispatches = 0, lifted_dispatches = 0;
+    for (const auto& [key, pl] : g.pipelines) {
+        if (pl.failed || pl.name.empty()) continue;
+        programs.insert(pl.name);
+        dispatches += pl.dispatches;
+        if (pl.lifted) {
+            lifted.insert(pl.name);
+            lifted_dispatches += pl.dispatches;
+            continue;
+        }
+        // A rejection without the instruction offset it names (as tools/area_check.py strips it).
+        std::string reason = pl.lift_why.empty() ? std::string("not asked for (BBHOST_LIFT_COMPUTE=0 or BBHOST_DECOMP)") : pl.lift_why;
+        if (reason.size() > 8 && reason[6] == ':' && reason[7] == ' ') reason = reason.substr(8);
+        auto& w = why[reason];
+        w.first.insert(pl.name);
+        w.second += pl.dispatches;
+    }
+    char buf[256];
+    std::snprintf(buf, sizeof(buf), "compute shader lifts: %zu of %zu programs lifted, %llu of %llu dispatches ran a lift", lifted.size(), programs.size(),
+                  static_cast<unsigned long long>(lifted_dispatches), static_cast<unsigned long long>(dispatches));
+    std::string out = buf;
+    for (const auto& [reason, w] : why) {
+        std::string names;
+        for (const std::string& n : w.first) names += (names.empty() ? "" : " ") + n;
+        std::snprintf(buf, sizeof(buf), "; translated (%zu programs, %llu dispatches): ", w.first.size(), static_cast<unsigned long long>(w.second));
+        out += buf + reason + " [" + names + "]";
+    }
+    return out;
+}
+
 void dispatch_cost_report() {
     const std::uint64_t n = g_dispatch_n.load();
     if (!g_dispatch_cost || !n) return;
@@ -6460,6 +6554,19 @@ bool host_gpu_dispatch(const GpuDispatch& d) {
         cd.translate.set("gds_counters", host_gpu_gds_counters());
         cd.translate.set("exec_known", g.exec_known);
         cd.translate.set("max_lds_bytes", g.max_lds_bytes);
+        cd.translate.set("lifted", pl.lifted);  // the captured module is the program's lift (gcn::lift_compute_shader)
+        {
+            // The image dimensions the pipeline was made with (with the texel
+            // kind in bits 8-9), for a tool to rebuild its options (gcnlift).
+            json::Value dj = json::Value::make_array();
+            for (const auto& [dim, arrayed] : dims) {
+                json::Value e = json::Value::make_array();
+                e.push(dim);
+                e.push(arrayed);
+                dj.push(e);
+            }
+            cd.translate.set("image_dims", dj);
+        }
         capture_session = capture_dispatch_begin_locked(std::move(cd));
     }
     profile_begin_locked(&pl.name);
@@ -6472,6 +6579,11 @@ bool host_gpu_dispatch(const GpuDispatch& d) {
         if (!g_render_min) rec().dispatch(d.dim[0], d.dim[1], d.dim[2]);
     }
     profile_end_locked();
+    // The dispatches by how their shader ran (BBHOST_LIFT_COMPUTE): per
+    // pipeline for the exit report, and in all for the second's detail line.
+    ++pl.dispatches;
+    g.shader_dispatches.fetch_add(1, std::memory_order_relaxed);
+    if (pl.lifted) g.lifted_dispatches.fetch_add(1, std::memory_order_relaxed);
     // Buffers the shader writes: the buffer shadow's copies of them are stale
     // from here on. A store whose V# the host cannot find is logged; the
     // shadow's verify mode (BBHOST_SHADOW_VERIFY) finds what it changed.
@@ -7711,6 +7823,7 @@ void host_gpu_report() {
                  static_cast<unsigned long long>(g_dispatch_image_blits.load()),
                  static_cast<unsigned long long>(g_dispatch_buf_to_image.load()));
         host_log("gpu: %s", indirect_clamp_report().c_str());
+        host_log("gpu: %s", compute_lift_report().c_str());
         host_log("gpu: dispatch census: %llu reached a shader over %zu programs, %llu were a fill and %llu a copy (no shader runs "
                  "for those)",
                  static_cast<unsigned long long>(g_dispatch_shaders.load()), g_dispatch_census.size(),
