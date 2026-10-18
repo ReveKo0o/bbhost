@@ -6093,11 +6093,14 @@ void defer_destroy_image(VkImage image, const ImageMemory& m) {
 // 1 (the default): targets go by their resources (relabelled, another
 // resource's not used); a source whose surface a shader wrote is still copied
 // as its memory - the guest memory under such a surface is never written
-// back, so that copy is stale, but copying the image changes how dark scenes
-// look (the Hunter's Nightmare, Central Yharnam: a lighter veil; three copies
-// a frame at the 12 places, two 1920x1080 RGBA8 textures and one 960x540
-// half-float a compute pass writes just before) and which is the game's look
-// is the owner's call. 2: those image to image too. 0: by addresses.
+// back, so that copy is stale. 2: those image to image too. 0: by addresses.
+// Level 2 changes no frame where it was measured (2026-10-18, the level
+// switched between frames a few flips apart): in steady play the one such
+// copy is the Hunter's Nightmare's 960x540 half-float texture, which the game
+// clears every frame (GX's fill) and a later pass reads as cleared, into a
+// copy no shader binds; Central Yharnam's G-buffer copies take that path only
+// before its G-buffer pass first draws after a load. The veil that comes and
+// goes over the Nightmare from run to run shows at level 1 too.
 const int g_copy_by_resource = [] {
     const char* e = std::getenv("BBHOST_COPY_BY_RESOURCE");
     return e && *e ? std::atoi(e) : 1;
