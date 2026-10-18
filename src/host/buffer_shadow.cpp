@@ -115,6 +115,9 @@ struct Page {
     // ended, so the copy holds for its recording only.
     bool provisional = false;
     std::uint16_t provisional_run = 0;  // copies in a row made so
+    // BBHOST_SHADOW_VERIFY: the bytes of it draws bound since its copy, as
+    // offsets in the page - a change outside them is no draw's.
+    std::uint32_t read_lo = ~0u, read_hi = 0;
     bool valid = false;               // the mirror holds it (or will, once this submission's copies run)
     bool dynamic = false;             // bound from the import from now on (rewritten, unwatchable)
 };
@@ -563,7 +566,7 @@ std::uint64_t g_told_seq = 0;  // under g.mu: one a drained write
 std::atomic<std::uint64_t> g_gx_records{0};
 std::uint64_t g_told_copies = 0, g_watched_partial = 0, g_watched_none = 0, g_told_invalid = 0, g_told_held = 0, g_told_overflows = 0,
               g_told_unmapped = 0;
-std::uint64_t g_verify_stale_told = 0;
+std::uint64_t g_verify_stale_told = 0, g_verify_stale_told_read = 0;
 
 // The newest GX write over a told page is one its copy predates, and the
 // submission walked now was made after that write was asked for (the CPU has
@@ -999,6 +1002,16 @@ void shadow_locate_locked(std::uint64_t va, std::uint64_t bytes, Located& loc) {
     // (Never past the mirror's pages: a copy or a sparse bind there runs past
     // the end of its buffer.)
     if (p1 >= m->pages.size()) return;
+    if (g_verify) {
+        for (std::uint32_t p = p0; p <= p1; ++p) {
+            Page& pg = m->pages[p];
+            const std::uint64_t page_lo = static_cast<std::uint64_t>(p) << kPageShift;
+            const std::uint32_t lo = static_cast<std::uint32_t>(std::max(off, page_lo) - page_lo);
+            const std::uint32_t hi = static_cast<std::uint32_t>(std::min(off + bytes, page_lo + kPageBytes) - page_lo);
+            pg.read_lo = std::min(pg.read_lo, lo);
+            pg.read_hi = std::max(pg.read_hi, hi);
+        }
+    }
     {
         const std::uint32_t span = p1 - p0 + 1;
         ++g_span_hist[span == 1 ? 0 : span <= 4 ? 1 : span <= 16 ? 2 : span <= 64 ? 3 : span <= 256 ? 4 : 5];
@@ -1244,6 +1257,10 @@ void shadow_locate_locked(std::uint64_t va, std::uint64_t bytes, Located& loc) {
         if (g_verify) {
             const auto* src = reinterpret_cast<const std::uint8_t*>(static_cast<std::uintptr_t>(lo));
             pg.hash = fnv1a(src, hi - lo);
+            // This draw's bytes in the page; later draws add theirs.
+            const std::uint64_t page_lo = static_cast<std::uint64_t>(p) << kPageShift;
+            pg.read_lo = static_cast<std::uint32_t>(std::max(off, page_lo) - page_lo);
+            pg.read_hi = static_cast<std::uint32_t>(std::min(off + bytes, page_lo + kPageBytes) - page_lo);
             g_verify_copies[(std::uint64_t{chunk} << 32) | p].assign(src, src + (hi - lo));
         }
         m->ok[p >> 6] |= 1ull << (p & 63);
@@ -1730,10 +1747,26 @@ void verify_batch_locked() {
             ++g_verify_checked;
             if (fnv1a(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(pg.va)), pg.bytes) == pg.hash) continue;
             if (pg.told ? pg.gx_written > pg.told_seq : written(pg)) continue;  // a write the next check will see anyway
-            if (pg.told) ++g_verify_stale_told;
+            if (pg.told && pg.provisional) continue;  // copied again at the next recording, outstanding renamed copies over it
+            bool read_changed = !pg.told;  // a watched page's change is one either way
+            if (pg.told) {
+                ++g_verify_stale_told;
+                // Of the told page's bytes, did a draw bind any that changed?
+                auto vc = g_verify_copies.find((std::uint64_t{chunk} << 32) | p);
+                if (vc != g_verify_copies.end() && vc->second.size() == pg.bytes && pg.read_lo < pg.read_hi) {
+                    const auto* now = reinterpret_cast<const std::uint8_t*>(static_cast<std::uintptr_t>(pg.va));
+                    const std::uint32_t lo = std::min<std::uint32_t>(pg.read_lo, static_cast<std::uint32_t>(pg.bytes));
+                    const std::uint32_t hi = std::min<std::uint32_t>(pg.read_hi, static_cast<std::uint32_t>(pg.bytes));
+                    read_changed = lo < hi && std::memcmp(now + lo, vc->second.data() + lo, hi - lo) != 0;
+                }
+                if (read_changed) ++g_verify_stale_told_read;
+            }
+            if (pg.told && !read_changed) continue;  // changed in bytes no draw bound since the copy (the pool's draw tables)
             if (g_verify_stale++ < 32) {
-                host_log("buffer shadow: VERIFY: %s page 0x%llx changed with no write this cache saw (chunk %u)", pg.told ? "told" : "watched",
-                         static_cast<unsigned long long>(page_va), chunk);
+                host_log("buffer shadow: VERIFY: %s page 0x%llx changed with no write this cache saw (chunk %u)%s", pg.told ? "told" : "watched",
+                         static_cast<unsigned long long>(page_va), chunk, pg.told ? ", in bytes draws bound" : "");
+                if (pg.told)
+                    host_log("buffer shadow: VERIFY:   draws bound [+0x%x, +0x%x) of it since its copy", pg.read_lo, pg.read_hi);
                 hle_kernel_mappings_of(pg.va);  // logs each address the page is mapped at
                 auto it = g_verify_copies.find((std::uint64_t{chunk} << 32) | p);
                 if (it != g_verify_copies.end() && it->second.size() == pg.bytes) {
@@ -2145,8 +2178,9 @@ std::string shadow_report() {
             told += hd;
         }
         if (g_verify) {
-            char vt[64];
-            std::snprintf(vt, sizeof(vt), "; stale told pages %llu", static_cast<unsigned long long>(g_verify_stale_told));
+            char vt[96];
+            std::snprintf(vt, sizeof(vt), "; stale told pages %llu (in bytes draws bound %llu)", static_cast<unsigned long long>(g_verify_stale_told),
+                          static_cast<unsigned long long>(g_verify_stale_told_read));
             told += vt;
         }
         host_log("  buffer shadow, %s", told.c_str());
