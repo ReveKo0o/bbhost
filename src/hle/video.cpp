@@ -69,6 +69,7 @@ struct VideoPort {
         PresentFlip present;
         bool shown;
         bool at_once = false;
+        std::uint64_t recorded_tick = 0;  // the vblank count when the command processor queued it (g_flip_hold)
     };
     std::deque<FlipReq> flip_queue;  // requested flips awaiting a vblank
     std::chrono::steady_clock::time_point last_complete{};
@@ -86,6 +87,29 @@ std::once_flag g_vsync_once;
 std::atomic<bool> g_vsync_run{true};
 std::atomic<std::uint64_t> g_flips_done{0};
 std::atomic<std::uint64_t> g_last_tick_ns{0};  // BBHOST_FLIP_TIMELINE (gnm.cpp): when the last vblank tick ran
+std::atomic<std::uint64_t> g_vcount{0};  // the vblank ticks so far (vblank_tick)
+// Hold a flip a whole frame period after the command processor queued it.
+// Bloodborne keeps two flips in flight (mcp_Gnm_WaitAndSubmitFlip, 0x2ad6e70:
+// before submitting a flip it waits for the flip event until the one two
+// back has completed). When the command processor records a frame right
+// after the game's call, the flip ahead of it completes on the next vblank
+// and this one on the vblank after: the game's wait meets a tick every frame
+// and its frames go out one a refresh. When a frame's last submissions come
+// in a burst just before the call, the CP records it several ms later and
+// the flip could complete on the very next vblank once its frame had run -
+// then the flip the game waits for has always completed by the time it
+// asks, its wait never meets a tick, and its frames follow its own timing
+// (~15 of 60 intervals a second over 16.7 ms at a steady 60). Either way the
+// state held itself once entered; with this hold a flip completes no sooner
+// than two flip periods after the tick it was queued in - what the steady
+// state does anyway - so the game is held to the tick in both. Only for flips
+// paced to the display (the vblank path); uncapped, 90 and 120 complete at
+// once (flip_waiter) and are not held. BBHOST_FLIP_HOLD=0 turns it off.
+const bool g_flip_hold = [] {
+    const char* e = std::getenv("BBHOST_FLIP_HOLD");
+    return !(e && e[0] == '0');
+}();
+std::atomic<std::uint64_t> g_flip_holds{0};
 std::atomic<int> g_fps_cap{30};  // video.fps_cap: upper bound on presented frames/s
 
 // Present on arrival (KyoPS4x #249's split, made here natively): a frame the
@@ -427,6 +451,7 @@ void wake_flip_waiter() {
 }
 
 void vblank_tick(std::uint64_t vcount) {
+    g_vcount.store(vcount, std::memory_order_relaxed);
     const std::uint64_t gpu_done = g_flip_after_gpu ? host_gpu_submissions_completed() : ~0ull;
     struct Done {
         int buffer;
@@ -455,6 +480,11 @@ void vblank_tick(std::uint64_t vcount) {
                              static_cast<unsigned long long>(n + 1));
                 }
                 continue;  // the GPU has not run the frame yet: a later vblank
+            }
+            if (g_flip_hold && p.flip_queue.front().recorded_tick &&
+                vcount < p.flip_queue.front().recorded_tick + 2 * (static_cast<std::uint64_t>(p.flip_rate) + 1)) {
+                g_flip_holds.fetch_add(1, std::memory_order_relaxed);
+                continue;  // queued less than two flip periods ago
             }
             // Also honour video.fps_cap: Bloodborne asks for flip_rate 0 (60)
             // but is a 30 fps title paced by GPU time on hardware; the cap
@@ -942,7 +972,14 @@ std::string hle_video_pacing_window() {
                   static_cast<unsigned long long>(late_1ms), avg(shown_us, shown) / 1000.0, static_cast<double>(shown_max) / 1000.0,
                   static_cast<unsigned long long>(shown), avg(done_us, done) / 1000.0, static_cast<double>(done_max) / 1000.0,
                   static_cast<unsigned long long>(done), g_present_on_arrival ? " (shown on arrival)" : " (shown on completion)");
-    return buf;
+    std::string out = buf;
+    if (g_flip_hold) {
+        char h[112];
+        std::snprintf(h, sizeof(h), "; flips held to two flip periods after the CP queued them: %llu ticks",
+                      static_cast<unsigned long long>(take(g_flip_holds)));
+        out += h;
+    }
+    return out;
 }
 
 void hle_video_set_loading_uncapped(bool on) { flip_holds_screen(g_flip_loading.exchange(on, std::memory_order_relaxed), on); }
@@ -1060,6 +1097,13 @@ void hle_video_finish_flip(int handle, int buffer, std::int64_t arg, bool record
             }
             flip.on_arrival = show;
             p->flip_queue.push_back({buffer, arg, mark, gpu_need, flip, show});
+            p->flip_queue.back().recorded_tick = recorded ? g_vcount.load(std::memory_order_relaxed) : 0;
+            static std::atomic<bool> said_hold{false};
+            if (recorded && !said_hold.exchange(true)) {
+                host_log("video: %s", g_flip_hold ? "a flip completes no sooner than two flip periods after the command processor queued it "
+                                                    "(BBHOST_FLIP_HOLD=0: on the first vblank after its frame has run)"
+                                                  : "a flip completes on the first vblank after its frame has run (BBHOST_FLIP_HOLD=0)");
+            }
             p->pending = static_cast<int>(p->flip_queue.size());
             if (!show) return;
             if (buffer >= 0 && buffer < 16) display_va = p->buffers[buffer];
