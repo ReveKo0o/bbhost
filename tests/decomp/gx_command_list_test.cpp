@@ -1,7 +1,8 @@
 // GX's command lists (decomp/gx/command_list.cpp) beside the game's own
 // (tests/decomp/eboot_kit.h): FinishCommandList's wrapper and body,
-// ExecuteCommandList's and ExecuteCommandLists' wrappers and bodies, and the
-// close of a command buffer's segment.
+// ExecuteCommandList's and ExecuteCommandLists' wrappers and bodies, the
+// close of a command buffer's segment, and the frame's last segment going out
+// with the flip.
 //
 // Every callee is a recorder (eboot_kit::stub - the game's code and ours both
 // reach it), and so are the allocator's free (+0x70 of a vtable the test
@@ -10,7 +11,8 @@
 // not, either record set selected for colour and for depth - lists of up to
 // four pages of up to seven spans with an allocator or none, batches of up
 // to five lists with gaps, span appends and recording failures, and compute
-// rings with their counters on the last value, past it, or wrapping - ours
+// rings with their counters on the last value, past it, or wrapping, flips
+// with room or without, refills that give some or none - ours
 // must make the game's calls with the game's arguments, return what it
 // returns and leave the memory as it leaves it. The game's one-line helpers
 // run as themselves. Six deliberate mistakes (MUTANT) must each be caught,
@@ -71,7 +73,8 @@ const Callee kCallees[] = {
 };
 constexpr int kNumCallees = static_cast<int>(std::size(kCallees));
 constexpr int kFinishBodyId = 0, kExecuteBodyId = 1, kExecuteListsBodyId = 2, kFinishRecordingId = 4, kAppendSpanId = 17;
-constexpr int kSubmitId = 100, kFreeId = 101;
+constexpr int kSubmitId = 100, kFreeId = 101, kRefillId = 102, kReserveId = 103, kCloseFlipId = 104, kSubmitFlipBodyId = 105, kSubmitFlipId = 106,
+              kSubmitDoneId = 107;
 
 u32 g_body_result = 0, g_recording_result = 0;
 std::vector<u32> g_append_results;  // one per append, then 0
@@ -117,20 +120,69 @@ GUEST_ABI u64 free_recorder(u64 self, u64 page) {
     g_rec.push_back({kFreeId, {self, page, 0, 0, 0, 0}});
     return 0;
 }
+// The flip's callees. The refill gives room or not (the end moved).
+bool g_refill_gives = false;
+GUEST_ABI u64 refill_recorder(u64 cb, u64 dwords, u64 arg3, u64 arg4) {
+    g_rec.push_back({kRefillId, {cb, dwords & 0xffffffffull, arg3, arg4, 0, 0}});
+    if (g_refill_gives) store<u64>(cb + 0x8, load<u64>(cb + 0x10) + 0x1000);
+    return 1;
+}
+// The system's flip packets: the 64 dwords' room taken, as the game's writer does.
+GUEST_ABI u64 reserve_recorder(u64 cb) {
+    g_rec.push_back({kReserveId, {cb, 0, 0, 0, 0, 0}});
+    store<u64>(cb + 0x10, load<u64>(cb + 0x10) + 0x100);
+    return 0;
+}
+u64 header_sum(u64 h) {
+    u64 sum = 0;
+    for (int k = 0; k < 8; ++k) sum = sum * 0x100000001b3ull ^ load<u64>(h + 8ull * k);
+    return sum;
+}
+// What the close with the flip is handed: the flip's fields it reads, not the
+// stack's leftovers between them.
+GUEST_ABI u64 close_flip_recorder(u64 cb, u64 fresh, u64 header, GxFlip flip) {
+    g_rec.push_back({kCloseFlipId, {cb, fresh, header_sum(header), flip.target, flip.mode & 0xffffffffull, flip.arg ^ (flip.kind & 0xff) << 56}});
+    return 0;
+}
+GUEST_ABI u64 submit_flip_body_recorder(u64 flip, u64 header) {
+    g_rec.push_back({kSubmitFlipBodyId, {load<u64>(flip), load<u32>(flip + 8), load<u64>(flip + 0x10), header, 0, 0}});
+    return 0;
+}
+GUEST_ABI s32 submit_flip_recorder(u64 count, u64 dcb, u64 dcb_bytes, u64 ccb, u64 ccb_bytes, u64 handle, u64 index, u64 mode, u64 arg) {
+    Call c{kSubmitFlipId, {count & 0xffffffffull, 0, 0, ccb | ccb_bytes << 1, handle, 0}};
+    const u32 n = static_cast<u32>(count);
+    if (n >= 1) c.a[1] = load<u64>(dcb) ^ static_cast<u64>(load<u32>(dcb_bytes)) << 40;
+    if (n >= 2) c.a[2] = load<u64>(dcb + 8) ^ static_cast<u64>(load<u32>(dcb_bytes + 4)) << 40;
+    c.a[5] = (index & 0xffffffffull) ^ (mode & 0xffffffffull) << 32 ^ arg * 31;
+    g_rec.push_back(c);
+    return 0;
+}
+GUEST_ABI s32 submit_done_recorder() {
+    g_rec.push_back({kSubmitDoneId, {0, 0, 0, 0, 0, 0}});
+    return 0;
+}
 
 const char* who_name(int who) {
     if (who == kSubmitId) return "submit";
     if (who == kFreeId) return "free";
+    if (who == kRefillId) return "refill";
+    if (who == kReserveId) return "reserve_flip_packets";
+    if (who == kCloseFlipId) return "close_segment_and_flip";
+    if (who == kSubmitFlipBodyId) return "submit_segment_and_flip";
+    if (who == kSubmitFlipId) return "submit_and_flip";
+    if (who == kSubmitDoneId) return "submit_done";
     return who >= 0 && who < kNumCallees ? kCallees[who].name : "-";
 }
 
 // The three bodies are stubbed for their wrappers and the game's again for
 // themselves: their first bytes kept, put back.
 constexpr int kShared[3] = {kFinishBodyId, kExecuteBodyId, kExecuteListsBodyId};
-u8 g_original_bytes[3][16];
+u8 g_original_bytes[5][16];  // the three bodies, then the close and the submit with the flip
 template <int... W>
 void stub_all(std::integer_sequence<int, W...>) {
     for (int k = 0; k < 3; ++k) std::memcpy(g_original_bytes[k], eboot_kit::at(kCallees[kShared[k]].bn), 16);
+    std::memcpy(g_original_bytes[3], eboot_kit::at(kCloseSegmentAndFlip), 16);
+    std::memcpy(g_original_bytes[4], eboot_kit::at(kSubmitSegmentAndFlip), 16);
     ((W == kFinishBodyId || W == kExecuteBodyId || W == kExecuteListsBodyId
           ? void()
           : eboot_kit::stub(kCallees[W].bn, reinterpret_cast<const void*>(&recorder<W>))),
@@ -150,6 +202,13 @@ void bodies_stubbed(bool on) {
     } else {
         for (int k = 0; k < 3; ++k) put_bytes(kCallees[kShared[k]].bn, g_original_bytes[k]);
     }
+}
+// The close with the flip and the submit it hands to, as recorders or the game's.
+void flip_bodies_stubbed(bool close, bool submit) {
+    if (close) eboot_kit::stub(kCloseSegmentAndFlip, reinterpret_cast<const void*>(&close_flip_recorder));
+    else put_bytes(kCloseSegmentAndFlip, g_original_bytes[3]);
+    if (submit) eboot_kit::stub(kSubmitSegmentAndFlip, reinterpret_cast<const void*>(&submit_flip_body_recorder));
+    else put_bytes(kSubmitSegmentAndFlip, g_original_bytes[4]);
 }
 
 int g_failed = 0;
@@ -375,6 +434,89 @@ int run_close_segment(int cases) {
     return cases;
 }
 
+// The compute ring and a command buffer's header, for the close and the flip.
+void make_ring(u64 cb) {
+    store<u64>(cb + 0xb490, base() + kHolder);
+    store<u64>(base() + kHolder + 0xb728, base() + kRing);
+    const u64 ring = base() + kRing;
+    store<u64>(ring + 0x10, base() + kRingWord);
+    store<u64>(ring + 0x18, base() + kCounters);
+    store<u64>(ring + 0x20, base() + kCounters + 4);
+    const u32 total = g_rng.chance(0.2) ? static_cast<u32>(g_rng.range(0, 2)) : g_rng.u32();
+    u32 waited = total - 1;
+    if (g_rng.chance(0.5)) waited = g_rng.chance(0.4) ? 0x80000000u | g_rng.u32() : g_rng.u32();
+    store<u32>(base() + kCounters, total);
+    store<u32>(base() + kCounters + 4, waited);
+}
+int g_flip_refused = 0, g_flip_refilled = 0, g_flip_fresh = 0, g_flip_last = 0;
+int run_flip(int cases) {
+    for (int t = 0; t < cases; ++t) {
+        fill_memory();
+        const u64 cb = ctx() + 0x10;
+        make_ring(cb);
+        const u64 wp = base() + 0x2000;
+        store<u64>(cb, wp - 8 * static_cast<u64>(g_rng.range(0, 64)));
+        store<u64>(cb + 0x10, wp);
+        // Room in dwords: none to plenty, the 64 and 7 edges often.
+        static const int kRooms[] = {0, 6, 7, 8, 63, 64, 65, 70, 71, 72, 1000};
+        const int room = g_rng.chance(0.7) ? kRooms[g_rng.range(0, 10)] : g_rng.range(0, 4000);
+        store<u64>(cb + 0x8, wp + 4ull * static_cast<u64>(room));
+        store<u64>(cb + 0x18, reinterpret_cast<u64>(&refill_recorder));
+        g_refill_gives = g_rng.chance(0.5);
+        const u64 handle = garbage(), index = garbage(), mode = garbage(), arg = garbage();
+        using F = GUEST_ABI u64 (*)(u64, u64, u64, u64, u64);
+        both("gx_command_buffer_flip", t, [&] { return eboot_kit::fn<F>(0x2aafb30)(cb, handle, index, mode, arg) & 0xffffffffull; },
+             [&] { return gx_command_buffer_flip(cb, handle, index, mode, arg) & 0xffffffffull; });
+        bool refused = false, refilled = false, closed = false;
+        u64 fresh = 0;
+        for (const Call& c : g_rec) {
+            refilled |= c.who == kRefillId;
+            if (c.who == kCloseFlipId) closed = true, fresh = c.a[1];
+        }
+        refused = !closed;
+        g_flip_refused += refused;
+        g_flip_refilled += refilled;
+        g_flip_fresh += closed && fresh;
+        g_flip_last += closed && !fresh;
+    }
+    return cases;
+}
+int run_close_and_flip(int cases) {
+    for (int t = 0; t < cases; ++t) {
+        fill_memory();
+        const u64 cb = ctx() + 0x10;
+        make_ring(cb);
+        const u64 fresh = g_rng.chance(0.7) ? cb : 0;
+        const auto span = [&](u64 at) {
+            const u64 begin = garbage() & ~0xfull;
+            store<u64>(at, begin);
+            const u32 bytes = g_rng.chance(0.2) ? static_cast<u32>(g_rng.range(0, 3)) : static_cast<u32>(g_rng.range(0, 1 << 20));
+            store<u64>(at + 0x10, begin + bytes);
+        };
+        span(cb);
+        span(base() + kHeader);
+        const GxFlip flip{garbage(), garbage(), garbage(), garbage()};
+        using F = GUEST_ABI void (*)(u64, u64, u64, GxFlip);
+        const u64 header = base() + kHeader;
+        both("gx_command_buffer_close_segment_and_flip", t, [&] { eboot_kit::fn<F>(kCloseSegmentAndFlip)(cb, fresh, header, flip); return 0ull; },
+             [&] { gx_command_buffer_close_segment_and_flip(cb, fresh, header, flip); return 0ull; });
+    }
+    return cases;
+}
+int run_submit_and_flip(int cases) {
+    for (int t = 0; t < cases; ++t) {
+        fill_memory();
+        const u64 header = base() + kHeader, flip = base() + kHeader + 0x80;
+        const u64 begin = garbage() & ~0xfull;
+        store<u64>(header, begin);
+        store<u64>(header + 0x10, begin + (g_rng.chance(0.2) ? static_cast<u32>(g_rng.range(0, 3)) : static_cast<u32>(g_rng.range(0, 1 << 20))));
+        using F = GUEST_ABI void (*)(u64, u64);
+        both("gx_submit_segment_and_flip", t, [&] { eboot_kit::fn<F>(kSubmitSegmentAndFlip)(flip, header); return 0ull; },
+             [&] { gx_submit_segment_and_flip(flip, header); return 0ull; });
+    }
+    return cases;
+}
+
 long run_all(int cases) {
     long total = 0;
     bodies_stubbed(true);
@@ -386,6 +528,12 @@ long run_all(int cases) {
     total += run_execute_body(cases);
     total += run_execute_lists_body(cases);
     total += run_close_segment(cases);
+    flip_bodies_stubbed(true, true);
+    total += run_flip(cases);
+    flip_bodies_stubbed(false, true);
+    total += run_close_and_flip(cases);
+    flip_bodies_stubbed(false, false);
+    total += run_submit_and_flip(cases);
     return total;
 }
 
@@ -408,6 +556,9 @@ int main(int argc, char** argv) {
     const int cases = argc > 1 ? std::atoi(argv[1]) : 4000;
     stub_all(std::make_integer_sequence<int, kNumCallees>{});
     eboot_kit::stub(kSubmitCommandBuffers, reinterpret_cast<const void*>(&submit_recorder));
+    eboot_kit::stub(kSubmitAndFlip, reinterpret_cast<const void*>(&submit_flip_recorder));
+    eboot_kit::stub(kSubmitDone, reinterpret_cast<const void*>(&submit_done_recorder));
+    eboot_kit::stub(kReserveFlipPackets, reinterpret_cast<const void*>(&reserve_recorder));
 
     struct Entry {
         u64 bn;
@@ -423,6 +574,9 @@ int main(int argc, char** argv) {
         {0x25679e0, kEntryExecuteListsWrapper, sizeof kEntryExecuteListsWrapper, "gx_execute_command_lists"},
         {kExecuteListsBody, kEntryExecuteLists, sizeof kEntryExecuteLists, "gx_context_execute_command_lists"},
         {0x2ab0b00, kEntryCloseSegment, sizeof kEntryCloseSegment, "gx_command_buffer_close_segment"},
+        {0x2aafb30, kEntryFlip, sizeof kEntryFlip, "gx_command_buffer_flip"},
+        {kCloseSegmentAndFlip, kEntryCloseSegmentAndFlip, sizeof kEntryCloseSegmentAndFlip, "gx_command_buffer_close_segment_and_flip"},
+        {kSubmitSegmentAndFlip, kEntrySubmitSegmentAndFlip, sizeof kEntrySubmitSegmentAndFlip, "gx_submit_segment_and_flip"},
     };
     for (const Entry& e : kEntries) {
         const u8* at = eboot_kit::file_at("gx_command_list_test", e.bn);
@@ -431,9 +585,11 @@ int main(int argc, char** argv) {
 
     const long total = run_all(cases);
     std::printf("  %ld cases against the game's: %ld spans appended (%ld of them refused, a page not had), %ld pages freed, %ld submissions; "
-                "close_segment %d with the ring's waits (%d for the wrap), %d submitting two buffers\n",
-                total, g_game_appends, g_append_failed, g_game_frees, g_game_submits, g_close_waits, g_close_wraps, g_close_two);
-    for (const int mutant : {1, 2, 3, 4, 5, 6}) {
+                "close_segment %d with the ring's waits (%d for the wrap), %d submitting two buffers; flips: %d refused (no room after the "
+                "refill), %d asked the refill, %d closed with a fresh start, %d the ring's last\n",
+                total, g_game_appends, g_append_failed, g_game_frees, g_game_submits, g_close_waits, g_close_wraps, g_close_two, g_flip_refused,
+                g_flip_refilled, g_flip_fresh, g_flip_last);
+    for (const int mutant : {1, 2, 3, 4, 5, 6, 7, 8, 9}) {
         if (!caught(mutant)) {
             ++g_failed;
             std::printf("FAIL: mutant %d not caught\n", mutant);
@@ -443,6 +599,6 @@ int main(int argc, char** argv) {
         std::printf("gx_command_list_test: %d failures (%ld cases)\n", g_failed, total);
         return 1;
     }
-    std::printf("gx_command_list_test: ok - %ld cases, 6 mutants caught\n", total);
+    std::printf("gx_command_list_test: ok - %ld cases, 9 mutants caught\n", total);
     return 0;
 }

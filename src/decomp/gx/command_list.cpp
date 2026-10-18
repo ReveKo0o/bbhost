@@ -7,7 +7,11 @@
 // its body 0x256a980) - the frame's render step, up to 72 lists at a time -
 // puts each list's spans into its own stream; a command buffer's segment
 // goes to the GPU in gx_command_buffer_close_segment (0x2ab0b00), through
-// sceGnmSubmitCommandBuffers. The objects they hand on are in
+// sceGnmSubmitCommandBuffers - and the frame's last one with the flip
+// (gx_command_buffer_flip 0x2aafb30, gx_command_buffer_close_segment_and_flip
+// 0x2ab0ce0, gx_submit_segment_and_flip 0x2ab0e30: the room for the system's
+// flip packets, the compute ring's waits, sceGnmSubmitAndFlipCommandBuffers
+// and sceGnmSubmitDone). The objects they hand on are in
 // decomp/gx/command_list.h: the span, the span queue, the command list.
 //
 // Each is the game's call sequence, its callees at the game's addresses
@@ -67,6 +71,11 @@ constexpr u64 kAppendSpan = 0x2ab03f0;          // (cb, span): 0, or 9 when a pa
 constexpr u64 kRetireChunkList = 0x2ab0630;     // gx_context_retire_chunk_list(cb): the spans to the GPU, the chunks retired
 constexpr u64 kWaitRegMem = 0x1477b30;          // gnm_wait_reg_mem(cb, address, mask, function, reference)
 constexpr u64 kSubmitCommandBuffers = 0x1489a10;  // sceGnmSubmitCommandBuffers' import entry
+constexpr u64 kSubmitAndFlip = 0x1489a20;         // sceGnmSubmitAndFlipCommandBuffers' import entry
+constexpr u64 kSubmitDone = 0x1489b50;            // sceGnmSubmitDone's import entry
+constexpr u64 kReserveFlipPackets = 0x14784a0;    // gnm_reserve_flip_packets(cb): the system's room, a 64-dword NOP
+constexpr u64 kCloseSegmentAndFlip = 0x2ab0ce0;   // gx_command_buffer_close_segment_and_flip(cb, fresh, header, flip)
+constexpr u64 kSubmitSegmentAndFlip = 0x2ab0e30;  // gx_submit_segment_and_flip(&flip, header)
 
 using Cb = GUEST_ABI void (*)(u64);
 using Ctx2 = GUEST_ABI void (*)(u64, u64);
@@ -304,6 +313,139 @@ DECOMP_LEAF void gx_command_buffer_close_segment(u64 cb, u64 fresh, u64 header, 
     game_function<Submit>(kSubmitCommandBuffers)(n, addresses, sizes, nullptr, nullptr);
 }
 
+// What the flip's submit is told, as the game builds it on its stack and
+// passes it by value: the video out handle (low 32 bits) with the display
+// buffer's index (high), the flip mode (low 32 bits), the flip's argument,
+// and the command buffer's kind byte (not read). The rest is what the stack
+// held.
+struct GxFlip {
+    u64 target, mode, arg, kind;
+};
+static_assert(sizeof(GxFlip) == 32, "passed in memory, four qwords");
+
+namespace {
+using SubmitFlip = GUEST_ABI s32 (*)(u32 count, const u64* dcb, const u32* dcb_bytes, const u64* ccb, const u32* ccb_bytes, u64 handle, u32 index,
+                                     u32 mode, u64 arg);
+// The one or two buffers a submission takes, from their sizes: both, the
+// first, the second, or none.
+u32 pick_buffers(u64 first, u32 first_bytes, u64 second, u32 second_bytes, u64* addresses, u32* sizes) {
+    if (first_bytes && second_bytes) {
+        addresses[0] = first;
+        sizes[0] = first_bytes;
+        addresses[1] = second;
+        sizes[1] = second_bytes;
+        return 2;
+    }
+    if (first_bytes) {
+        addresses[0] = first;
+        sizes[0] = first_bytes;
+        return 1;
+    }
+    if (second_bytes) {
+        addresses[0] = second;
+        sizes[0] = second_bytes;
+        return 1;
+    }
+    return 0;
+}
+}  // namespace
+
+// gx_submit_segment_and_flip(&flip, header): the segment the header describes
+// to the GPU with the flip (beside the empty command buffer the game builds
+// on its stack), then the submission done. Nothing goes for no bytes.
+DECOMP_LEAF void gx_submit_segment_and_flip(u64 flip, u64 header) {
+    const u64 first = load<u64>(header);
+    const u32 first_bytes = (load<u32>(header + 0x10) - static_cast<u32>(first)) & ~3u;
+    u64 addresses[2];
+    u32 sizes[2];
+    const u32 n = pick_buffers(first, first_bytes, 0, 0, addresses, sizes);
+    if (!n) return;
+    game_function<SubmitFlip>(kSubmitAndFlip)(n, addresses, sizes, nullptr, nullptr, load<u32>(flip), load<u32>(flip + 4), load<u32>(flip + 8),
+                                              load<u64>(flip + 0x10));
+    game_function<GUEST_ABI void (*)()>(kSubmitDone)();
+}
+
+// gx_command_buffer_close_segment_and_flip(cb, fresh, header, flip): as
+// gx_command_buffer_close_segment - the compute ring's waits at a fresh start
+// ahead of the segment - but submitted with the flip, then the submission
+// done; without a fresh start, gx_submit_segment_and_flip.
+DECOMP_LEAF void gx_command_buffer_close_segment_and_flip(u64 cb, u64 fresh, u64 header, GxFlip flip) {
+    const u64 flip_at = reinterpret_cast<u64>(&flip);
+    if (!fresh) {
+        game_function<GUEST_ABI void (*)(u64, u64)>(kSubmitSegmentAndFlip)(flip_at, header);
+        return;
+    }
+    const u64 ring = load<u64>(load<u64>(cb + 0xb490) + 0xb728);
+    const u32 last = load<u32>(load<u64>(ring + 0x18)) - 1;
+    const u32 waited = load<u32>(load<u64>(ring + 0x20));
+    if (waited != last) {
+        using Wait = GUEST_ABI u64 (*)(u64 cb, u64 address, u64 mask, u64 function, u64 reference);
+        const auto wait = game_function<Wait>(kWaitRegMem);
+        if (static_cast<s32>(waited) < 0 && static_cast<s32>(last) >= 0) wait(fresh, load<u64>(ring + 0x10), 0xffffffffu, 1, waited);
+        wait(fresh, load<u64>(ring + 0x10), 0xffffffffu, 5, last);
+        store<u32>(load<u64>(ring + 0x20), last);
+    }
+    const u64 first = load<u64>(fresh), second = load<u64>(header);
+    const u32 first_bytes = (load<u32>(fresh + 0x10) - static_cast<u32>(first)) & ~3u;
+    const u32 second_bytes = (load<u32>(header + 0x10) - static_cast<u32>(second)) & ~3u;
+    u64 addresses[2];
+    u32 sizes[2];
+    const u32 n = pick_buffers(first, first_bytes, second, second_bytes, addresses, sizes);
+    if (!n) return;
+    // The handle's register carries the index in its high half, as the
+    // game's loads it.
+    game_function<SubmitFlip>(kSubmitAndFlip)(n, addresses, sizes, nullptr, nullptr, MUTANT(7) ? static_cast<u32>(flip.target) : flip.target,
+                                              static_cast<u32>(flip.target >> 32), static_cast<u32>(flip.mode), flip.arg);
+    game_function<GUEST_ABI void (*)()>(kSubmitDone)();
+}
+
+// gx_command_buffer_flip(cb, video out handle, display buffer, flip mode,
+// flip argument): the frame's last segment, with the flip. Room for 64
+// dwords first (the refill asked once; 9 if it gave less), the system's flip
+// packets reserved, then the segment closed with the flip: a fresh start
+// after it unless the compute ring's counter is on its last value (none) or
+// fewer than seven dwords are left (then the refill is asked for none and
+// nothing is submitted). The write pointer noted as flushed. 0 otherwise.
+DECOMP_LEAF u64 gx_command_buffer_flip(u64 cb, u64 handle, u64 index, u64 mode, u64 arg) {
+    using Refill = GUEST_ABI u64 (*)(u64 cb, u64 dwords, u64 arg3, u64 arg4);
+    const auto refill = [cb](u64 arg3, u64 arg4) {
+        reinterpret_cast<Refill>(static_cast<std::uintptr_t>(load<u64>(cb + 0x18)))(cb, 0, arg3, arg4);
+    };
+    const auto room = [cb] { return (load<u64>(cb + 0x8) - load<u64>(cb + 0x10)) >> 2; };
+    if (static_cast<u32>(room()) <= 0x3f) {
+        // The refill with the buffer itself for its argument, and the flip
+        // mode's register as it came, as the game's call leaves them.
+        refill(cb, MUTANT(8) ? 0 : mode);
+        if (static_cast<u32>(room()) < 0x40) return 9;
+    }
+    call1(kReserveFlipPackets, cb);
+    GxFlip flip{};
+    flip.target = static_cast<u32>(handle) | static_cast<u64>(static_cast<u32>(index)) << 32;
+    flip.mode = static_cast<u32>(mode);
+    flip.arg = arg;
+    flip.kind = load<u8>(cb + 0xb4f0);
+    u64 header[8];
+    u64 fresh = 0;
+    const u64 ring = load<u64>(load<u64>(cb + 0xb490) + 0xb728);
+    if (load<u32>(load<u64>(ring + 0x20)) == load<u32>(load<u64>(ring + 0x18)) - 1) {
+        for (int k = 0; k < 8; ++k) header[k] = load<u64>(cb + 8ull * k);
+    } else {
+        const u64 left = room();
+        if (static_cast<u32>(left) < (MUTANT(9) ? 8u : 7u)) {
+            refill(load<u64>(cb + 0x20), left);
+            return 0;
+        }
+        for (int k = 0; k < 8; ++k) header[k] = load<u64>(cb + 8ull * k);
+        store<u64>(cb, load<u64>(cb + 0x10));
+        fresh = cb;
+    }
+    game_function<GUEST_ABI void (*)(u64, u64, u64, GxFlip)>(kCloseSegmentAndFlip)(cb, fresh, reinterpret_cast<u64>(header), flip);
+    const u64 wp = load<u64>(cb + 0x10);
+    store<u64>(cb, wp);
+    store<u64>(cb + 0xb4b8, wp);
+    return 0;
+}
+
 namespace {
 
 // The entries: the prologues the decomp list places ours at.
@@ -322,6 +464,12 @@ constexpr u8 kEntryExecuteWrapper[] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x56, 0x53,
 constexpr u8 kEntryExecuteListsWrapper[] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x56, 0x53, 0x41, 0x89, 0xce, 0x89, 0xd0};
 // PUSH6; sub rsp, 0x68; mov r14, rdx; mov r15, rsi
 constexpr u8 kEntryCloseSegment[] = {PUSH6, 0x48, 0x83, 0xec, 0x68, 0x49, 0x89, 0xd6, 0x49, 0x89, 0xf7};
+// PUSH6; sub rsp, 0x98; mov [rbp-0xa0], r8; mov r15d, ecx
+constexpr u8 kEntryFlip[] = {PUSH6, 0x48, 0x81, 0xec, 0x98, 0x00, 0x00, 0x00, 0x4c, 0x89, 0x85, 0x60, 0xff, 0xff, 0xff, 0x41, 0x89, 0xcf};
+// PUSH6; sub rsp, 0x38; mov r15, rdx; mov r12, rsi; lea rdx, [rbp+0x10]
+constexpr u8 kEntryCloseSegmentAndFlip[] = {PUSH6, 0x48, 0x83, 0xec, 0x38, 0x49, 0x89, 0xd7, 0x49, 0x89, 0xf4, 0x48, 0x8d, 0x55, 0x10};
+// push rbp; mov rbp, rsp; push r15; push r14; push rbx; sub rsp, 0x78; mov rbx, rsi; mov r14, rdi
+constexpr u8 kEntrySubmitSegmentAndFlip[] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x53, 0x48, 0x83, 0xec, 0x78, 0x48, 0x89, 0xf3, 0x49, 0x89, 0xfe};
 #undef PUSH6
 
 }  // namespace
@@ -342,6 +490,11 @@ void decomp_gx_command_list_add() {
          reinterpret_cast<void*>(&gx_context_execute_command_lists), DecompKind::Leaf},
         {"gx_command_buffer_close_segment", "gx", 0x2ab0b00, kEntryCloseSegment, sizeof kEntryCloseSegment,
          reinterpret_cast<void*>(&gx_command_buffer_close_segment), DecompKind::Leaf},
+        {"gx_command_buffer_flip", "gx", 0x2aafb30, kEntryFlip, sizeof kEntryFlip, reinterpret_cast<void*>(&gx_command_buffer_flip), DecompKind::Leaf},
+        {"gx_command_buffer_close_segment_and_flip", "gx", kCloseSegmentAndFlip, kEntryCloseSegmentAndFlip, sizeof kEntryCloseSegmentAndFlip,
+         reinterpret_cast<void*>(&gx_command_buffer_close_segment_and_flip), DecompKind::Leaf},
+        {"gx_submit_segment_and_flip", "gx", kSubmitSegmentAndFlip, kEntrySubmitSegmentAndFlip, sizeof kEntrySubmitSegmentAndFlip,
+         reinterpret_cast<void*>(&gx_submit_segment_and_flip), DecompKind::Leaf},
     };
     for (const DecompFunction& fn : fns) decomp_add(fn);
 }
