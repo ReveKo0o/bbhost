@@ -865,8 +865,8 @@ std::vector<GxDrawRecords*>* const g_records_free = new std::vector<GxDrawRecord
 // Trivially destructible, so records released during thread exit still find it.
 thread_local GxDrawRecords* t_records_cache[2 * kRecordsBatch] = {};
 thread_local unsigned t_records_cached = 0;
-// BBHOST_GX_PACKED_RECORDS (the compact-records experiment, off): 1 packs a
-// native draw's records at the call - each stage's first line, then only what
+// BBHOST_GX_PACKED_RECORDS (1, the default; 0 hands over the sparse set): 1
+// packs a native draw's records at the call - each stage's first line, then only what
 // its bits and counts say is set, back to back, at the front of a pooled set
 // instead of spread over the set's ~28 KB - and the command processor unpacks
 // them into a set of its own, which stays in its caches from draw to draw, so
@@ -874,9 +874,12 @@ thread_local unsigned t_records_cached = 0;
 // one run, without first reading each stage's header to find the set slots.
 // 2 also keeps the records as they were and compares the unpacked ones with
 // them at every draw (the readers then read the unpacked ones).
+// Measured (10-18, one hold, A B A B at --fps 120): 669 bytes a draw against
+// the ~28 KB set; the command processor 0.5-0.7 ms a flip faster at Mensis'
+// 1,270 draws, Central Yharnam and Old Yharnam within their spread.
 const int g_packed_records = [] {
     const char* e = std::getenv("BBHOST_GX_PACKED_RECORDS");
-    return e && e[0] ? std::atoi(e) : 0;
+    return e && e[0] ? std::atoi(e) : 1;
 }();
 // The set a GX thread snapshots a draw into before packing it: the same set
 // draw after draw, so in its caches, where a pooled set comes back cold.

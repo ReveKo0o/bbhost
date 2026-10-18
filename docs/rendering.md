@@ -23,7 +23,10 @@ engine's own objects - its shaders, vertex layout, state descriptions,
 textures and constant buffers - and leaves a small token in the command
 buffer. When the command processor reaches the token, the draw is built from
 those inputs. No packet is decoded and no register file is consulted for a
-draw.
+draw. The draw's resource records travel packed - each stage's header and
+only the slots it sets, a few hundred bytes - and the command processor
+unpacks them into a set of its own (`BBHOST_GX_PACKED_RECORDS=0` hands over
+the whole sparse set).
 
 **Compute dispatches** are tokens too. A dispatch through GX's compute
 commit - the GPU particles, the tone-map and depth-of-field look-up tables -
