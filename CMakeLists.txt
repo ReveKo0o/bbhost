@@ -154,6 +154,7 @@ add_executable(bbhost
   src/hle/http.cpp
   src/hle/ajm.cpp
   src/hle/system.cpp
+  src/host/label_landing.cpp
 )
 
 target_include_directories(bbhost PRIVATE src include ${CMAKE_BINARY_DIR}/gen)
@@ -590,6 +591,12 @@ if(UNIX)
   target_link_libraries(at9_test PRIVATE atrac9 pthread)
   add_test(NAME at9_test COMMAND at9_test)
   set_tests_properties(at9_test PROPERTIES SKIP_RETURN_CODE 77)
+  # Labels written by the host once their submission has run, a counter for the GPU (tests/label_landing_test.cpp).
+  add_executable(label_landing_test tests/label_landing_test.cpp src/core/portable.cpp)
+  target_include_directories(label_landing_test PRIVATE src include)
+  target_link_libraries(label_landing_test PRIVATE pthread)
+  add_test(NAME label_landing_test COMMAND label_landing_test)
+  set_tests_properties(label_landing_test PROPERTIES ENVIRONMENT "BBHOST_LABEL_LANDING=1")
   if(SDL3_FOUND)
     # Audio output lifetimes under concurrent writes, on SDL's dummy driver.
     add_executable(host_audio_test tests/host_audio_test.cpp src/host/audio.cpp src/core/portable.cpp)

@@ -62,6 +62,18 @@ submitted range reaches the command processor as its list's packets instead
 of all its bytes (`BBHOST_HOST_LISTS=1`; `=2` records the lists and checks
 them against the walk, range by range; off by default).
 
+**Labels.** The completions are GPU fills of guest memory at the end of
+their submission's command buffer. With `BBHOST_LABEL_LANDING=1` (off by
+default while it is measured) a submission carries its labels instead, and a
+thread of the host's, `bb-labels`, writes them into guest memory in the order
+the command processor made them once the timeline semaphore says the
+submission has run: the queue's order holds without barriers between fills,
+and a label's memory needs no import. A submission counts as completed for
+the rest of bbhost only once its labels are in memory, and the command
+arena's acquire, waiting for a chunk, looks again as each label lands. The
+thread waits in the driver, or polls on Windows (`BBHOST_LABEL_WAIT`), where
+NVIDIA's driver holds its lock through that wait.
+
 **Recording.** The command processor leaves the Vulkan calls to a thread of
 its own, `bb-record`. Each draw goes into a packet, and most of its other
 commands - barriers, fills, copies and the like - into the same ordered

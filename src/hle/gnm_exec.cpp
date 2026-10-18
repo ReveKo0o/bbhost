@@ -9,6 +9,7 @@
 #include "host/frame_stats.h"
 #include "hle/modules.h"
 #include "host/host_lists.h"
+#include "host/label_landing.h"
 #include "engine/gx_resources.h"
 #include "host/gpu.h"
 
@@ -3424,7 +3425,13 @@ GUEST_ABI int hle_gx_arena_acquire(std::uint64_t* allocator, std::uint64_t* out)
     const auto start = std::chrono::steady_clock::now();
     do {
         host_gpu_submit();  // the completions the CP has recorded go to the GPU
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        if (label_landing::on()) {
+            // The retirement's 0 is a label the host writes once its
+            // submission has run (label_landing.h): look again when one lands.
+            label_landing::wait_landed_past(label_landing::landed(), std::chrono::milliseconds(1));
+        } else {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
         status = scan();
     } while (status != 0 && std::chrono::steady_clock::now() - start < std::chrono::seconds(10));
     const auto us = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count();

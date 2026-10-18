@@ -5,6 +5,7 @@
 #include "host/foreign_hooks.h"
 #include "host/draw_capture.h"
 #include "host/gpu_internal.h"
+#include "host/label_landing.h"
 #include "host/ring_budget.h"
 #include "host/shader_patch.h"
 #include "host/shaders/gpu_stall.spv.h"
@@ -30,6 +31,7 @@
 #include <memory>
 #include <optional>
 #include <iterator>
+#include <numeric>
 #include <fstream>
 #include <filesystem>
 #include <set>
@@ -141,6 +143,11 @@ const bool g_submit_thread_on = [] {
 std::atomic<std::uint64_t> g_stream_submitted{0};
 std::atomic<std::uint64_t> g_foreign_submitted{0};
 std::atomic<bool> g_timeline_on{false};  // Gpu::timeline made: set once, before any submission
+// BBHOST_LABEL_LANDING=1, with a timeline semaphore to say when a submission
+// has run: the command processor's labels are written by the host then
+// (label_landing.h); without one they stay GPU fills.
+bool landing_on() { return label_landing::on() && g_timeline_on.load(std::memory_order_relaxed); }
+void start_label_landing();  // once the timeline is made (init_locked)
 constexpr std::uint64_t kForeignTicket = 1ull << 63;  // host_gpu_submit_presenter's tickets for a kForeignSubmit
 
 // A game submission (`serial` its Gpu::flushes) also signals the timeline
@@ -1735,8 +1742,102 @@ constexpr std::uint64_t kAuditPages = static_cast<std::uint64_t>(gcn::kDmemChunk
 std::atomic<std::uint64_t> g_audit_pages[kImportUses][kAuditPages / 64];
 std::atomic<std::uint64_t> g_audit_flex_bytes[kImportUses];
 
+// BBHOST_LABEL_READ_CHECK=1 (with BBHOST_IMPORT_AUDIT=1 and
+// BBHOST_LABEL_LANDING=1): every guest range the GPU side resolves
+// (audit_range: bindings, device addresses, the mirror's sources, transfers,
+// index and indirect reads) against the labels the host writes. The landing
+// rests on no GPU work reading one: such a read would see the label only once
+// the host has written it, whatever the queue's order says.
+const bool g_label_check = [] {
+    const char* e = std::getenv("BBHOST_LABEL_READ_CHECK");
+    return e && e[0] == '1';
+}();
+std::mutex g_label_check_mu;
+struct LabelDword {
+    std::uint32_t off;     // in its 4 KiB page
+    std::uint32_t value;   // the last written
+    std::uint64_t serial;  // the submission that carries the last write
+};
+std::unordered_map<std::uint64_t, std::vector<LabelDword>> g_label_pages;  // 4 KiB page -> its label dwords
+std::uint64_t g_label_hits[kImportUses] = {}, g_label_hits_waiting[kImportUses] = {};
+std::uint64_t g_label_dwords = 0;
+
+void label_check_note_locked(std::uint64_t va, const void* data, std::uint64_t bytes, std::uint64_t serial) {
+    if (!g_label_check) return;
+    std::lock_guard<std::mutex> lk(g_label_check_mu);
+    for (std::uint64_t a = va; a < va + bytes; a += 4) {
+        std::vector<LabelDword>& dws = g_label_pages[a >> 12];
+        const std::uint32_t off = static_cast<std::uint32_t>(a & 0xfff);
+        std::uint32_t v = 0;
+        std::memcpy(&v, static_cast<const std::uint8_t*>(data) + (a - va), 4);
+        auto it = std::find_if(dws.begin(), dws.end(), [off](const LabelDword& d) { return d.off == off; });
+        if (it == dws.end()) {
+            dws.push_back({off, v, serial});
+            ++g_label_dwords;
+        } else {
+            it->value = v;
+            it->serial = serial;
+        }
+    }
+}
+
+void label_check_range(std::uint64_t va, std::uint64_t bytes, ImportUse use) {
+    // (A one-byte mirror range is the buffer shadow told of a write -
+    // shadow_written_locked's lookup of the page, a label's own among them -
+    // not a read.)
+    if (!g_label_check || !bytes || (use == kUseMirror && bytes == 1)) return;
+    std::lock_guard<std::mutex> lk(g_label_check_mu);
+    if (g_label_pages.empty()) return;
+    for (std::uint64_t p = va >> 12; p <= (va + bytes - 1) >> 12; ++p) {
+        const auto it = g_label_pages.find(p);
+        if (it == g_label_pages.end()) continue;
+        for (const LabelDword& d : it->second) {
+            const std::uint64_t a = (p << 12) | d.off;
+            if (a + 4 <= va || a >= va + bytes) continue;
+            // Its landing still to come, from an earlier submission: a read
+            // recorded now may run before it lands, where after a GPU fill it
+            // would have read it. (One in this same submission it reads as
+            // it read a fill: the fills went at the command buffer's end.)
+            const bool waiting = d.serial >= label_landing::landed() && d.serial < g.flushes;
+            static const char* const names[kImportUses] = {"bound", "pagetable", "untile", "mirror", "transfer", "index"};
+            if (std::accumulate(std::begin(g_label_hits), std::end(g_label_hits), std::uint64_t{0}) < 48) {
+                host_log("gpu: label check: a %s range 0x%llx..0x%llx (%llu bytes) holds the label at 0x%llx (+0x%llx) the host writes: "
+                         "last %u, in submission %llu, %s (now recording %llu, flip %llu)",
+                         names[use], static_cast<unsigned long long>(va), static_cast<unsigned long long>(va + bytes),
+                         static_cast<unsigned long long>(bytes), static_cast<unsigned long long>(a), static_cast<unsigned long long>(a - va),
+                         d.value, static_cast<unsigned long long>(d.serial),
+                         waiting ? "still to land" : d.serial >= g.flushes ? "in this submission" : "landed",
+                         static_cast<unsigned long long>(g.flushes), static_cast<unsigned long long>(hle_video_flip_count()));
+            }
+            ++g_label_hits[use];
+            if (waiting) ++g_label_hits_waiting[use];
+            return;
+        }
+    }
+}
+
+std::string label_check_report() {
+    if (!g_label_check) return {};
+    std::lock_guard<std::mutex> lk(g_label_check_mu);
+    char b[480];
+    using ull = unsigned long long;
+    std::snprintf(b, sizeof(b),
+                  "label check (BBHOST_LABEL_READ_CHECK=1%s): %llu label dwords the host writes in %zu pages; GPU-side ranges over one "
+                  "(of them with its landing from an earlier submission still to come): bound %llu (%llu), page table %llu (%llu), untile %llu (%llu), mirror %llu "
+                  "(%llu), transfer %llu (%llu), index/indirect %llu (%llu)",
+                  g_import_audit ? "" : ", without BBHOST_IMPORT_AUDIT=1 nothing is checked", static_cast<ull>(g_label_dwords),
+                  g_label_pages.size(), static_cast<ull>(g_label_hits[kUseBound]), static_cast<ull>(g_label_hits_waiting[kUseBound]),
+                  static_cast<ull>(g_label_hits[kUsePageTable]), static_cast<ull>(g_label_hits_waiting[kUsePageTable]),
+                  static_cast<ull>(g_label_hits[kUseUntile]), static_cast<ull>(g_label_hits_waiting[kUseUntile]),
+                  static_cast<ull>(g_label_hits[kUseMirror]), static_cast<ull>(g_label_hits_waiting[kUseMirror]),
+                  static_cast<ull>(g_label_hits[kUseTransfer]), static_cast<ull>(g_label_hits_waiting[kUseTransfer]),
+                  static_cast<ull>(g_label_hits[kUseIndex]), static_cast<ull>(g_label_hits_waiting[kUseIndex]));
+    return b;
+}
+
 void audit_range(std::uint64_t va, std::uint64_t bytes, ImportUse use) {
     if (!bytes) return;
+    label_check_range(va, bytes, use);
     const std::uint64_t end = va + bytes;
     for (const GuestMapInfo& mi : g.maps) {
         const std::uint64_t lo = std::max(va, mi.va), hi = std::min(end, mi.va + mi.len);
@@ -2847,6 +2948,7 @@ bool init_locked() {
     g_timeline_on.store(g.timeline != VK_NULL_HANDLE, std::memory_order_release);
     host_log("gpu: submissions %s", g.timeline ? "signal a timeline semaphore: completion is read and waited for without the renderer's lock"
                                               : "are followed by their fences alone (no timeline semaphore, or BBHOST_TIMELINE=0)");
+    start_label_landing();
     VkCommandPoolCreateInfo pci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
     pci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
     pci.queueFamilyIndex = g.family;
@@ -5254,6 +5356,62 @@ void present_reads_wait(std::uint64_t target) {
         host_log("gpu: the presenter's copy %llu not done 5 s after its frame; its slot retires anyway", static_cast<unsigned long long>(target));
 }
 
+namespace {
+// The label landing's view of the GPU (label_landing::Hooks): the timeline's
+// own value and wait - host_gpu_submissions_completed and
+// host_gpu_wait_completed land, and the thread is the one landing.
+std::uint64_t timeline_value() {
+    std::uint64_t v = 0;
+    if (g_device_lost.load(std::memory_order_relaxed) || vkGetSemaphoreCounterValue(g.device, g.timeline, &v) != VK_SUCCESS) return ~0ull;
+    return v;
+}
+bool timeline_wait(std::uint64_t need, std::uint64_t timeout_ns) {
+    if (g_device_lost.load(std::memory_order_relaxed)) return true;
+    VkSemaphoreWaitInfo wi{VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO};
+    wi.semaphoreCount = 1;
+    wi.pSemaphores = &g.timeline;
+    wi.pValues = &need;
+    return vkWaitSemaphores(g.device, &wi, timeout_ns) == VK_SUCCESS;
+}
+void landing_thread_start() {
+    host_thread_set_name("bb-labels");
+    host_thread_set_class(HostThreadClass::GpuFeed, "bb-labels");
+}
+
+void start_label_landing() {
+    if (!label_landing::on()) return;
+    if (!g_timeline_on.load(std::memory_order_relaxed)) {
+        host_log("gpu: BBHOST_LABEL_LANDING=1 needs a timeline semaphore: the command processor's labels stay GPU fills");
+        return;
+    }
+    label_landing::Hooks h;
+    h.completed = timeline_value;
+    h.submitted = stream_submitted_serial;
+    h.wait = timeline_wait;
+    h.mapped = hle_kernel_va_mapped;
+    h.thread_start = landing_thread_start;
+    label_landing::start(h);
+    host_log("gpu: the command processor's labels are written by the host once their submission has run, not filled by the GPU "
+             "(BBHOST_LABEL_LANDING=1)");
+}
+
+// At submit: the labels this submission carries go to the landing, written
+// by the host once it has run, in this order (label_landing.h) - in place of
+// flush_deferred_writes_locked's fills and the barriers between them.
+void hand_labels_to_landing_locked() {
+    if (g.deferred_writes.empty()) return;
+    static std::vector<label_landing::Write> ws;  // under g.mu
+    ws.clear();
+    for (const Gpu::SmallWrite& w : g.deferred_writes) {
+        label_landing::Write l{w.va, w.bytes, {}};
+        std::memcpy(l.data, w.data, sizeof(l.data));
+        ws.push_back(l);
+    }
+    label_landing::add(g.flushes, ws.data(), ws.size());
+    g.deferred_writes.clear();
+}
+}  // namespace
+
 void retire_slot_locked(int k) {
     Gpu::Slot& sl = g.slots[k];
     if (!sl.in_flight) return;
@@ -5334,7 +5492,10 @@ void retire_slot_locked(int k) {
     sl.dead_sets.clear();
     sl.in_flight = false;
     // Fences on one queue complete in submission order, so every CP write
-    // recorded into this submission or an earlier one is in memory now.
+    // recorded into this submission or an earlier one is in memory now - the
+    // labels the host writes too, landed here if the landing thread has not
+    // yet (label_landing.h).
+    if (landing_on()) label_landing::land_through(sl.serial + 1);
     g.completed_submits = std::max(g.completed_submits, sl.serial + 1);
     g_completed_submits_seen.store(g.completed_submits, std::memory_order_relaxed);
     for (auto it = g.pending_writes.begin(); it != g.pending_writes.end();) {
@@ -6265,6 +6426,7 @@ void submit_locked() {
     // The occlusion counters this recording dumped land before its labels,
     // as the PS4's DBs write them before the end-of-pipe event that follows.
     occlusion_submit_locked();
+    if (landing_on()) hand_labels_to_landing_locked();  // written by the host once this submission has run
     flush_deferred_writes_locked();  // (its transfer batch puts deferred copy-backs in place first)
     transfer_flush_locked();
     render_end_pass_locked();
@@ -8169,6 +8331,19 @@ bool host_gpu_mem_write_serial(std::uint64_t va, const void* data, std::size_t b
         std::memcpy(&v, data, bytes < 8 ? bytes : 8);
         if (v > 2) note_gpu_write_over_marker("write", va, v, bytes);
     }
+    // A label the host writes once this submission has run
+    // (label_landing.h): no import, no fill. Whatever reads it in place reads
+    // it as behind this submission, as it did a GPU fill's.
+    if (bytes <= 8 && landing_on()) {
+        if ((va & 3) || (bytes & 3) || !hle_kernel_va_mapped(va, bytes)) return false;
+        Gpu::SmallWrite w{va, static_cast<std::uint32_t>(bytes), {}};
+        std::memcpy(w.data, data, bytes);
+        g.deferred_writes.push_back(w);
+        begin_recording_locked();  // the submission whose completion lands it
+        shadow_written_locked(va, bytes, true);
+        label_check_note_locked(va, data, bytes, g.flushes);
+        return true;
+    }
     Located loc;
     if (!locate_range(va, bytes, loc)) return false;
     // A four- or eight-byte write is a fence, not data any shader in this
@@ -8661,6 +8836,7 @@ std::string copy_versions_report() {
                   static_cast<ull>(g_cv_put[kCvRetired].load()), static_cast<ull>(g_batch_orders.load()));
     return b;
 }
+
 }  // namespace gpu
 
 bool host_gpu_copy_back(std::uint64_t dst, std::uint64_t src, std::size_t bytes) {
@@ -8694,7 +8870,9 @@ std::uint64_t host_gpu_submissions_completed() {
     if (g_timeline_on.load(std::memory_order_acquire)) {
         std::uint64_t v = 0;
         if (g_device_lost.load(std::memory_order_relaxed) || vkGetSemaphoreCounterValue(g.device, g.timeline, &v) != VK_SUCCESS)
-            return ~0ull;  // nothing more will run: nothing to wait for
+            v = ~0ull;  // nothing more will run: nothing to wait for
+        // What counts as run has its labels in memory (label_landing.h).
+        if (landing_on()) label_landing::land_through(v);
         return v;
     }
     std::lock_guard<GpuMutex> lock(g.mu);
@@ -8720,12 +8898,17 @@ void host_gpu_present_reads_locked(std::uint64_t target) {
 
 bool host_gpu_wait_completed(std::uint64_t need, std::uint64_t timeout_ns) {
     if (!g_timeline_on.load(std::memory_order_acquire)) return false;
-    if (g_device_lost.load(std::memory_order_relaxed)) return true;
+    if (g_device_lost.load(std::memory_order_relaxed)) {
+        if (landing_on()) label_landing::land_through(~0ull);
+        return true;
+    }
     VkSemaphoreWaitInfo wi{VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO};
     wi.semaphoreCount = 1;
     wi.pSemaphores = &g.timeline;
     wi.pValues = &need;
-    return vkWaitSemaphores(g.device, &wi, timeout_ns) == VK_SUCCESS;
+    const bool done = vkWaitSemaphores(g.device, &wi, timeout_ns) == VK_SUCCESS;
+    if (done && landing_on()) label_landing::land_through(need);  // its labels in memory before the caller reads it
+    return done;
 }
 
 void host_gpu_report() {
@@ -8774,6 +8957,8 @@ void host_gpu_report() {
         // dispatch takes the census lock under g.mu (host_gpu_dispatch) -
         // the other order hung a timed exit with the CP still dispatching.
         const std::string lift = compute_lift_report();
+        const std::string landing = label_landing::report();
+        const std::string label_reads = label_check_report();
         std::lock_guard<std::mutex> lk(g_dispatch_census_mu);
         std::vector<std::pair<std::uint64_t, std::string>> by_count;
         for (const auto& [n, c] : g_dispatch_census) by_count.emplace_back(c, n);
@@ -8785,6 +8970,8 @@ void host_gpu_report() {
         host_log("gpu: command-arena chunk retirements that came after a label into their own chunk in the same unordered "
                  "fills, given a barrier ahead of the marker's 0: %llu",
                  static_cast<unsigned long long>(g_arena_retires_ordered.load()));
+        host_log("gpu: %s", landing.c_str());
+        if (!label_reads.empty()) host_log("gpu: %s", label_reads.c_str());
         host_log("gpu: %s", lift.c_str());
         host_log("gpu: dispatch census: %llu reached a shader over %zu programs, %llu were a fill and %llu a copy (no shader runs "
                  "for those)",
