@@ -407,6 +407,21 @@ const bool g_stage_dedup = [] {
     const char* e = std::getenv("BBHOST_STAGE_DEDUP");
     return !(e && e[0] == '0');
 }();
+// BBHOST_STAGE_CENSUS=1: the ranges staged for their draw since the last
+// report, by bytes, with why their pages are in host memory - [0] a page
+// bound from host memory for good (dynamic), [1] a page a GPU write left
+// unmirrored, [2] a page not valid otherwise (refused, never copied) - and
+// the GX resource they lie in.
+const bool g_stage_census = [] {
+    const char* e = std::getenv("BBHOST_STAGE_CENSUS");
+    return e && e[0] == '1';
+}();
+struct StageStat {
+    std::uint64_t bytes = 0, copies = 0, record = 0;
+    int why = -1;
+};
+std::unordered_map<std::uint64_t, StageStat> g_stage_stats;  // by the range's start, under g.mu
+std::uint64_t g_stage_why_bytes[4] = {};
 
 void stage_release_slot(int slot) {
     for (const StageChunk& c : g_stage_held[slot]) g_stage_free.push_back(c);
@@ -1440,6 +1455,21 @@ bool shadow_stage_locked(std::uint64_t va, std::uint64_t bytes, Located& loc) {
     const StageChunk& c = g_stage_held[slot].back();
     const VkBufferCopy region{loc.offset, g_stage_fill[slot], bytes};
     vkCmdCopyBuffer(cmd, loc.buffer, c.buffer, 1, &region);
+    if (g_stage_census) {
+        StageStat& st = g_stage_stats[va];
+        if (st.why < 0) {
+            st.why = 3;
+            for (std::uint64_t p = off >> kPageShift; p <= (off + bytes - 1) >> kPageShift; ++p) {
+                const Page& pg = m.pages[p];
+                const int w = pg.dynamic ? 0 : (!pg.valid && pg.gpu_written) ? 1 : !pg.valid ? 2 : 3;
+                st.why = std::min(st.why, w);
+            }
+        }
+        st.bytes += bytes;
+        ++st.copies;
+        st.record = std::max<std::uint64_t>(st.record, bytes);
+        g_stage_why_bytes[st.why] += bytes;
+    }
     if (g_stage_dedup) {
         StagedRange& seen = g_stage_seen[slot][StageKey{loc.buffer, loc.offset}];
         if (bytes >= seen.bytes) seen = StagedRange{c.buffer, g_stage_fill[slot], bytes};
@@ -2192,6 +2222,27 @@ std::string shadow_report() {
                   static_cast<unsigned long long>(g_snapshot_staged.load()), static_cast<unsigned long long>(g_snapshot_pending.load()));
     out += st;
     out += sn;
+    if (g_stage_census && !g_stage_stats.empty()) {
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> top;  // bytes, va
+        for (const auto& [va, stt] : g_stage_stats) top.push_back({stt.bytes, va});
+        std::sort(top.rbegin(), top.rend());
+        static const char* const kWhy[4] = {"dynamic", "GPU-written", "not mirrored", "mirrored?"};
+        host_log("buffer shadow: stage census since the last report: %zu ranges; MiB by why: dynamic %.0f, GPU-written %.0f, not mirrored %.0f, "
+                 "mirrored? %.0f",
+                 g_stage_stats.size(), g_stage_why_bytes[0] / 1048576.0, g_stage_why_bytes[1] / 1048576.0, g_stage_why_bytes[2] / 1048576.0,
+                 g_stage_why_bytes[3] / 1048576.0);
+        for (std::size_t i = 0; i < top.size() && i < 12; ++i) {
+            const StageStat& stt = g_stage_stats[top[i].second];
+            GxResourceInfo info;
+            const bool res = gx_resource_at(top[i].second, 1, &info);
+            host_log("buffer shadow: stage census:   0x%llx %llu B x%llu = %.0f MiB (%s)%s%llx +%u bind 0x%x usage %u", static_cast<unsigned long long>(top[i].second),
+                     static_cast<unsigned long long>(stt.record), static_cast<unsigned long long>(stt.copies), stt.bytes / 1048576.0,
+                     kWhy[stt.why < 0 ? 3 : stt.why], res ? (info.type == 1 ? " in GX buffer 0x" : " in GX texture 0x") : " in no GX resource 0x",
+                     static_cast<unsigned long long>(res ? info.memory : 0), res ? info.bytes : 0, res ? info.bind : 0, res ? info.usage : 0);
+        }
+        g_stage_stats.clear();
+        std::fill(std::begin(g_stage_why_bytes), std::end(g_stage_why_bytes), 0);
+    }
     // What GX's calls told the mirrors, on a line of its own (the report
     // fills one).
     if (g_shadow_gx) {
