@@ -804,7 +804,17 @@ GUEST_ABI std::int64_t yebis_create_hook(std::uint64_t, const std::uint64_t* sav
     const_cast<std::uint64_t*>(saved)[6] = reinterpret_cast<std::uint64_t>(&gx_res_ret);
     return 0;
 }
+std::uint32_t yebis_kind(std::uint64_t object) {
+    std::uint32_t kind = 0;
+    if (!object || !rd(object + 0x80, &kind) || kind > 4) return 0;
+    return kind;
+}
+// Without the census only a 2D texture's Map, Unmap or update matters (the
+// registry's): YEBIS maps its buffers ~3,000 times a second, its 2D textures
+// never, and those return at once.
+bool yebis_skip(std::uint64_t object) { return !g_census && yebis_kind(object) != 3; }
 GUEST_ABI std::int64_t yebis_map_hook(std::uint64_t, const std::uint64_t* saved) {
+    if (yebis_skip(saved[4])) return 0;
     // The resource's memory before the Map: a discard (type 4) renames it -
     // new memory from YEBIS's ring (ctx + 0x3458 + 0x120, 0x15e5950) at
     // +0x90 and +0x98, the T# (+0xc4) and its views' rebased.
@@ -816,12 +826,8 @@ GUEST_ABI std::int64_t yebis_map_hook(std::uint64_t, const std::uint64_t* saved)
     const_cast<std::uint64_t*>(saved)[6] = reinterpret_cast<std::uint64_t>(&gx_res_ret);
     return 0;
 }
-std::uint32_t yebis_kind(std::uint64_t object) {
-    std::uint32_t kind = 0;
-    if (!object || !rd(object + 0x80, &kind) || kind > 4) return 0;
-    return kind;
-}
 GUEST_ABI std::int64_t yebis_update_hook(std::uint64_t, const std::uint64_t* saved) {
+    if (yebis_skip(saved[4])) return 0;
     Pending p{saved[6], kYebisUpdateCall, 0, 0, 0};
     p.extra = saved[4];
     t_pending.push_back(p);
@@ -858,11 +864,19 @@ void yebis_written(std::uint64_t object, bool after_map = false) {
     if (memory && bytes) host_gpu_texture_written(memory, bytes);
 }
 GUEST_ABI std::int64_t yebis_unmap_hook(std::uint64_t, const std::uint64_t* saved) {
+    if (yebis_skip(saved[4])) return 0;
     yebis_written(saved[4]);
     return 0;
 }
 GUEST_ABI std::int64_t yebis_tex2d_dtor_hook(std::uint64_t, const std::uint64_t* saved) {
+    // The destructor runs for far more 2D objects than the creator makes
+    // (37,450 against 2,261 in a 12-place tour): only those it made count.
+    bool registered = false;
     if (g_res_yebis) {
+        std::lock_guard<std::mutex> lk(g_mu);
+        registered = g_by_holder.count(kYebisKey | saved[5]) != 0;
+    }
+    if (registered) {
         unregister_holder(kYebisKey | saved[5]);
         g_yebis_unregistered.fetch_add(1, std::memory_order_relaxed);
     }
