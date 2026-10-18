@@ -839,6 +839,7 @@ bool twin_covers_locked(std::uint64_t va, std::uint64_t bytes);
 bool twin_candidate_holds(std::uint64_t va, std::uint64_t bytes);  // a twin holds it, or will at its first binding
 bool twin_holds_live_locked(std::uint64_t va, std::uint64_t bytes);  // inside a live twin: its stores leave guest memory as it was
 bool twin_candidate_straddles(std::uint64_t va, std::uint64_t bytes);  // runs across a candidate's edge
+void twin_note_import_near_locked(std::uint64_t va, std::uint64_t bytes, const char* site);  // logs a few imports over a candidate's kind
 // A GPU copy (a copy token, a copy version) about to write [dst, dst + bytes):
 // with BBHOST_GX_TWINS=2 the GX buffer it lies in becomes a candidate.
 void twin_note_copy_target_locked(std::uint64_t dst, std::uint64_t bytes);

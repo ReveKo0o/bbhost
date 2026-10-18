@@ -7378,7 +7378,10 @@ bool host_gpu_dispatch(const GpuDispatch& d_in) {
         // A GX buffer a device-local twin holds (or will, at its binding below:
         // BBHOST_GX_TWINS) needs no import - its stores go to the twin, also
         // when the V# claims more records than the buffer holds.
-        if (base && !twin_candidate_holds(base, std::min<std::uint64_t>(span, min_bytes))) import_windows(base, span);
+        if (base && !twin_candidate_holds(base, std::min<std::uint64_t>(span, min_bytes))) {
+            if (twins_on()) twin_note_import_near_locked(base, span, t_import_site);
+            import_windows(base, span);
+        }
     };
     if (!g_import_whole) {
         {
@@ -8619,6 +8622,31 @@ void twins_buffer_mapped_own(std::uint64_t memory, std::uint64_t gen) {
         it->second.let_go = true;
         g_twin_cpu_mapped_n.fetch_add(1, std::memory_order_relaxed);
     }
+}
+
+void twin_note_import_near_locked(std::uint64_t va, std::uint64_t bytes, const char* site) {
+    static std::atomic<int> logs{0};
+    if (!g_twins || logs.load(std::memory_order_relaxed) >= 8) return;
+    GxResourceInfo info;
+    const bool gx = gx_resource_overlapping(va, 1, &info);
+    std::uint64_t pm = 0, pb = 0, nm = 0;
+    bool plet = false;
+    {
+        std::lock_guard<std::mutex> lk(g_twin_cand_mu);
+        auto it = g_twin_cand.upper_bound(va);
+        if (it != g_twin_cand.end()) nm = it->first;
+        if (it != g_twin_cand.begin()) {
+            --it;
+            pm = it->first, pb = it->second.bytes, plet = it->second.let_go;
+        }
+    }
+    if (!gx || info.type != 1 || info.usage != 0 || !(info.bind & 0x80)) return;  // only a candidate's kind
+    logs.fetch_add(1, std::memory_order_relaxed);
+    host_log("gpu: twins: %s at 0x%llx + 0x%llx imports a window over a GX buffer 0x%llx + 0x%x (bind 0x%x); the candidate before it 0x%llx + 0x%llx%s, "
+             "the next at 0x%llx",
+             site ? site : "a path", static_cast<unsigned long long>(va), static_cast<unsigned long long>(bytes),
+             static_cast<unsigned long long>(info.memory), info.bytes, info.bind, static_cast<unsigned long long>(pm),
+             static_cast<unsigned long long>(pb), plet ? " (let go)" : "", static_cast<unsigned long long>(nm));
 }
 
 bool twin_candidate_holds(std::uint64_t va, std::uint64_t bytes) {
