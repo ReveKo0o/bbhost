@@ -11540,7 +11540,11 @@ void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t
             copy_only = !imports_whole() && snapshots_on && !b.written && bytes && bytes <= (1u << 20) &&
                         !gpu_writes_pending_locked(base, bytes) && hle_kernel_va_mapped(base, bytes) && !twin_covers_locked(base, bytes);
             if (!copy_only) {
-                const ImportSite site(b.written ? "a shader's buffer, stored to" : "a shader's buffer, read");
+                const ImportSite site(b.written                         ? "a shader's buffer, stored to"
+                                      : imports_whole()                 ? "a shader's buffer, read"
+                                      : bytes > (1u << 20)              ? "a shader's buffer, read (over 1 MiB)"
+                                      : gpu_writes_pending_locked(base, bytes) ? "a shader's buffer, read (a GPU write pending)"
+                                                                        : "a shader's buffer, read (not copied)");
                 loc = locate(base, std::min<std::uint64_t>(bytes, g.ssbo_max_range ? g.ssbo_max_range : bytes));
             }
         }
@@ -11818,7 +11822,8 @@ void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t
                 note_arena_read(kArenaConstants, base, bytes);
                 // The draw writes this memory as it runs: no mirror copy made in
                 // this recording serves it as vertex or index data before that.
-                if (b.written) shadow_written_locked(base, bytes, true);
+                // (A live twin takes the stores: guest memory is not written.)
+                if (b.written && !twin_holds_live_locked(base, bytes)) shadow_written_locked(base, bytes, true);
             }
         }
         if (outcome != kBound) {
@@ -12516,7 +12521,11 @@ bool plan_vertex_input(const std::vector<std::uint32_t>& fetch_words, std::uint6
                 }
             }
             if (!windowed && !mirrored && !snapped) {
-                const ImportSite site("a vertex buffer");
+                const std::uint64_t rec_va = va - fe.offset, rec_bytes = w[2] ? static_cast<std::uint64_t>(w[2]) * stride : fe.offset + bytes;
+                const ImportSite site(imports_whole()                              ? "a vertex buffer"
+                                      : version != kCopyVersionNone                ? "a vertex buffer (a copy version straddled)"
+                                      : gpu_writes_pending_locked(rec_va, rec_bytes) ? "a vertex buffer (a GPU write pending)"
+                                                                                   : "a vertex buffer (neither mirrored nor snapshotted)");
                 loc = locate(va, need);
             }
         }

@@ -7356,8 +7356,8 @@ bool host_gpu_dispatch(const GpuDispatch& d_in) {
         if (pl.meta.gds_counters) {
             const ImportSite site("a GDS counter word");
             for (const GpuDispatch::GdsCounter& c : d.gds) {
-                if (c.word) import_windows(c.word, 4);
-                if (c.start == GpuDispatch::kGdsCopy && c.from) import_windows(c.from, 4);
+                if (c.word && !twin_candidate_holds(c.word, 4)) import_windows(c.word, 4);
+                if (c.start == GpuDispatch::kGdsCopy && c.from && !twin_candidate_holds(c.from, 4)) import_windows(c.from, 4);
             }
         }
     }
@@ -7673,7 +7673,9 @@ bool host_gpu_dispatch(const GpuDispatch& d_in) {
             host_log("gpu: store %s %s -> 0x%llx %llu bytes (stride %u, records %u)", pl.name.c_str(), path.str().c_str(),
                      static_cast<unsigned long long>(base), static_cast<unsigned long long>(bytes), stride, v[2]);
         }
-        shadow_written_locked(base, bytes, true);
+        // (A live twin takes the stores: guest memory stays as it was until
+        // the twin is copied back, which notes its own write.)
+        if (!twin_holds_live_locked(base, bytes)) shadow_written_locked(base, bytes, true);
     }
     if (pl.meta.untraced_stores && !pl.untraced_stores_logged) {
         pl.untraced_stores_logged = true;
@@ -8219,7 +8221,9 @@ void twin_drop_locked(std::uint64_t memory, bool copy_back, int why, std::uint64
         Twin& t = it->second;
         if (copy_back) {
             const Located guest = locate_guest(memory, t.bytes);
-            if (guest.buffer && guest.avail >= t.bytes) twin_copy_locked(t.buf.buffer, 0, guest.buffer, guest.offset, t.bytes);
+            if (guest.buffer && guest.avail >= t.bytes && twin_copy_locked(t.buf.buffer, 0, guest.buffer, guest.offset, t.bytes)) {
+                shadow_written_locked(memory, t.bytes, true);  // lands on the GPU's timeline
+            }
         }
         g_twin_live_bytes -= t.buf.size;
         defer_destroy(t.buf);  // after the work recorded with it has run
@@ -8290,7 +8294,14 @@ bool twin_locate_locked(std::uint64_t va, std::uint64_t bytes, Located& out, VkD
         }
         if (!inside) {
             for (int k = 0; k < n_edge; ++k) {
-                if (g_twin_live.count(edge[k])) {
+                if (const auto lt = g_twin_live.find(edge[k]); lt != g_twin_live.end()) {
+                    // Which path asks across an edge, and how (logged a few times).
+                    static std::atomic<int> logs{0};
+                    if (logs.fetch_add(1, std::memory_order_relaxed) < 12) {
+                        host_log("gpu: twins: %s asks for 0x%llx + 0x%llx across the edge of a twin at 0x%llx + 0x%llx%s", t_import_site ? t_import_site : "a path",
+                                 static_cast<unsigned long long>(va), static_cast<unsigned long long>(bytes), static_cast<unsigned long long>(edge[k]),
+                                 static_cast<unsigned long long>(lt->second.bytes), pass ? " inside a render pass: read from guest memory" : ": copied back, let go");
+                    }
                     if (pass) g_twin_edge_in_pass.fetch_add(1, std::memory_order_relaxed);
                     else twin_drop_locked(edge[k], true, kTwinGoneEdge);
                 } else {
@@ -8371,6 +8382,14 @@ bool twin_covers_locked(std::uint64_t va, std::uint64_t bytes) {
         twin_drop_locked(hit, false, kTwinGoneDead, t.gen);
     }
     return false;
+}
+
+bool twin_holds_live_locked(std::uint64_t va, std::uint64_t bytes) {
+    if (!g_twins || g_twin_live.empty() || !bytes) return false;
+    auto it = g_twin_live.upper_bound(va);
+    if (it == g_twin_live.begin()) return false;
+    --it;
+    return va >= it->first && va + bytes <= it->first + it->second.bytes;
 }
 
 bool twin_candidate_holds(std::uint64_t va, std::uint64_t bytes) {
@@ -8953,11 +8972,17 @@ bool host_gpu_mem_fill(std::uint64_t va, std::uint32_t value, std::size_t bytes)
 
 bool host_gpu_mem_copy(std::uint64_t dst, std::uint64_t src, std::size_t bytes) {
     std::lock_guard<GpuMutex> lock(g.mu);
-    const ImportSite site("a CP copy");
     if (!g.ok) return false;
     if (dst < src + bytes && src < dst + bytes) return false;  // overlapping: memmove on the host
     Located d, sr;
-    if (!locate_range(dst, bytes, d) || !locate_range(src, bytes, sr)) return false;
+    {
+        const ImportSite site("a CP copy's destination");
+        if (!locate_range(dst, bytes, d)) return false;
+    }
+    {
+        const ImportSite site("a CP copy's source");
+        if (!locate_range(src, bytes, sr)) return false;
+    }
     note_gpu_write_over_marker("copy", dst, src, bytes);
     transfer_begin_locked();
     transfer_order_locked(sr.buffer, sr.offset, d.buffer, d.offset, bytes, true);
@@ -8998,13 +9023,19 @@ std::atomic<std::uint64_t> g_counter_copies{0}, g_counter_fills{0};
 
 bool host_gpu_counter_copy(std::uint64_t dst, std::uint64_t src, std::size_t bytes) {
     std::lock_guard<GpuMutex> lock(g.mu);
-    const ImportSite site("a counter copy");
     if (!g.ok || !bytes) return false;
     if (dst < src + bytes && src < dst + bytes) return false;
-    import_windows(src, bytes);
-    import_windows(dst, bytes);
     Located d, sr;
-    if (!locate_range(dst, bytes, d) || !locate_range(src, bytes, sr)) return false;
+    {
+        const ImportSite site("a counter copy's source");
+        if (!twin_candidate_holds(src, bytes)) import_windows(src, bytes);
+        if (!locate_range(src, bytes, sr)) return false;
+    }
+    {
+        const ImportSite site("a counter copy's destination");
+        if (!twin_candidate_holds(dst, bytes)) import_windows(dst, bytes);
+        if (!locate_range(dst, bytes, d)) return false;
+    }
     note_gpu_write_over_marker("counter copy", dst, src, bytes);
     transfer_begin_locked();
     transfer_order_locked(sr.buffer, sr.offset, d.buffer, d.offset, bytes, true);
@@ -9020,7 +9051,7 @@ bool host_gpu_counter_fill(std::uint64_t dst, std::uint32_t value, std::size_t b
     std::lock_guard<GpuMutex> lock(g.mu);
     const ImportSite site("a counter fill");
     if (!g.ok || !bytes) return false;
-    import_windows(dst, bytes);
+    if (!twin_candidate_holds(dst, bytes)) import_windows(dst, bytes);
     Located d;
     if (!locate_range(dst, bytes, d)) return false;
     note_gpu_write_over_marker("counter fill", dst, value, bytes);
@@ -9039,7 +9070,6 @@ std::uint64_t host_gpu_guest_copy_targets() { return g_guest_copy_targets.load(s
 
 bool host_gpu_copy_guest(std::uint64_t dst, std::uint64_t src, std::size_t bytes, std::uint64_t src_gen, std::uint64_t dst_gen) {
     std::lock_guard<GpuMutex> lock(g.mu);
-    const ImportSite site("a copy token");
     if (!g.ok) return false;
     if (!bytes) return true;
     if (dst < src + bytes && src < dst + bytes) return false;
@@ -9106,7 +9136,15 @@ bool host_gpu_copy_guest(std::uint64_t dst, std::uint64_t src, std::size_t bytes
     std::optional<DrawCmds> own;
     if (!DrawCmds::open() && !stream_on()) own.emplace(!g.profile && !g.has_checkpoints);  // with the stream, ops of their own
     for (std::size_t done = 0; done < bytes;) {
-        const Located d = locate(dst + done, bytes - done), s = locate(src + done, bytes - done);
+        Located d, s;
+        {
+            const ImportSite site("a copy token's destination");
+            d = locate(dst + done, bytes - done);
+        }
+        {
+            const ImportSite site("a copy token's source");
+            s = locate(src + done, bytes - done);
+        }
         if (!d.buffer || !s.buffer) return false;
         const std::size_t n = static_cast<std::size_t>(std::min<std::uint64_t>(bytes - done, std::min<std::uint64_t>(d.avail, s.avail)));
         if (!n) return false;
@@ -9253,7 +9291,7 @@ bool copy_version_make_locked(std::uint64_t dst, std::uint64_t src, std::uint64_
     if ((dst < src + bytes && src < dst + bytes) || g_copy_versions.size() >= kCopyVersionsPending) return refuse(kCvOther);
     if (!hle_kernel_va_mapped(dst, bytes) || !hle_kernel_va_mapped(src, bytes) || !rebuild_page_tables()) return refuse(kCvOther);
     if (surfaces_may_cover_locked(dst, bytes)) return refuse(kCvSurfaces);
-    const ImportSite site("a copy version");
+    const ImportSite site("a copy version's destination");
     if (find_render_target(src) || find_render_target(dst)) return refuse(kCvTarget);
     const Located canon = locate(dst, bytes);
     if (!canon.buffer || canon.avail < bytes) return refuse(kCvImport);
@@ -9479,18 +9517,16 @@ void host_gpu_report() {
             askers.assign(g_import_askers.begin(), g_import_askers.end());
         }
         if (!askers.empty()) {
-            // The most bytes first; the mapping the first import of a kind lay in.
+            // The most bytes first, a line each; the mapping the first import of a kind lay in.
             std::sort(askers.begin(), askers.end(), [](const auto& x, const auto& y) { return x.second.bytes > y.second.bytes; });
-            std::string by;
+            host_log("gpu: window imports by the path that asked (binding, device address, walk, prefetch; the site) and what lies at its "
+                     "address, %zu kinds:",
+                     askers.size());
             for (const auto& [kind, a] : askers) {
-                char b[320];
-                std::snprintf(b, sizeof(b), "%s%s %llu (%llu MiB, first at 0x%llx in 0x%llx + %llu MiB, prot 0x%x)", by.empty() ? "" : "; ",
-                              kind.c_str(), static_cast<ull>(a.n), static_cast<ull>(a.bytes >> 20), static_cast<ull>(a.first_va),
-                              static_cast<ull>(a.map_va), static_cast<ull>(a.map_len >> 20), a.map_prot);
-                by += b;
+                host_log("gpu:   %s: %llu (%llu MiB), the first at 0x%llx in the mapping 0x%llx + %llu MiB (prot 0x%x)", kind.c_str(),
+                         static_cast<ull>(a.n), static_cast<ull>(a.bytes >> 20), static_cast<ull>(a.first_va), static_cast<ull>(a.map_va),
+                         static_cast<ull>(a.map_len >> 20), a.map_prot);
             }
-            host_log("gpu: window imports by the path that asked (binding, device address, walk, prefetch; the site) and what lies at its address: %s",
-                     by.c_str());
         }
         if (const std::string tw = twins_report(); !tw.empty()) host_log("%s", tw.c_str());
     }
