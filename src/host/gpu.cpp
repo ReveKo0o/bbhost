@@ -7372,8 +7372,9 @@ bool host_gpu_dispatch(const GpuDispatch& d_in) {
         const std::uint64_t bytes = pointer ? 0 : stride ? std::uint64_t{v[2]} * stride : v[2];
         const std::uint64_t span = std::min<std::uint64_t>(std::max(bytes, min_bytes), 64ull << 20);
         // A GX buffer a device-local twin holds (or will, at its binding below:
-        // BBHOST_GX_TWINS=1) needs no import - its stores go to the twin.
-        if (base && !twin_candidate_holds(base, span)) import_windows(base, span);
+        // BBHOST_GX_TWINS) needs no import - its stores go to the twin, also
+        // when the V# claims more records than the buffer holds.
+        if (base && !twin_candidate_holds(base, std::min<std::uint64_t>(span, min_bytes))) import_windows(base, span);
     };
     if (!g_import_whole) {
         {
@@ -9264,6 +9265,7 @@ bool host_gpu_counter_copy(std::uint64_t dst, std::uint64_t src, std::size_t byt
     }
     {
         const ImportSite site("a counter copy's destination");
+        twin_note_copy_target_locked(dst, bytes);  // a GX buffer the GPU writes (BBHOST_GX_TWINS=2)
         if (!twin_candidate_holds(dst, bytes)) import_windows(dst, bytes);
         if (!locate_range(dst, bytes, d)) return false;
     }
@@ -9273,7 +9275,7 @@ bool host_gpu_counter_copy(std::uint64_t dst, std::uint64_t src, std::size_t byt
     VkBufferCopy region{sr.offset, d.offset, bytes};
     rec().copy_buffer(sr.buffer, d.buffer, 1, &region);
     transfer_end_locked();
-    shadow_written_locked(dst, bytes, true);
+    if (!twin_holds_live_locked(dst, bytes)) shadow_written_locked(dst, bytes, true);  // (a twin's write leaves guest memory)
     g_counter_copies.fetch_add(1, std::memory_order_relaxed);
     return true;
 }
@@ -9282,6 +9284,7 @@ bool host_gpu_counter_fill(std::uint64_t dst, std::uint32_t value, std::size_t b
     std::lock_guard<GpuMutex> lock(g.mu);
     const ImportSite site("a counter fill");
     if (!g.ok || !bytes) return false;
+    twin_note_copy_target_locked(dst, bytes);  // a GX buffer the GPU writes (BBHOST_GX_TWINS=2)
     if (!twin_candidate_holds(dst, bytes)) import_windows(dst, bytes);
     Located d;
     if (!locate_range(dst, bytes, d)) return false;
@@ -9290,7 +9293,7 @@ bool host_gpu_counter_fill(std::uint64_t dst, std::uint32_t value, std::size_t b
     transfer_order_locked(VK_NULL_HANDLE, 0, d.buffer, d.offset, bytes, true);
     rec().fill_buffer(d.buffer, d.offset, bytes, value);
     transfer_end_locked();
-    shadow_written_locked(dst, bytes, true);
+    if (!twin_holds_live_locked(dst, bytes)) shadow_written_locked(dst, bytes, true);  // (a twin's write leaves guest memory)
     g_counter_fills.fetch_add(1, std::memory_order_relaxed);
     return true;
 }
