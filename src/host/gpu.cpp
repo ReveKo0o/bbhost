@@ -6089,21 +6089,22 @@ void defer_destroy_image(VkImage image, const ImageMemory& m) {
 // destination the host draws into as a target, which keeps its pixels (a
 // census: not seen so far); [5] targets copied into, relabelled the
 // destination's generation; [6] sources a shader or copy wrote, copied as
-// their stale memory because =2 is not set.
-// 1 (the default): targets go by their resources (relabelled, another
-// resource's not used); a source whose surface a shader wrote is still copied
-// as its memory - the guest memory under such a surface is never written
-// back, so that copy is stale. 2: those image to image too. 0: by addresses.
-// Level 2 changes no frame where it was measured (2026-10-18, the level
-// switched between frames a few flips apart): in steady play the one such
-// copy is the Hunter's Nightmare's 960x540 half-float texture, which the game
-// clears every frame (GX's fill) and a later pass reads as cleared, into a
-// copy no shader binds; Central Yharnam's G-buffer copies take that path only
-// before its G-buffer pass first draws after a load. The veil that comes and
-// goes over the Nightmare from run to run shows at level 1 too.
+// their stale memory (level 1).
+// 2 (the default): targets go by their resources (relabelled, another
+// resource's not used), and a source whose surface a shader or copy wrote is
+// copied image to image - the copy carries what the GPU wrote, as the
+// console's memory would. 1: such a source is copied as its memory, which
+// the GPU's writes never reach (stale), as before. 0: by addresses.
+// Level 2 changes no frame where it was measured (2026-10-18): in steady play
+// the one such copy is the Hunter's Nightmare's 960x540 half-float texture,
+// which the game clears every frame (GX's fill) and a later pass reads as
+// cleared, into a copy no shader binds; the G-buffer copies take that path
+// only before the G-buffer pass first draws after a load (the title and the
+// menu after it: identical frames at either level, outside the text the
+// screens animate themselves). Command processor and GPU time within noise.
 const int g_copy_by_resource = [] {
     const char* e = std::getenv("BBHOST_COPY_BY_RESOURCE");
-    return e && *e ? std::atoi(e) : 1;
+    return e && *e ? std::atoi(e) : 2;
 }();
 std::atomic<std::uint64_t> g_copy_res[7] = {};
 bool copy_by_resource_on() { return g_copy_by_resource > 0 && res_identity_on(); }
@@ -6123,7 +6124,7 @@ std::string image_heap_report() {
     host_log("  %s", image_reuse_report_locked().c_str());
     host_log("  %s", draw_gen_report_locked().c_str());
     host_log("  whole textures copied as memory, by their resources%s: the source's target as an image %llu, its surface image to image %llu "
-             "(GPU-written ones copied as their stale memory, BBHOST_COPY_BY_RESOURCE=2 not set, %llu), another resource's target at the "
+             "(GPU-written ones copied as their stale memory, BBHOST_COPY_BY_RESOURCE=1, %llu), another resource's target at the "
              "source - its memory copied %llu, its memory its content %llu (into a destination drawn as a target, which keeps its pixels, %llu), "
              "targets copied into made the destination's %llu; image to image: %s",
              g_copy_by_resource ? "" : " (BBHOST_COPY_BY_RESOURCE=0: by address)", static_cast<unsigned long long>(g_copy_res[0].load()),
