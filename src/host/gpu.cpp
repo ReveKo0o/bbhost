@@ -8590,6 +8590,10 @@ void twin_note_copy_target_locked(std::uint64_t dst, std::uint64_t bytes) {
     GxResourceInfo info;
     if (!gx_resource_at(dst, static_cast<std::size_t>(bytes), &info) || info.type != 1 || (info.usage != 0 && info.usage != 2)) return;
     if (dst < info.memory || dst + bytes > info.memory + info.bytes) return;
+    // Not one smaller than a binding (16 bytes): a counter copy's 12-byte
+    // indirect arguments are bound as 16 by the shaders that read them, which
+    // runs across the twin's edge at every use (let go after a few).
+    if (info.bytes < 16) return;
     // A new twin is filled before the recording's own work (twin_fill_locked):
     // not while this recording has a GPU write on its pages still to come
     // before this copy (a later copy makes it one).
