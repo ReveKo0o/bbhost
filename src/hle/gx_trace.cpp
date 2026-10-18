@@ -865,8 +865,8 @@ std::vector<GxDrawRecords*>* const g_records_free = new std::vector<GxDrawRecord
 // Trivially destructible, so records released during thread exit still find it.
 thread_local GxDrawRecords* t_records_cache[2 * kRecordsBatch] = {};
 thread_local unsigned t_records_cached = 0;
-// BBHOST_GX_PACKED_RECORDS (1, the default; 0 hands over the sparse set): 1
-// packs a native draw's records at the call - each stage's first line, then only what
+// BBHOST_GX_PACKED_RECORDS (decided at start, by the frame rate; 0 or 1
+// forces it): 1 packs a native draw's records at the call - each stage's first line, then only what
 // its bits and counts say is set, back to back, at the front of a pooled set
 // instead of spread over the set's ~28 KB - and the command processor unpacks
 // them into a set of its own, which stays in its caches from draw to draw, so
@@ -876,11 +876,13 @@ thread_local unsigned t_records_cached = 0;
 // them at every draw (the readers then read the unpacked ones).
 // Measured (10-18, one hold, A B A B at --fps 120): 669 bytes a draw against
 // the ~28 KB set; the command processor 0.5-0.7 ms a flip faster at Mensis'
-// 1,270 draws, Central Yharnam and Old Yharnam within their spread.
-const int g_packed_records = [] {
-    const char* e = std::getenv("BBHOST_GX_PACKED_RECORDS");
-    return e && e[0] ? std::atoi(e) : 1;
-}();
+// 1,270 draws, Central Yharnam and Old Yharnam within their spread. Round 6's
+// gate at 60 fps: the GX workers 7-9 points of a core busier together for it,
+// and nothing gained - a paced frame does not wait for the command processor.
+// So by default it packs only where the command processor limits the frame
+// rate: Uncapped, 90 and 120 (the game's pace, hle_video_game_pace, chosen
+// before the trace arms); not at 30 and 60. Set in hle_gx_trace_arm.
+int g_packed_records = 0;
 // The set a GX thread snapshots a draw into before packing it: the same set
 // draw after draw, so in its caches, where a pooled set comes back cold.
 thread_local GxDrawRecords* t_gx_scratch = nullptr;
@@ -6565,6 +6567,23 @@ void hle_gx_trace_arm(GuestMemory* mem) {
     }
     g_slide = mem->slide;
     g_image_size = mem->size;
+    {
+        const int pace = hle_video_game_pace();
+        const char* e = std::getenv("BBHOST_GX_PACKED_RECORDS");
+        g_packed_records = e && e[0] ? std::atoi(e) : (pace == 0 || pace > 60) ? 1 : 0;
+        if (e && e[0]) {
+            host_log("gx-native: a draw's records %s (BBHOST_GX_PACKED_RECORDS=%d)", g_packed_records ? "packed at the call" : "handed over as the sparse set",
+                     g_packed_records);
+        } else if (g_packed_records) {
+            host_log("gx-native: a draw's records packed at the call: the game runs %s, where the command processor limits the frame rate "
+                     "(BBHOST_GX_PACKED_RECORDS=0: the sparse set)",
+                     pace ? (pace == 90 ? "at 90" : "at 120") : "uncapped");
+        } else {
+            host_log("gx-native: a draw's records handed over as the sparse set: the game is paced at %d, where packing costs the GX threads "
+                     "more than it saves the command processor (BBHOST_GX_PACKED_RECORDS=1: packed)",
+                     pace > 0 ? pace : 30);
+        }
+    }
     void* host = thunk_wrap(reinterpret_cast<void*>(&gx_hook));
     void* page = host_page_alloc(0x10000, true);  // a stub of up to ~230 bytes per hook (with the xmm save)
     if (!page) {

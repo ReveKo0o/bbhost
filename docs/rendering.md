@@ -23,10 +23,13 @@ engine's own objects - its shaders, vertex layout, state descriptions,
 textures and constant buffers - and leaves a small token in the command
 buffer. When the command processor reaches the token, the draw is built from
 those inputs. No packet is decoded and no register file is consulted for a
-draw. The draw's resource records travel packed - each stage's header and
+draw. At Uncapped, 90 and 120, where the command processor limits the frame
+rate, the draw's resource records travel packed - each stage's header and
 only the slots it sets, a few hundred bytes - and the command processor
-unpacks them into a set of its own (`BBHOST_GX_PACKED_RECORDS=0` hands over
-the whole sparse set).
+unpacks them into a set of its own; at 30 and 60 the GX threads hand over the
+whole sparse set, which costs them less CPU, and a paced frame does not wait
+for the command processor (`BBHOST_GX_PACKED_RECORDS=1` or `=0` forces
+either).
 
 **Compute dispatches** are tokens too. A dispatch through GX's compute
 commit - the GPU particles, the tone-map and depth-of-field look-up tables -
