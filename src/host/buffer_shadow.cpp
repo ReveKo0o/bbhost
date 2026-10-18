@@ -2270,6 +2270,8 @@ void host_gpu_shadow_gx_created(std::uint64_t va, std::size_t bytes) {
     g_gx_writes_pending.store(true, std::memory_order_release);
 }
 
+bool host_gpu_shadow_hands_out() { return gpu::g_shadow_handed; }
+
 void host_gpu_shadow_gx_handed(std::uint64_t va, std::size_t bytes, int kind) {
     using namespace gpu;
     if (!(g_shadow_gx || g_map_census) || !va || !bytes) return;

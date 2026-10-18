@@ -80,6 +80,11 @@ constexpr std::uint8_t kSamplerPrologue[16] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x5
 constexpr std::uint8_t kInputLayoutPrologue[15] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56,
                                                    0x41, 0x54, 0x53, 0x48, 0x83, 0xec, 0x70};
 constexpr std::uint64_t kRing = 0x2adb1b0;  // the dynamic ring allocator: (ring, out*, ctx, bytes) -> *out
+// Where the ring allocator's two Maps of its buffer return (no-overwrite at
+// 0x2adb23f, discard at 0x2adb28b when it wraps or no copy is left): each
+// allocation maps the ring's whole renamed copy, though the CPU writes only
+// [*out, + bytes) of it.
+constexpr std::uint64_t kRingMapReturn1 = 0x2adb244, kRingMapReturn2 = 0x2adb290;
 // The upload pool's block source: (allocator, bytes = 0x10000) -> a block
 // whose memory is at +8. Its one caller is the context's upload pool
 // 0x2aaddc0 (pool, ctx, bytes), which carves allocations of up to 64 KiB out
@@ -229,6 +234,18 @@ std::atomic<std::uint64_t> g_map_where[5][4] = {}, g_map_failed[5] = {};
 // long over) - settled then. The last copy each buffer has in each context,
 // under g_mu, dropped with the holder.
 std::atomic<std::uint64_t> g_maps_told{0}, g_maps_constant{0}, g_copies_freed{0};
+// The ring allocator's Maps (BBHOST_SHADOW_RING_EXACT, on unless 0, with the
+// shadow acting on hand-outs): not told as the ring's whole copy - each
+// allocation is, when the allocator returns (ring_hook): ring Maps passed
+// over, allocations told, of a constant-buffer ring not told. The Map's
+// constant flag reaches the allocator's return through t_ring_map (the same
+// thread, inside the allocator).
+bool g_ring_exact = false;
+std::atomic<std::uint64_t> g_ring_maps_passed{0}, g_ring_allocs_told{0}, g_ring_allocs_constant{0};
+struct RingMap {
+    bool valid = false, constant = false;
+};
+thread_local RingMap t_ring_map;
 struct LastCopy {
     std::uint64_t ctx = 0, va = 0;
     std::uint32_t bytes = 0;
@@ -628,7 +645,8 @@ void unregister_holder(std::uint64_t holder) {
 
 // A Map on the holder: the resource is about to be written by the CPU. Its
 // memory may have been renamed (type 3/4): re-read +0x20 and re-index.
-void note_map(std::uint64_t holder, std::uint64_t type, std::uint64_t mapped_out, std::uint32_t result, std::uint64_t ctx) {
+void note_map(std::uint64_t holder, std::uint64_t type, std::uint64_t mapped_out, std::uint32_t result, std::uint64_t ctx,
+              bool ring_map = false) {
     std::uint64_t memory = 0;
     rd(holder + 0x20, &memory);
     std::uint64_t mapped = 0;
@@ -720,6 +738,7 @@ void note_map(std::uint64_t holder, std::uint64_t type, std::uint64_t mapped_out
     if (buffer_bytes && mapped) {
         // A constant buffer's copy holds constants, never vertex data: the
         // shadow need not hear of it (D3D11 joins no other bind flag to it).
+        if (ring_map && g_ring_exact) t_ring_map = RingMap{true, constant};
         if (constant) {
             g_maps_constant.fetch_add(1, std::memory_order_relaxed);
         } else {
@@ -728,7 +747,9 @@ void note_map(std::uint64_t holder, std::uint64_t type, std::uint64_t mapped_out
                 g_copies_freed.fetch_add(1, std::memory_order_relaxed);
                 host_gpu_shadow_gx_settled(freed.va, freed.bytes);
             }
-            host_gpu_shadow_gx_handed(mapped, buffer_bytes, 0);
+            // The ring allocator's: its allocation is told at its return.
+            if (ring_map && g_ring_exact) g_ring_maps_passed.fetch_add(1, std::memory_order_relaxed);
+            else host_gpu_shadow_gx_handed(mapped, buffer_bytes, 0);
         }
     }
     // A discard moved the buffer: the memory it leaves is no buffer's now.
@@ -1231,10 +1252,25 @@ extern "C" GUEST_ABI std::uint64_t gx_res_after(std::uint64_t result) {
     }
     if (p.kind == kMapCall) {
         if (!p.ring) {
-            note_map(p.holder, p.type, p.out, static_cast<std::uint32_t>(result), p.extra);
-        } else if (g_census) {
+            const std::uint64_t caller = bn(p.ret);
+            note_map(p.holder, p.type, p.out, static_cast<std::uint32_t>(result), p.extra,
+                     caller == kRingMapReturn1 || caller == kRingMapReturn2);
+        } else {
             std::uint64_t ptr = 0;
-            if (p.out && rd(p.out, &ptr) && ptr && p.ring_bytes) {
+            const bool got = static_cast<std::uint32_t>(result) == 0 && p.out && rd(p.out, &ptr) && ptr && p.ring_bytes;
+            if (g_ring_exact) {
+                // What this allocation's Map said of its buffer (a constant
+                // buffer's copy is never told); none seen: told, to be safe.
+                const RingMap m = t_ring_map;
+                t_ring_map = RingMap{};
+                if (got && m.valid && m.constant) {
+                    g_ring_allocs_constant.fetch_add(1, std::memory_order_relaxed);
+                } else if (got) {
+                    g_ring_allocs_told.fetch_add(1, std::memory_order_relaxed);
+                    host_gpu_shadow_gx_handed(ptr, p.ring_bytes, 0);
+                }
+            }
+            if (g_census && got) {
                 g_ring_calls.fetch_add(1, std::memory_order_relaxed);
                 g_ring_bytes.fetch_add(p.ring_bytes, std::memory_order_relaxed);
                 host_gpu_shadow_gx_handed(ptr, p.ring_bytes, 2);
@@ -1423,7 +1459,11 @@ void gx_resources_install(ElfImage* image) {
         const char* e = std::getenv("BBHOST_RESOURCE_CENSUS");
         return e && e[0] == '1';
     }();
-    if (g_trace || g_census) hook(kRing, kRingPrologue, sizeof(kRingPrologue), reinterpret_cast<void*>(&ring_hook), 0);
+    g_ring_exact = host_gpu_shadow_hands_out() && [] {
+        const char* e = std::getenv("BBHOST_SHADOW_RING_EXACT");
+        return !(e && e[0] == '0');
+    }();
+    if (g_trace || g_census || g_ring_exact) hook(kRing, kRingPrologue, sizeof(kRingPrologue), reinterpret_cast<void*>(&ring_hook), 0);
     g_res_yebis = [] {
         const char* e = std::getenv("BBHOST_RES_YEBIS");
         return !(e && e[0] == '0');
@@ -1796,6 +1836,11 @@ void gx_resources_report() {
         host_log("gx-resources: buffer Maps told to the shadow %llu, constant buffers' not %llu; a renamed copy freed by its buffer's next "
                  "discard Map in the same context, settled %llu",
                  static_cast<ull>(g_maps_told.load()), static_cast<ull>(g_maps_constant.load()), static_cast<ull>(g_copies_freed.load()));
+        host_log("gx-resources: the ring allocator's Maps%s: passed over as the ring's whole copy %llu, its allocations told %llu, of a "
+                 "constant-buffer ring not told %llu",
+                 g_ring_exact ? "" : " (not told by allocation: BBHOST_SHADOW_RING_EXACT=0 or the shadow off)",
+                 static_cast<ull>(g_ring_maps_passed.load()), static_cast<ull>(g_ring_allocs_told.load()),
+                 static_cast<ull>(g_ring_allocs_constant.load()));
         host_log("gx-resources: where a buffer's Map hands the CPU its writes:%s ring allocations seen %llu (%llu MiB), upload pool "
                  "blocks %llu (%llu MiB)",
                  where.empty() ? " none;" : where.c_str(), static_cast<ull>(g_ring_calls.load()), static_cast<ull>(g_ring_bytes.load() >> 20),

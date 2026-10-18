@@ -489,6 +489,10 @@ void host_gpu_shadow_gx_created(std::uint64_t va, std::size_t bytes);
 // (1), a ring allocation (2) and the memory a YEBIS discard Map renames a
 // resource into (3). Any thread, no lock held.
 void host_gpu_shadow_gx_handed(std::uint64_t va, std::size_t bytes, int kind);
+// Whether the buffer shadow acts on kind-0 hand-outs (BBHOST_SHADOW_GX and
+// BBHOST_SHADOW_HANDED on): the registry then tells it of each allocation the
+// ring allocator makes in place of the ring's whole renamed copy.
+bool host_gpu_shadow_hands_out();
 // GX writes a renamed copy in [va, va + bytes) back to its buffer (a map
 // resolve's copy, gx_trace's 0x2ab2810 / 0x2ab2670 hooks) or frees it (a
 // later discard Map of its buffer in the same context): the CPU's writes to
