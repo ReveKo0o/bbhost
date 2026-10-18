@@ -8367,6 +8367,10 @@ void host_gpu_report() {
         return;
     }
     {
+        // Before the census lock: compute_lift_report takes g.mu, and a
+        // dispatch takes the census lock under g.mu (host_gpu_dispatch) -
+        // the other order hung a timed exit with the CP still dispatching.
+        const std::string lift = compute_lift_report();
         std::lock_guard<std::mutex> lk(g_dispatch_census_mu);
         std::vector<std::pair<std::uint64_t, std::string>> by_count;
         for (const auto& [n, c] : g_dispatch_census) by_count.emplace_back(c, n);
@@ -8378,7 +8382,7 @@ void host_gpu_report() {
         host_log("gpu: command-arena chunk retirements that came after a label into their own chunk in the same unordered "
                  "fills, given a barrier ahead of the marker's 0: %llu",
                  static_cast<unsigned long long>(g_arena_retires_ordered.load()));
-        host_log("gpu: %s", compute_lift_report().c_str());
+        host_log("gpu: %s", lift.c_str());
         host_log("gpu: dispatch census: %llu reached a shader over %zu programs, %llu were a fill and %llu a copy (no shader runs "
                  "for those)",
                  static_cast<unsigned long long>(g_dispatch_shaders.load()), g_dispatch_census.size(),
