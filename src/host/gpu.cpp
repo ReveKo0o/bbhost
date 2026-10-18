@@ -1325,8 +1325,14 @@ std::uint32_t host_memory_type(std::uint32_t type_bits) {
 bool create_dev_buffer(DevBuffer& b, std::uint64_t size, bool host_visible, bool cached) {
     VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
     bci.size = size;
+    // Vertex and index usage too: a draw binds copies made in these buffers as
+    // its vertex or index data - a copy version (GX's copy-back, in staging),
+    // a YEBIS window's copy - and a binding without the usage is invalid
+    // (VUID-vkCmdBindVertexBuffers-pBuffers-00627, seen on lavapipe with
+    // window imports).
     bci.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
-                VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+                VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT |
+                VK_BUFFER_USAGE_INDEX_BUFFER_BIT;
     if (vkCreateBuffer(g.device, &bci, nullptr, &b.buffer) != VK_SUCCESS) return false;
     VkMemoryRequirements req{};
     vkGetBufferMemoryRequirements(g.device, b.buffer, &req);
