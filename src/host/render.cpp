@@ -11666,8 +11666,9 @@ void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t
             copy_only = !imports_whole() && snapshots_on && !b.written && bytes && bytes <= (1u << 20) &&
                         !gpu_writes_pending_locked(base, bytes) && hle_kernel_va_mapped(base, bytes) && !twin_covers_locked(base, bytes);
             if (!copy_only) {
+                // (The reason is worked out only for the census, BBHOST_IMPORT_CENSUS=1.)
                 const ImportSite site(b.written                         ? "a shader's buffer, stored to"
-                                      : imports_whole()                 ? "a shader's buffer, read"
+                                      : imports_whole() || !import_census_on() ? "a shader's buffer, read"
                                       : bytes > (1u << 20)              ? "a shader's buffer, read (over 1 MiB)"
                                       : gpu_writes_pending_locked(base, bytes) ? "a shader's buffer, read (a GPU write pending)"
                                                                         : "a shader's buffer, read (not copied)");
@@ -12649,7 +12650,7 @@ bool plan_vertex_input(const std::vector<std::uint32_t>& fetch_words, std::uint6
             }
             if (!windowed && !mirrored && !snapped) {
                 const std::uint64_t rec_va = va - fe.offset, rec_bytes = w[2] ? static_cast<std::uint64_t>(w[2]) * stride : fe.offset + bytes;
-                const ImportSite site(imports_whole()                              ? "a vertex buffer"
+                const ImportSite site(imports_whole() || !import_census_on()        ? "a vertex buffer"
                                       : version != kCopyVersionNone                ? "a vertex buffer (a copy version straddled)"
                                       : gpu_writes_pending_locked(rec_va, rec_bytes) ? "a vertex buffer (a GPU write pending)"
                                                                                    : "a vertex buffer (neither mirrored nor snapshotted)");

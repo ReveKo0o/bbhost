@@ -573,6 +573,15 @@ thread_local int t_import_who = kIwBinding;
 // resource there: no GX object, a buffer by its usage and bind flags, a
 // texture - counted when a window import is made).
 thread_local std::uint64_t t_import_va = 0;
+// The census of guest memory imported, read and written in place (the exit
+// report's window imports by the path that asked and what lies there, the
+// in-place users by path, the GX buffers GPU copies write):
+// BBHOST_IMPORT_CENSUS=1. Off - the default - nothing is counted, so the
+// default path does no work for it at any access.
+const bool g_census = [] {
+    const char* e = std::getenv("BBHOST_IMPORT_CENSUS");
+    return e && e[0] == '1';
+}();
 struct ImportAsker {
     std::uint64_t n = 0, bytes = 0, first_va = 0;
     std::uint64_t map_va = 0, map_len = 0;  // the guest mapping the first lies in
@@ -580,7 +589,7 @@ struct ImportAsker {
 };
 std::map<std::string, ImportAsker> g_import_askers;  // under g.mu
 void note_import_asker_locked(std::uint64_t bytes) {
-    if (!t_import_va || t_import_who == kIwSpan) return;
+    if (!g_census || !t_import_va || t_import_who == kIwSpan) return;
     static const char* const whos[] = {"binding", "device address", "walk", "prefetch"};
     const char* const who = whos[t_import_who];
     const char* const site = t_import_site ? t_import_site : "other";
@@ -616,6 +625,7 @@ struct SiteUse {
 };
 SiteUse g_site_uses[64];  // under g.mu
 void note_site_use_locked(std::uint64_t bytes) {
+    if (!g_census) return;
     const char* const site = t_import_site ? t_import_site : "other";
     for (SiteUse& u : g_site_uses) {
         if (!u.site) u.site = site;
@@ -636,6 +646,7 @@ struct CopiedBuffer {
 std::unordered_map<std::uint64_t, CopiedBuffer> g_copied_buffers;  // under g.mu
 std::uint64_t g_copied_other = 0;                                // under g.mu: into no GX buffer
 void note_copied_locked(std::uint64_t dst) {
+    if (!g_census) return;
     GxResourceInfo info;
     if (!gx_resource_at(dst, 1, &info) || info.type != 1) {
         ++g_copied_other;
@@ -8464,6 +8475,7 @@ void twins_drop_cpu_mapped_locked() {
 }  // namespace
 
 bool twins_on() { return g_twins != 0; }
+bool import_census_on() { return g_census; }
 int twins_level() { return g_twins; }
 
 bool twin_locate_locked(std::uint64_t va, std::uint64_t bytes, Located& out, VkDeviceAddress* address) {
@@ -9947,7 +9959,10 @@ void host_gpu_report() {
                          static_cast<ull>(a.map_len >> 20), a.map_prot);
             }
         }
-        {
+        if (!g_census) {
+            host_log("gpu: guest memory census off (BBHOST_IMPORT_CENSUS=1 counts the imports by the path that asked, what reads or writes "
+                     "guest memory in place and the GX buffers GPU copies write)");
+        } else {
             std::vector<SiteUse> uses;
             std::vector<std::pair<std::string, std::pair<std::uint64_t, std::uint64_t>>> copied;  // kind -> buffers, bytes
             std::uint64_t copied_other = 0, copies_total = 0;
@@ -9986,10 +10001,10 @@ void host_gpu_report() {
             }
             host_log("gpu: GX buffers GPU copies wrote (copy tokens, copy versions; %llu copies): %s; copies into no GX buffer %llu",
                      static_cast<ull>(copies_total), cb.empty() ? "none" : cb.c_str(), static_cast<ull>(copied_other));
-            if (!g_import_whole) {
-                host_log("gpu: copy tokens' sources copied into upload staging (window imports): %llu (%llu MiB)",
-                         static_cast<ull>(g_copy_src_staged.load()), static_cast<ull>(g_copy_src_staged_bytes.load() >> 20));
-            }
+        }
+        if (!g_import_whole) {
+            host_log("gpu: copy tokens' sources copied into upload staging (window imports): %llu (%llu MiB)",
+                     static_cast<ull>(g_copy_src_staged.load()), static_cast<ull>(g_copy_src_staged_bytes.load() >> 20));
         }
         if (const std::string tw = twins_report(); !tw.empty()) host_log("%s", tw.c_str());
     }
