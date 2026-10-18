@@ -133,8 +133,9 @@ page-table walk. GCN's loops that run until every lane's execution bit
 clears become structured per-invocation loops, a block GCN branches over
 where no lane needs it becomes a selection an invocation skips where its own
 bit is clear, and the GPU particles' wave-wide counter idiom (`ds_append`/`ds_consume` in GDS, each lane's rank
-from `v_mbcnt`) becomes one atomic add per invocation, so no compute lift
-needs subgroup operations. A barrier is accepted only where every invocation
+from `v_mbcnt`) becomes one atomic add per invocation, on the counter word
+the dispatch hands over by its device address, so no compute lift needs
+subgroup operations or the page table for it. A barrier is accepted only where every invocation
 of the workgroup provably reaches it, and LDS, which no game compute shader
 uses, is refused. `BBHOST_LIFT_COMPUTE=0` keeps every compute shader
 translated. A compute shader reads its constant buffers, tables and typed
@@ -161,7 +162,14 @@ when the engine makes a resource there (on a thread of its own); an import
 over several windows replaces the ones it covers, so no page is imported
 twice, and a dispatch imports what its shader reads and stores. It is off by
 default: the work under way moves each of those uses off guest memory, and
-windows are then only the fallback for what is not moved yet.
+windows are then only the fallback for what is not moved yet. One such move,
+off while it is measured: `BBHOST_GX_TWINS=1` keeps the GX buffers the GPU
+writes - particle state, append buffers and their counters, arguments a
+dispatch fills - in device memory, as a copy made at the buffer's first GPU
+use that every GPU use reads and writes from then on; nothing copies their
+guest bytes on the CPU after that, and anything that would read them from
+guest memory (a page-table walk, a texture over one) has the copy written
+back first.
 Textures are detiled on the GPU. A texture's image, a render target's and a
 copy's belong to the GX resource they were made for, by that resource's
 generation: GX's own calls change them - the resource's creation, upload and
