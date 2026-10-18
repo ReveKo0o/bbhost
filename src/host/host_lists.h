@@ -10,13 +10,14 @@
 // ring's calls, data written inline. Data the shaders read in place, markers
 // and register packets nothing reads are not in it.
 //
-// BBHOST_HOST_LISTS: 0 (the default) records nothing. 2 (shadow) records the
-// lists, takes each submitted range's part of its list on the submitting
-// thread, and has the command processor compare it with what its walk of the
-// range meets - packet for packet, in order - counting agreements and every
-// disagreement by reason (the exit report). 1 is the handoff: a range goes to
-// the command processor as the packets its list holds, instead of all its
-// bytes (hand_over). 3 records only (the recording's own cost).
+// BBHOST_HOST_LISTS: 1 (the default) is the handoff: a range goes to the
+// command processor as the packets its list holds, instead of all its bytes
+// (hand_over); a range no list covers is walked, counted by reason. 0 records
+// nothing and walks every range. 2 (shadow) records the lists, takes each
+// submitted range's part of its list on the submitting thread, and has the
+// command processor compare it with what its walk of the range meets - packet
+// for packet, in order - counting agreements and every disagreement by reason
+// (the exit report). 3 records only (the recording's own cost).
 //
 // The recording side is leaf-safe (decomp leaves call it on the game's
 // threads, with the game's FS): no locks, no allocation, no host

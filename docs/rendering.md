@@ -59,8 +59,9 @@ transfer clear when something reads the image first.
 the tokens, labels and waits, which our versions of Gnm's packet writers write -
 can be recorded as it is written, a list per chunk of command buffer, so that a
 submitted range reaches the command processor as its list's packets instead
-of all its bytes (`BBHOST_HOST_LISTS=1`; `=2` records the lists and checks
-them against the walk, range by range; off by default).
+of all its bytes (`BBHOST_HOST_LISTS=1`, the default; a range no list covers
+is walked, counted by reason; `=0` walks every range as before, `=2` records
+the lists and checks them against the walk, range by range).
 
 **Labels.** The completions are GPU fills of guest memory at the end of
 their submission's command buffer. With `BBHOST_LABEL_LANDING=1` (off by

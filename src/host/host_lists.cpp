@@ -18,7 +18,7 @@ namespace host_lists {
 
 const int g_mode = [] {
     const char* e = std::getenv("BBHOST_HOST_LISTS");
-    return e && e[0] ? std::atoi(e) : 0;
+    return e && e[0] ? std::atoi(e) : 1;
 }();
 
 namespace {
