@@ -842,6 +842,9 @@ bool twin_candidate_straddles(std::uint64_t va, std::uint64_t bytes);  // runs a
 // with BBHOST_GX_TWINS=2 the GX buffer it lies in becomes a candidate.
 void twin_note_copy_target_locked(std::uint64_t dst, std::uint64_t bytes);
 void twins_release_locked(std::uint64_t va, std::uint64_t bytes, int why);
+// [va, va + bytes) is read by the CPU (an occlusion block): twins over it are
+// copied back and let go, and candidates over it let go before they are made.
+void twins_keep_in_guest_locked(std::uint64_t va, std::uint64_t bytes);
 void twins_buffer_made(std::uint64_t memory, std::uint64_t bytes, std::uint8_t usage, std::uint8_t bind, std::uint64_t gen);
 void twins_buffer_mapped_own(std::uint64_t memory, std::uint64_t gen);
 std::string twins_report();

@@ -489,6 +489,9 @@ bool host_gpu_zpass_dump(std::uint64_t va) {
     std::lock_guard<GpuMutex> lock(g.mu);
     if (!g.ok || (va & 7)) return false;
     const ImportSite site("an occlusion dump");
+    // The game reads the block on the CPU (GetData): never a GX twin's copy
+    // (BBHOST_GX_TWINS) - one over it is copied back and let go first.
+    if (twins_on()) twins_keep_in_guest_locked(va, kBlockExtent);
     const VkDeviceAddress at = guest_device_address(va, kBlockExtent);
     if (!at) {
         // Not imported memory: the shader cannot reach it; the caller's fake.
@@ -577,6 +580,7 @@ void host_gpu_set_predication(std::uint64_t block, unsigned op, bool draw_if_vis
         return;
     }
     const ImportSite site("an occlusion predicate");
+    if (twins_on()) twins_keep_in_guest_locked(block, 16 * kPipes);  // as for a dump
     const VkDeviceAddress at = guest_device_address(block, 16 * kPipes);
     begin_recording_locked();
     SlotOcc& so = g_occ[g.slot];

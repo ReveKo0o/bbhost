@@ -8613,6 +8613,15 @@ void twins_release_locked(std::uint64_t va, std::uint64_t bytes, int why) {
     for (int k = 0; k < n; ++k) twin_drop_locked(hit[k], true, why == 1 ? kTwinGoneTexture : kTwinGoneWalk);
 }
 
+void twins_keep_in_guest_locked(std::uint64_t va, std::uint64_t bytes) {
+    if (!g_twins || !bytes || !g_twin_cand_n.load(std::memory_order_relaxed)) return;
+    twins_release_locked(va, bytes, 0);
+    std::lock_guard<std::mutex> lk(g_twin_cand_mu);
+    auto it = g_twin_cand.upper_bound(va);
+    if (it != g_twin_cand.begin() && va < std::prev(it)->first + std::prev(it)->second.bytes) --it;
+    for (; it != g_twin_cand.end() && it->first < va + bytes; ++it) it->second.let_go = true;
+}
+
 std::string twins_report() {
     if (!g_twins) return {};
     std::size_t cands = 0, live = 0, blocks = 0, cpu_mapped = 0;
