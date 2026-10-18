@@ -663,11 +663,29 @@ bool phys_at(std::uint64_t va, std::uint64_t& phys, std::uint64_t& span) {
 // invalidates the mirror pages over it - told pages for the submissions
 // after the hand-out, watched ones at their next check - and stays
 // outstanding until GX writes it back or frees it (settle_locked).
+// The 4 KiB bits [i0, i1] of `bits` set (`set`) or cleared, a word at a time;
+// returns how many changed. A hand-out spans its whole buffer - megabytes for
+// a particle ring, thousands of hand-outs a second on the command processor.
+std::uint64_t mark_bits(std::vector<std::uint64_t>& bits, std::uint64_t i0, std::uint64_t i1, bool set) {
+    std::uint64_t changed = 0;
+    i1 = std::min(i1, kHand4k - 1);
+    for (std::uint64_t w = i0 >> 6; i0 <= i1 && w <= i1 >> 6; ++w) {
+        std::uint64_t mask = ~0ull;
+        if (w == i0 >> 6) mask &= ~0ull << (i0 & 63);
+        if (w == i1 >> 6) mask &= ~0ull >> (63 - (i1 & 63));
+        std::uint64_t& word = bits[w];
+        const std::uint64_t flip = (set ? ~word : word) & mask;
+        changed += static_cast<std::uint64_t>(__builtin_popcountll(flip));
+        word = set ? word | mask : word & ~mask;
+    }
+    return changed;
+}
+
 void mark_handed_locked(const GxWrite& w) {
     const unsigned k = static_cast<unsigned>(w.kind - 1);
     if (k >= kHandKinds) return;
     if (g_hand_bits[k].empty()) g_hand_bits[k].assign(kHand4k / 64, 0);
-    if (k == kHandMap) {
+    if (k == kHandMap && g_map_census) {
         std::uint64_t phys = 0, span = 0;
         if (phys_at(w.va, phys, span)) {
             g_map_in_pool += handed(kHandPool, phys);
@@ -676,42 +694,38 @@ void mark_handed_locked(const GxWrite& w) {
     }
     const bool act = k == kHandMap && g_shadow_handed;
     const std::uint64_t seq = act ? ++g_told_seq : 0;
-    std::uint64_t last = ~0ull;  // the 64 KiB page last invalidated
-    std::uint64_t va = w.va & ~0xfffull;
+    std::uint64_t first_phys = ~0ull, first_span = 0;
+    std::uint64_t va = w.va;
     const std::uint64_t end = w.va + w.bytes;
     while (va < end) {
         std::uint64_t phys = 0, span = 0;
         if (!phys_at(va, phys, span)) {
-            va += 0x1000;
+            va = (va | 0xfff) + 1;
             continue;
         }
-        for (std::uint64_t a = 0; a < span && va + a < end; a += 0x1000) {
-            const std::uint64_t at = phys + a, i = at >> 12;
-            if (i >= kHand4k) break;
-            std::uint64_t& word = g_hand_bits[k][i >> 6];
-            const std::uint64_t bit = 1ull << (i & 63);
-            if (!(word & bit)) {
-                word |= bit;
-                ++g_hand_pages[k];
-            }
-            if (!act || (at >> kPageShift) == last) continue;
-            last = at >> kPageShift;
-            Mirror& m = g_mirrors[at >> gcn::kDmemChunkShift];
-            if (m.pages.empty()) continue;
-            const std::uint32_t p = static_cast<std::uint32_t>((at & (kChunkBytes - 1)) >> kPageShift);
-            Page& pg = m.pages[p];
-            if (pg.valid) ++g_handed_invalid;
-            pg.gx_written = seq;
-            pg.gx_submit = w.submit;
-            m.ok[p >> 6] &= ~(1ull << (p & 63));
+        const std::uint64_t seg = std::min(end - va, span);
+        if (first_phys == ~0ull) {
+            first_phys = phys;
+            first_span = seg;
         }
-        va += (span + 0xfff) & ~0xfffull;
+        g_hand_pages[k] += mark_bits(g_hand_bits[k], phys >> 12, (phys + seg - 1) >> 12, true);
+        if (act) {
+            for (std::uint64_t at = phys & ~(kPageBytes - 1); at < phys + seg; at += kPageBytes) {
+                Mirror& m = g_mirrors[at >> gcn::kDmemChunkShift];
+                if (m.pages.empty()) continue;
+                const std::uint32_t p = static_cast<std::uint32_t>((at & (kChunkBytes - 1)) >> kPageShift);
+                Page& pg = m.pages[p];
+                if (pg.valid) ++g_handed_invalid;
+                pg.gx_written = seq;
+                pg.gx_submit = w.submit;
+                m.ok[p >> 6] &= ~(1ull << (p & 63));
+            }
+        }
+        va += seg;
     }
-    if (!act) return;
-    std::uint64_t phys = 0, span = 0;
-    if (!phys_at(w.va, phys, span)) return;
-    Outstanding& o = g_outstanding[phys];
-    o.end = std::max(o.end, phys + std::min<std::uint64_t>(w.bytes, span));
+    if (!act || first_phys == ~0ull) return;
+    Outstanding& o = g_outstanding[first_phys];
+    o.end = std::max(o.end, first_phys + first_span);
     o.since_ms = now_ms();
     g_outstanding_most = std::max<std::uint64_t>(g_outstanding_most, g_outstanding.size());
 }
@@ -757,28 +771,22 @@ void age_outstanding_locked() {
 // longer what GX hands out to be rewritten (the allocators may share it).
 void clear_handed_locked(const GxWrite& w) {
     bool any = false;
-    std::uint64_t va = w.va & ~0xfffull;
+    std::uint64_t va = w.va;
     const std::uint64_t end = w.va + w.bytes;
     while (va < end) {
         std::uint64_t phys = 0, span = 0;
         if (!phys_at(va, phys, span)) {
-            va += 0x1000;
+            va = (va | 0xfff) + 1;
             continue;
         }
-        for (std::uint64_t a = 0; a < span && va + a < end; a += 0x1000) {
-            const std::uint64_t i = (phys + a) >> 12;
-            if (i >= kHand4k) break;
-            for (unsigned k = 0; k < kHandKinds; ++k) {
-                if (g_hand_bits[k].empty()) continue;
-                std::uint64_t& word = g_hand_bits[k][i >> 6];
-                const std::uint64_t bit = 1ull << (i & 63);
-                if (!(word & bit)) continue;
-                word &= ~bit;
-                --g_hand_pages[k];
-                any = true;
-            }
+        const std::uint64_t seg = std::min(end - va, span);
+        for (unsigned k = 0; k < kHandKinds; ++k) {
+            if (g_hand_bits[k].empty()) continue;
+            const std::uint64_t n = mark_bits(g_hand_bits[k], phys >> 12, (phys + seg - 1) >> 12, false);
+            g_hand_pages[k] -= n;
+            any |= n != 0;
         }
-        va += (span + 0xfff) & ~0xfffull;
+        va += seg;
     }
     if (any && g_made_over_handed++ < 4)
         host_log("buffer shadow: a GX resource made over memory GX had handed out to be rewritten: [0x%llx, +0x%llx)",
