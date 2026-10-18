@@ -536,6 +536,13 @@ std::map<std::uint64_t, Outstanding> g_outstanding;
 std::uint64_t g_outstanding_most = 0, g_settled = 0, g_settle_unmatched = 0, g_aged_out = 0, g_provisional_copies = 0, g_handed_invalid = 0;
 constexpr std::uint64_t kOutstandingAgeMs = 10000;  // a copy left out longer was written back unseen (a resolve not hooked)
 constexpr std::uint16_t kMaxProvisionalRun = 64;     // copies in a row a page may take unsettled before host memory serves it
+// A page under GX's renamed copies is copied again at every hand-out over its
+// copy - a no-overwrite Map's notice spans the whole copy, though the CPU
+// appends to part of it - without the faults and arming a watched page's
+// copy costs; on the snapshot path every draw of it would cost the command
+// processor a copy as recorded. So it goes to host memory only past
+// kMaxUploadsHanded copies in the window (3 a second), not 4.
+constexpr std::uint32_t kMaxUploadsHanded = 24;
 std::uint64_t g_made_over_handed = 0;                // GX resources made over memory GX had handed out
 // Whether renamed copies were ever on the 64 KiB page p of chunk `chunk` (the
 // 16 bits of one word). The census's kinds do not count.
@@ -1108,11 +1115,12 @@ void shadow_locate_locked(std::uint64_t va, std::uint64_t bytes, Located& loc) {
                 run = p + 1;
                 continue;
             }
-            const std::uint32_t uploads = t - pg.window_ms >= kUploadWindowMs ? 0 : pg.window_uploads;
-            if (!pg.provisional && uploads + 1 > kMaxUploads) break;  // the loop sends it to host memory and stops there
-            if (pg.provisional && pg.provisional_run + 1 >= kMaxProvisionalRun) break;
             // Told of its writes by GX: not armed, and it ends a run of watched pages.
             told_class[p - p0] = page_told(p) ? 1 : 2;
+            const std::uint32_t uploads = t - pg.window_ms >= kUploadWindowMs ? 0 : pg.window_uploads;
+            const std::uint32_t limit = told_class[p - p0] == 1 && page_handed(chunk, p) ? kMaxUploadsHanded : kMaxUploads;
+            if (!pg.provisional && uploads + 1 > limit) break;  // the loop sends it to host memory and stops there
+            if (pg.provisional && pg.provisional_run + 1 >= kMaxProvisionalRun) break;
             if (told_class[p - p0] == 1) {
                 arm_run(run, p);
                 run = p + 1;
@@ -1194,7 +1202,7 @@ void shadow_locate_locked(std::uint64_t va, std::uint64_t bytes, Located& loc) {
                 bump(g_imports);
                 return;
             }
-        } else if (++pg.window_uploads > kMaxUploads) {
+        } else if (++pg.window_uploads > (g_shadow_handed && page_handed(chunk, p) ? kMaxUploadsHanded : kMaxUploads)) {
             go_dynamic(*m, p, page_va, "keeps being rewritten");
             flush();
             bump(g_imports);
