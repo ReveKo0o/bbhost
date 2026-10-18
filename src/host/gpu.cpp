@@ -7308,7 +7308,10 @@ bool host_gpu_dispatch(const GpuDispatch& d_in) {
         const std::uint64_t base = v[0] | (static_cast<std::uint64_t>(pointer ? v[1] : (v[1] & 0xff)) << 32);
         const std::uint32_t stride = pointer ? 0 : (v[1] >> 16) & 0x3fff;
         const std::uint64_t bytes = pointer ? 0 : stride ? std::uint64_t{v[2]} * stride : v[2];
-        if (base) import_windows(base, std::min<std::uint64_t>(std::max(bytes, min_bytes), 64ull << 20));
+        const std::uint64_t span = std::min<std::uint64_t>(std::max(bytes, min_bytes), 64ull << 20);
+        // A GX buffer a device-local twin holds (or will, at its binding below:
+        // BBHOST_GX_TWINS=1) needs no import - its stores go to the twin.
+        if (base && !twin_candidate_holds(base, span)) import_windows(base, span);
     };
     if (!g_import_whole) {
         for (const gcn::ResourcePath& p : pl.meta.store_buffers) import_path(p, false, 16);
@@ -7504,6 +7507,8 @@ bool host_gpu_dispatch(const GpuDispatch& d_in) {
         const gcn::TranslateResult& walks = lean ? lean->meta : pl.meta;
         if (!lean) {
             for (const gcn::BufferBinding& b : pl.meta.buffers) import_path(b.path, b.pointer, std::max<std::uint64_t>(b.max_dw * 4ull, 16));
+            // (Its stores too: a twin they would have gone to was let go above.)
+            for (const gcn::ResourcePath& p : pl.meta.store_buffers) import_path(p, false, 16);
         } else {
             for (const gcn::ResourcePath& p : lean->meta.store_buffers) import_path(p, false, 16);
         }
@@ -8338,6 +8343,15 @@ bool twin_covers_locked(std::uint64_t va, std::uint64_t bytes) {
         twin_drop_locked(hit, false, kTwinGoneDead, t.gen);
     }
     return false;
+}
+
+bool twin_candidate_holds(std::uint64_t va, std::uint64_t bytes) {
+    if (!g_twins || !bytes || !g_twin_cand_n.load(std::memory_order_relaxed)) return false;
+    std::lock_guard<std::mutex> lk(g_twin_cand_mu);
+    auto it = g_twin_cand.upper_bound(va);
+    if (it == g_twin_cand.begin()) return false;
+    --it;
+    return !it->second.let_go && va + bytes <= it->first + it->second.bytes;
 }
 
 void twins_release_locked(std::uint64_t va, std::uint64_t bytes, int why) {

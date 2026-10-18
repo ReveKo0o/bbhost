@@ -824,6 +824,7 @@ Located locate_guest(std::uint64_t va, std::uint64_t bytes);
 bool twins_on();
 bool twin_locate_locked(std::uint64_t va, std::uint64_t bytes, Located& out, VkDeviceAddress* address = nullptr);
 bool twin_covers_locked(std::uint64_t va, std::uint64_t bytes);
+bool twin_candidate_holds(std::uint64_t va, std::uint64_t bytes);  // a twin holds it, or will at its first binding
 void twins_release_locked(std::uint64_t va, std::uint64_t bytes, int why);
 void twins_buffer_made(std::uint64_t memory, std::uint64_t bytes, std::uint8_t usage, std::uint8_t bind, std::uint64_t gen);
 std::string twins_report();
