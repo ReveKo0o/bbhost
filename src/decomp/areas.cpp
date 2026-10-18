@@ -21,6 +21,7 @@ void decomp_gx_dma_add();              // gx/dma.cpp: the Gnm DMA_DATA writer
 void decomp_gx_constant_engine_add();  // gx/constant_engine.cpp: the Gnm constant-engine writers
 void decomp_gx_draw_add();             // gx/draw.cpp: GX's draw, dispatch and commit methods, the post-draw, the buffer's flush
 void decomp_gx_command_list_add();     // gx/command_list.cpp: GX's command lists finished and executed, a segment to the GPU
+void decomp_gx_present_add();          // gx/present.cpp: the swap chain's present - the frame's end and its pacing
 void decomp_yebis_gnm_add();           // yebis/gnm.cpp: YEBIS's Gnm draw and dispatch wrappers
 void decomp_yebis_context_add();       // yebis/context.cpp: YEBIS's D3D11-shaped context: targets, draws, flushes, waits
 void decomp_game_memcpy_add();         // memory/game_memcpy.cpp: the eboot's memcpy
@@ -46,6 +47,7 @@ void decomp_add_areas() {
     decomp_gx_constant_engine_add();
     decomp_gx_draw_add();
     decomp_gx_command_list_add();
+    decomp_gx_present_add();
     decomp_yebis_gnm_add();
     decomp_yebis_context_add();
     decomp_game_memcpy_add();
