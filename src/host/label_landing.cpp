@@ -51,8 +51,17 @@ const std::uint64_t g_poll_us = [] {
 
 struct Batch {
     std::uint64_t serial;
-    std::uint32_t count;
+    std::uint32_t count;  // its entries, in g_writes
     std::uint64_t added_ns;
+};
+// A label (its bytes inline) or a copy (add_copy: bytes from a host buffer
+// the submission's GPU work wrote), in the order they land.
+struct Entry {
+    std::uint64_t va;
+    std::uint32_t bytes;
+    bool copy;
+    std::uint8_t data[8];
+    const void* src;
 };
 
 Hooks g_hooks;
@@ -63,20 +72,21 @@ struct State {
     std::condition_variable work_cv;    // the thread: a batch to land
     std::condition_variable landed_cv;  // wait_landed_past: something landed
     std::deque<Batch> batches;          // in serial order, under mu
-    std::deque<Write> writes;           // the batches' writes, in order, under mu
+    std::deque<Entry> writes;           // the batches' entries, in order, under mu
 };
 State& g_st = *new State;
 std::mutex& g_mu = g_st.mu;
 std::condition_variable& g_work_cv = g_st.work_cv;
 std::condition_variable& g_landed_cv = g_st.landed_cv;
 std::deque<Batch>& g_batches = g_st.batches;
-std::deque<Write>& g_writes = g_st.writes;
+std::deque<Entry>& g_writes = g_st.writes;
 std::atomic<std::uint64_t> g_landed{0};
 std::atomic<bool> g_started{false};
 bool g_on_thread = false;  // under g_mu: the thread is landing (for the counts)
 
 // Counts, under g_mu unless atomic.
 std::uint64_t g_n_writes = 0, g_n_batches = 0, g_by_thread = 0, g_by_others = 0, g_unmapped = 0, g_most_batches = 0, g_most_writes = 0;
+std::uint64_t g_n_copies = 0, g_copy_bytes = 0;
 std::atomic<std::uint64_t> g_waits{0}, g_polls{0}, g_unsubmitted{0};
 // Submit to landed, in 0.1 ms buckets up to 256 ms (the last bucket: more).
 constexpr int kBuckets = 2561;
@@ -88,12 +98,18 @@ std::uint64_t now_ns() {
         std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
 }
 
-void store(const Write& w) {
+void store(const Entry& w) {
     if (g_hooks.mapped && !g_hooks.mapped(w.va, w.bytes)) {
         ++g_unmapped;
         return;
     }
     void* const p = reinterpret_cast<void*>(static_cast<std::uintptr_t>(w.va));
+    if (w.copy) {
+        std::memcpy(p, w.src, w.bytes);  // the labels after it store with release
+        ++g_n_copies;
+        g_copy_bytes += w.bytes;
+        return;
+    }
     if (w.bytes == 4 && !(w.va & 3)) {
         std::uint32_t v;
         std::memcpy(&v, w.data, 4);
@@ -119,7 +135,7 @@ void land_locked(std::uint64_t completed) {
             store(g_writes.front());
             g_writes.pop_front();
         }
-        g_n_writes += b.count;
+        g_n_writes += b.count;  // (copies among them counted apart in store)
         ++g_n_batches;
         ++(g_on_thread ? g_by_thread : g_by_others);
         const std::uint64_t age = t > b.added_ns ? (t - b.added_ns) / kBucketNs : 0;
@@ -171,11 +187,15 @@ void start(const Hooks& hooks) {
     std::thread(thread_main).detach();
 }
 
-void add(std::uint64_t serial, const Write* writes, std::size_t n) {
-    if (!n) return;
-    std::lock_guard<std::mutex> lk(g_mu);
-    g_batches.push_back({serial, static_cast<std::uint32_t>(n), now_ns()});
-    for (std::size_t k = 0; k < n; ++k) g_writes.push_back(writes[k]);
+namespace {
+// The batch of submission `serial`: the newest one when it is that
+// submission's (add_copy made it while the submission was recorded), else a
+// new one after it.
+Batch& batch_locked(std::uint64_t serial) {
+    if (g_batches.empty() || g_batches.back().serial != serial) g_batches.push_back({serial, 0, now_ns()});
+    return g_batches.back();
+}
+void added_locked(std::uint64_t serial) {
     g_most_batches = std::max<std::uint64_t>(g_most_batches, g_batches.size());
     g_most_writes = std::max<std::uint64_t>(g_most_writes, g_writes.size());
     // A submission already counted as run (no GPU any more: every count is ~0).
@@ -184,6 +204,29 @@ void add(std::uint64_t serial, const Write* writes, std::size_t n) {
         return;
     }
     g_work_cv.notify_one();
+}
+}  // namespace
+
+void add(std::uint64_t serial, const Write* writes, std::size_t n) {
+    if (!n) return;
+    std::lock_guard<std::mutex> lk(g_mu);
+    Batch& b = batch_locked(serial);
+    for (std::size_t k = 0; k < n; ++k) {
+        Entry e{writes[k].va, writes[k].bytes, false, {}, nullptr};
+        std::memcpy(e.data, writes[k].data, sizeof(e.data));
+        g_writes.push_back(e);
+    }
+    b.count += static_cast<std::uint32_t>(n);
+    added_locked(serial);
+}
+
+void add_copy(std::uint64_t serial, std::uint64_t va, const void* src, std::uint32_t bytes) {
+    if (!bytes) return;
+    std::lock_guard<std::mutex> lk(g_mu);
+    Batch& b = batch_locked(serial);
+    g_writes.push_back({va, bytes, true, {}, src});
+    b.count += 1;
+    added_locked(serial);
 }
 
 std::uint64_t land_through(std::uint64_t completed) {
@@ -216,14 +259,16 @@ std::string report() {
         }
         return kBuckets * kBucketNs / 1e6;
     };
-    char b[640];
+    char b[720];
     std::snprintf(b, sizeof(b),
-                  "labels written by the host once their submission had run (BBHOST_LABEL_LANDING=1, %s): %llu writes from %llu submissions, "
+                  "labels written by the host once their submission had run (BBHOST_LABEL_LANDING=1, %s): %llu writes from %llu submissions "
+                  "(%llu of them copies ahead of the labels, %llu KiB), "
                   "%llu landed by the landing thread and %llu by a wait for the GPU (a slot's retirement, a flush, a completion asked); "
                   "%llu waits in the driver, %llu polls (%llu for a submission not yet in the queue); %llu writes to unmapped memory "
                   "skipped; most waiting %llu submissions / %llu writes; submit to landed p50 %.2f ms, p99 %.2f ms; %llu still waiting",
                   g_block ? "the thread waits in the driver" : "the thread polls", static_cast<unsigned long long>(g_n_writes),
-                  static_cast<unsigned long long>(g_n_batches), static_cast<unsigned long long>(g_by_thread),
+                  static_cast<unsigned long long>(g_n_batches), static_cast<unsigned long long>(g_n_copies),
+                  static_cast<unsigned long long>(g_copy_bytes >> 10), static_cast<unsigned long long>(g_by_thread),
                   static_cast<unsigned long long>(g_by_others), static_cast<unsigned long long>(g_waits.load()),
                   static_cast<unsigned long long>(g_polls.load()), static_cast<unsigned long long>(g_unsubmitted.load()),
                   static_cast<unsigned long long>(g_unmapped), static_cast<unsigned long long>(g_most_batches),

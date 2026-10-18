@@ -3,7 +3,8 @@
 // the timeline. Nothing lands before its submission has run; a submission's
 // writes land in the order they were made and before any later submission's;
 // a wait for the GPU (land_through) lands what the thread has not yet, and the
-// thread then lands nothing twice; unmapped memory is skipped; with no GPU any
+// thread then lands nothing twice; unmapped memory is skipped; a copy
+// added while a submission is recorded lands ahead of its labels; with no GPU any
 // more everything lands, and so does what is added after; and with a producer,
 // a GPU and two landers racing, every label only ever moves forward and holds,
 // once its submission counts as landed, at least that submission's value, and
@@ -163,7 +164,37 @@ int main() {
     // the thread and a second lander (a slot's retirement) land them. Each
     // label only moves forward, and once a submission counts as landed, every
     // label it wrote holds at least its value.
-    constexpr std::uint64_t kFirst = 7, kLast = 20000;
+    // A copy ahead of the labels (add_copy, while the submission is
+    // recorded): it lands before them, and on its own in a submission with no
+    // labels; not before its submission has run.
+    {
+        alignas(8) static std::uint8_t dump[64], guest[64], guest2[16];
+        for (int k = 0; k < 64; ++k) dump[k] = static_cast<std::uint8_t>(k * 3 + 1);
+        g_keep_order = true;
+        add_copy(7, va(guest), dump, 64);
+        const Write a[] = {w32(&labels[9], 17)};
+        add(7, a, 1);
+        add_copy(8, va(guest2), dump, 16);  // no labels in submission 8
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        CHECK(guest[0] == 0 && labels[9] == 0);
+        g_gpu.store(8);
+        CHECK(landed_through(8));
+        CHECK(std::memcmp(guest, dump, 64) == 0);
+        CHECK(labels[9] == 17);
+        CHECK(guest2[0] == 0);  // submission 8 has not run
+        {
+            std::lock_guard<std::mutex> lk(g_order_mu);
+            const std::vector<std::uint64_t> want = {va(guest), va(&labels[9])};
+            CHECK(g_order == want);
+            g_order.clear();
+        }
+        g_keep_order = false;
+        g_gpu.store(9);
+        CHECK(landed_through(9));
+        CHECK(std::memcmp(guest2, dump, 16) == 0);
+    }
+
+    constexpr std::uint64_t kFirst = 9, kLast = 20000;
     {
         std::atomic<std::uint64_t> made{kFirst};
         std::atomic<bool> stop{false};

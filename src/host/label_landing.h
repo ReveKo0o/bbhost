@@ -53,6 +53,12 @@ void start(const Hooks& hooks);  // the landing thread (bb-labels), once
 // At submit (under the renderer's lock): the writes submission `serial`
 // carries, in the order they were made.
 void add(std::uint64_t serial, const Write* writes, std::size_t n);
+// While submission `serial` is recorded (before its labels are handed over):
+// `bytes` from `src` - a host buffer its GPU work writes - copied to guest
+// `va` once it has run, ahead of its labels and in the order added. `src`
+// must stay valid until the submission has landed (a slot's retirement lands
+// it first).
+void add_copy(std::uint64_t serial, std::uint64_t va, const void* src, std::uint32_t bytes);
 // Lands the writes of every submission before `completed` (submissions are
 // counted from 0: `completed` of them have run); returns landed().
 std::uint64_t land_through(std::uint64_t completed);
