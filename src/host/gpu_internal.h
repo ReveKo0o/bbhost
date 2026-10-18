@@ -1331,6 +1331,14 @@ struct HostImageRef {
     bool gpu_written = false;    // its image holds what the guest memory does not
 };
 bool host_image_by_resource_locked(std::uint64_t memory, std::uint64_t gen, HostImageRef* out);
+// A GX texture copied whole as memory whose source surface a shader or copy
+// wrote: copied image to image into the destination resource's target or
+// surface (textures.cpp). 1 copied, 0 not that case (counted by reason).
+int textures_copy_resource_locked(std::uint64_t src, std::uint64_t src_gen, std::uint64_t dst, std::uint64_t dst_gen);
+std::string textures_resource_copy_report();
+// BBHOST_COPY_BY_RESOURCE (on unless 0, and with BBHOST_RES_IDENTITY): copies
+// and texture binds take a target by its resource's generation (gpu.cpp).
+bool copy_by_resource_on();
 // Images belong to their GX resource's generation (BBHOST_RES_IDENTITY, on
 // unless 0): retired with it, never handed to a later resource at the same
 // memory (textures.cpp).

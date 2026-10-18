@@ -5924,6 +5924,25 @@ void defer_destroy_image(VkImage image, const ImageMemory& m) {
     g.slots[g.slot].dead_ranges.push_back(m);
 }
 
+// A whole GX texture copied as memory (src_gen / dst_gen, a CopyResource)
+// goes by its resources' images (BBHOST_COPY_BY_RESOURCE, on unless 0; it
+// covers textures.cpp's copy-image sides and binds by resource too):
+// [0] the source's target, its generation's, copied as an image (the
+// render-target path); [1] the source's surface a shader or copy wrote,
+// copied image to image (textures_copy_resource_locked); [2] a target at the
+// source's memory another resource's (a dead one's: the source was made with
+// texels of its own), so the memory is copied, not that target; [3] the
+// source's memory its content: copied as memory; [4] of those, ones into a
+// destination the host draws into as a target, which keeps its pixels (a
+// census: not seen so far); [5] targets copied into, relabelled the
+// destination's generation.
+const bool g_copy_by_resource = [] {
+    const char* e = std::getenv("BBHOST_COPY_BY_RESOURCE");
+    return !(e && e[0] == '0');
+}();
+std::atomic<std::uint64_t> g_copy_res[6] = {};
+bool copy_by_resource_on() { return g_copy_by_resource && res_identity_on(); }
+
 std::string image_heap_report() {
     VkDeviceSize used = 0;
     for (const HeapBlock& b : g_heap) used += b.used;
@@ -5938,6 +5957,13 @@ std::string image_heap_report() {
     if (const std::string sites = view_epoch_sites_report(); !sites.empty()) host_log("  %s", sites.c_str());
     host_log("  %s", image_reuse_report_locked().c_str());
     host_log("  %s", draw_gen_report_locked().c_str());
+    host_log("  whole textures copied as memory, by their resources%s: the source's target as an image %llu, its surface image to image %llu, "
+             "another resource's target at the source - its memory copied %llu, its memory its content %llu (into a destination drawn as a "
+             "target, which keeps its pixels, %llu), targets copied into made the destination's %llu; image to image: %s",
+             g_copy_by_resource ? "" : " (BBHOST_COPY_BY_RESOURCE=0: by address)", static_cast<unsigned long long>(g_copy_res[0].load()),
+             static_cast<unsigned long long>(g_copy_res[1].load()), static_cast<unsigned long long>(g_copy_res[2].load()),
+             static_cast<unsigned long long>(g_copy_res[3].load()), static_cast<unsigned long long>(g_copy_res[4].load()),
+             static_cast<unsigned long long>(g_copy_res[5].load()), textures_resource_copy_report().c_str());
     {
         VkDeviceSize free_vram = 0, free_host = 0;
         for (const HeapBlock& b : g_heap) {
@@ -8561,15 +8587,49 @@ bool host_gpu_counter_fill(std::uint64_t dst, std::uint32_t value, std::size_t b
 std::atomic<std::uint64_t> g_guest_copy_targets{0};
 std::uint64_t host_gpu_guest_copy_targets() { return g_guest_copy_targets.load(std::memory_order_relaxed); }
 
-bool host_gpu_copy_guest(std::uint64_t dst, std::uint64_t src, std::size_t bytes) {
+bool host_gpu_copy_guest(std::uint64_t dst, std::uint64_t src, std::size_t bytes, std::uint64_t src_gen, std::uint64_t dst_gen) {
     std::lock_guard<GpuMutex> lock(g.mu);
     if (!g.ok) return false;
     if (!bytes) return true;
     if (dst < src + bytes && src < dst + bytes) return false;
     note_gpu_write_over_marker("guest copy", dst, src, bytes);
+    bool skip_target = false, by_resource = src_gen && copy_by_resource_on();
+    if (by_resource) {
+        HostImageRef ref;
+        if (host_image_by_resource_locked(src, src_gen, &ref)) {
+            if (!ref.target && textures_copy_resource_locked(src, src_gen, dst, dst_gen)) {
+                // Image to image: the destination's memory is not written, so
+                // its surfaces are not marked (its own image took the copy).
+                g_copy_res[1].fetch_add(1, std::memory_order_relaxed);
+                return true;
+            }
+            if (ref.target) {
+                g_copy_res[0].fetch_add(1, std::memory_order_relaxed);
+            } else {
+                skip_target = true;  // the source is its surface: a target at its memory is another resource's
+                g_copy_res[3].fetch_add(1, std::memory_order_relaxed);
+            }
+        } else if (RtImage* rt = find_render_target(src); rt && rt->gx_gen && static_cast<std::uint32_t>(rt->gx_gen) != static_cast<std::uint32_t>(src_gen)) {
+            skip_target = true;
+            g_copy_res[2].fetch_add(1, std::memory_order_relaxed);
+        } else {
+            g_copy_res[3].fetch_add(1, std::memory_order_relaxed);
+        }
+    }
     // Copied image to image, the guest memory is not written: the surfaces
     // over it are not marked (mark_surfaces_dirty_locked's memory_written).
-    const bool as_image = render_copy_target_locked(src, dst, bytes, "copy token");
+    const bool as_image = !skip_target && render_copy_target_locked(src, dst, bytes, "copy token");
+    if (by_resource && dst_gen) {
+        if (RtImage* into = find_render_target(dst); into && into->image) {
+            if (as_image && static_cast<std::uint32_t>(into->gx_gen) != static_cast<std::uint32_t>(dst_gen)) {
+                into->gx_gen = dst_gen;  // what the copy wrote is the destination resource's
+                into->dead_ms = into->dead_after = into->dead_memory = 0;
+                g_copy_res[5].fetch_add(1, std::memory_order_relaxed);
+            } else if (!as_image && static_cast<std::uint32_t>(into->gx_gen) == static_cast<std::uint32_t>(dst_gen)) {
+                g_copy_res[4].fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+    }
     const int on_surfaces = mark_surfaces_dirty_locked(dst, bytes, !as_image, "copy token");
     if (as_image) {
         tex_event(dst, bytes, "copy token 0x%llx -> 0x%llx 0x%zx bytes: render target copied as an image",

@@ -400,7 +400,12 @@ void host_gpu_import_prefetch(std::uint64_t va, std::uint64_t bytes, std::uint8_
 // destination's; otherwise records buffer copies in command order, split where
 // either range crosses imports. False when a piece cannot be located or source
 // and destination share bytes.
-bool host_gpu_copy_guest(std::uint64_t dst, std::uint64_t src, std::size_t bytes);
+// src_gen / dst_gen: the generations of the GX textures the copy moves whole
+// (a CopyResource), 0 when it is not one: the source is then copied as its
+// resource's image when the host holds one (textures_copy_resource_locked,
+// the render-target path for a target), and the memory copy stays the
+// fallback.
+bool host_gpu_copy_guest(std::uint64_t dst, std::uint64_t src, std::size_t bytes, std::uint64_t src_gen = 0, std::uint64_t dst_gen = 0);
 // A GX dynamic buffer's renamed bytes copied back to its own address (a copy
 // token's batched copies): inside a render pass, the draws after it read a
 // copy of the bytes taken now and the copy into place waits for the pass's
@@ -448,6 +453,9 @@ struct GpuImageCopy {
     std::uint32_t src_mip, src_layer, src_x, src_y;
     std::uint32_t dst_mip, dst_layer, dst_x, dst_y;
     std::uint32_t w, h;
+    // The two resources' generations at the call (0: not known): a side whose
+    // image at its memory is another resource's is not used (textures.cpp).
+    std::uint64_t src_gen = 0, dst_gen = 0;
 };
 bool host_gpu_copy_image_region(const GpuImageCopy& c);
 // The memory [base, base+bytes) of a resource GX destroyed or the kernel

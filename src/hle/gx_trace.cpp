@@ -2508,7 +2508,15 @@ struct GuestCopy {
     std::uint64_t src;
     std::uint64_t bytes;
     bool back = false;  // a renamed dynamic buffer copied back to its own address (host_gpu_copy_back)
+    // A whole texture copied (CopyResource): the generations of the textures
+    // whose memory the copy starts at, 0 for anything else (host_gpu_copy_guest).
+    std::uint64_t src_gen = 0, dst_gen = 0;
 };
+// The live GX texture whose memory starts at `va` and covers `bytes`: its generation, or 0.
+std::uint64_t whole_texture_gen(std::uint64_t va, std::uint64_t bytes) {
+    GxResourceInfo r;
+    return gx_resource_at(va, bytes, &r) && r.memory == va && r.type >= 2 ? r.gen : 0;
+}
 std::mutex g_copies_mu;
 std::unordered_map<std::uint64_t, std::vector<GuestCopy>> g_copies;  // by token id, until the CP walks the token
 // BBHOST_CP_CENSUS: GX's buffer-copy passes by kind and caller (CopyResource,
@@ -2561,7 +2569,14 @@ std::uint64_t native_copy(Kind kind, const std::uint64_t* f) {
             copies.push_back({rd64(e), rd64(e + 8), (rd32(e + 0x10) >> 2) * 4ull, true});
         }
     } else {
-        copies.push_back({f[4], f[2], ((f[0] >> 2) & 0xffffffffull) * 4});
+        GuestCopy one{f[4], f[2], ((f[0] >> 2) & 0xffffffffull) * 4};
+        // CopyResource of two textures reaches here as their memory: name both,
+        // so the command processor copies their images by identity.
+        if (const std::uint64_t sg = whole_texture_gen(one.src, one.bytes)) {
+            one.src_gen = sg;
+            one.dst_gen = whole_texture_gen(one.dst, one.bytes);
+        }
+        copies.push_back(one);
     }
     if (g_copy_calls.fetch_add(1, std::memory_order_relaxed) < 8) {
         host_log("gx-copy: %s from 0x%llx: %zu copies, first 0x%llx -> 0x%llx, %llu bytes", kKindName[kind], static_cast<ull>(bn(f[6])),
@@ -3066,6 +3081,11 @@ std::uint64_t native_copy_texture(const std::uint64_t* f) {
     if (((c.src_tsharp[1] >> 20) & 0x3ff) != ((c.dst_tsharp[1] >> 20) & 0x3ff)) {
         g_icopy_format.fetch_add(1, std::memory_order_relaxed);
         return 0;
+    }
+    {
+        GxResourceInfo ri;
+        if (gx_resource_at(d.memory, 1, &ri) && ri.memory == d.memory) c.dst_gen = ri.gen;
+        if (gx_resource_at(s.memory, 1, &ri) && ri.memory == s.memory) c.src_gen = ri.gen;
     }
     c.dst_mip = dst_sub % d.mips;
     c.dst_layer = dst_sub / d.mips;
@@ -6815,7 +6835,9 @@ void hle_gx_copy_token(std::uint64_t id) {
         const GuestCopy& c = copies[i++];
         ++ranges;
         bytes += c.bytes;
-        if (!c.bytes || (c.back && !refused ? host_gpu_copy_back(c.dst, c.src, c.bytes) : host_gpu_copy_guest(c.dst, c.src, c.bytes))) continue;
+        if (!c.bytes ||
+            (c.back && !refused ? host_gpu_copy_back(c.dst, c.src, c.bytes) : host_gpu_copy_guest(c.dst, c.src, c.bytes, c.src_gen, c.dst_gen)))
+            continue;
         if (g_copy_failed.fetch_add(1, std::memory_order_relaxed) < 8) {
             host_log("gx-copy: buffer copy 0x%llx -> 0x%llx (%llu bytes) could not be recorded", static_cast<ull>(c.src),
                      static_cast<ull>(c.dst), static_cast<ull>(c.bytes));
