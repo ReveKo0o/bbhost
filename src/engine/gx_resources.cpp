@@ -1471,6 +1471,22 @@ std::uint32_t gx_view_extent(std::uint64_t view) {
     return 0;
 }
 
+std::uint32_t gx_view_extent_gen(std::uint64_t view, std::uint64_t* gen) {
+    *gen = 0;
+    if (!view) return 0;
+    const std::uint32_t h = obj_slot(view);
+    for (std::uint32_t probe = 0; probe < kObjProbes; ++probe) {
+        const ObjSlot& s = g_obj[(h + probe) & (kObjSlots - 1)];
+        const std::uint64_t o = s.object.load(std::memory_order_acquire);
+        if (o == view) {
+            *gen = s.gen.load(std::memory_order_relaxed);
+            return s.extent.load(std::memory_order_relaxed);
+        }
+        if (!o) break;
+    }
+    return 0;
+}
+
 std::uint64_t gx_view_gen_by_id(std::uint32_t id) {
     if (!id) return 0;
     const IdGen& ig = g_id_gen[id & (kIdGenSlots - 1)];

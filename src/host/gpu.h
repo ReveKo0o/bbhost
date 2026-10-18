@@ -87,6 +87,13 @@ struct GpuDrawInputs {
     // not known), which the registers give only padded; and the depth view's.
     std::uint32_t color_extent[8] = {};
     std::uint32_t depth_extent = 0;
+    // The generation of the resource each target's view was made of
+    // (gx_view_gen; 0: not known - the view not seen made, or no view: a
+    // packet draw, YEBIS's, Scaleform's): the image a draw finds at the
+    // target's base is that resource's from the draw on (render.cpp
+    // target_image). A session makes far fewer than 2^32 resources.
+    std::uint32_t color_gen[8] = {};
+    std::uint32_t depth_gen = 0;
     std::uint32_t blend[8] = {};         // CB_BLENDn_CONTROL
     float blend_const[4] = {};           // CB_BLEND_RED..ALPHA
     std::uint32_t depth_control = 0, stencil_control = 0, stencil_ref = 0, stencil_ref_bf = 0;
@@ -489,6 +496,7 @@ struct GpuClearView {
     bool depth = false;           // a depth-stencil view
     std::uint32_t view_id = 0;    // gx_object_id of the view (0: not seen made)
     std::uint32_t extent = 0;     // gx_view_extent: (width << 16) | height, 0 when not known
+    std::uint32_t gen = 0;        // gx_view_gen: the view's resource's generation, 0 when not known
     // Colour: CB_COLOR BASE, PITCH, SLICE, VIEW, INFO; the view's own mip,
     // first slice and slice count; whether CMASK fast clears it (CB_COLOR_INFO
     // FAST_CLEAR, where GX fills CMASK instead of the surface).

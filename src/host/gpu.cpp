@@ -5937,6 +5937,7 @@ std::string image_heap_report() {
                   static_cast<unsigned long long>(g.staging_free_bytes >> 20), static_cast<unsigned long long>(view_epoch()));
     if (const std::string sites = view_epoch_sites_report(); !sites.empty()) host_log("  %s", sites.c_str());
     host_log("  %s", image_reuse_report_locked().c_str());
+    host_log("  %s", draw_gen_report_locked().c_str());
     {
         VkDeviceSize free_vram = 0, free_host = 0;
         for (const HeapBlock& b : g_heap) {

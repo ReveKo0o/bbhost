@@ -1588,8 +1588,49 @@ std::uint32_t unpadded_width(std::uint64_t base, std::uint32_t padded, std::uint
 
 void copy_layers_locked(const RtImage& from, RtImage& to);
 
+// A draw's or a clear's target named by its view's resource generation
+// (GpuDrawInputs::color_gen / depth_gen, GpuClearView::gen; 0: not known).
+// The image at the target's base is that resource's from the draw on - the
+// resource drew into it - whatever the address rule had made it: no
+// resource's, a dead resource's waiting out the idle time
+// (render_retire_generation_locked), or another's the registry gave it when
+// the image was made. That waited for the reuse sweep or the old resource's
+// death before, and a copy by resource (host_image_by_resource_locked) in
+// between missed the image. BBHOST_RT_DRAW_GEN=0: the generations are
+// counted, not used.
+const bool g_rt_draw_gen = [] {
+    const char* e = std::getenv("BBHOST_RT_DRAW_GEN");
+    return !(e && e[0] == '0');
+}();
+// Under g.mu: targets found already that generation's; taken from no
+// generation, a dead resource's, another live resource's; images made for a
+// generation, of them ones the registry would have given another; target
+// lookups with no generation, by what asked: [0] a native draw whose view
+// was not seen made, [1] YEBIS's draws, [2] Scaleform's, [3] packet draws,
+// [4] a clear token whose view was not seen made.
+std::uint64_t g_draw_gen_same = 0, g_draw_gen_taken[3] = {}, g_draw_gen_made = 0, g_draw_gen_made_other = 0, g_draw_gen_none[5] = {};
+void rt_take_generation(RtImage& r, std::uint32_t gen) {
+    if (!gen) return;
+    if (static_cast<std::uint32_t>(r.gx_gen) == gen) {
+        ++g_draw_gen_same;
+        return;
+    }
+    const int why = !r.gx_gen ? 0 : r.dead_ms ? 1 : 2;
+    ++g_draw_gen_taken[why];
+    static int logs = 0;
+    if (logs++ < 12) {
+        host_log("render: %s target 0x%llx %ux%u format %d drawn as generation %u's, %s%llu", r.depth ? "depth" : "colour",
+                 static_cast<unsigned long long>(r.base), r.width, r.height, static_cast<int>(r.format), gen,
+                 why == 0 ? "no resource's before" : why == 1 ? "a dead resource's before: generation " : "another live resource's before: generation ",
+                 static_cast<unsigned long long>(why ? r.gx_gen : 0));
+    }
+    if (!g_rt_draw_gen) return;
+    r.gx_gen = gen;
+    r.dead_ms = r.dead_after = r.dead_memory = 0;
+}
+
 RtImage* rt_image(std::uint64_t base, VkFormat format, std::uint32_t width, std::uint32_t height, bool depth,
-                  std::uint32_t layers = 1, std::uint64_t slice_bytes = 0) {
+                  std::uint32_t layers = 1, std::uint64_t slice_bytes = 0, std::uint32_t gen = 0) {
     // An image this one replaces whose last write was a fill (RtImage::
     // fill_last): the new image starts with that fill if it covers it. The
     // blood layers' small targets move between sizes as well as between sRGB
@@ -1638,6 +1679,7 @@ RtImage* rt_image(std::uint64_t base, VkFormat format, std::uint32_t width, std:
             RtImage& kept = (g_rts[base] = std::move(promoted));
             g_max_rt_bytes = std::max<std::uint64_t>(g_max_rt_bytes, rt_size_bytes(kept));
             rt_written(kept);
+            rt_take_generation(kept, gen);
             return &kept;
         }
         g.rt_replacements.fetch_add(1);
@@ -1660,6 +1702,7 @@ RtImage* rt_image(std::uint64_t base, VkFormat format, std::uint32_t width, std:
             if (!r.slice_bytes) r.slice_bytes = slice_bytes;
             apply_pending_clear(r);
             rt_written(r);
+            rt_take_generation(r, gen);
             return &r;
         }
         // A clear token's clear still owed to the old image goes first: its
@@ -1797,6 +1840,11 @@ RtImage* rt_image(std::uint64_t base, VkFormat format, std::uint32_t width, std:
     rt_written(created);
     created.created_flip = created.written_flip;
     created.gx_gen = rt_resource_gen(base, rt_size_bytes(created));
+    if (gen) {
+        ++g_draw_gen_made;
+        if (static_cast<std::uint32_t>(created.gx_gen) != gen) ++g_draw_gen_made_other;
+        if (g_rt_draw_gen) created.gx_gen = gen;
+    }
     if (auto ga = g_gen_retired_at.find(base); ga != g_gen_retired_at.end()) {
         if (created.written_ms - ga->second < reuse_idle_ms()) ++g_gen_remade;
         g_gen_retired_at.erase(ga);
@@ -1892,17 +1940,19 @@ std::uint64_t g_extent_from_gx = 0;  // under g.mu: extents for view-less draws 
 
 RtImage* target_image(int slot, std::uint64_t base, VkFormat format, std::uint32_t padded_w, std::uint32_t padded_h,
                       std::uint32_t scissor_right, std::uint32_t scissor_bottom, bool depth, std::uint32_t layers,
-                      std::uint64_t slice_bytes, std::uint32_t extent = 0) {
+                      std::uint64_t slice_bytes, std::uint32_t extent = 0, std::uint32_t res_gen = 0) {
     struct Memo {
         std::uint64_t gen = 0, base = 0, slice_bytes = 0;
         VkFormat format = VK_FORMAT_UNDEFINED;
-        std::uint32_t padded_w = 0, padded_h = 0, right = 0, bottom = 0, layers = 0, extent = 0;
+        std::uint32_t padded_w = 0, padded_h = 0, right = 0, bottom = 0, layers = 0, extent = 0, res_gen = 0;
         RtImage* rt = nullptr;
     };
     static Memo memo[10];  // 0-7 colour, 8 depth, 9 clear tokens (render_clear_view_locked)
     Memo& m = memo[slot];
     if (m.rt && m.gen == g_rt_gen && m.base == base && m.format == format && m.padded_w == padded_w && m.padded_h == padded_h &&
-        m.right == scissor_right && m.bottom == scissor_bottom && m.layers == layers && m.slice_bytes == slice_bytes && m.extent == extent) {
+        m.right == scissor_right && m.bottom == scissor_bottom && m.layers == layers && m.slice_bytes == slice_bytes && m.extent == extent &&
+        m.res_gen == res_gen) {
+        if (res_gen) ++g_draw_gen_same;
         apply_pending_clear(*m.rt);
         rt_written(*m.rt);
         return m.rt;
@@ -1961,8 +2011,8 @@ RtImage* target_image(int slot, std::uint64_t base, VkFormat format, std::uint32
     } else {
         ++g_extent_guessed;
     }
-    RtImage* rt = rt_image(base, format, w, h, depth, layers, slice_bytes);
-    m = Memo{g_rt_gen, base, slice_bytes, format, padded_w, padded_h, scissor_right, scissor_bottom, layers, extent, rt};
+    RtImage* rt = rt_image(base, format, w, h, depth, layers, slice_bytes, res_gen);
+    m = Memo{g_rt_gen, base, slice_bytes, format, padded_w, padded_h, scissor_right, scissor_bottom, layers, extent, res_gen, rt};
     return rt;
 }
 
@@ -11217,6 +11267,22 @@ void image_reuse_sweep_locked() {
     g_reuse_textures.bytes += x.bytes;
 }
 
+std::string draw_gen_report_locked() {
+    using ull = unsigned long long;
+    char buf[640];
+    std::snprintf(buf, sizeof(buf),
+                  "targets by the generation of the resource their view was made of%s: found that resource's %llu, taken from no resource "
+                  "%llu, from a dead resource %llu, from another live resource %llu; made for it %llu (the registry's guess another %llu); "
+                  "lookups with no generation: native draws whose view was not seen made %llu, YEBIS's %llu, Scaleform's %llu, packet "
+                  "draws %llu, clears whose view was not seen made %llu",
+                  g_rt_draw_gen ? "" : " (BBHOST_RT_DRAW_GEN=0: counted only)", static_cast<ull>(g_draw_gen_same),
+                  static_cast<ull>(g_draw_gen_taken[0]), static_cast<ull>(g_draw_gen_taken[1]), static_cast<ull>(g_draw_gen_taken[2]),
+                  static_cast<ull>(g_draw_gen_made), static_cast<ull>(g_draw_gen_made_other), static_cast<ull>(g_draw_gen_none[0]),
+                  static_cast<ull>(g_draw_gen_none[1]), static_cast<ull>(g_draw_gen_none[2]), static_cast<ull>(g_draw_gen_none[3]),
+                  static_cast<ull>(g_draw_gen_none[4]));
+    return buf;
+}
+
 std::string image_reuse_report_locked() {
     char buf[640];
     std::snprintf(buf, sizeof(buf),
@@ -13073,6 +13139,12 @@ void host_gpu_depth_clear(std::uint64_t base, std::uint32_t word, std::uint32_t 
 
 // ---- clear tokens: GX's Clear*View in the view's own terms ----------------
 namespace {
+// The clear's view's resource generation for its target lookup, counted when
+// not known (rt_take_generation).
+std::uint32_t clear_gen(const GpuClearView& c) {
+    if (!c.gen) ++g_draw_gen_none[4];
+    return c.gen;
+}
 // What a clear token resolves to: the image a draw binding the view would
 // draw into, found exactly as the draw finds it (target_image, from the same
 // words), and the layers the view covers. `create` false only looks.
@@ -13100,7 +13172,7 @@ RtImage* clear_view_target_locked(const GpuClearView& c, bool create, std::uint3
             return r && !r->depth ? r : nullptr;
         }
         return target_image(9, base, fmt, pitch, padded_h, 0, 0, false, layers,
-                            static_cast<std::uint64_t>(pitch) * padded_h * format_bytes_per_pixel(fmt), c.extent);
+                            static_cast<std::uint64_t>(pitch) * padded_h * format_bytes_per_pixel(fmt), c.extent, clear_gen(c));
     }
     const VkFormat df = db_format(c.z_info, c.stencil_info);
     if (df == VK_FORMAT_UNDEFINED || !c.z_read_base) return nullptr;
@@ -13116,7 +13188,7 @@ RtImage* clear_view_target_locked(const GpuClearView& c, bool create, std::uint3
         return it != g_rts.end() && it->second.depth ? &it->second : nullptr;
     }
     const std::size_t bpp = df == VK_FORMAT_D16_UNORM ? 2 : 4;
-    RtImage* r = target_image(9, dbase, df, w, h, 0, 0, true, layers, static_cast<std::uint64_t>(w) * h * bpp, c.extent);
+    RtImage* r = target_image(9, dbase, df, w, h, 0, 0, true, layers, static_cast<std::uint64_t>(w) * h * bpp, c.extent, clear_gen(c));
     if (r) {
         // What a draw binding the view learns about its HTILE, so fills of
         // that HTILE from anywhere else still find the target.
@@ -15866,6 +15938,15 @@ bool host_gpu_draw(const GpuDraw& d) {
     return tess_draw_one(d, t);
 }
 
+// A draw target's resource generation for its lookup (rt_take_generation),
+// counted by what the draw is when not known.
+std::uint32_t target_gen(const GpuDraw& d, std::uint32_t gen) {
+    if (gen) return gen;
+    const char* kind = d.gx_token ? d.gx_token_kind : nullptr;
+    ++g_draw_gen_none[!d.gx_token ? 3 : kind && std::strcmp(kind, "yebis") == 0 ? 1 : kind && std::strcmp(kind, "scaleform") == 0 ? 2 : 0];
+    return 0;
+}
+
 static bool draw_impl(const GpuDraw& d) {
     g_draw_dummies = 0;  // the draw record takes the count of this draw's
     t_draw_pipeline = nullptr;
@@ -16074,7 +16155,8 @@ static bool draw_impl(const GpuDraw& d) {
         const std::uint32_t layers = ((c[3] >> 13) & 0x7ff) + 1;
         const std::uint32_t slice_start = linear_general ? 0 : std::min(c[3] & 0x7ff, layers - 1);
         s.color[t] = target_image(t, base, fmt, pitch, padded_h, scissor_right, scissor_bottom, false, layers,
-                                  static_cast<std::uint64_t>(pitch) * padded_h * format_bytes_per_pixel(fmt), in.color_extent[t]);
+                                  static_cast<std::uint64_t>(pitch) * padded_h * format_bytes_per_pixel(fmt), in.color_extent[t],
+                                  target_gen(d, in.color_gen[t]));
         s.color_layer[t] = slice_start;
         if (layers > 1) {
             static std::set<std::uint64_t> logged;
@@ -16151,7 +16233,7 @@ static bool draw_impl(const GpuDraw& d) {
                 const std::uint32_t layers = ((in.depth_view >> 13) & 0x7ff) + 1;
                 const std::size_t bpp = df == VK_FORMAT_D16_UNORM ? 2 : 4;
                 s.depth = target_image(8, dbase, df, w, h, scissor_right, scissor_bottom, true, layers,
-                                       static_cast<std::uint64_t>(w) * h * bpp, in.depth_extent);
+                                       static_cast<std::uint64_t>(w) * h * bpp, in.depth_extent, target_gen(d, in.depth_gen));
                 s.depth_layer = std::min(in.depth_view & 0x7ff, layers - 1);
                 if (layers > 1) {
                     static std::set<std::uint64_t> logged;

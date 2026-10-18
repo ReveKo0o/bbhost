@@ -1086,6 +1086,8 @@ bool render_target_newer_overlapping_locked(std::uint64_t va, std::size_t bytes,
 void textures_drop_rt_regions_locked(std::uint64_t base);
 // The reuse retire's line for the 5-second report.
 std::string image_reuse_report_locked();
+// The draws' and clears' target lookups by their views' resource generations (render.cpp rt_take_generation).
+std::string draw_gen_report_locked();
 RtImage* find_render_target(std::uint64_t base);
 // The view formats a colour target of `format` is created for (at most 5, the
 // format first): its channel layout's other numeric kinds, which keep RADV's

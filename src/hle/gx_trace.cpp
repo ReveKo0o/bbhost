@@ -1347,7 +1347,9 @@ shaders_done:
         const std::uint64_t rtv = rd64(s + 0x4e0 + 8 * static_cast<std::uint64_t>(t));
         if (!rtv) continue;
         for (int k = 0; k < 5; ++k) in.color[t][k] = rd32(rtv + 0x10 + 4 * static_cast<std::uint64_t>(k));
-        in.color_extent[t] = gx_view_extent(rtv);
+        std::uint64_t gen = 0;
+        in.color_extent[t] = gx_view_extent_gen(rtv, &gen);
+        in.color_gen[t] = static_cast<std::uint32_t>(gen);
     }
     const std::uint64_t ds = r.ds ? r.ds : guest(kDefaultDepthStencil);
     in.depth_control = rd32(ds);
@@ -1364,7 +1366,9 @@ shaders_done:
         // (0x14739b0) packs it after the eight register-0x10 words.
         in.depth_view = rd32(r.dsv + 0x30);
         in.htile_base = rd32(r.dsv + 0x34);
-        in.depth_extent = gx_view_extent(r.dsv);
+        std::uint64_t gen = 0;
+        in.depth_extent = gx_view_extent_gen(r.dsv, &gen);
+        in.depth_gen = static_cast<std::uint32_t>(gen);
     }
 
     // Rasterizer (0x2ad3370), with the masks the Gnm setters apply.
@@ -2726,6 +2730,7 @@ bool clear_rtv_view(const std::uint64_t* f) {
     c.slices = rd32(rt + 0x3c);
     c.fast_clear = (rd32(rt + 0x10) >> 13) & 1;  // CB_COLOR_INFO.FAST_CLEAR: what 0x1486d60 reads
     c.extent = clear_view_extent(view, res, c.mip);
+    c.gen = static_cast<std::uint32_t>(gx_view_gen(view));
     if (!safe_read(value, c.rgba, sizeof(c.rgba))) return false;
     // A CMASK fast clear ignores the value on the console: the tiles read as
     // the clear words GX keeps per bound slot (ctx+0xb658, 0x2ad1f80). Said
@@ -2770,6 +2775,7 @@ bool clear_dsv_view(const std::uint64_t* f) {
     std::memcpy(&c.om_stencil, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(ctx + 0xb654)), 4);
     c.om_stencil &= 0xff;
     c.extent = clear_view_extent(view, res, 0);
+    c.gen = static_cast<std::uint32_t>(gx_view_gen(view));
     // GX's own pass builds HTILE from the output merger's depth clear, and
     // its quad (no HTILE) writes the argument.
     if (c.htile && c.om_depth != c.depth_value) g_cv_depth_differs.fetch_add(1, std::memory_order_relaxed);

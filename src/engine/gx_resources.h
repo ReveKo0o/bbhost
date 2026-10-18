@@ -133,6 +133,8 @@ std::uint64_t gx_view_gen(std::uint64_t view);
 // The same by the view's id (gx_object_id: what a draw's records carry), for
 // the command processor; 0 when not known.
 std::uint64_t gx_view_gen_by_id(std::uint32_t id);
+// gx_view_extent and gx_view_gen in one lookup: a draw's targets take both.
+std::uint32_t gx_view_extent_gen(std::uint64_t view, std::uint64_t* gen);
 // Shader-resource views (0x25669a0) and samplers (0x2565b40)
 // are registered too, with their T# (at +0x10) or S# (at +0x0) hashed at
 // creation (gx_words_hash of the 32 bytes). The id of `object` and that hash.
