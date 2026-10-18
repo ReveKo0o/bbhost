@@ -6760,8 +6760,12 @@ void host_gpu_import_prefetch(std::uint64_t va, std::uint64_t bytes, std::uint8_
     const bool in_place = (bind & 0x80) || usage == 2 || ((bind & 0x3) && !buffer_shadow_on());
     if (!in_place) return;
     // One the GPU writes, kept as a device-local twin (BBHOST_GX_TWINS=1), needs
-    // no import: its twin is filled through staging at its first use.
+    // no import: its twin is filled through staging at its first use. With
+    // level 2 neither does a dynamic one: the draws read its renamed copies
+    // (CPU-written rings), and its own memory once GX's copy-backs have
+    // written it - which makes it a twin.
     if (twins_on() && usage == 0 && (bind & 0x80)) return;
+    if (twins_level() >= 2 && usage == 2) return;
     std::lock_guard<std::mutex> lk(g_pf_mu);
     g_pf_asked.fetch_add(1, std::memory_order_relaxed);
     if (g_pf_jobs.size() >= 8192) {
@@ -8401,6 +8405,7 @@ void twins_drop_cpu_mapped_locked() {
 }  // namespace
 
 bool twins_on() { return g_twins != 0; }
+int twins_level() { return g_twins; }
 
 bool twin_locate_locked(std::uint64_t va, std::uint64_t bytes, Located& out, VkDeviceAddress* address) {
     if (!g_twins || !bytes || !g_twin_cand_n.load(std::memory_order_relaxed)) return false;

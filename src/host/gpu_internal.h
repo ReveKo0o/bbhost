@@ -833,6 +833,7 @@ Located locate_guest(std::uint64_t va, std::uint64_t bytes);
 // them. twins_release_locked: a reader of guest memory (`why` 0 a page-table
 // walk, 1 a texture) reaches them - copied back and let go.
 bool twins_on();
+int twins_level();  // BBHOST_GX_TWINS: 0 off, 1 the buffers shaders write, 2 also those GPU copies write
 bool twin_locate_locked(std::uint64_t va, std::uint64_t bytes, Located& out, VkDeviceAddress* address = nullptr);
 bool twin_covers_locked(std::uint64_t va, std::uint64_t bytes);
 bool twin_candidate_holds(std::uint64_t va, std::uint64_t bytes);  // a twin holds it, or will at its first binding
