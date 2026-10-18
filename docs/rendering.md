@@ -164,8 +164,12 @@ only what is used, a 16 MB window at a time when something first needs it or
 when the engine makes a resource there (on a thread of its own); an import
 over several windows replaces the ones it covers, so no page is imported
 twice, and a dispatch imports what its shader reads and stores. It is off by
-default: the work under way moves each of those uses off guest memory, and
-windows are then only the fallback for what is not moved yet. One such move,
+default (`gpu.import_windows` in the config turns it on too): the work under
+way moves each of those uses off guest memory, and windows are then only the
+fallback for what is not moved yet. The Steam Deck kit turns it on: there the
+memory shared with the GPU stays under the driver's budget and the start is
+about 3 s sooner, at the same frame rate (its device-local twins, below, stay
+off: on an APU they are the same memory plus copies). One such move,
 off while it is measured: `BBHOST_GX_TWINS=1` keeps the GX buffers the GPU
 writes - particle state, append buffers and their counters, arguments a
 dispatch fills - in device memory, as a copy made at the buffer's first GPU

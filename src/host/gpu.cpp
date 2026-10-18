@@ -93,15 +93,22 @@ VKAPI_ATTR VkBool32 VKAPI_CALL debug_callback(VkDebugUtilsMessageSeverityFlagBit
     return VK_FALSE;
 }
 
-// BBHOST_IMPORT_WINDOWS=1: direct memory imported a window at a time, on
-// demand. Off by default: a tenth of the draws keep page-table walks through
-// V#s and pointers the host does not resolve (the exit report's "walk" lines),
-// and what they reach must already be imported or they read the sink. Off,
-// each chunk's GPU-visible span is imported whole when the mappings are made.
-const bool g_import_whole = [] {
-    const char* e = std::getenv("BBHOST_IMPORT_WINDOWS");
-    return !(e && e[0] == '1');
-}();
+// Window imports: direct memory imported a window at a time, on demand -
+// BBHOST_IMPORT_WINDOWS=1, or gpu.import_windows = true in the config (the
+// Steam Deck kit's default: the host heap under its budget, the start ~3 s
+// sooner, the same frames and frame rate). Off by default elsewhere: a tenth
+// of the draws keep page-table walks through V#s and pointers the host does
+// not resolve (the exit report's "walk" lines), and what they reach must
+// already be imported or they read the sink. Off, each chunk's GPU-visible
+// span is imported whole when the mappings are made. Decided at its first use
+// (after the config is read); the environment wins over the config.
+bool import_whole_mode() {
+    static const bool whole = [] {
+        if (const char* e = std::getenv("BBHOST_IMPORT_WINDOWS"); e && *e) return e[0] != '1';
+        return config_value("gpu.import_windows") != "true";
+    }();
+    return whole;
+}
 std::atomic<std::uint64_t> g_imports_made{0}, g_imports_merged{0}, g_import_bytes{0}, g_import_us{0};
 
 // ---- The submission thread (BBHOST_SUBMIT_THREAD, on unless 0) ----
@@ -895,7 +902,7 @@ const Chunk* dmem_import(std::uint32_t index, std::uint64_t in, std::uint64_t by
     if (index >= gcn::kDmemChunks) return nullptr;
     DmemChunk& d = g.dmem[index];
     if (!bytes) bytes = 1;
-    if (g_import_whole) {
+    if (import_whole_mode()) {
         // The whole spans (imported when the mappings are made): a range their
         // windows do not cover lies outside every GPU-visible mapping.
         if (in >= kChunkBytes || bytes > kChunkBytes - in) return nullptr;
@@ -975,7 +982,7 @@ void import_windows(std::uint64_t va, std::uint64_t bytes) {
     t_import_who = who;
 }
 
-bool imports_whole() { return g_import_whole; }
+bool imports_whole() { return import_whole_mode(); }
 
 // ---- import prefetch (window imports) ----
 // A GX buffer made over GPU-visible direct memory that the GPU reads in place
@@ -1726,7 +1733,7 @@ bool rebuild_page_tables() {
         }
         d.span_lo = lo;
         d.span_hi = hi;
-        if (g_import_whole && !(d.window[lo >> kImportWindowShift] && chunk_covers(*d.window[lo >> kImportWindowShift], lo, hi - lo))) {
+        if (import_whole_mode() && !(d.window[lo >> kImportWindowShift] && chunk_covers(*d.window[lo >> kImportWindowShift], lo, hi - lo))) {
             // A span that runs to the chunk's end, where the next chunk's
             // starts, goes on into it (kChunkOverlap): a buffer the game placed
             // across the seam - a vertex buffer, a constant array - then lies
@@ -2062,7 +2069,7 @@ Located located_in(const GuestMapInfo& mi, std::uint64_t va, std::uint64_t bytes
         const std::uint32_t chunk = static_cast<std::uint32_t>(phys >> gcn::kDmemChunkShift);
         const std::uint64_t in = phys & (kChunkBytes - 1);
         // Window imports may run on across the seam into the next chunk (span_reach).
-        const std::uint64_t reach = g_import_whole ? kChunkBytes : span_reach(chunk);
+        const std::uint64_t reach = import_whole_mode() ? kChunkBytes : span_reach(chunk);
         t_import_va = va;
         const Chunk* c = dmem_import(chunk, in, std::min<std::uint64_t>({bytes, mi.len - off, reach > in ? reach - in : 1}), true);
         t_import_va = 0;
@@ -6797,7 +6804,7 @@ void host_gpu_gx_buffer_mapped_own(std::uint64_t memory, std::uint64_t, std::uin
 void host_gpu_gx_buffer_gone(std::uint64_t memory, std::uint64_t gen) { twins_buffer_gone(memory, gen); }
 
 void host_gpu_import_prefetch(std::uint64_t va, std::uint64_t bytes, std::uint8_t usage, std::uint8_t bind) {
-    if (g_import_whole || !g_prefetch_on || !bytes || usage == 3 /* STAGING */) return;
+    if (import_whole_mode() || !g_prefetch_on || !bytes || usage == 3 /* STAGING */) return;
     // What the GPU reads in place: an unordered-access buffer (bind 0x80: what
     // compute writes, particles), a dynamic one (usage 2: rings the game
     // rewrites, bound from host memory). A vertex or index buffer (bind 0x1,
@@ -7432,7 +7439,7 @@ bool host_gpu_dispatch(const GpuDispatch& d_in) {
             import_windows(base, span);
         }
     };
-    if (!g_import_whole) {
+    if (!import_whole_mode()) {
         {
             const ImportSite site("a dispatch's stores");
             for (const gcn::ResourcePath& p : pl.meta.store_buffers) import_path(p, false, 16);
@@ -7627,7 +7634,7 @@ bool host_gpu_dispatch(const GpuDispatch& d_in) {
             release(r.path, r.pointer, r.pointer ? (r.max_dw ? r.max_dw * 4ull : 64ull << 10) : 16);
         }
     }
-    if (!g_import_whole) {
+    if (!import_whole_mode()) {
         const gcn::TranslateResult& walks = lean ? lean->meta : pl.meta;
         if (!lean) {
             const ImportSite site("a walking dispatch's buffers");
@@ -9924,7 +9931,7 @@ void host_gpu_report() {
         host_log("gpu: guest memory imports (%s): %llu made, %llu MiB in %llu ms of the driver's time - bindings %llu (%llu MiB), device "
                  "addresses %llu (%llu MiB), walks %llu (%llu MiB), prefetch %llu (%llu MiB), whole spans %llu (%llu MiB); %llu replaced "
                  "others, %llu retired (%llu MiB); live %llu MiB in %zu imports, flexible %llu MiB",
-                 g_import_whole ? "whole spans" : "by window, BBHOST_IMPORT_WINDOWS=1", static_cast<ull>(g_imports_made.load()),
+                 import_whole_mode() ? "whole spans" : "by window: BBHOST_IMPORT_WINDOWS=1 or gpu.import_windows", static_cast<ull>(g_imports_made.load()),
                  mib(g_import_bytes), static_cast<ull>(g_import_us.load() / 1000), static_cast<ull>(g_import_who_n[kIwBinding].load()),
                  mib(g_import_who_bytes[kIwBinding]), static_cast<ull>(g_import_who_n[kIwAddress].load()), mib(g_import_who_bytes[kIwAddress]),
                  static_cast<ull>(g_import_who_n[kIwWalk].load()), mib(g_import_who_bytes[kIwWalk]),
@@ -9932,7 +9939,7 @@ void host_gpu_report() {
                  static_cast<ull>(g_import_who_n[kIwSpan].load()), mib(g_import_who_bytes[kIwSpan]), static_cast<ull>(g_imports_merged.load()),
                  static_cast<ull>(g_imports_retired.load()), mib(g_import_retired_bytes), static_cast<ull>(live >> 20), nlive,
                  static_cast<ull>(flex >> 20));
-        if (!g_import_whole) {
+        if (!import_whole_mode()) {
             host_log("gpu: import prefetch: %llu asked, %llu already imported, %llu looked at, %llu imports made (%llu MiB), %llu dropped as a "
                      "binding imported first, %llu not queued; dispatches: %llu reads imported, %llu with a base that does not trace "
                      "(their walks reach what nothing imports for them)",
@@ -9943,7 +9950,7 @@ void host_gpu_report() {
         // (A copy taken under the lock: the command processor may still be
         // making imports while the exit report runs.)
         std::vector<std::pair<std::string, ImportAsker>> askers;
-        if (!g_import_whole) {
+        if (!import_whole_mode()) {
             std::lock_guard<GpuMutex> lock(g.mu);
             askers.assign(g_import_askers.begin(), g_import_askers.end());
         }
@@ -10002,7 +10009,7 @@ void host_gpu_report() {
             host_log("gpu: GX buffers GPU copies wrote (copy tokens, copy versions; %llu copies): %s; copies into no GX buffer %llu",
                      static_cast<ull>(copies_total), cb.empty() ? "none" : cb.c_str(), static_cast<ull>(copied_other));
         }
-        if (!g_import_whole) {
+        if (!import_whole_mode()) {
             host_log("gpu: copy tokens' sources copied into upload staging (window imports): %llu (%llu MiB)",
                      static_cast<ull>(g_copy_src_staged.load()), static_cast<ull>(g_copy_src_staged_bytes.load() >> 20));
         }
