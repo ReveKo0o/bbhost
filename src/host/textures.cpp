@@ -1139,6 +1139,11 @@ bool upload_surface(Surface& sf, VkImageAspectFlags aspect, bool first) {
                      static_cast<unsigned long long>(head[3]));
         }
     }
+    // A texture over a GX buffer kept as a device-local twin (BBHOST_GX_TWINS=1;
+    // not seen in the census): the twin is copied back and let go, so guest
+    // memory serves the buffer from here on - this upload still reads what
+    // the CPU sees now, counted.
+    if (twins_on() && twin_covers_locked(sf.base, sf.total_src)) twins_release_locked(sf.base, sf.total_src, 1);
     const auto* src = reinterpret_cast<const std::uint8_t*>(static_cast<std::uintptr_t>(sf.base));
     DevBuffer staging;
     auto t_part = std::chrono::steady_clock::now();

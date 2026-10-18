@@ -1018,6 +1018,7 @@ bool buffer_shadow_on() {
 
 void shadow_locate_locked(std::uint64_t va, std::uint64_t bytes, Located& loc) {
     if (!buffer_shadow_on() || !bytes || !loc.buffer) return;
+    if (twin_covers_locked(va, bytes)) return;  // a GX buffer's device-local twin: already device memory, its guest bytes stale
     std::uint32_t chunk = 0;
     std::uint64_t off = 0, map_lo = 0, map_hi = 0;
     if (!phys_of(va, bytes, chunk, off, &map_lo, &map_hi)) return;
@@ -1378,7 +1379,7 @@ void shadow_locate_locked(std::uint64_t va, std::uint64_t bytes, Located& loc) {
 // mirror the GPU will read stale. Pure: `write_watch_dirty` only memoises a
 // clean answer, and a written watch stays written until it is armed again.
 bool shadow_mirror_locked(std::uint64_t va, std::uint64_t bytes, Located& out) {
-    if (!buffer_shadow_on() || !bytes || !g.sink.buffer) return false;
+    if (!buffer_shadow_on() || !bytes || !g.sink.buffer || twin_covers_locked(va, bytes)) return false;
     // A stand-in host location: shadow_locate_locked replaces it with the
     // mirror when the mirror serves the range, and leaves it otherwise.
     Located probe{g.sink.buffer, 0, bytes};
@@ -1389,7 +1390,7 @@ bool shadow_mirror_locked(std::uint64_t va, std::uint64_t bytes, Located& out) {
 }
 
 bool shadow_stage_locked(std::uint64_t va, std::uint64_t bytes, Located& loc) {
-    if (!buffer_shadow_on() || !bytes || !loc.buffer || loc.avail < bytes) return false;
+    if (!buffer_shadow_on() || !bytes || !loc.buffer || loc.avail < bytes || twin_covers_locked(va, bytes)) return false;
     if (bytes > kStageMaxBytes) {
         bump(g_stage_refused);
         return false;
@@ -1533,7 +1534,7 @@ bool snap_ring_make() {
 }  // namespace
 
 bool shadow_snapshot_maybe_locked(std::uint64_t va, std::uint64_t bytes) {
-    if (!g_snapshot_on || !buffer_shadow_on() || !bytes) return false;
+    if (!g_snapshot_on || !buffer_shadow_on() || !bytes || twin_covers_locked(va, bytes)) return false;
     std::uint32_t chunk = 0;
     std::uint64_t off = 0;
     if (!phys_of(va, bytes, chunk, off) || off + bytes > kChunkBytes) return true;  // not told this cheaply
@@ -1542,7 +1543,7 @@ bool shadow_snapshot_maybe_locked(std::uint64_t va, std::uint64_t bytes) {
 }
 
 bool shadow_snapshot_locked(std::uint64_t va, std::uint64_t bytes, Located& loc) {
-    if (!g_snapshot_on || !buffer_shadow_on() || !bytes || bytes > kSnapMaxBytes) return false;
+    if (!g_snapshot_on || !buffer_shadow_on() || !bytes || bytes > kSnapMaxBytes || twin_covers_locked(va, bytes)) return false;
     // Only a range on a page the game keeps rewriting: a static page the
     // mirrors had no room for is staged as before, not copied by the CPU at
     // every draw.
@@ -1851,6 +1852,8 @@ void verify_batch_locked() {
     }
 }
 }  // namespace
+
+VkCommandBuffer shadow_upload_cmd_locked() { return upload_cmd_locked(); }
 
 // The copies this recording made, ended; submit_locked runs them first.
 VkCommandBuffer shadow_end_uploads_locked() {

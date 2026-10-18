@@ -980,7 +980,7 @@ bool draw_last_vertex(std::int64_t& last) {
             v.last = v.base + v.count - 1;
         } else {
             const std::uint64_t ib = static_cast<std::uint64_t>(v.count) * (v.index_type ? 4u : 2u);
-            if (hle_kernel_va_mapped(v.index_va, ib) && !gpu_writes_pending_locked(v.index_va, ib)) {
+            if (hle_kernel_va_mapped(v.index_va, ib) && !gpu_writes_pending_locked(v.index_va, ib) && !twin_covers_locked(v.index_va, ib)) {
                 std::uint32_t hi = 0;
                 if (v.index_type) {
                     const auto* p = reinterpret_cast<const std::uint32_t*>(static_cast<std::uintptr_t>(v.index_va));
@@ -11538,7 +11538,7 @@ void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t
         if (outcome == kUnmapped && version == kCopyVersionNone &&
             (b.written || t_draw_windows.empty() || !(in_window = draw_window_locked(base, bytes, loc)))) {
             copy_only = !imports_whole() && snapshots_on && !b.written && bytes && bytes <= (1u << 20) &&
-                        !gpu_writes_pending_locked(base, bytes) && hle_kernel_va_mapped(base, bytes);
+                        !gpu_writes_pending_locked(base, bytes) && hle_kernel_va_mapped(base, bytes) && !twin_covers_locked(base, bytes);
             if (!copy_only) loc = locate(base, std::min<std::uint64_t>(bytes, g.ssbo_max_range ? g.ssbo_max_range : bytes));
         }
         if (g_import_audit && base) audit_range(base, bytes, loc.buffer && loc.avail >= bytes ? kUseBound : kUsePageTable);
@@ -11587,6 +11587,9 @@ void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t
             // the draw is recorded - a snapshot of the bytes, so a later CPU
             // write to that memory cannot reach a draw still in flight.
             bool realign = realign_mode == 1 ? (bias % 16) != 0 : realign_mode == 2 ? (bias % 16) == 0 : realign_mode == 3;
+            // A GX buffer kept as a device-local twin (BBHOST_GX_TWINS=1): bound
+            // in place, the twin; its guest bytes are stale, so no copy of them.
+            const bool twin = twin_covers_locked(base, bytes);
             if (t_snapshot_cbs && !realign) {
                 realign = true;  // BBHOST_SF_SNAPSHOT: the bytes as recorded
                 bump(g_sf_cb_snapshots);
@@ -11615,7 +11618,7 @@ void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t
                 return !(e && e[0] == '0');
             }();
             bool snapshot = false;
-            if (!realign && snapshot_cpu && version == kCopyVersionNone && !in_window && !b.written &&
+            if (!realign && snapshot_cpu && version == kCopyVersionNone && !in_window && !b.written && !twin &&
                 !gpu_writes_pending_locked(base, bytes)) {
                 realign = snapshot = true;
                 if (host_tooling()) bump(g_cb_snapshots);
@@ -11639,7 +11642,7 @@ void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t
                                          b.pointer ? ", a pointer" : "");
                 realign = realign || glitch_snapshot_draw();  // BBHOST_GLITCH_SNAPSHOT: the bytes as recorded
             }
-            if (b.written) realign = false;  // stores go to the guest memory, never to a copy
+            if (b.written || twin) realign = false;  // stores go to the guest memory (or its twin), never to a copy
             static DevBuffer scratch;
             static VkDeviceSize scratch_next = 0;
             constexpr VkDeviceSize kScratch = 64ull << 20, kScratchSegment = 4ull << 20;

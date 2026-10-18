@@ -2,6 +2,7 @@
 #include "core/host_clock.h"
 #include "core/paced_file.h"
 #include "core/portable.h"
+#include "engine/gx_resources.h"
 #include "host/foreign_hooks.h"
 #include "host/draw_capture.h"
 #include "host/gpu_internal.h"
@@ -1337,10 +1338,11 @@ bool create_dev_buffer(DevBuffer& b, std::uint64_t size, bool host_visible, bool
     // its vertex or index data - a copy version (GX's copy-back, in staging),
     // a YEBIS window's copy - and a binding without the usage is invalid
     // (VUID-vkCmdBindVertexBuffers-pBuffers-00627, seen on lavapipe with
-    // window imports).
+    // window imports); indirect usage for a GX buffer's device-local twin
+    // that holds a dispatch's or a draw's arguments.
     bci.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
                 VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT |
-                VK_BUFFER_USAGE_INDEX_BUFFER_BIT;
+                VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT;
     if (vkCreateBuffer(g.device, &bci, nullptr, &b.buffer) != VK_SUCCESS) return false;
     VkMemoryRequirements req{};
     vkGetBufferMemoryRequirements(g.device, b.buffer, &req);
@@ -1980,6 +1982,15 @@ Located located_in(const GuestMapInfo& mi, std::uint64_t va, std::uint64_t bytes
 }  // namespace
 
 Located locate(std::uint64_t va, std::uint64_t bytes) {
+    // A GX buffer the GPU writes, kept as a device-local twin (BBHOST_GX_TWINS=1).
+    if (twins_on()) {
+        Located t;
+        if (twin_locate_locked(va, bytes, t)) return t;
+    }
+    return locate_guest(va, bytes);
+}
+
+Located locate_guest(std::uint64_t va, std::uint64_t bytes) {
     // The mapping this thread's last lookup found: most land in the same one
     // (the big direct-memory mapping), and one range check over a line
     // already in cache beats the walk. Mappings do not overlap, so whichever
@@ -6642,6 +6653,10 @@ void retire_through_locked(std::uint64_t serial) {
 
 using namespace gpu;
 
+void host_gpu_gx_buffer_made(std::uint64_t memory, std::uint64_t bytes, std::uint8_t usage, std::uint8_t bind, std::uint64_t gen) {
+    twins_buffer_made(memory, bytes, usage, bind, gen);
+}
+
 void host_gpu_import_prefetch(std::uint64_t va, std::uint64_t bytes, std::uint8_t usage, std::uint8_t bind) {
     if (g_import_whole || !g_prefetch_on || !bytes || usage == 3 /* STAGING */) return;
     // What the GPU reads in place: an unordered-access buffer (bind 0x80: what
@@ -6652,6 +6667,9 @@ void host_gpu_import_prefetch(std::uint64_t va, std::uint64_t bytes, std::uint8_
     // through staging too.
     const bool in_place = (bind & 0x80) || usage == 2 || ((bind & 0x3) && !buffer_shadow_on());
     if (!in_place) return;
+    // One the GPU writes, kept as a device-local twin (BBHOST_GX_TWINS=1), needs
+    // no import: its twin is filled through staging at its first use.
+    if (twins_on() && usage == 0 && (bind & 0x80)) return;
     std::lock_guard<std::mutex> lk(g_pf_mu);
     g_pf_asked.fetch_add(1, std::memory_order_relaxed);
     if (g_pf_jobs.size() >= 8192) {
@@ -7431,6 +7449,27 @@ bool host_gpu_dispatch(const GpuDispatch& d_in) {
     // walks left in it (TranslateResult::read_buffers: a V#'s records, a
     // pointer's dwords up to the highest a load reads, 64 KiB when no load's
     // offset is known), and its stores.
+    // GX buffers' device-local twins (BBHOST_GX_TWINS=1) a page-table walk
+    // reaches - every buffer of the walking variant, the walks left in the
+    // lean one - are copied back and let go first: the walk reads guest memory.
+    if (twins_on()) {
+        const auto release = [&](const gcn::ResourcePath& path, bool pointer, std::uint64_t min_bytes) {
+            std::uint32_t v[4]{};
+            if (!resolve_resource(path, d.user_data, pointer ? 2 : 4, v)) return;
+            const std::uint64_t base = v[0] | (static_cast<std::uint64_t>(pointer ? v[1] : (v[1] & 0xff)) << 32);
+            const std::uint32_t stride = pointer ? 0 : (v[1] >> 16) & 0x3fff;
+            const std::uint64_t bytes = pointer ? 0 : stride ? std::uint64_t{v[2]} * stride : v[2];
+            if (base) twins_release_locked(base, std::min<std::uint64_t>(std::max(bytes, min_bytes), 64ull << 20), 0);
+        };
+        const gcn::TranslateResult& walks = lean ? lean->meta : pl.meta;
+        if (!lean) {
+            for (const gcn::BufferBinding& b : pl.meta.buffers) release(b.path, b.pointer, std::max<std::uint64_t>(b.max_dw * 4ull, 16));
+            for (const gcn::ResourcePath& p : pl.meta.store_buffers) release(p, false, 16);
+        }
+        for (const gcn::TranslateResult::BufferRead& r : walks.read_buffers) {
+            release(r.path, r.pointer, r.pointer ? (r.max_dw ? r.max_dw * 4ull : 64ull << 10) : 16);
+        }
+    }
     if (!g_import_whole) {
         const gcn::TranslateResult& walks = lean ? lean->meta : pl.meta;
         if (!lean) {
@@ -8017,6 +8056,304 @@ void transfer_end_locked() { g.transfers.fetch_add(1); }
 
 namespace gpu {
 
+// ---- GX buffers the GPU writes, as device resources (BBHOST_GX_TWINS=1) ----
+// A GX buffer the GPU writes - a particle system's state, an append buffer
+// and its counter, indirect arguments a dispatch fills: type buffer, usage
+// default (no CPU access, D3D11's rule; the 12-place census: 0 Maps of them),
+// unordered-access bind - lived in imported guest memory, so every dispatch
+// wrote it and every draw read it across the bus on a discrete GPU, and its
+// pages had to stay imported (phase B's census: the in-place users left once
+// copies need no import). Such a buffer gets a device-local twin, keyed by
+// its memory and the registry's generation (gx_resources: a resource made
+// later over the same memory is another), made and filled from guest memory
+// on its first GPU use; from then on locate() and guest_device_address()
+// hand out the twin, and the guest bytes go stale - so every CPU copy of
+// them is refused (twin_covers_locked: constant-buffer snapshots, the buffer
+// shadow's mirrors, snapshots and stages, copy versions' sources, the index
+// scan). What cannot use the twin lets it go after copying it back: a range
+// across its edge, a page-table walk over it. A twin whose resource died
+// (the registry no longer has that generation there) is dropped. Off by
+// default while it is measured; the exit report counts all of it.
+namespace {
+const bool g_twins = [] {
+    const char* e = std::getenv("BBHOST_GX_TWINS");
+    return e && e[0] == '1';
+}();
+struct TwinCandidate {
+    std::uint64_t bytes = 0, gen = 0;
+    bool let_go = false;  // copied back and let go: guest memory serves it from then on
+};
+std::mutex g_twin_cand_mu;  // GX's threads add candidates; the renderer reads them (lock order: g.mu, then this)
+std::map<std::uint64_t, TwinCandidate> g_twin_cand;  // by memory, under g_twin_cand_mu
+std::atomic<std::size_t> g_twin_cand_n{0};
+struct Twin {
+    std::uint64_t bytes = 0, gen = 0;
+    DevBuffer buf;
+};
+std::map<std::uint64_t, Twin> g_twin_live;  // by memory, under g.mu
+enum { kTwinGoneWalk, kTwinGoneEdge, kTwinGoneDead, kTwinGoneFill, kTwinGoneTexture, kTwinGoneWhys };
+std::atomic<std::uint64_t> g_twin_cands{0}, g_twin_made{0}, g_twin_made_bytes{0}, g_twin_served{0}, g_twin_addresses{0},
+    g_twin_refused{0}, g_twin_partial{0}, g_twin_edge_in_pass{0}, g_twin_gone[kTwinGoneWhys];
+std::uint64_t g_twin_live_bytes = 0;  // under g.mu
+
+// The copy of `bytes` from (src, so) to (dst, do) at this point in the
+// stream, as the copy tokens' transfers go (the batch's barriers order it).
+bool twin_copy_locked(VkBuffer src, VkDeviceSize so, VkBuffer dst, VkDeviceSize dso, VkDeviceSize bytes) {
+    if (!src || !dst || !bytes) return false;
+    transfer_begin_locked();
+    transfer_order_locked(src, so, dst, dso, bytes);
+    const VkBufferCopy region{so, dso, bytes};
+    DrawCmds* c = DrawCmds::open();
+    if (!c || !c->copy_buffer(src, dst, region)) rec().copy_buffer(src, dst, 1, &region);
+    transfer_end_locked();
+    return true;
+}
+
+// A new twin's bytes from guest memory, in the recording's uploads (the
+// buffer shadow's command buffer, run before the recording's own work: the
+// first GPU use of the resource is the one that asked, so nothing earlier in
+// the recording wrote it), never inside a render pass. With window imports
+// the bytes come through upload staging, unless a GPU write is still to
+// land on them (then from the import, after that write in queue order).
+bool twin_fill_locked(std::uint64_t memory, std::uint64_t bytes, VkBuffer twin) {
+    begin_recording_locked();
+    const VkCommandBuffer cmd = shadow_upload_cmd_locked();
+    if (!cmd) return false;
+    VkBuffer src = VK_NULL_HANDLE;
+    VkDeviceSize so = 0;
+    if (!imports_whole() && !gpu_writes_pending_locked(memory, bytes) && hle_kernel_va_mapped(memory, bytes)) {
+        DevBuffer sb;
+        if (acquire_staging_locked(sb, bytes, so)) {
+            std::memcpy(sb.map, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(memory)), bytes);  // sb.map: the placement's own
+            src = sb.buffer;
+        }
+    }
+    if (!src) {
+        const Located guest = locate_guest(memory, bytes);
+        if (!guest.buffer || guest.avail < bytes) return false;
+        src = guest.buffer;
+        so = guest.offset;
+    }
+    VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    mb.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;  // earlier submissions' writes of the source
+    mb.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
+    const VkBufferCopy region{so, 0, bytes};
+    vkCmdCopyBuffer(cmd, src, twin, 1, &region);
+    mb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;  // ... before every use of the twin in the recording
+    mb.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
+    return true;
+}
+
+// Drops the twin at `memory` (copied back into guest memory first when
+// `copy_back`), and marks its candidate let go (a later use reads guest
+// memory) - or, its resource dead (`why` kTwinGoneDead, generation `gen`),
+// forgets the candidate unless a newer resource's has taken its place.
+void twin_drop_locked(std::uint64_t memory, bool copy_back, int why, std::uint64_t gen = 0) {
+    auto it = g_twin_live.find(memory);
+    if (it != g_twin_live.end()) {
+        Twin& t = it->second;
+        if (copy_back) {
+            const Located guest = locate_guest(memory, t.bytes);
+            if (guest.buffer && guest.avail >= t.bytes) twin_copy_locked(t.buf.buffer, 0, guest.buffer, guest.offset, t.bytes);
+        }
+        g_twin_live_bytes -= t.buf.size;
+        defer_destroy(t.buf);  // after the work recorded with it has run
+        g_twin_live.erase(it);
+    }
+    g_twin_gone[why].fetch_add(1, std::memory_order_relaxed);
+    std::lock_guard<std::mutex> lk(g_twin_cand_mu);
+    if (auto c = g_twin_cand.find(memory); c != g_twin_cand.end()) {
+        if (why == kTwinGoneDead) {
+            if (c->second.gen == gen) {
+                g_twin_cand.erase(c);
+                g_twin_cand_n.store(g_twin_cand.size(), std::memory_order_relaxed);
+            }
+        } else {
+            c->second.let_go = true;
+        }
+    }
+}
+}  // namespace
+
+bool twins_on() { return g_twins; }
+
+bool twin_locate_locked(std::uint64_t va, std::uint64_t bytes, Located& out, VkDeviceAddress* address) {
+    if (!g_twins || !bytes || !g_twin_cand_n.load(std::memory_order_relaxed)) return false;
+    std::uint64_t memory = 0, cbytes = 0, gen = 0;
+    std::uint64_t edge[2] = {0, 0};  // twins a range across their edge must let go first
+    int n_edge = 0;
+    bool inside = false;
+    {
+        std::lock_guard<std::mutex> lk(g_twin_cand_mu);
+        // The candidate holding va, and any starting inside the range after it.
+        auto it = g_twin_cand.upper_bound(va);
+        if (it != g_twin_cand.begin()) {
+            auto prev = std::prev(it);
+            if (va < prev->first + prev->second.bytes && !prev->second.let_go) {
+                if (va + bytes <= prev->first + prev->second.bytes) {
+                    inside = true;
+                    memory = prev->first;
+                    cbytes = prev->second.bytes;
+                    gen = prev->second.gen;
+                } else {
+                    edge[n_edge++] = prev->first;
+                }
+            }
+        }
+        for (; it != g_twin_cand.end() && it->first < va + bytes && n_edge < 2; ++it) {
+            if (!it->second.let_go) edge[n_edge++] = it->first;
+        }
+    }
+    if (n_edge) {
+        // A range across a twin's edge: the twin cannot serve it whole, and
+        // guest memory may not be read past a live twin - copied back and let
+        // go. With a render pass open a copy back would end it mid-draw: one
+        // live twin holding the range's start serves what it holds (the rest
+        // reads past it), and anything else is counted and read from guest
+        // memory as it stands.
+        const bool pass = render_pass_open_locked();
+        if (pass && n_edge == 1 && edge[0] <= va && g_twin_live.count(edge[0])) {
+            std::lock_guard<std::mutex> lk(g_twin_cand_mu);
+            const auto c = g_twin_cand.find(edge[0]);
+            if (c != g_twin_cand.end()) {
+                memory = edge[0];
+                cbytes = c->second.bytes;
+                gen = c->second.gen;
+                inside = true;
+                g_twin_partial.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+        if (!inside) {
+            for (int k = 0; k < n_edge; ++k) {
+                if (g_twin_live.count(edge[k])) {
+                    if (pass) g_twin_edge_in_pass.fetch_add(1, std::memory_order_relaxed);
+                    else twin_drop_locked(edge[k], true, kTwinGoneEdge);
+                } else {
+                    std::lock_guard<std::mutex> lk(g_twin_cand_mu);
+                    if (auto c = g_twin_cand.find(edge[k]); c != g_twin_cand.end()) c->second.let_go = true;
+                }
+            }
+            return false;
+        }
+    }
+    if (!inside) return false;
+    // Still the resource the candidate was made for?
+    GxResourceInfo info;
+    if (!gx_resource_at(memory, static_cast<std::size_t>(cbytes), &info) || info.memory != memory || info.gen != gen) {
+        twin_drop_locked(memory, false, kTwinGoneDead, gen);
+        return false;
+    }
+    auto t = g_twin_live.find(memory);
+    if (t != g_twin_live.end() && t->second.gen != gen) {
+        // An older resource's twin at the same memory (its candidate was replaced).
+        g_twin_live_bytes -= t->second.buf.size;
+        defer_destroy(t->second.buf);
+        g_twin_live.erase(t);
+        t = g_twin_live.end();
+    }
+    if (t == g_twin_live.end()) {
+        // Made and filled from guest memory here, before the binding that asked.
+        Twin nt;
+        nt.bytes = cbytes;
+        nt.gen = gen;
+        if (!create_dev_buffer(nt.buf, (cbytes + 255) & ~std::uint64_t{255}, false) || !twin_fill_locked(memory, cbytes, nt.buf.buffer)) {
+            if (nt.buf.buffer) defer_destroy(nt.buf);
+            g_twin_gone[kTwinGoneFill].fetch_add(1, std::memory_order_relaxed);
+            std::lock_guard<std::mutex> lk(g_twin_cand_mu);
+            if (auto c = g_twin_cand.find(memory); c != g_twin_cand.end()) c->second.let_go = true;
+            return false;
+        }
+        g_twin_made.fetch_add(1, std::memory_order_relaxed);
+        g_twin_made_bytes.fetch_add(nt.buf.size, std::memory_order_relaxed);
+        g_twin_live_bytes += nt.buf.size;
+        t = g_twin_live.emplace(memory, nt).first;
+    }
+    out.buffer = t->second.buf.buffer;
+    out.offset = va - memory;
+    out.avail = cbytes - (va - memory);
+    if (address) {
+        *address = t->second.buf.address + (va - memory);
+        g_twin_addresses.fetch_add(1, std::memory_order_relaxed);
+    } else {
+        g_twin_served.fetch_add(1, std::memory_order_relaxed);
+    }
+    return true;
+}
+
+bool twin_covers_locked(std::uint64_t va, std::uint64_t bytes) {
+    if (!g_twins || g_twin_live.empty() || !bytes) return false;
+    // The live twins over the range, each checked against the registry: one
+    // whose resource died is dropped (its memory may be a CPU ring now, which
+    // must keep its copies), and does not count.
+    for (int pass = 0; pass < 4; ++pass) {
+        std::uint64_t hit = 0;
+        bool any = false;
+        auto it = g_twin_live.upper_bound(va);
+        if (it != g_twin_live.begin() && va < std::prev(it)->first + std::prev(it)->second.bytes) {
+            hit = std::prev(it)->first;
+            any = true;
+        } else if (it != g_twin_live.end() && it->first < va + bytes) {
+            hit = it->first;
+            any = true;
+        }
+        if (!any) return false;
+        const Twin& t = g_twin_live[hit];
+        GxResourceInfo info;
+        if (gx_resource_at(hit, static_cast<std::size_t>(t.bytes), &info) && info.memory == hit && info.gen == t.gen) {
+            g_twin_refused.fetch_add(1, std::memory_order_relaxed);
+            return true;
+        }
+        twin_drop_locked(hit, false, kTwinGoneDead, t.gen);
+    }
+    return false;
+}
+
+void twins_release_locked(std::uint64_t va, std::uint64_t bytes, int why) {
+    if (!g_twins || g_twin_live.empty() || !bytes) return;
+    std::uint64_t hit[8];
+    int n = 0;
+    auto it = g_twin_live.upper_bound(va);
+    if (it != g_twin_live.begin() && va < std::prev(it)->first + std::prev(it)->second.bytes) hit[n++] = std::prev(it)->first;
+    for (; it != g_twin_live.end() && it->first < va + bytes && n < 8; ++it) hit[n++] = it->first;
+    for (int k = 0; k < n; ++k) twin_drop_locked(hit[k], true, why == 1 ? kTwinGoneTexture : kTwinGoneWalk);
+}
+
+std::string twins_report() {
+    if (!g_twins) return {};
+    std::size_t cands = 0;
+    {
+        std::lock_guard<std::mutex> lk(g_twin_cand_mu);
+        cands = g_twin_cand.size();
+    }
+    using ull = unsigned long long;
+    char b[640];
+    std::snprintf(b, sizeof(b),
+                  "gpu: GX buffers the GPU writes as device resources (BBHOST_GX_TWINS=1): %llu candidates seen made, %zu kept; %llu "
+                  "twins made (%llu MiB), %zu live (%llu MiB); served %llu bindings (%llu across an edge, in part) and %llu device addresses; CPU copies refused %llu; "
+                  "let go after copying back: page-table walks %llu, ranges across an edge %llu (%llu more inside a render pass, read from guest memory), a texture over one %llu; dropped with "
+                  "their resource %llu; never made (no guest bytes or no memory) %llu",
+                  static_cast<ull>(g_twin_cands.load()), cands, static_cast<ull>(g_twin_made.load()),
+                  static_cast<ull>(g_twin_made_bytes.load() >> 20), g_twin_live.size(), static_cast<ull>(g_twin_live_bytes >> 20),
+                  static_cast<ull>(g_twin_served.load()), static_cast<ull>(g_twin_partial.load()), static_cast<ull>(g_twin_addresses.load()),
+                  static_cast<ull>(g_twin_refused.load()),
+                  static_cast<ull>(g_twin_gone[kTwinGoneWalk].load()), static_cast<ull>(g_twin_gone[kTwinGoneEdge].load()),
+                  static_cast<ull>(g_twin_edge_in_pass.load()),
+                  static_cast<ull>(g_twin_gone[kTwinGoneTexture].load()), static_cast<ull>(g_twin_gone[kTwinGoneDead].load()),
+                  static_cast<ull>(g_twin_gone[kTwinGoneFill].load()));
+    return b;
+}
+
+void twins_buffer_made(std::uint64_t memory, std::uint64_t bytes, std::uint8_t usage, std::uint8_t bind, std::uint64_t gen) {
+    // Type buffer (the caller's), usage default, unordered-access bind.
+    if (!g_twins || !memory || !bytes || usage != 0 || !(bind & 0x80)) return;
+    g_twin_cands.fetch_add(1, std::memory_order_relaxed);
+    std::lock_guard<std::mutex> lk(g_twin_cand_mu);
+    g_twin_cand[memory] = TwinCandidate{bytes, gen, false};
+    g_twin_cand_n.store(g_twin_cand.size(), std::memory_order_relaxed);
+}
+
 // BBHOST_ARENA_WATCH: the last deferred writes replayed, with where each
 // resolved, so a value that turns up somewhere it should not can be traced
 // back to the write that carried it.
@@ -8208,6 +8545,11 @@ void record_copy_order_barrier(VkCommandBuffer cmd) {
 // they do not.
 VkDeviceAddress guest_device_address(std::uint64_t va, std::size_t bytes) {
     if (!bytes || !hle_kernel_va_mapped(va, bytes) || !rebuild_page_tables()) return 0;
+    if (twins_on()) {
+        Located t;
+        VkDeviceAddress at = 0;
+        if (twin_locate_locked(va, bytes, t, &at)) return at;
+    }
     for (const GuestMapInfo& mi : g.maps) {
         if (va < mi.va || va >= mi.va + mi.len) continue;
         if (g_import_audit) {
@@ -8816,6 +9158,9 @@ bool copy_version_make_locked(std::uint64_t dst, std::uint64_t src, std::uint64_
         return false;
     };
     if (!bytes || bytes > kCopyVersionMax || ((dst | src | bytes) & 3)) return refuse(kCvSize);
+    // A GX buffer kept as a device-local twin: its guest bytes are stale (the
+    // version's are read on the CPU), and the copy goes to the GPU as it stands.
+    if (twin_covers_locked(src, bytes) || twin_covers_locked(dst, bytes)) return refuse(kCvOther);
     if ((dst < src + bytes && src < dst + bytes) || g_copy_versions.size() >= kCopyVersionsPending) return refuse(kCvOther);
     if (!hle_kernel_va_mapped(dst, bytes) || !hle_kernel_va_mapped(src, bytes) || !rebuild_page_tables()) return refuse(kCvOther);
     if (surfaces_may_cover_locked(dst, bytes)) return refuse(kCvSurfaces);
@@ -9036,6 +9381,7 @@ void host_gpu_report() {
                      static_cast<ull>(g_pf_imports.load()), mib(g_pf_bytes), static_cast<ull>(g_pf_raced.load()), static_cast<ull>(g_pf_dropped.load()),
                      static_cast<ull>(g_dispatch_read_imports.load()), static_cast<ull>(g_dispatch_untraced.load()));
         }
+        if (const std::string tw = twins_report(); !tw.empty()) host_log("%s", tw.c_str());
     }
     {
         // Before the census lock: compute_lift_report takes g.mu, and a

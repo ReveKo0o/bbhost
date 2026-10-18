@@ -812,6 +812,24 @@ void audit_range(std::uint64_t va, std::uint64_t bytes, ImportUse use);
 // The device address of guest bytes when they lie in one imported mapping,
 // else 0 (gpu.cpp).
 VkDeviceAddress guest_device_address(std::uint64_t va, std::size_t bytes);
+// locate() without the GX buffers' device-local twins: guest memory's import.
+Located locate_guest(std::uint64_t va, std::uint64_t bytes);
+// GX buffers the GPU writes, as device resources (BBHOST_GX_TWINS=1; gpu.cpp,
+// gx twins). twin_locate_locked: [va, va + bytes) inside one - `out` the twin
+// (made and filled from guest memory at its first use), `address` its device
+// address when asked; false: guest memory serves it. twin_covers_locked: the
+// range overlaps a live twin, whose guest bytes are stale - no CPU copy of
+// them. twins_release_locked: a reader of guest memory (`why` 0 a page-table
+// walk, 1 a texture) reaches them - copied back and let go.
+bool twins_on();
+bool twin_locate_locked(std::uint64_t va, std::uint64_t bytes, Located& out, VkDeviceAddress* address = nullptr);
+bool twin_covers_locked(std::uint64_t va, std::uint64_t bytes);
+void twins_release_locked(std::uint64_t va, std::uint64_t bytes, int why);
+void twins_buffer_made(std::uint64_t memory, std::uint64_t bytes, std::uint8_t usage, std::uint8_t bind, std::uint64_t gen);
+std::string twins_report();
+// The buffer shadow's command buffer for this recording's uploads, run before
+// the recording's own work (buffer_shadow.cpp upload_cmd_locked).
+VkCommandBuffer shadow_upload_cmd_locked();
 // A PS4 tiled texture level untiled on the GPU into linear elements
 // (gpu_untile.cpp, shaders/untile.comp), recorded into the current command
 // buffer outside a render pass. `mode` 0 linear, 1 1D tiled thin, 2 2D tiled

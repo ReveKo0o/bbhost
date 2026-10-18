@@ -426,6 +426,8 @@ void register_holder(std::uint64_t key, std::uint64_t holder, Kind kind, bool in
         std::uint8_t bind = 0;
         rd(holder + 0x3b, &bind);
         host_gpu_import_prefetch(e.info.memory, e.info.bytes, e.info.usage, bind);
+        // BBHOST_GX_TWINS=1: one the GPU writes gets a device-local twin at its first use.
+        host_gpu_gx_buffer_made(e.info.memory, e.info.bytes, e.info.usage, bind, e.info.gen);
     }
     if (key & kMemoryKey) key = kMemoryKey | e.info.memory;
     register_entry(key, e);
