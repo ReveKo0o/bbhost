@@ -7385,7 +7385,12 @@ bool host_gpu_dispatch(const GpuDispatch& d_in) {
     std::memcpy(params.user_sgpr, d.user_data, sizeof(params.user_sgpr));
     if (gds_bound) {
         params.gds_base = d.gds_base;
-        for (std::uint32_t k = 0; k < GpuDispatch::kGdsCounters; ++k) params.gds_counter[k] = d.gds[k].word;
+        // The words by their device addresses: the shader takes them as such,
+        // not through the page table - their place in the import, or in a GX
+        // buffer's device-local copy (gx_twins.cpp). 0 (not reachable): the
+        // counter does nothing, where the page table gave the sink page.
+        for (std::uint32_t k = 0; k < GpuDispatch::kGdsCounters; ++k)
+            params.gds_counter[k] = d.gds[k].word ? guest_device_address(d.gds[k].word, 4) : 0;
     }
     // BBHOST_CS_BUFFERS: the variant with its buffers pushed, when every one
     // of them binds; otherwise the pipeline that walks the page table. Not
@@ -7497,6 +7502,9 @@ bool host_gpu_dispatch(const GpuDispatch& d_in) {
         cd.spirv = &pl.meta.spirv;
         cd.gcn_words = &words;
         cd.params = params;
+        // The counters as the guest names them: a replay puts them on its own
+        // pages (tools/drawreplay.cpp), where these device addresses mean nothing.
+        for (std::uint32_t k = 0; k < GpuDispatch::kGdsCounters; ++k) cd.params.gds_counter[k] = gds_bound ? d.gds[k].word : 0;
         cd.images = &stage_images;
         std::memcpy(cd.dim, d.dim, sizeof(cd.dim));
         std::memcpy(cd.threads, d.threads, sizeof(cd.threads));
@@ -7514,6 +7522,7 @@ bool host_gpu_dispatch(const GpuDispatch& d_in) {
         cd.translate.set("exec_known", g.exec_known);
         cd.translate.set("max_lds_bytes", g.max_lds_bytes);
         cd.translate.set("lifted", pl.lifted);  // the captured module is the program's lift (gcn::lift_compute_shader)
+        cd.translate.set("gds_by_address", true);  // its GDS counters by device address (params hold the guest words: drawreplay maps them)
         {
             // The image dimensions the pipeline was made with (with the texel
             // kind in bits 8-9), for a tool to rebuild its options (gcnlift).
