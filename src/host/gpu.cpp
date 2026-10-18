@@ -6747,6 +6747,8 @@ void host_gpu_gx_buffer_made(std::uint64_t memory, std::uint64_t bytes, std::uin
     twins_buffer_made(memory, bytes, usage, bind, gen);
 }
 
+void host_gpu_gx_buffer_mapped_own(std::uint64_t memory, std::uint64_t, std::uint64_t gen) { twins_buffer_mapped_own(memory, gen); }
+
 void host_gpu_import_prefetch(std::uint64_t va, std::uint64_t bytes, std::uint8_t usage, std::uint8_t bind) {
     if (g_import_whole || !g_prefetch_on || !bytes || usage == 3 /* STAGING */) return;
     // What the GPU reads in place: an unordered-access buffer (bind 0x80: what
@@ -8179,10 +8181,20 @@ namespace gpu {
 // across its edge, a page-table walk over it. A twin whose resource died
 // (the registry no longer has that generation there) is dropped. Off by
 // default while it is measured; the exit report counts all of it.
+//
+// BBHOST_GX_TWINS=2 adds the buffers GX's GPU copies write: a dynamic buffer's
+// renamed bytes written back to its own address when a context's map
+// resolves, a static (constant) buffer's UpdateSubresource - their own
+// memory is written by those copies alone (the CPU writes the renamed copy;
+// `memory moved by a map` 0), and read in place by the draws after them (a
+// world: ~3,800 constant buffers, ~2.8 MiB, and ~90 dynamic ones). Each
+// becomes a candidate at its first copy (twin_note_copy_target_locked), and
+// copy versions put their bytes into the twin. A buffer a Map hands its own
+// memory to (the CPU writes it in place) is never one.
 namespace {
-const bool g_twins = [] {
+const int g_twins = [] {
     const char* e = std::getenv("BBHOST_GX_TWINS");
-    return e && e[0] == '1';
+    return e && (e[0] == '1' || e[0] == '2') ? e[0] - '0' : 0;
 }();
 struct TwinCandidate {
     std::uint64_t bytes = 0, gen = 0;
@@ -8190,16 +8202,99 @@ struct TwinCandidate {
 };
 std::mutex g_twin_cand_mu;  // GX's threads add candidates; the renderer reads them (lock order: g.mu, then this)
 std::map<std::uint64_t, TwinCandidate> g_twin_cand;  // by memory, under g_twin_cand_mu
+std::unordered_set<std::uint64_t> g_twin_cpu_mapped;  // generations a Map handed their own memory, under g_twin_cand_mu
 std::atomic<std::size_t> g_twin_cand_n{0};
+// A twin's place: a slice of a pool block (block >= 0), or a buffer of its own.
 struct Twin {
     std::uint64_t bytes = 0, gen = 0;
-    DevBuffer buf;
+    VkBuffer buffer = VK_NULL_HANDLE;
+    VkDeviceSize offset = 0, size = 0;
+    VkDeviceAddress address = 0;
+    int block = -1;
+    DevBuffer own;
 };
 std::map<std::uint64_t, Twin> g_twin_live;  // by memory, under g.mu
-enum { kTwinGoneWalk, kTwinGoneEdge, kTwinGoneDead, kTwinGoneFill, kTwinGoneTexture, kTwinGoneWhys };
+enum { kTwinGoneWalk, kTwinGoneEdge, kTwinGoneDead, kTwinGoneFill, kTwinGoneTexture, kTwinGoneCpuMapped, kTwinGoneWhys };
 std::atomic<std::uint64_t> g_twin_cands{0}, g_twin_made{0}, g_twin_made_bytes{0}, g_twin_served{0}, g_twin_addresses{0},
-    g_twin_refused{0}, g_twin_partial{0}, g_twin_edge_in_pass{0}, g_twin_gone[kTwinGoneWhys];
+    g_twin_refused{0}, g_twin_partial{0}, g_twin_edge_in_pass{0}, g_twin_gone[kTwinGoneWhys], g_twin_copy_cands{0},
+    g_twin_cpu_mapped_n{0};
 std::uint64_t g_twin_live_bytes = 0;  // under g.mu
+
+// Twins are placed in pool blocks - device-local buffers of kTwinBlockBytes,
+// first fit at 256-byte steps - so a world's thousands of small constant
+// buffers take no allocation each; one bigger than kTwinOwnBytes gets a
+// buffer of its own. A dropped twin's slice is free again once the work
+// recorded with it has run (the recording it was dropped in has completed).
+constexpr VkDeviceSize kTwinBlockBytes = 4u << 20, kTwinOwnBytes = 1u << 20, kTwinAlign = 256;
+struct TwinBlock {
+    DevBuffer buf;
+    std::map<VkDeviceSize, VkDeviceSize> free;  // offset -> size: disjoint, merged with their neighbours
+};
+std::vector<TwinBlock> g_twin_blocks;  // under g.mu
+struct DeadTwinSlice {
+    std::uint64_t serial;
+    int block;
+    VkDeviceSize offset, size;
+};
+std::deque<DeadTwinSlice> g_twin_dead;  // under g.mu, oldest first
+
+void twin_slice_free_locked(int block, VkDeviceSize offset, VkDeviceSize size) {
+    auto& fr = g_twin_blocks[static_cast<std::size_t>(block)].free;
+    auto it = fr.emplace(offset, size).first;
+    if (const auto nx = std::next(it); nx != fr.end() && it->first + it->second == nx->first) {
+        it->second += nx->second;
+        fr.erase(nx);
+    }
+    if (it != fr.begin()) {
+        if (const auto pv = std::prev(it); pv->first + pv->second == it->first) {
+            pv->second += it->second;
+            fr.erase(it);
+        }
+    }
+}
+
+bool twin_place_locked(VkDeviceSize bytes, Twin& t) {
+    const VkDeviceSize need = (bytes + kTwinAlign - 1) & ~(kTwinAlign - 1);
+    if (need > kTwinOwnBytes) {
+        if (!create_dev_buffer(t.own, need, false)) return false;
+        t.buffer = t.own.buffer, t.offset = 0, t.size = t.own.size, t.address = t.own.address, t.block = -1;
+        return true;
+    }
+    while (!g_twin_dead.empty() && g_twin_dead.front().serial < g.completed_submits) {
+        const DeadTwinSlice& d = g_twin_dead.front();
+        twin_slice_free_locked(d.block, d.offset, d.size);
+        g_twin_dead.pop_front();
+    }
+    for (int round = 0; round < 2; ++round) {
+        for (std::size_t b = 0; b < g_twin_blocks.size(); ++b) {
+            auto& fr = g_twin_blocks[b].free;
+            for (auto it = fr.begin(); it != fr.end(); ++it) {
+                if (it->second < need) continue;
+                const VkDeviceSize off = it->first, rest = it->second - need;
+                fr.erase(it);
+                if (rest) fr.emplace(off + need, rest);
+                const DevBuffer& bb = g_twin_blocks[b].buf;
+                t.buffer = bb.buffer, t.offset = off, t.size = need, t.address = bb.address + off, t.block = static_cast<int>(b);
+                return true;
+            }
+        }
+        if (round) break;
+        TwinBlock nb;
+        if (!create_dev_buffer(nb.buf, kTwinBlockBytes, false)) return false;
+        nb.free.emplace(0, nb.buf.size);
+        g_twin_blocks.push_back(std::move(nb));
+    }
+    return false;
+}
+
+void twin_unplace_locked(Twin& t) {
+    if (t.block < 0) {
+        defer_destroy(t.own);  // after the work recorded with it has run
+    } else {
+        g_twin_dead.push_back({g.flushes, t.block, t.offset, t.size});
+    }
+    t.buffer = VK_NULL_HANDLE;
+}
 
 // The copy of `bytes` from (src, so) to (dst, do) at this point in the
 // stream, as the copy tokens' transfers go (the batch's barriers order it).
@@ -8220,7 +8315,7 @@ bool twin_copy_locked(VkBuffer src, VkDeviceSize so, VkBuffer dst, VkDeviceSize 
 // the recording wrote it), never inside a render pass. With window imports
 // the bytes come through upload staging, unless a GPU write is still to
 // land on them (then from the import, after that write in queue order).
-bool twin_fill_locked(std::uint64_t memory, std::uint64_t bytes, VkBuffer twin) {
+bool twin_fill_locked(std::uint64_t memory, std::uint64_t bytes, VkBuffer twin, VkDeviceSize to) {
     begin_recording_locked();
     const VkCommandBuffer cmd = shadow_upload_cmd_locked();
     if (!cmd) return false;
@@ -8243,7 +8338,7 @@ bool twin_fill_locked(std::uint64_t memory, std::uint64_t bytes, VkBuffer twin) 
     mb.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;  // earlier submissions' writes of the source
     mb.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
     vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
-    const VkBufferCopy region{so, 0, bytes};
+    const VkBufferCopy region{so, to, bytes};
     vkCmdCopyBuffer(cmd, src, twin, 1, &region);
     mb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;  // ... before every use of the twin in the recording
     mb.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
@@ -8259,14 +8354,16 @@ void twin_drop_locked(std::uint64_t memory, bool copy_back, int why, std::uint64
     auto it = g_twin_live.find(memory);
     if (it != g_twin_live.end()) {
         Twin& t = it->second;
+        // Copy versions still to be put into it go first (their copies name its slice).
+        if (copy_versions_into_locked(t.buffer, t.offset, t.offset + t.size)) copy_versions_put_in_place_locked(kCvPutTwin);
         if (copy_back) {
             const Located guest = locate_guest(memory, t.bytes);
-            if (guest.buffer && guest.avail >= t.bytes && twin_copy_locked(t.buf.buffer, 0, guest.buffer, guest.offset, t.bytes)) {
+            if (guest.buffer && guest.avail >= t.bytes && twin_copy_locked(t.buffer, t.offset, guest.buffer, guest.offset, t.bytes)) {
                 shadow_written_locked(memory, t.bytes, true);  // lands on the GPU's timeline
             }
         }
-        g_twin_live_bytes -= t.buf.size;
-        defer_destroy(t.buf);  // after the work recorded with it has run
+        g_twin_live_bytes -= t.size;
+        twin_unplace_locked(t);
         g_twin_live.erase(it);
     }
     g_twin_gone[why].fetch_add(1, std::memory_order_relaxed);
@@ -8282,12 +8379,31 @@ void twin_drop_locked(std::uint64_t memory, bool copy_back, int why, std::uint64
         }
     }
 }
+// Live twins of buffers a Map has since handed their own memory (the CPU
+// writes them in place): dropped without a copy back, which would overwrite
+// the CPU's bytes. Checked when the count of such Maps has moved.
+std::uint64_t g_twin_cpu_mapped_seen = 0;  // under g.mu
+void twins_drop_cpu_mapped_locked() {
+    const std::uint64_t n = g_twin_cpu_mapped_n.load(std::memory_order_relaxed);
+    if (n == g_twin_cpu_mapped_seen || g_twin_live.empty()) return;
+    g_twin_cpu_mapped_seen = n;
+    std::vector<std::uint64_t> gone;
+    {
+        std::lock_guard<std::mutex> lk(g_twin_cand_mu);
+        for (const auto& [memory, t] : g_twin_live) {
+            const auto c = g_twin_cand.find(memory);
+            if (c != g_twin_cand.end() && c->second.gen == t.gen && c->second.let_go && g_twin_cpu_mapped.count(t.gen)) gone.push_back(memory);
+        }
+    }
+    for (const std::uint64_t memory : gone) twin_drop_locked(memory, false, kTwinGoneCpuMapped);
+}
 }  // namespace
 
-bool twins_on() { return g_twins; }
+bool twins_on() { return g_twins != 0; }
 
 bool twin_locate_locked(std::uint64_t va, std::uint64_t bytes, Located& out, VkDeviceAddress* address) {
     if (!g_twins || !bytes || !g_twin_cand_n.load(std::memory_order_relaxed)) return false;
+    twins_drop_cpu_mapped_locked();
     std::uint64_t memory = 0, cbytes = 0, gen = 0;
     std::uint64_t edge[2] = {0, 0};  // twins a range across their edge must let go first
     int n_edge = 0;
@@ -8362,9 +8478,7 @@ bool twin_locate_locked(std::uint64_t va, std::uint64_t bytes, Located& out, VkD
     auto t = g_twin_live.find(memory);
     if (t != g_twin_live.end() && t->second.gen != gen) {
         // An older resource's twin at the same memory (its candidate was replaced).
-        g_twin_live_bytes -= t->second.buf.size;
-        defer_destroy(t->second.buf);
-        g_twin_live.erase(t);
+        twin_drop_locked(memory, false, kTwinGoneDead, t->second.gen);
         t = g_twin_live.end();
     }
     if (t == g_twin_live.end()) {
@@ -8372,23 +8486,24 @@ bool twin_locate_locked(std::uint64_t va, std::uint64_t bytes, Located& out, VkD
         Twin nt;
         nt.bytes = cbytes;
         nt.gen = gen;
-        if (!create_dev_buffer(nt.buf, (cbytes + 255) & ~std::uint64_t{255}, false) || !twin_fill_locked(memory, cbytes, nt.buf.buffer)) {
-            if (nt.buf.buffer) defer_destroy(nt.buf);
+        const bool placed = twin_place_locked(cbytes, nt);
+        if (!placed || !twin_fill_locked(memory, cbytes, nt.buffer, nt.offset)) {
+            if (placed) twin_unplace_locked(nt);
             g_twin_gone[kTwinGoneFill].fetch_add(1, std::memory_order_relaxed);
             std::lock_guard<std::mutex> lk(g_twin_cand_mu);
             if (auto c = g_twin_cand.find(memory); c != g_twin_cand.end()) c->second.let_go = true;
             return false;
         }
         g_twin_made.fetch_add(1, std::memory_order_relaxed);
-        g_twin_made_bytes.fetch_add(nt.buf.size, std::memory_order_relaxed);
-        g_twin_live_bytes += nt.buf.size;
+        g_twin_made_bytes.fetch_add(nt.size, std::memory_order_relaxed);
+        g_twin_live_bytes += nt.size;
         t = g_twin_live.emplace(memory, nt).first;
     }
-    out.buffer = t->second.buf.buffer;
-    out.offset = va - memory;
+    out.buffer = t->second.buffer;
+    out.offset = t->second.offset + (va - memory);
     out.avail = cbytes - (va - memory);
     if (address) {
-        *address = t->second.buf.address + (va - memory);
+        *address = t->second.address + (va - memory);
         g_twin_addresses.fetch_add(1, std::memory_order_relaxed);
     } else {
         g_twin_served.fetch_add(1, std::memory_order_relaxed);
@@ -8398,6 +8513,7 @@ bool twin_locate_locked(std::uint64_t va, std::uint64_t bytes, Located& out, VkD
 
 bool twin_covers_locked(std::uint64_t va, std::uint64_t bytes) {
     if (!g_twins || g_twin_live.empty() || !bytes) return false;
+    twins_drop_cpu_mapped_locked();
     // The live twins over the range, each checked against the registry: one
     // whose resource died is dropped (its memory may be a CPU ring now, which
     // must keep its copies), and does not count.
@@ -8446,6 +8562,38 @@ bool twin_candidate_straddles(std::uint64_t va, std::uint64_t bytes) {
     return false;
 }
 
+void twin_note_copy_target_locked(std::uint64_t dst, std::uint64_t bytes) {
+    if (g_twins < 2 || !bytes) return;
+    GxResourceInfo info;
+    if (!gx_resource_at(dst, static_cast<std::size_t>(bytes), &info) || info.type != 1 || (info.usage != 0 && info.usage != 2)) return;
+    if (dst < info.memory || dst + bytes > info.memory + info.bytes) return;
+    // A new twin is filled before the recording's own work (twin_fill_locked):
+    // not while this recording has a GPU write on its pages still to come
+    // before this copy (a later copy makes it one).
+    // Nor while copy versions still to be put in place write it: their
+    // copies go to guest memory, after the twin's fill.
+    if (gpu_wrote_since_locked(info.memory, info.bytes, g.flushes) || copy_versions_overlap_locked(info.memory, info.memory + info.bytes)) return;
+    std::lock_guard<std::mutex> lk(g_twin_cand_mu);
+    if (const auto it = g_twin_cand.find(info.memory); it != g_twin_cand.end() && it->second.gen == info.gen) return;  // one already (or let go)
+    if (g_twin_cpu_mapped.count(info.gen)) return;
+    g_twin_cand[info.memory] = TwinCandidate{info.bytes, info.gen, false};
+    g_twin_cand_n.store(g_twin_cand.size(), std::memory_order_relaxed);
+    g_twin_copy_cands.fetch_add(1, std::memory_order_relaxed);
+}
+
+void twins_buffer_mapped_own(std::uint64_t memory, std::uint64_t gen) {
+    if (!g_twins) return;
+    std::lock_guard<std::mutex> lk(g_twin_cand_mu);
+    g_twin_cpu_mapped.insert(gen);
+    if (auto it = g_twin_cand.find(memory); it != g_twin_cand.end() && it->second.gen == gen && !it->second.let_go) {
+        // The CPU writes it in place from now on: guest memory serves it (a
+        // live twin is dropped at its next use, without copying back over
+        // the CPU's bytes - counted, as what it held since is lost).
+        it->second.let_go = true;
+        g_twin_cpu_mapped_n.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
 bool twin_candidate_holds(std::uint64_t va, std::uint64_t bytes) {
     if (!g_twins || !bytes || !g_twin_cand_n.load(std::memory_order_relaxed)) return false;
     std::lock_guard<std::mutex> lk(g_twin_cand_mu);
@@ -8467,32 +8615,34 @@ void twins_release_locked(std::uint64_t va, std::uint64_t bytes, int why) {
 
 std::string twins_report() {
     if (!g_twins) return {};
-    std::size_t cands = 0, live = 0;
+    std::size_t cands = 0, live = 0, blocks = 0, cpu_mapped = 0;
     std::uint64_t live_bytes = 0;
     {
         std::lock_guard<std::mutex> lk(g_twin_cand_mu);
         cands = g_twin_cand.size();
+        cpu_mapped = g_twin_cpu_mapped.size();
     }
     {
         std::lock_guard<GpuMutex> lock(g.mu);  // the command processor may still be making twins
         live = g_twin_live.size();
         live_bytes = g_twin_live_bytes;
+        blocks = g_twin_blocks.size();
     }
     using ull = unsigned long long;
-    char b[640];
+    char b[900];
     std::snprintf(b, sizeof(b),
-                  "gpu: GX buffers the GPU writes as device resources (BBHOST_GX_TWINS=1): %llu candidates seen made, %zu kept; %llu "
-                  "twins made (%llu MiB), %zu live (%llu MiB); served %llu bindings (%llu across an edge, in part) and %llu device addresses; CPU copies refused %llu; "
+                  "gpu: GX buffers the GPU writes as device resources (BBHOST_GX_TWINS=%d): %llu candidates seen made, %llu more at a GPU copy, %zu kept; %llu "
+                  "twins made (%llu KiB), %zu live (%llu KiB) in %zu pool blocks; served %llu bindings (%llu across an edge, in part) and %llu device addresses; CPU copies refused %llu; "
                   "let go after copying back: page-table walks %llu, ranges across an edge %llu (%llu more inside a render pass, read from guest memory), a texture over one %llu; dropped with "
-                  "their resource %llu; never made (no guest bytes or no memory) %llu",
-                  static_cast<ull>(g_twin_cands.load()), cands, static_cast<ull>(g_twin_made.load()),
-                  static_cast<ull>(g_twin_made_bytes.load() >> 20), live, static_cast<ull>(live_bytes >> 20),
+                  "their resource %llu; never made (no guest bytes or no memory) %llu; mapped in place by the CPU %llu (%llu of them candidates)",
+                  g_twins, static_cast<ull>(g_twin_cands.load()), static_cast<ull>(g_twin_copy_cands.load()), cands, static_cast<ull>(g_twin_made.load()),
+                  static_cast<ull>(g_twin_made_bytes.load() >> 10), live, static_cast<ull>(live_bytes >> 10), blocks,
                   static_cast<ull>(g_twin_served.load()), static_cast<ull>(g_twin_partial.load()), static_cast<ull>(g_twin_addresses.load()),
                   static_cast<ull>(g_twin_refused.load()),
                   static_cast<ull>(g_twin_gone[kTwinGoneWalk].load()), static_cast<ull>(g_twin_gone[kTwinGoneEdge].load()),
                   static_cast<ull>(g_twin_edge_in_pass.load()),
                   static_cast<ull>(g_twin_gone[kTwinGoneTexture].load()), static_cast<ull>(g_twin_gone[kTwinGoneDead].load()),
-                  static_cast<ull>(g_twin_gone[kTwinGoneFill].load()));
+                  static_cast<ull>(g_twin_gone[kTwinGoneFill].load()), static_cast<ull>(cpu_mapped), static_cast<ull>(g_twin_cpu_mapped_n.load()));
     return b;
 }
 
@@ -9173,7 +9323,16 @@ bool host_gpu_copy_guest(std::uint64_t dst, std::uint64_t src, std::size_t bytes
             }
         }
     }
-    const int on_surfaces = mark_surfaces_dirty_locked(dst, bytes, !as_image, "copy token");
+    // A GX buffer GPU copies write (BBHOST_GX_TWINS=2): its twin takes the
+    // copy, and guest memory - which the buffer shadow would note as written -
+    // stays as it was.
+    if (!as_image) twin_note_copy_target_locked(dst, bytes);
+    // A destination across a twin's edge: the twin is copied back and let go
+    // at the locate below, which a render pass would stop (and the copy would
+    // write guest memory past a live twin) - the pass ends here, as the copy's
+    // transfer would end it anyway.
+    if (!as_image && twin_candidate_straddles(dst, bytes)) render_end_pass_locked();
+    const int on_surfaces = !as_image && twin_candidate_holds(dst, bytes) ? 0 : mark_surfaces_dirty_locked(dst, bytes, !as_image, "copy token");
     if (as_image) {
         tex_event(dst, bytes, "copy token 0x%llx -> 0x%llx 0x%zx bytes: render target copied as an image",
                   static_cast<unsigned long long>(src), static_cast<unsigned long long>(dst), bytes);
@@ -9326,6 +9485,21 @@ void copy_versions_put_in_place_locked(int why) {
     copy_versions_flush_locked();
 }
 
+bool copy_versions_overlap_locked(std::uint64_t lo, std::uint64_t hi) {
+    if (g_copy_versions.empty() || hi <= g_cv_lo || lo >= g_cv_hi) return false;
+    for (const CopyVersion& v : g_copy_versions) {
+        if (v.dst < hi && v.dst + v.bytes > lo) return true;
+    }
+    return false;
+}
+
+bool copy_versions_into_locked(VkBuffer buffer, VkDeviceSize lo, VkDeviceSize hi) {
+    for (const CopyVersion& v : g_copy_versions) {
+        if (v.canon.buffer == buffer && v.canon.offset < hi && v.canon.offset + v.bytes > lo) return true;
+    }
+    return false;
+}
+
 bool copy_versions_name_buffer_locked(VkBuffer buffer) {
     for (const CopyVersion& v : g_copy_versions) {
         if (v.canon.buffer == buffer) return true;
@@ -9366,14 +9540,16 @@ bool copy_version_make_locked(std::uint64_t dst, std::uint64_t src, std::uint64_
         return false;
     };
     if (!bytes || bytes > kCopyVersionMax || ((dst | src | bytes) & 3)) return refuse(kCvSize);
-    // A GX buffer kept as a device-local twin: its guest bytes are stale (the
-    // version's are read on the CPU), and the copy goes to the GPU as it stands.
-    if (twin_covers_locked(src, bytes) || twin_covers_locked(dst, bytes)) return refuse(kCvOther);
+    // A source kept as a device-local twin: its guest bytes are stale (the
+    // version's are read on the CPU), and the copy goes to the GPU as it
+    // stands. A destination in one takes the version's bytes into the twin.
+    if (twin_covers_locked(src, bytes) || twin_candidate_straddles(dst, bytes)) return refuse(kCvOther);
     if ((dst < src + bytes && src < dst + bytes) || g_copy_versions.size() >= kCopyVersionsPending) return refuse(kCvOther);
     if (!hle_kernel_va_mapped(dst, bytes) || !hle_kernel_va_mapped(src, bytes) || !rebuild_page_tables()) return refuse(kCvOther);
     if (surfaces_may_cover_locked(dst, bytes)) return refuse(kCvSurfaces);
     const ImportSite site("a copy version's destination");
     if (find_render_target(src) || find_render_target(dst)) return refuse(kCvTarget);
+    twin_note_copy_target_locked(dst, bytes);
     const Located canon = locate(dst, bytes);
     if (!canon.buffer || canon.avail < bytes) return refuse(kCvImport);
     note_copied_locked(dst);
@@ -9420,7 +9596,9 @@ void copy_versions_flush_locked() {
     std::size_t copies = 0;
     for (auto it = pending.rbegin(); it != pending.rend(); ++it) {
         const CopyVersion& v = *it;
-        mark_surfaces_dirty_locked(v.dst, v.bytes, true, "copy version");  // the buffer shadow sees the GPU write
+        // The buffer shadow sees the GPU write - unless it lands in a twin,
+        // which leaves guest memory as it was.
+        if (!twin_holds_live_locked(v.dst, v.bytes)) mark_surfaces_dirty_locked(v.dst, v.bytes, true, "copy version");
         const std::uint64_t end = v.dst + v.bytes;
         auto copy_piece = [&](std::uint64_t lo, std::uint64_t hi) {
             const VkBufferCopy region{v.offset + (lo - v.dst), v.canon.offset + (lo - v.dst), hi - lo};
@@ -9464,8 +9642,8 @@ std::string copy_versions_report() {
                   "copy versions: %llu made (%llu read an earlier one), %llu bindings took one, %llu bindings across one's edge, "
                   "%llu copies refused (size %llu, surfaces %llu, targets %llu, not imported %llu, source %llu, other %llu); "
                   "%llu copies into place in %llu batches (%llu versions all overwritten by newer ones), of them early for a binding "
-                  "across an edge %llu, a page-table read %llu, a page-table pipeline %llu, a retired import %llu; %llu transfers waited "
-                  "for an earlier one in their batch",
+                  "across an edge %llu, a page-table read %llu, a page-table pipeline %llu, a retired import %llu, a twin let go %llu; "
+                  "%llu transfers waited for an earlier one in their batch",
                   static_cast<ull>(g_cv_made.load()), static_cast<ull>(g_cv_from_version.load()), static_cast<ull>(g_cv_bound.load()),
                   static_cast<ull>(g_cv_straddled.load()), static_cast<ull>(g_cv_refused.load()), static_cast<ull>(g_cv_refused_why[kCvSize].load()),
                   static_cast<ull>(g_cv_refused_why[kCvSurfaces].load()), static_cast<ull>(g_cv_refused_why[kCvTarget].load()),
@@ -9473,7 +9651,8 @@ std::string copy_versions_report() {
                   static_cast<ull>(g_cv_refused_why[kCvOther].load()), static_cast<ull>(g_cv_copies.load()),
                   static_cast<ull>(g_cv_batches.load()), static_cast<ull>(g_cv_overwritten.load()), static_cast<ull>(g_cv_put[kCvStraddle].load()),
                   static_cast<ull>(g_cv_put[kCvPageTable].load()), static_cast<ull>(g_cv_put[kCvWalks].load()),
-                  static_cast<ull>(g_cv_put[kCvRetired].load()), static_cast<ull>(g_batch_orders.load()));
+                  static_cast<ull>(g_cv_put[kCvRetired].load()), static_cast<ull>(g_cv_put[kCvPutTwin].load()),
+                  static_cast<ull>(g_batch_orders.load()));
     return b;
 }
 

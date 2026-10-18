@@ -637,6 +637,7 @@ void note_map(std::uint64_t holder, std::uint64_t type, std::uint64_t mapped_out
     std::uint64_t moved_from = 0;
     bool constant = false;
     LastCopy freed;
+    std::uint64_t own_memory = 0, own_bytes = 0, own_gen = 0;  // a Map handing out the buffer's own memory
     {
         std::lock_guard<std::mutex> lk(g_mu);
         auto it = g_by_holder.find(holder);
@@ -688,6 +689,9 @@ void note_map(std::uint64_t holder, std::uint64_t type, std::uint64_t mapped_out
                 std::uint8_t other_bind = 0;
                 if (mapped >= e.info.memory && mapped < e.info.memory + e.info.bytes) {
                     where = 0;
+                    own_memory = e.info.memory;
+                    own_bytes = e.info.bytes;
+                    own_gen = e.info.gen;
                 } else if (auto c = g_by_memory.upper_bound(mapped); c != g_by_memory.begin()) {
                     --c;
                     if (auto h = g_by_holder.find(c->second); h != g_by_holder.end() && h->second.info.alive &&
@@ -727,6 +731,8 @@ void note_map(std::uint64_t holder, std::uint64_t type, std::uint64_t mapped_out
     }
     // A discard moved the buffer: the memory it leaves is no buffer's now.
     if (moved_from && moved_bytes) host_gpu_shadow_gx_write(moved_from, moved_bytes);
+    // The CPU writes the buffer in place: gx twins keep no device-local copy of it.
+    if (own_memory) host_gpu_gx_buffer_mapped_own(own_memory, own_bytes, own_gen);
     // A texture mapped (none is, in any run so far): the CPU writes it next,
     // and its image is no longer what its memory holds - the texture cache,
     // which does not watch a GX resource's memory, is told (host textures).

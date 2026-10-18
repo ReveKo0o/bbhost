@@ -399,6 +399,9 @@ void host_gpu_import_prefetch(std::uint64_t va, std::uint64_t bytes, std::uint8_
 // GPU writes (usage default, unordered-access bind) gets a device-local twin
 // at its first GPU use (gpu.cpp, gx twins). Any thread, any lock.
 void host_gpu_gx_buffer_made(std::uint64_t memory, std::uint64_t bytes, std::uint8_t usage, std::uint8_t bind, std::uint64_t gen);
+// A Map of that buffer handed out its own memory: the CPU writes it in place
+// (gx twins keep no device-local copy of it).
+void host_gpu_gx_buffer_mapped_own(std::uint64_t memory, std::uint64_t bytes, std::uint64_t gen);
 // A GX buffer copy reached as a copy token, handled as the compute copy
 // path handles a recognised copy shader: marks the destination's surfaces
 // dirty; when the source is a render target, copies its image into the

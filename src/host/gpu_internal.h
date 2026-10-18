@@ -838,8 +838,12 @@ bool twin_covers_locked(std::uint64_t va, std::uint64_t bytes);
 bool twin_candidate_holds(std::uint64_t va, std::uint64_t bytes);  // a twin holds it, or will at its first binding
 bool twin_holds_live_locked(std::uint64_t va, std::uint64_t bytes);  // inside a live twin: its stores leave guest memory as it was
 bool twin_candidate_straddles(std::uint64_t va, std::uint64_t bytes);  // runs across a candidate's edge
+// A GPU copy (a copy token, a copy version) about to write [dst, dst + bytes):
+// with BBHOST_GX_TWINS=2 the GX buffer it lies in becomes a candidate.
+void twin_note_copy_target_locked(std::uint64_t dst, std::uint64_t bytes);
 void twins_release_locked(std::uint64_t va, std::uint64_t bytes, int why);
 void twins_buffer_made(std::uint64_t memory, std::uint64_t bytes, std::uint8_t usage, std::uint8_t bind, std::uint64_t gen);
+void twins_buffer_mapped_own(std::uint64_t memory, std::uint64_t gen);
 std::string twins_report();
 // The buffer shadow's command buffer for this recording's uploads, run before
 // the recording's own work (buffer_shadow.cpp upload_cmd_locked).
@@ -1451,11 +1455,15 @@ void copy_versions_pass_end_locked();
 // The copies into place now, the pass ended for them if one is open: a
 // binding across a version's edge, a page-table read over one, a pipeline
 // that walks the page table.
-enum { kCvStraddle, kCvPageTable, kCvWalks, kCvRetired, kCvPutReasons };
+enum { kCvStraddle, kCvPageTable, kCvWalks, kCvRetired, kCvPutTwin, kCvPutReasons };
 void copy_versions_put_in_place_locked(int why);
 // Whether a pending version's copy into place writes `buffer` (a window import
 // about to retire: its copies go into place first).
 bool copy_versions_name_buffer_locked(VkBuffer buffer);
+// The same for [lo, hi) of `buffer` (a GX twin's slice about to be let go).
+bool copy_versions_into_locked(VkBuffer buffer, VkDeviceSize lo, VkDeviceSize hi);
+// Whether a pending version's destination overlaps guest [lo, hi).
+bool copy_versions_overlap_locked(std::uint64_t lo, std::uint64_t hi);
 // A binding of [base, base + bytes) against the pending versions:
 // kCopyVersionInside (`out` is the copy to bind), kCopyVersionStraddles (it
 // covers part of one: put them in place first), or kCopyVersionNone.
