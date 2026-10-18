@@ -566,6 +566,33 @@ VkResult dmabuf_span(Chunk& c, std::uint64_t offset, std::uint64_t size) {
 // GX resource's memory (bb-import), the whole spans.
 enum ImportWho { kIwBinding, kIwAddress, kIwWalk, kIwPrefetch, kIwSpan, kImportWhos };
 thread_local int t_import_who = kIwBinding;
+// The guest address whose locate() or device address asked for the import
+// under way (the census of what still needs window imports: by the GX
+// resource there - no GX object, a buffer by its usage and bind flags, a
+// texture - counted when a binding or a device address makes a new import).
+thread_local std::uint64_t t_import_va = 0;
+struct ImportAsker {
+    std::uint64_t n = 0, bytes = 0, first_va = 0;
+};
+std::map<std::string, ImportAsker> g_import_askers;  // under g.mu
+void note_import_asker_locked(std::uint64_t bytes) {
+    if (!t_import_va || (t_import_who != kIwBinding && t_import_who != kIwAddress)) return;
+    GxResourceInfo info;
+    char kind[96];
+    if (!gx_resource_overlapping(t_import_va, 1, &info)) {
+        std::snprintf(kind, sizeof(kind), "%s, no GX object", t_import_who == kIwBinding ? "binding" : "device address");
+    } else if (info.type == 1) {
+        static const char* const usages[] = {"default", "immutable", "dynamic", "staging"};
+        std::snprintf(kind, sizeof(kind), "%s, buffer %s bind 0x%x", t_import_who == kIwBinding ? "binding" : "device address",
+                      info.usage < 4 ? usages[info.usage] : "?", info.bind);
+    } else {
+        std::snprintf(kind, sizeof(kind), "%s, texture", t_import_who == kIwBinding ? "binding" : "device address");
+    }
+    ImportAsker& a = g_import_askers[kind];
+    if (!a.n) a.first_va = t_import_va;
+    ++a.n;
+    a.bytes += bytes;
+}
 std::atomic<std::uint64_t> g_import_who_n[kImportWhos], g_import_who_bytes[kImportWhos];
 std::atomic<std::uint64_t> g_imports_retired{0}, g_import_retired_bytes{0};
 std::atomic<std::uint64_t> g_dispatch_read_imports{0}, g_dispatch_untraced{0};  // window imports of what dispatches read
@@ -861,6 +888,7 @@ const Chunk* dmem_import(std::uint32_t index, std::uint64_t in, std::uint64_t by
     }
     Chunk* c = import_span(index, lo, hi);
     if (!c) return nullptr;
+    note_import_asker_locked(c->size);
     install_import_locked(index, c);
     return c;
 }
@@ -1965,7 +1993,9 @@ Located located_in(const GuestMapInfo& mi, std::uint64_t va, std::uint64_t bytes
         const std::uint64_t in = phys & (kChunkBytes - 1);
         // Window imports may run on across the seam into the next chunk (span_reach).
         const std::uint64_t reach = g_import_whole ? kChunkBytes : span_reach(chunk);
+        t_import_va = va;
         const Chunk* c = dmem_import(chunk, in, std::min<std::uint64_t>({bytes, mi.len - off, reach > in ? reach - in : 1}), true);
+        t_import_va = 0;
         if (!c) return out;
         out.buffer = c->buffer;
         out.offset = in - c->lo;
@@ -8564,7 +8594,9 @@ VkDeviceAddress guest_device_address(std::uint64_t va, std::size_t bytes) {
             const std::uint64_t in = phys & (kChunkBytes - 1);
             const int who = t_import_who;
             t_import_who = kIwAddress;
+            t_import_va = va;
             const Chunk* c = chunk < gcn::kDmemChunks ? dmem_import(static_cast<std::uint32_t>(chunk), in, bytes, true) : nullptr;
+            t_import_va = 0;
             t_import_who = who;
             return c ? c->address + (in - c->lo) : 0;
         }
@@ -9380,6 +9412,16 @@ void host_gpu_report() {
                      static_cast<ull>(g_pf_asked.load()), static_cast<ull>(g_pf_known.load()), static_cast<ull>(g_pf_checked.load()),
                      static_cast<ull>(g_pf_imports.load()), mib(g_pf_bytes), static_cast<ull>(g_pf_raced.load()), static_cast<ull>(g_pf_dropped.load()),
                      static_cast<ull>(g_dispatch_read_imports.load()), static_cast<ull>(g_dispatch_untraced.load()));
+        }
+        if (!g_import_whole && !g_import_askers.empty()) {
+            std::string by;
+            for (const auto& [kind, a] : g_import_askers) {
+                char b[192];
+                std::snprintf(b, sizeof(b), "%s%s %llu (%llu MiB, first at 0x%llx)", by.empty() ? "" : "; ", kind.c_str(),
+                              static_cast<ull>(a.n), static_cast<ull>(a.bytes >> 20), static_cast<ull>(a.first_va));
+                by += b;
+            }
+            host_log("gpu: window imports a binding or a device address made, by what lies at the address that asked: %s", by.c_str());
         }
         if (const std::string tw = twins_report(); !tw.empty()) host_log("%s", tw.c_str());
     }
