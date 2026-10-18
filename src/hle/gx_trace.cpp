@@ -865,7 +865,30 @@ std::vector<GxDrawRecords*>* const g_records_free = new std::vector<GxDrawRecord
 // Trivially destructible, so records released during thread exit still find it.
 thread_local GxDrawRecords* t_records_cache[2 * kRecordsBatch] = {};
 thread_local unsigned t_records_cached = 0;
+// BBHOST_GX_PACKED_RECORDS (the compact-records experiment, off): 1 packs a
+// native draw's records at the call - each stage's first line, then only what
+// its bits and counts say is set, back to back, at the front of a pooled set
+// instead of spread over the set's ~28 KB - and the command processor unpacks
+// them into a set of its own, which stays in its caches from draw to draw, so
+// every reader stays as it is; the token lookahead asks for the packed bytes in
+// one run, without first reading each stage's header to find the set slots.
+// 2 also keeps the records as they were and compares the unpacked ones with
+// them at every draw (the readers then read the unpacked ones).
+const int g_packed_records = [] {
+    const char* e = std::getenv("BBHOST_GX_PACKED_RECORDS");
+    return e && e[0] ? std::atoi(e) : 0;
+}();
+// The set a GX thread snapshots a draw into before packing it: the same set
+// draw after draw, so in its caches, where a pooled set comes back cold.
+thread_local GxDrawRecords* t_gx_scratch = nullptr;
+GxDrawRecords* pooled_records_raw();
 GxRecordsPtr new_records() {
+    // Default-initialized, as `new GxDrawRecords` was: counts and slot bits
+    // cleared, the large arrays left as they are.
+    return GxRecordsPtr(new (pooled_records_raw()) GxDrawRecords);
+}
+// A pooled set's memory, not constructed (a packed set is written over its front).
+GxDrawRecords* pooled_records_raw() {
     if (!t_records_cached) {
         std::lock_guard<std::mutex> lk(g_records_mu);
         const auto n = static_cast<unsigned>(std::min<std::size_t>(g_records_free->size(), kRecordsBatch));
@@ -877,20 +900,24 @@ GxRecordsPtr new_records() {
     if (t_records_cached) {
         raw = t_records_cache[--t_records_cached];
         // The next draw's set: its stage headers, which the constructor and
-        // the snapshot write first, asked for now (a pooled set is cold).
+        // the snapshot write first, asked for now (a pooled set is cold) - or
+        // the front a packed set is written into.
         if (t_records_cached) {
             const auto* next = reinterpret_cast<const char*>(t_records_cache[t_records_cached - 1]);
-            for (int k = 0; k < kGxRecords; ++k) prefetch_for_write(next + offsetof(GxDrawRecords, stage) + k * sizeof(GxStageRecords));
+            if (g_packed_records) {
+                for (int off = 0; off < 512; off += 64) prefetch_for_write(next + off);
+            } else {
+                for (int k = 0; k < kGxRecords; ++k) prefetch_for_write(next + offsetof(GxDrawRecords, stage) + k * sizeof(GxStageRecords));
+            }
         }
     } else {
         raw = ::operator new(sizeof(GxDrawRecords), std::align_val_t{alignof(GxDrawRecords)});
         g_records_new.fetch_add(1, std::memory_order_relaxed);
     }
-    // Default-initialized, as `new GxDrawRecords` was: counts and slot bits
-    // cleared, the large arrays left as they are.
-    return GxRecordsPtr(new (raw) GxDrawRecords);
+    return static_cast<GxDrawRecords*>(raw);
 }
 void GxRecordsRelease::operator()(GxDrawRecords* p) const noexcept {
+    if (p == t_gx_scratch) return;  // the GX thread's own set, never pooled
     if (t_records_cached == 2 * kRecordsBatch) {
         std::lock_guard<std::mutex> lk(g_records_mu);
         for (unsigned i = kRecordsBatch; i < 2 * kRecordsBatch; ++i) {
@@ -1525,7 +1552,142 @@ constexpr std::size_t kShaderInfos = 256;
 thread_local ShaderInfo* t_shader_infos = nullptr;
 Tally<2> g_shader_info;  // [0] records from the cache, [1] read from the object
 
-GxRecordsPtr snapshot_records(const GxRec& r) {
+// BBHOST_GX_PACKED_RECORDS: a draw's records packed into the front of a
+// pooled set - a 16-byte head, then per stage its first line (counts, masks,
+// slot bits, desc_fp: everything the constructor clears), its descriptors,
+// and the set slots' records in slot order (views and their ids, samplers -
+// an empty slot's default too -, constant buffers), the context block when it
+// has one, the proof's and the cost check's handles when set. What a stage's
+// bits and counts do not cover is not in it; no reader looks there.
+constexpr std::uint32_t kPackedMagic = 0x44524b50;  // "PKRD"
+struct PackedHead {
+    std::uint32_t magic;
+    std::uint32_t bytes;  // head included
+    std::uint8_t stages;  // the first `stages` are packed; the rest are empty
+    std::uint8_t pad[7];
+};
+static_assert(sizeof(PackedHead) == 16);
+static_assert(offsetof(GxStageRecords, desc) == 64, "a stage's first line is what the bits and counts are");
+constexpr std::size_t kPackedMax = sizeof(PackedHead) + kGxRecords * (64 + 64 * 4 + 64 * 36 + 16 * 32 + 14 * 16 + 0xc0 + 2 * 14 * 8);
+static_assert(kPackedMax <= sizeof(GxDrawRecords));
+std::atomic<std::uint64_t> g_packed_draws{0}, g_packed_bytes{0}, g_packed_most{0};
+
+std::uint32_t pack_records(const GxDrawRecords& src, int stages, void* dst) {
+    auto* const base = static_cast<std::uint8_t*>(dst);
+    std::uint8_t* p = base + sizeof(PackedHead);
+    const auto put = [&p](const void* from, std::size_t n) {
+        std::memcpy(p, from, n);
+        p += n;
+    };
+    for (int k = 0; k < stages; ++k) {
+        const GxStageRecords& s = src.stage[k];
+        put(&s, 64);
+        put(s.desc, std::min<std::uint32_t>(s.ndesc, 64) * 4u);
+        for (std::uint64_t m = s.obj_tex_set; m; m &= m - 1) put(s.obj_tex + __builtin_ctzll(m) * 32, 32);
+        for (std::uint64_t m = s.obj_tex_set; m; m &= m - 1) put(&s.obj_tex_id[__builtin_ctzll(m)], 4);
+        for (std::uint32_t m = s.obj_smp_set | s.obj_smp_default; m; m &= m - 1) put(s.obj_smp + __builtin_ctz(m) * 32, 32);
+        for (std::uint32_t m = s.obj_cb_set; m; m &= m - 1) put(s.obj_cb + __builtin_ctz(m) * 16, 16);
+        if (s.has_ctx_block) put(s.ctx_block, sizeof(s.ctx_block));
+        for (std::uint32_t m = s.cb_proofed; m; m &= m - 1) put(&s.cb_proof[__builtin_ctz(m)], 8);
+        for (std::uint32_t m = s.cb_hashed; m; m &= m - 1) put(&s.cb_hash[__builtin_ctz(m)], 8);
+    }
+    const PackedHead head{kPackedMagic, static_cast<std::uint32_t>(p - base), static_cast<std::uint8_t>(stages), {}};
+    std::memcpy(base, &head, sizeof(head));
+    return head.bytes;
+}
+
+// The command processor's set the packed records are unpacked into: the same
+// set draw after draw (a draw holds it until hle_gx_native_release, and a
+// command processor draws one at a time), so its lines stay in its caches.
+thread_local GxDrawRecords* t_cp_unpacked = nullptr;
+const GxDrawRecords* unpack_records(const void* packed) {
+    const auto* const base = static_cast<const std::uint8_t*>(packed);
+    PackedHead head;
+    std::memcpy(&head, base, sizeof(head));
+    if (head.magic != kPackedMagic) return static_cast<const GxDrawRecords*>(packed);  // (not packed: as it is)
+    if (!t_cp_unpacked) t_cp_unpacked = new GxDrawRecords;
+    GxDrawRecords& out = *t_cp_unpacked;
+    const std::uint8_t* p = base + sizeof(PackedHead);
+    const auto get = [&p](void* to, std::size_t n) {
+        std::memcpy(to, p, n);
+        p += n;
+    };
+    for (int k = 0; k < kGxRecords; ++k) {
+        GxStageRecords& s = out.stage[k];
+        if (k >= head.stages) {
+            std::memset(static_cast<void*>(&s), 0, 64);  // as constructed: no counts, no bits
+            continue;
+        }
+        get(&s, 64);
+        get(s.desc, std::min<std::uint32_t>(s.ndesc, 64) * 4u);
+        for (std::uint64_t m = s.obj_tex_set; m; m &= m - 1) get(s.obj_tex + __builtin_ctzll(m) * 32, 32);
+        for (std::uint64_t m = s.obj_tex_set; m; m &= m - 1) get(&s.obj_tex_id[__builtin_ctzll(m)], 4);
+        for (std::uint32_t m = s.obj_smp_set | s.obj_smp_default; m; m &= m - 1) get(s.obj_smp + __builtin_ctz(m) * 32, 32);
+        for (std::uint32_t m = s.obj_cb_set; m; m &= m - 1) get(s.obj_cb + __builtin_ctz(m) * 16, 16);
+        if (s.has_ctx_block) get(s.ctx_block, sizeof(s.ctx_block));
+        for (std::uint32_t m = s.cb_proofed; m; m &= m - 1) get(&s.cb_proof[__builtin_ctz(m)], 8);
+        for (std::uint32_t m = s.cb_hashed; m; m &= m - 1) get(&s.cb_hash[__builtin_ctz(m)], 8);
+    }
+    return &out;
+}
+
+// BBHOST_GX_PACKED_RECORDS=2: the unpacked records against the records as
+// they were made, field by field where the bits and counts say a reader
+// looks (which is everything a reader reads).
+enum PackedField { kPfHeader, kPfDesc, kPfTex, kPfTexId, kPfSmp, kPfCb, kPfCtx, kPfProof, kPfHash, kPackedFields };
+const char* const kPackedFieldName[kPackedFields] = {"stage headers", "descriptors", "views", "view ids", "samplers",
+                                                     "constant buffers", "context blocks", "proof handles", "cost hashes"};
+std::atomic<std::uint64_t> g_packed_compared{0}, g_packed_differ[kPackedFields] = {};
+void compare_unpacked(const GxDrawRecords& made, const GxDrawRecords& got) {
+    g_packed_compared.fetch_add(1, std::memory_order_relaxed);
+    bool seen[kPackedFields] = {};
+    const auto differ = [&](PackedField f) {
+        if (seen[f]) return;
+        seen[f] = true;
+        g_packed_differ[f].fetch_add(1, std::memory_order_relaxed);
+    };
+    for (int k = 0; k < kGxRecords; ++k) {
+        const GxStageRecords& a = made.stage[k];
+        const GxStageRecords& b = got.stage[k];
+        if (std::memcmp(&a, &b, 64) != 0) {
+            differ(kPfHeader);
+            continue;
+        }
+        if (std::memcmp(a.desc, b.desc, std::min<std::uint32_t>(a.ndesc, 64) * 4u) != 0) differ(kPfDesc);
+        for (std::uint64_t m = a.obj_tex_set; m; m &= m - 1) {
+            const int j = __builtin_ctzll(m);
+            if (std::memcmp(a.obj_tex + j * 32, b.obj_tex + j * 32, 32) != 0) differ(kPfTex);
+            if (a.obj_tex_id[j] != b.obj_tex_id[j]) differ(kPfTexId);
+        }
+        for (std::uint32_t m = a.obj_smp_set; m; m &= m - 1) {
+            if (std::memcmp(a.obj_smp + __builtin_ctz(m) * 32, b.obj_smp + __builtin_ctz(m) * 32, 32) != 0) differ(kPfSmp);
+        }
+        for (std::uint32_t m = a.obj_smp_default; m; m &= m - 1) {
+            if (std::memcmp(a.obj_smp + __builtin_ctz(m) * 32, b.obj_smp + __builtin_ctz(m) * 32, 16) != 0) differ(kPfSmp);
+        }
+        for (std::uint32_t m = a.obj_cb_set; m; m &= m - 1) {
+            if (std::memcmp(a.obj_cb + __builtin_ctz(m) * 16, b.obj_cb + __builtin_ctz(m) * 16, 16) != 0) differ(kPfCb);
+        }
+        if (a.has_ctx_block && std::memcmp(a.ctx_block, b.ctx_block, sizeof(a.ctx_block)) != 0) differ(kPfCtx);
+        for (std::uint32_t m = a.cb_proofed; m; m &= m - 1) {
+            if (a.cb_proof[__builtin_ctz(m)] != b.cb_proof[__builtin_ctz(m)]) differ(kPfProof);
+        }
+        for (std::uint32_t m = a.cb_hashed; m; m &= m - 1) {
+            if (a.cb_hash[__builtin_ctz(m)] != b.cb_hash[__builtin_ctz(m)]) differ(kPfHash);
+        }
+    }
+}
+
+// The packed records' lines, asked for in one run: no header to read first.
+void prefetch_packed(const void* packed, std::uint32_t bytes) {
+    const auto* p = static_cast<const char*>(packed);
+    for (std::uint32_t off = 0; off < bytes; off += 64) __builtin_prefetch(p + off);
+}
+
+// `scratch` (BBHOST_GX_PACKED_RECORDS, from native_draw_call): into this
+// thread's own set, which is packed into a pooled one where the draw is
+// stored; the pointer's release leaves it alone.
+GxRecordsPtr snapshot_records(const GxRec& r, bool scratch = false) {
     struct Arrays {
         std::uint64_t tex, smp, cache, cb, ext;
     };
@@ -1534,7 +1696,12 @@ GxRecordsPtr snapshot_records(const GxRec& r) {
     GxRecordsPtr out;
     {
         GxCostTimer timer(kCostRecAlloc);
-        out = new_records();
+        if (scratch) {
+            if (!t_gx_scratch) t_gx_scratch = new GxDrawRecords;
+            out = GxRecordsPtr(new (t_gx_scratch) GxDrawRecords);
+        } else {
+            out = new_records();
+        }
     }
     static thread_local unsigned hash_count = 0;
     const bool hash_cbs = g_gx_cost_enabled && (hash_count++ % 16) == 0;
@@ -2038,6 +2205,10 @@ struct NativeDraw {
     alignas(64) GpuDrawInputs in;
     alignas(16) GxDrawObjects objects;
     GxRecordsPtr records;
+    // BBHOST_GX_PACKED_RECORDS: the packed records' size (the lookahead asks
+    // for that many bytes), and with =2 the packed ones beside `records`.
+    std::uint32_t records_bytes = 0;
+    GxRecordsPtr packed;
     // The call, for the report on tokens that never came back (the
     // overflow map's entries only; a slot leaves them as they are).
     std::uint64_t ret = 0, ctx = 0;
@@ -2269,7 +2440,7 @@ std::uint64_t records_signature(const GxDrawRecords& rec) {
 bool native_draw_call(GxRec& r) {
     GxCostTimer timer(kCostNative);
     GxCostStamp stamp;
-    GxRecordsPtr records = snapshot_records(r);
+    GxRecordsPtr records = snapshot_records(r, g_packed_records == 1);
     stamp.to(kCostNativeRecords);
     IneligibleWhy why = kWhyRecords;
     if (!native_eligible(r, records.get(), &why)) {
@@ -2342,6 +2513,26 @@ bool native_draw_call(GxRec& r) {
     int free_state = 0;
     GxDrawObjects objects;
     build_objects(r, objects);
+    // BBHOST_GX_PACKED_RECORDS: the records packed into a pooled set, after
+    // everything on this thread that reads them; =1 hands the command
+    // processor only those (this thread's own set goes back to being its own),
+    // =2 both.
+    std::uint32_t records_bytes = 0;
+    GxRecordsPtr packed;
+    if (g_packed_records && records) {
+        GxRecordsPtr block(pooled_records_raw());
+        records_bytes = pack_records(*records, (r.st[1].shader || r.st[2].shader) ? 4 : 2, block.get());
+        g_packed_draws.fetch_add(1, std::memory_order_relaxed);
+        g_packed_bytes.fetch_add(records_bytes, std::memory_order_relaxed);
+        for (std::uint64_t most = g_packed_most.load(std::memory_order_relaxed);
+             records_bytes > most && !g_packed_most.compare_exchange_weak(most, records_bytes, std::memory_order_relaxed);) {
+        }
+        if (g_packed_records == 1) {
+            records = std::move(block);
+        } else {
+            packed = std::move(block);
+        }
+    }
     if (slot.state.compare_exchange_strong(free_state, 1, std::memory_order_acquire)) {
         // Plain stores: the previous draw on this thread asked for these lines
         // (prefetch_next_slot), and the release below orders them before the
@@ -2351,6 +2542,8 @@ bool native_draw_call(GxRec& r) {
         slot.draw.in = r.in;
         slot.draw.objects = objects;
         slot.draw.records = std::move(records);
+        slot.draw.records_bytes = records_bytes;
+        slot.draw.packed = std::move(packed);
         slot.state.store(2, std::memory_order_release);
         g_native_slot_pending.add();
         prefetch_next_slot();
@@ -2362,6 +2555,8 @@ bool native_draw_call(GxRec& r) {
         d.in = r.in;
         d.objects = objects;
         d.records = std::move(records);
+        d.records_bytes = records_bytes;
+        d.packed = std::move(packed);
         d.ret = r.ret;
         d.ctx = r.ctx;
         d.kind = r.kind;
@@ -7321,10 +7516,26 @@ const GpuDrawInputs* hle_gx_native_token(std::uint64_t id, const std::uint32_t* 
             // slots that are set. They were written on the recording thread and
             // are just as cold; whichever phase of the draw touched them first
             // paid for them one at a time.
-            if (const GxDrawRecords* rec = draw->records.get()) prefetch_records(*rec);
+            if (const GxDrawRecords* rec = draw->records.get()) {
+                if (g_packed_records == 1) {
+                    prefetch_packed(rec, draw->records_bytes);
+                } else {
+                    prefetch_records(*rec);
+                }
+            }
         }
         t_native_slot = slot;
-        draw->objects.records = draw->records.get();
+        // BBHOST_GX_PACKED_RECORDS: the readers read the records unpacked
+        // into this thread's own set (=2: and checked against the made ones).
+        if (g_packed_records == 1 && draw->records) {
+            draw->objects.records = unpack_records(draw->records.get());
+        } else if (g_packed_records == 2 && draw->records && draw->packed) {
+            const GxDrawRecords* unpacked = unpack_records(draw->packed.get());
+            compare_unpacked(*draw->records, *unpacked);
+            draw->objects.records = unpacked;
+        } else {
+            draw->objects.records = draw->records.get();
+        }
         t_native_objects = &draw->objects;
         GpuDrawInputs& t_native_in = draw->in;
         // A token draw takes nothing from the register file.
@@ -7526,6 +7737,15 @@ const GpuDrawInputs* hle_gx_native_token(std::uint64_t id, const std::uint32_t* 
                      static_cast<ull>(g_native_ineligible.load()), static_cast<ull>(g_native_late.load()),
                      static_cast<ull>(g_native_unmatched.load()), static_cast<ull>(g_native_failed.load()),
                      static_cast<ull>(g_native_overflow.load()));
+            if (g_packed_records) {
+                const std::uint64_t n = g_packed_draws.load();
+                std::string differ;
+                for (int f = 0; f < kPackedFields; ++f) appendf(differ, " %s %llu;", kPackedFieldName[f], static_cast<ull>(g_packed_differ[f].load()));
+                host_log("gx-native: records packed at the call (BBHOST_GX_PACKED_RECORDS=%d): %llu draws, %.0f bytes a draw on average, "
+                         "%llu at most; compared with the records as made after unpacking: %llu draws, differing:%s",
+                         g_packed_records, static_cast<ull>(n), n ? static_cast<double>(g_packed_bytes.load()) / static_cast<double>(n) : 0.0,
+                         static_cast<ull>(g_packed_most.load()), static_cast<ull>(g_packed_compared.load()), differ.c_str());
+            }
             host_log("gx-native: stage records' shader fields from the per-shader cache %llu, read from the object %llu; inputs' "
                      "shader linkage from the per-thread cache %llu, worked out %llu (checked %llu, differing %llu)",
                      static_cast<ull>(g_shader_info.load(0)), static_cast<ull>(g_shader_info.load(1)), static_cast<ull>(g_link_info.load(0)),
@@ -7856,6 +8076,10 @@ void hle_gx_native_prefetch(std::uint64_t id, bool next) {
     }
     if (slot.state.load(std::memory_order_acquire) != 2 || slot.id != id) return;
     if (const GxDrawRecords* rec = slot.draw.records.get()) {
+        if (g_packed_records == 1) {
+            prefetch_packed(rec, slot.draw.records_bytes);  // its size is in the slot: nothing to read first
+            return;
+        }
         for (const GxStageRecords& s : rec->stage) __builtin_prefetch(&s);  // the headers the bit masks below are read from
         prefetch_records(*rec);
     }
@@ -7866,10 +8090,12 @@ void hle_gx_native_release() {
     if (NativeSlot* slot = t_native_slot) {
         t_native_slot = nullptr;
         slot->draw.records.reset();  // back to the pool here, as before, not on a recording thread
+        slot->draw.packed.reset();
         slot->state.store(0, std::memory_order_release);
         g_native_slot_pending.add(~0ull);
     } else {
         t_native_overflow.records.reset();
+        t_native_overflow.packed.reset();
     }
 }
 std::uint64_t hle_gx_emitter_caller(std::uint64_t packet_va) {
