@@ -2,6 +2,7 @@
 a chunk's log read back into segments, and the union of the chunks'
 manifests that keeps every recipe in use."""
 
+import importlib.util
 import sys
 import tempfile
 import unittest
@@ -19,6 +20,8 @@ def plan(items):
     return {"options": {"stop_hold": 1.0, "headings": 6, "heading_s": 0.5, "remo_skip": 40, "remo_max": 120}, "items": items}
 
 
+# The stops' spread (the plan step) runs on numpy, which a CI runner need not have.
+@unittest.skipUnless(importlib.util.find_spec("numpy"), "the spread needs numpy")
 class SpreadTest(unittest.TestCase):
     def test_covers_and_stops(self):
         import numpy as np
