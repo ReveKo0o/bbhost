@@ -85,6 +85,7 @@ int g_video_next = 1;
 std::once_flag g_vsync_once;
 std::atomic<bool> g_vsync_run{true};
 std::atomic<std::uint64_t> g_flips_done{0};
+std::atomic<std::uint64_t> g_last_tick_ns{0};  // BBHOST_FLIP_TIMELINE (gnm.cpp): when the last vblank tick ran
 std::atomic<int> g_fps_cap{30};  // video.fps_cap: upper bound on presented frames/s
 
 // Present on arrival (KyoPS4x #249's split, made here natively): a frame the
@@ -669,6 +670,7 @@ void start_vsync() {
                     pacing_max(g_pacing.tick_late_max_us, late_us);
                     if (late_us >= 1000) g_pacing.ticks_late_1ms.fetch_add(1, std::memory_order_relaxed);
                 }
+                g_last_tick_ns.store(steady_ns(), std::memory_order_relaxed);
                 vblank_tick(++vcount);
                 // BBHOST_VBLANK_LOG=1: what the clock and the completions
                 // actually came out at, once a second.
@@ -923,6 +925,7 @@ void hle_video_set_picture(unsigned w, unsigned h) {
 }
 
 std::uint64_t hle_video_flip_count() { return g_flips_done.load(); }
+std::uint64_t hle_video_last_tick_ns() { return g_last_tick_ns.load(std::memory_order_relaxed); }
 
 std::string hle_video_pacing_window() {
     const auto take = [](std::atomic<std::uint64_t>& a) { return a.exchange(0, std::memory_order_relaxed); };

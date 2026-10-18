@@ -370,19 +370,71 @@ std::vector<std::pair<const void*, std::size_t>> collect_ce(unsigned count, void
     return cbs;
 }
 
+// BBHOST_FLIP_TIMELINE=1 (diagnostic): how each frame's work reaches the
+// command processor - per flip, when the game asked for it against the
+// previous flip and the vblank clock, how many submissions of its frame came
+// and how many of them in the 3 ms before it, how long the game waited to
+// hand it over (the backlog bound), and when the command processor had
+// recorded it. Two lines a flip ("flip-tl" from the game's thread, "flip-tr"
+// from the command processor's), matched by number.
+const bool g_flip_tl = [] {
+    const char* e = std::getenv("BBHOST_FLIP_TIMELINE");
+    return e && e[0] == '1';
+}();
+std::mutex g_tl_mu;
+std::vector<std::uint64_t> g_tl_jobs;  // under g_tl_mu: the game's submission calls since the last flip
+std::uint64_t g_tl_last_call = 0, g_tl_flips = 0;
+std::uint64_t tl_now() {
+    return static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+double tl_phase_ms(std::uint64_t t) {
+    const std::uint64_t tick = hle_video_last_tick_ns();
+    if (!tick || t < tick) return -1.0;
+    return static_cast<double>((t - tick) % 16666667ull) / 1e6;
+}
+
 GUEST_ABI int hle_gnm_submit(unsigned count, void** dcb, unsigned* dcb_bytes, void** ccb, unsigned* ccb_bytes) {
+    if (g_flip_tl) {
+        std::lock_guard<std::mutex> lk(g_tl_mu);
+        g_tl_jobs.push_back(tl_now());
+    }
     hle_gnm_submit_async(0, collect_submit(count, dcb, dcb_bytes), [] { post_gnm_eop(); },
                          collect_ce(count, ccb, ccb_bytes));
     return 0;
 }
 GUEST_ABI int hle_gnm_submit_flip(unsigned count, void** dcb, unsigned* dcb_bytes, void** ccb, unsigned* ccb_bytes,
                                  int handle, int buffer, unsigned, std::int64_t arg) {
+    const std::uint64_t tl_call = g_flip_tl ? tl_now() : 0;
+    std::uint64_t tl_n = 0;
+    if (g_flip_tl) {
+        std::lock_guard<std::mutex> lk(g_tl_mu);
+        tl_n = ++g_tl_flips;
+    }
     hle_gnm_submit_async(0, collect_submit(count, dcb, dcb_bytes),
-                         [handle, buffer, arg] {
+                         [handle, buffer, arg, tl_call, tl_n] {
+                             if (tl_call) {
+                                 const std::uint64_t t = tl_now();
+                                 host_log("flip-tr #%llu recorded %.2f ms after the call, at tick phase %.2f",
+                                          static_cast<unsigned long long>(tl_n), static_cast<double>(t - tl_call) / 1e6, tl_phase_ms(t));
+                             }
                              hle_video_finish_flip(handle, buffer, arg, true);  // the job's commands are recorded
                              post_gnm_eop();
                          },
                          collect_ce(count, ccb, ccb_bytes));
+    if (tl_call) {
+        const std::uint64_t t = tl_now();
+        std::lock_guard<std::mutex> lk(g_tl_mu);
+        unsigned late = 0;
+        for (const std::uint64_t j : g_tl_jobs) late += tl_call - j <= 3000000ull ? 1 : 0;
+        host_log("flip-tl #%llu call +%.2f ms (tick phase %.2f), %zu jobs since the last flip (%u in the 3 ms before), waited %.2f ms to hand "
+                 "over, backlog %llu",
+                 static_cast<unsigned long long>(tl_n), g_tl_last_call ? static_cast<double>(tl_call - g_tl_last_call) / 1e6 : 0.0,
+                 tl_phase_ms(tl_call), g_tl_jobs.size(), late, static_cast<double>(t - tl_call) / 1e6,
+                 static_cast<unsigned long long>(hle_gnm_cp_backlog()));
+        g_tl_jobs.clear();
+        g_tl_last_call = tl_call;
+    }
     // Diagnostic: watch the SprjScaleform singleton's resident-resource
     // loader (*(singleton+8)) and the "resident load complete" flag
     // (byte at 0x5962878+0x32) across the first flips, to see whether the
