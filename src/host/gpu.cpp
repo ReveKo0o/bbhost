@@ -8394,10 +8394,16 @@ void twins_release_locked(std::uint64_t va, std::uint64_t bytes, int why) {
 
 std::string twins_report() {
     if (!g_twins) return {};
-    std::size_t cands = 0;
+    std::size_t cands = 0, live = 0;
+    std::uint64_t live_bytes = 0;
     {
         std::lock_guard<std::mutex> lk(g_twin_cand_mu);
         cands = g_twin_cand.size();
+    }
+    {
+        std::lock_guard<GpuMutex> lock(g.mu);  // the command processor may still be making twins
+        live = g_twin_live.size();
+        live_bytes = g_twin_live_bytes;
     }
     using ull = unsigned long long;
     char b[640];
@@ -8407,7 +8413,7 @@ std::string twins_report() {
                   "let go after copying back: page-table walks %llu, ranges across an edge %llu (%llu more inside a render pass, read from guest memory), a texture over one %llu; dropped with "
                   "their resource %llu; never made (no guest bytes or no memory) %llu",
                   static_cast<ull>(g_twin_cands.load()), cands, static_cast<ull>(g_twin_made.load()),
-                  static_cast<ull>(g_twin_made_bytes.load() >> 20), g_twin_live.size(), static_cast<ull>(g_twin_live_bytes >> 20),
+                  static_cast<ull>(g_twin_made_bytes.load() >> 20), live, static_cast<ull>(live_bytes >> 20),
                   static_cast<ull>(g_twin_served.load()), static_cast<ull>(g_twin_partial.load()), static_cast<ull>(g_twin_addresses.load()),
                   static_cast<ull>(g_twin_refused.load()),
                   static_cast<ull>(g_twin_gone[kTwinGoneWalk].load()), static_cast<ull>(g_twin_gone[kTwinGoneEdge].load()),
@@ -9465,17 +9471,21 @@ void host_gpu_report() {
                      static_cast<ull>(g_pf_imports.load()), mib(g_pf_bytes), static_cast<ull>(g_pf_raced.load()), static_cast<ull>(g_pf_dropped.load()),
                      static_cast<ull>(g_dispatch_read_imports.load()), static_cast<ull>(g_dispatch_untraced.load()));
         }
-        if (!g_import_whole && !g_import_askers.empty()) {
+        // (A copy taken under the lock: the command processor may still be
+        // making imports while the exit report runs.)
+        std::vector<std::pair<std::string, ImportAsker>> askers;
+        if (!g_import_whole) {
+            std::lock_guard<GpuMutex> lock(g.mu);
+            askers.assign(g_import_askers.begin(), g_import_askers.end());
+        }
+        if (!askers.empty()) {
             // The most bytes first; the mapping the first import of a kind lay in.
-            std::vector<std::pair<std::uint64_t, const std::string*>> order;
-            for (const auto& [kind, a] : g_import_askers) order.emplace_back(a.bytes, &kind);
-            std::sort(order.begin(), order.end(), [](const auto& x, const auto& y) { return x.first > y.first; });
+            std::sort(askers.begin(), askers.end(), [](const auto& x, const auto& y) { return x.second.bytes > y.second.bytes; });
             std::string by;
-            for (const auto& [bytes, kind] : order) {
-                const ImportAsker& a = g_import_askers[*kind];
+            for (const auto& [kind, a] : askers) {
                 char b[320];
                 std::snprintf(b, sizeof(b), "%s%s %llu (%llu MiB, first at 0x%llx in 0x%llx + %llu MiB, prot 0x%x)", by.empty() ? "" : "; ",
-                              kind->c_str(), static_cast<ull>(a.n), static_cast<ull>(a.bytes >> 20), static_cast<ull>(a.first_va),
+                              kind.c_str(), static_cast<ull>(a.n), static_cast<ull>(a.bytes >> 20), static_cast<ull>(a.first_va),
                               static_cast<ull>(a.map_va), static_cast<ull>(a.map_len >> 20), a.map_prot);
                 by += b;
             }
