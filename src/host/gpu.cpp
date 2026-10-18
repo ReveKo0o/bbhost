@@ -7379,8 +7379,10 @@ bool host_gpu_dispatch(const GpuDispatch& d_in) {
         const std::uint64_t span = std::min<std::uint64_t>(std::max(bytes, min_bytes), 64ull << 20);
         // A GX buffer a device-local twin holds (or will, at its binding below:
         // BBHOST_GX_TWINS) needs no import - its stores go to the twin, also
-        // when the V# claims more records than the buffer holds.
-        if (base && !twin_candidate_holds(base, std::min<std::uint64_t>(span, min_bytes))) {
+        // when the V# claims more than the buffer holds (a 12-byte argument
+        // buffer stored as 16); a binding that lets the twin go imports what
+        // it needs at its locate.
+        if (base && !twin_candidate_holds(base, 1)) {
             if (twins_on()) twin_note_import_near_locked(base, span, t_import_site);
             import_windows(base, span);
         }
