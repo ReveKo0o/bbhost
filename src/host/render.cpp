@@ -419,6 +419,13 @@ const int g_vertex_input = [] {
 std::atomic<std::uint64_t> g_vertex_input_draws{0}, g_vertex_input_kept{0}, g_vertex_tables_read{0};
 std::atomic<std::uint64_t> g_vertex_tables_with_input{0};  // vertex-input draws whose vertex shader still reads the table
 std::atomic<std::uint64_t> g_vertex_staged_records{0};  // plan_vertex_input: records copied into device memory for their draw
+// plan_vertex_input: records in host memory whose extent stopped at the end of
+// their GX buffer, and of those the ones the mirrors then kept (BBHOST_VERTEX_CLAMP).
+std::atomic<std::uint64_t> g_vertex_records_clamped{0}, g_vertex_clamped_mirrored{0};
+const bool g_vertex_clamp = [] {
+    const char* e = std::getenv("BBHOST_VERTEX_CLAMP");
+    return !(e && e[0] == '0');
+}();
 std::atomic<std::uint64_t> g_vertex_snapshot_records{0};  // plan_vertex_input: records the game rewrites, copied as recorded
 std::atomic<std::uint64_t> g_vertex_window_records{0};  // plan_vertex_input: records read from the draw's window copy
 std::atomic<std::uint64_t> g_vertex_input_no_gx_draws{0}, g_vertex_input_no_gx_kept{0};  // BBHOST_VERTEX_INPUT_NO_GX
@@ -10395,9 +10402,12 @@ void render_report() {
                  static_cast<unsigned long long>(g_vertex_input_draws.load()), static_cast<unsigned long long>(g_vertex_input_kept.load()),
                  static_cast<unsigned long long>(g_vertex_tables_with_input.load()), static_cast<unsigned long long>(g_vertex_tables_read.load()));
         host_log("render: vertex records the buffer shadow keeps in host memory, copied into device memory for their draw %llu; "
-                 "records the game rewrites, copied as their draw recorded %llu",
+                 "records the game rewrites, copied as their draw recorded %llu; records whose V# runs past their GX buffer, stopped at "
+                 "its end %llu (mirrored then %llu)%s",
                  static_cast<unsigned long long>(g_vertex_staged_records.load()),
-                 static_cast<unsigned long long>(g_vertex_snapshot_records.load()));
+                 static_cast<unsigned long long>(g_vertex_snapshot_records.load()),
+                 static_cast<unsigned long long>(g_vertex_records_clamped.load()),
+                 static_cast<unsigned long long>(g_vertex_clamped_mirrored.load()), g_vertex_clamp ? "" : " (BBHOST_VERTEX_CLAMP=0)");
         host_log("render: draws without GX geometry with vertex input from their fetch shader's table %llu, fetch shader kept %llu; "
                  "vertex records read from the draw's window copy %llu",
                  static_cast<unsigned long long>(g_vertex_input_no_gx_draws.load()), static_cast<unsigned long long>(g_vertex_input_no_gx_kept.load()),
@@ -12682,7 +12692,7 @@ bool plan_vertex_input(const std::vector<std::uint32_t>& fetch_words, std::uint6
         }
         if (!rs) {
             const std::uint64_t record_va = va - fe.offset;
-            const std::uint64_t record_bytes = w[2] ? static_cast<std::uint64_t>(w[2]) * stride : fe.offset + bytes;
+            std::uint64_t record_bytes = w[2] ? static_cast<std::uint64_t>(w[2]) * stride : fe.offset + bytes;
             RecordShadow& ns = shadows[n_shadows++];
             ns.w = w;
             ns.whole = {};
@@ -12713,6 +12723,26 @@ bool plan_vertex_input(const std::vector<std::uint32_t>& fetch_words, std::uint6
             } else if (loc.offset >= fe.offset && loc.avail + fe.offset >= record_bytes) {
                 ns.whole = {loc.buffer, loc.offset - fe.offset, record_bytes};
                 shadow_locate_locked(record_va, record_bytes, ns.whole);
+                // A record whose V# counts on past the end of the GX buffer it
+                // starts in - its records counted from the buffer's start
+                // though the base is an offset into it (five 582 KB records of
+                // one immutable mesh at Astral Clocktower, each a vertex
+                // element 4 bytes on): its draws read within the buffer, and
+                // the extent stops at the buffer's end. Whatever lies after it
+                // - another buffer's ring the game rewrites, as the run's
+                // placement has it - kept the whole record in host memory, and
+                // each draw staged all of it (0.2-18 GB a 15-s window there,
+                // run to run). BBHOST_VERTEX_CLAMP=0: the V#'s extent.
+                if (ns.whole.buffer == loc.buffer && g_vertex_clamp) {
+                    const std::uint64_t end = gx_buffer_end(record_va);
+                    if (end && end - record_va < record_bytes) {
+                        record_bytes = end - record_va;
+                        bump(g_vertex_records_clamped);
+                        ns.whole = {loc.buffer, loc.offset - fe.offset, record_bytes};
+                        shadow_locate_locked(record_va, record_bytes, ns.whole);
+                        if (ns.whole.buffer != loc.buffer) bump(g_vertex_clamped_mirrored);
+                    }
+                }
                 if (ns.whole.buffer == loc.buffer) {  // stays in host memory
                     // A ring the game rewrites: the bytes as the draw records
                     // (shadow_snapshot_locked); otherwise staged as the GPU

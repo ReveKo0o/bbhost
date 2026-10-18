@@ -66,6 +66,10 @@ bool gx_resource_at(std::uint64_t va, std::size_t bytes, GxResourceInfo* out);
 // CPU writes such memory through GX's Map or a creation with data, which the
 // buffer shadow's mirrors are told of (host_gpu_shadow_gx_write).
 bool gx_buffers_cover(std::uint64_t va, std::uint64_t bytes);
+// The end of the live GX buffer whose memory holds `va` (0: none) - how far a
+// vertex record that starts in it can be read (render.cpp's records whose
+// V# counts past the buffer).
+std::uint64_t gx_buffer_end(std::uint64_t va);
 // The first live resource whose memory overlaps [va, va + bytes) at all, if
 // any (the census of surfaces no resource covers whole).
 bool gx_resource_overlapping(std::uint64_t va, std::size_t bytes, GxResourceInfo* out);

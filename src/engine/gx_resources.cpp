@@ -1671,6 +1671,17 @@ bool gx_resource_at(std::uint64_t va, std::size_t bytes, GxResourceInfo* out) {
     return true;
 }
 
+std::uint64_t gx_buffer_end(std::uint64_t va) {
+    std::lock_guard<std::mutex> lk(g_mu);
+    auto it = g_by_memory.upper_bound(va);
+    if (it == g_by_memory.begin()) return 0;
+    --it;
+    const auto h = g_by_holder.find(it->second);
+    if (h == g_by_holder.end() || !h->second.info.alive || h->second.info.type != 1) return 0;
+    const GxResourceInfo& r = h->second.info;
+    return va < r.memory + r.bytes ? r.memory + r.bytes : 0;
+}
+
 bool gx_buffers_cover(std::uint64_t va, std::uint64_t bytes) {
     if (!bytes) return false;
     std::lock_guard<std::mutex> lk(g_mu);
