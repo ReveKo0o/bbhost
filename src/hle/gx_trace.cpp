@@ -6602,8 +6602,12 @@ void hle_gx_trace_arm(GuestMemory* mem) {
         host_log("gx: stub page allocation failed; trace off");
         return;
     }
-    // GX's immediate methods on the decomp list call it themselves
-    // (decomp/gx/draw.cpp); no stub goes over one that is placed.
+    // GX's immediate methods and YEBIS's Gnm wrappers on the decomp list call
+    // it themselves (decomp/gx/draw.cpp, decomp/yebis/gnm.cpp); no stub goes
+    // over one that is placed.
+    decomp_gx::g_yebis_draw_kind = kYebisDraw;
+    decomp_gx::g_yebis_dispatch_kind = kYebisDispatch;
+    decomp_gx::g_yebis_dispatch_hooked = g_yebis_dispatch != 0;
     decomp_gx::g_gx_hook_entry = host;
     auto* c = static_cast<std::uint8_t*>(page);
     int hooked = 0;
@@ -6613,6 +6617,8 @@ void hle_gx_trace_arm(GuestMemory* mem) {
         if (id == kCopyStructureCount && !g_count_copies) continue;
         if (id == kYebisDispatch && !g_yebis_dispatch) continue;
         if (id <= kDispatchIndirect && decomp_placed(decomp_gx::kMethodNames[id]) == 1) continue;  // ours, which calls gx_hook
+        if (id == kYebisDraw && decomp_placed("yebis_gnm_draw_index") == 1) continue;
+        if (id == kYebisDispatch && decomp_placed("yebis_gnm_dispatch") == 1) continue;
         const Hook& h = kHooks[id];
         const std::uint64_t va = g_slide + (h.va - kPreferredGuestSlide);
         if (va < mem->slide || va + h.n > mem->slide + mem->size) continue;

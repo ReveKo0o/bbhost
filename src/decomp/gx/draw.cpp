@@ -63,19 +63,18 @@ extern int g_draw_mutant;
 #define MUTANT(n) false
 #endif
 
-// The nine methods' section and its bounds.
+// The writer callers' section (decomp/gx/draw.h) and its bounds.
+#define GX_METHOD DECOMP_GX_WRITER_CALLER
 #ifdef _WIN32
 // COFF: input sections of one name before the $ make one section, in the
 // order of what follows the $. The two ends are functions of their own (not
 // alike, so that no linker folds them into one).
-#define GX_METHOD __attribute__((section("bbgxm$m")))
 extern "C" __attribute__((section("bbgxm$a"), used, noinline)) int bbhost_gx_methods_lo() { return 1; }
 extern "C" __attribute__((section("bbgxm$z"), used, noinline)) int bbhost_gx_methods_hi() { return 2; }
 #define GX_METHODS_LO reinterpret_cast<std::uint64_t>(&bbhost_gx_methods_lo)
 #define GX_METHODS_HI reinterpret_cast<std::uint64_t>(&bbhost_gx_methods_hi)
 #else
 // ELF: the linker's bounds of a section named as a C identifier.
-#define GX_METHOD __attribute__((section("bbhost_gx_methods")))
 extern "C" __attribute__((visibility("hidden"))) const char __start_bbhost_gx_methods[];
 extern "C" __attribute__((visibility("hidden"))) const char __stop_bbhost_gx_methods[];
 #define GX_METHODS_LO reinterpret_cast<std::uint64_t>(__start_bbhost_gx_methods)
@@ -84,6 +83,8 @@ extern "C" __attribute__((visibility("hidden"))) const char __stop_bbhost_gx_met
 
 void* decomp_gx::g_gx_hook_entry = nullptr;
 std::uint64_t decomp_gx::g_method_code_lo = 0, decomp_gx::g_method_code_hi = 0;
+std::uint64_t decomp_gx::g_yebis_draw_kind = ~0ull, decomp_gx::g_yebis_dispatch_kind = ~0ull;
+bool decomp_gx::g_yebis_dispatch_hooked = false;
 const char* const decomp_gx::kMethodNames[9] = {
     "gx_immediate_draw",
     "gx_immediate_draw_indexed",
@@ -104,7 +105,14 @@ using decomp_gx::MethodKind;
 // kind (decomp_gx::game_return); the commit writes no packet of its own and
 // has its entry.
 constexpr u64 kGameReturns[9] = {0x2569753, 0x256981c, 0x25698d4, 0x25699a1, 0x2569a8e, 0x2569b71, 0x2569ba0, 0x256960d, 0x256968f};
-u64 g_method_entries[9] = {};
+// Every writer caller told (note_writer_caller): ours' entry, and the game's
+// return address it stands for. Filled as the decomp list is made, before
+// any of ours runs; read only after.
+struct WriterCaller {
+    u64 entry, game_return_bn;
+};
+WriterCaller g_writer_callers[32];
+int g_writer_callers_n = 0;
 
 // What the methods call, by Binary Ninja address (symbols/1.09-names.tsv).
 constexpr u64 kFlushOutputMerger = 0x2ad2230;  // gx_flush_output_merger(ctx + 0xb558, ctx, state)
@@ -192,17 +200,12 @@ std::uint64_t total_taken(int kind) {
     return n;
 }
 
-// The GX trace's look at the call (decomp/gx/draw.h): true when it took the
-// draw whole, and the method's sequence is not run.
+// A GX method's look from the trace, counted: true when it took the draw
+// whole, and the method's sequence is not run.
 bool trace_took(MethodKind kind, u64 rdi, u64 rsi, u64 rdx, u64 rcx, u64 r8, u64 r9, u64 ret) {
     CallShard& shard = call_shard();
     shard.calls[kind].fetch_add(1, std::memory_order_relaxed);
-    const auto entry = reinterpret_cast<GUEST_ABI u64 (*)(u64, const u64*)>(decomp_gx::g_gx_hook_entry);
-    if (!entry) return false;
-    // A return slot, then what the stubs push: r9 r8 rcx rdx rsi rdi, the
-    // return address and the first stack argument (none of these have one).
-    const u64 frame[9] = {0, r9, r8, rcx, rdx, rsi, rdi, ret, 0};
-    if (!entry(kind, frame + 1)) return false;
+    if (!decomp_gx::hand_to_trace(kind, rdi, rsi, rdx, rcx, r8, r9, ret)) return false;
     shard.taken[kind].fetch_add(1, std::memory_order_relaxed);
     return true;
 }
@@ -349,14 +352,31 @@ DECOMP_LEAF GX_METHOD void gx_immediate_dispatch_indirect(u64 ctx, u64 state, u6
 
 #undef RET
 
+bool decomp_gx::hand_to_trace(std::uint64_t kind, std::uint64_t rdi, std::uint64_t rsi, std::uint64_t rdx, std::uint64_t rcx, std::uint64_t r8,
+                              std::uint64_t r9, std::uint64_t ret) {
+    const auto entry = reinterpret_cast<GUEST_ABI u64 (*)(u64, const u64*)>(g_gx_hook_entry);
+    if (!entry) return false;
+    // A return slot, then what the stubs push: r9 r8 rcx rdx rsi rdi, the
+    // return address and the first stack argument (none of these have one).
+    const u64 frame[9] = {0, r9, r8, rcx, rdx, rsi, rdi, ret, 0};
+    return entry(kind, frame + 1) != 0;
+}
+
+void decomp_gx::note_writer_caller(const void* ours, std::uint64_t game_return_bn) {
+    if (g_writer_callers_n < static_cast<int>(sizeof g_writer_callers / sizeof g_writer_callers[0]))
+        g_writer_callers[g_writer_callers_n++] = {reinterpret_cast<u64>(ours), game_return_bn};
+    g_method_code_lo = GX_METHODS_LO;
+    g_method_code_hi = GX_METHODS_HI;
+}
+
 std::uint64_t decomp_gx::game_return_in_methods(std::uint64_t ret) {
-    // The method whose code holds it: the one entered last below it (the
-    // section holds the nine and nothing else).
+    // The function whose code holds it: the one entered last below it (the
+    // section holds the writer callers told and nothing else).
     int best = -1;
-    for (int k = 0; k < 9; ++k) {
-        if (g_method_entries[k] <= ret && (best < 0 || g_method_entries[k] > g_method_entries[best])) best = k;
+    for (int k = 0; k < g_writer_callers_n; ++k) {
+        if (g_writer_callers[k].entry <= ret && (best < 0 || g_writer_callers[k].entry > g_writer_callers[best].entry)) best = k;
     }
-    return best < 0 ? ret : game_address(kGameReturns[best]);
+    return best < 0 ? ret : game_address(g_writer_callers[best].game_return_bn);
 }
 
 // gx_flush_output_merger(om = ctx + 0xb558, ctx, state): what changed in the
@@ -836,10 +856,8 @@ void decomp_gx_draw_add() {
         DecompFunction fn{kMethodNames[k], "gx", kMethods[k].bn, kMethods[k].entry, kMethods[k].n, kMethods[k].ours, DecompKind::Leaf};
         if (k == 0) fn.report = &report;
         decomp_add(fn);
-        g_method_entries[k] = reinterpret_cast<u64>(kMethods[k].ours);
+        decomp_gx::note_writer_caller(kMethods[k].ours, kGameReturns[k]);
     }
-    decomp_gx::g_method_code_lo = GX_METHODS_LO;
-    decomp_gx::g_method_code_hi = GX_METHODS_HI;
     DecompFunction om{"gx_flush_output_merger", "gx", kFlushOutputMerger, kEntryOutputMerger, sizeof kEntryOutputMerger,
                       reinterpret_cast<void*>(&gx_flush_output_merger), DecompKind::Leaf};
     om.original = &g_original_om;
