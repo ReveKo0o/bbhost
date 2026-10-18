@@ -18256,7 +18256,7 @@ static bool draw_impl(const GpuDraw& d) {
     if (copy_versions_pending_locked() &&
         ((d.index_va && copy_version_lookup_locked(d.index_va, static_cast<std::uint64_t>(d.index_count) * (d.index_type == 1 ? 4 : 2),
                                                    nullptr) == kCopyVersionStraddles) ||
-         (d.indirect_va && copy_version_lookup_locked(d.indirect_va, 20, nullptr) == kCopyVersionStraddles))) {
+         (d.indirect_va && copy_version_lookup_locked(d.indirect_va, d.index_va ? 20 : 16, nullptr) == kCopyVersionStraddles))) {
         copy_versions_put_in_place_locked(kCvStraddle);
     }
     // Lazy pass barriers: what this draw samples against the targets written
@@ -18706,12 +18706,15 @@ static bool draw_impl(const GpuDraw& d) {
     }
     if (!g.profile_passes) profile_begin_locked(&bind_pl->profile_name);
     if (d.indirect_va) {
-        if (g_import_audit) audit_range(d.indirect_va, 20, kUseIndex);
+        // What the GPU reads: five dwords for an indexed draw, four otherwise
+        // (a 16-byte argument buffer is not read past its end).
+        const std::uint64_t args_bytes = d.index_va ? 20 : 16;
+        if (g_import_audit) audit_range(d.indirect_va, args_bytes, kUseIndex);
         Located loc;
-        const int version = copy_version_lookup_locked(d.indirect_va, 20, &loc);  // a straddle ended the pass above
+        const int version = copy_version_lookup_locked(d.indirect_va, args_bytes, &loc);  // a straddle ended the pass above
         if (version != kCopyVersionInside) {
             const ImportSite site("a draw's indirect arguments");
-            loc = locate(d.indirect_va, 20);
+            loc = locate(d.indirect_va, args_bytes);
         }
         if (!loc.buffer) {
             if (!g.profile_passes) profile_end_locked();
