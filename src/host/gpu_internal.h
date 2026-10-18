@@ -849,6 +849,7 @@ void twins_release_locked(std::uint64_t va, std::uint64_t bytes, int why);
 void twins_keep_in_guest_locked(std::uint64_t va, std::uint64_t bytes);
 void twins_buffer_made(std::uint64_t memory, std::uint64_t bytes, std::uint8_t usage, std::uint8_t bind, std::uint64_t gen);
 void twins_buffer_mapped_own(std::uint64_t memory, std::uint64_t gen);
+void twins_buffer_gone(std::uint64_t memory, std::uint64_t gen);
 std::string twins_report();
 // The buffer shadow's command buffer for this recording's uploads, run before
 // the recording's own work (buffer_shadow.cpp upload_cmd_locked).

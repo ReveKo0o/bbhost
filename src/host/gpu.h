@@ -402,6 +402,8 @@ void host_gpu_gx_buffer_made(std::uint64_t memory, std::uint64_t bytes, std::uin
 // A Map of that buffer handed out its own memory: the CPU writes it in place
 // (gx twins keep no device-local copy of it).
 void host_gpu_gx_buffer_mapped_own(std::uint64_t memory, std::uint64_t bytes, std::uint64_t gen);
+// That buffer was destroyed (gx twins drop its device-local copy).
+void host_gpu_gx_buffer_gone(std::uint64_t memory, std::uint64_t gen);
 // A GX buffer copy reached as a copy token, handled as the compute copy
 // path handles a recognised copy shader: marks the destination's surfaces
 // dirty; when the source is a render target, copies its image into the

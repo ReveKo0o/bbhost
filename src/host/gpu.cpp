@@ -6749,6 +6749,8 @@ void host_gpu_gx_buffer_made(std::uint64_t memory, std::uint64_t bytes, std::uin
 
 void host_gpu_gx_buffer_mapped_own(std::uint64_t memory, std::uint64_t, std::uint64_t gen) { twins_buffer_mapped_own(memory, gen); }
 
+void host_gpu_gx_buffer_gone(std::uint64_t memory, std::uint64_t gen) { twins_buffer_gone(memory, gen); }
+
 void host_gpu_import_prefetch(std::uint64_t va, std::uint64_t bytes, std::uint8_t usage, std::uint8_t bind) {
     if (g_import_whole || !g_prefetch_on || !bytes || usage == 3 /* STAGING */) return;
     // What the GPU reads in place: an unordered-access buffer (bind 0x80: what
@@ -8391,6 +8393,24 @@ void twin_drop_locked(std::uint64_t memory, bool copy_back, int why, std::uint64
 // writes them in place): dropped without a copy back, which would overwrite
 // the CPU's bytes. Checked when the count of such Maps has moved.
 std::uint64_t g_twin_cpu_mapped_seen = 0;  // under g.mu
+// GX buffers destroyed (the registry's host_gpu_gx_buffer_gone, or a buffer
+// made over a candidate's memory), whose twins the renderer drops: a live
+// twin is valid until then, so its uses ask the registry nothing.
+std::vector<std::pair<std::uint64_t, std::uint64_t>> g_twin_gone_q;  // (memory, generation), under g_twin_cand_mu
+std::atomic<std::uint64_t> g_twin_gone_n{0};
+std::uint64_t g_twin_gone_seen = 0;  // under g.mu
+void twins_drain_gone_locked() {
+    if (g_twin_gone_n.load(std::memory_order_acquire) == g_twin_gone_seen) return;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> q;
+    {
+        std::lock_guard<std::mutex> lk(g_twin_cand_mu);
+        q.swap(g_twin_gone_q);
+        g_twin_gone_seen = g_twin_gone_n.load(std::memory_order_relaxed);
+    }
+    for (const auto& [memory, gen] : q) {
+        if (const auto it = g_twin_live.find(memory); it != g_twin_live.end() && it->second.gen == gen) twin_drop_locked(memory, false, kTwinGoneDead, gen);
+    }
+}
 void twins_drop_cpu_mapped_locked() {
     const std::uint64_t n = g_twin_cpu_mapped_n.load(std::memory_order_relaxed);
     if (n == g_twin_cpu_mapped_seen || g_twin_live.empty()) return;
@@ -8412,7 +8432,27 @@ int twins_level() { return g_twins; }
 
 bool twin_locate_locked(std::uint64_t va, std::uint64_t bytes, Located& out, VkDeviceAddress* address) {
     if (!g_twins || !bytes || !g_twin_cand_n.load(std::memory_order_relaxed)) return false;
+    twins_drain_gone_locked();
     twins_drop_cpu_mapped_locked();
+    // Inside a live twin (the common case): served without the candidates'
+    // lock or the registry - a twin lives until its buffer is gone, let go or
+    // mapped in place by the CPU, which drop it.
+    if (auto lt = g_twin_live.upper_bound(va); lt != g_twin_live.begin()) {
+        --lt;
+        const std::uint64_t m = lt->first;
+        if (va >= m && va + bytes <= m + lt->second.bytes) {
+            out.buffer = lt->second.buffer;
+            out.offset = lt->second.offset + (va - m);
+            out.avail = lt->second.bytes - (va - m);
+            if (address) {
+                *address = lt->second.address + (va - m);
+                g_twin_addresses.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                g_twin_served.fetch_add(1, std::memory_order_relaxed);
+            }
+            return true;
+        }
+    }
     std::uint64_t memory = 0, cbytes = 0, gen = 0;
     std::uint64_t edge[2] = {0, 0};  // twins a range across their edge must let go first
     int n_edge = 0;
@@ -8456,6 +8496,15 @@ bool twin_locate_locked(std::uint64_t va, std::uint64_t bytes, Located& out, VkD
                 gen = c->second.gen;
                 inside = true;
                 g_twin_partial.fetch_add(1, std::memory_order_relaxed);
+                static std::atomic<int> logs{0};
+                if (logs.fetch_add(1, std::memory_order_relaxed) < 12) {
+                    GxResourceInfo info;
+                    const bool gx = gx_resource_at(memory, static_cast<std::size_t>(cbytes), &info);
+                    host_log("gpu: twins: %s asks for 0x%llx + 0x%llx, past the end of a twin at 0x%llx + 0x%llx (usage %d, bind 0x%x) inside a "
+                             "render pass: the twin serves what it holds",
+                             t_import_site ? t_import_site : "a path", static_cast<unsigned long long>(va), static_cast<unsigned long long>(bytes),
+                             static_cast<unsigned long long>(memory), static_cast<unsigned long long>(cbytes), gx ? info.usage : -1, gx ? info.bind : 0);
+                }
             }
         }
         if (!inside) {
@@ -8539,31 +8588,15 @@ bool twin_locate_locked(std::uint64_t va, std::uint64_t bytes, Located& out, VkD
 
 bool twin_covers_locked(std::uint64_t va, std::uint64_t bytes) {
     if (!g_twins || g_twin_live.empty() || !bytes) return false;
+    // A twin whose buffer died is dropped first (its memory may be a CPU ring
+    // now, which must keep its copies): the registry tells (twins_buffer_gone).
+    twins_drain_gone_locked();
     twins_drop_cpu_mapped_locked();
-    // The live twins over the range, each checked against the registry: one
-    // whose resource died is dropped (its memory may be a CPU ring now, which
-    // must keep its copies), and does not count.
-    for (int pass = 0; pass < 4; ++pass) {
-        std::uint64_t hit = 0;
-        bool any = false;
-        auto it = g_twin_live.upper_bound(va);
-        if (it != g_twin_live.begin() && va < std::prev(it)->first + std::prev(it)->second.bytes) {
-            hit = std::prev(it)->first;
-            any = true;
-        } else if (it != g_twin_live.end() && it->first < va + bytes) {
-            hit = it->first;
-            any = true;
-        }
-        if (!any) return false;
-        const Twin& t = g_twin_live[hit];
-        GxResourceInfo info;
-        if (gx_resource_at(hit, static_cast<std::size_t>(t.bytes), &info) && info.memory == hit && info.gen == t.gen) {
-            g_twin_refused.fetch_add(1, std::memory_order_relaxed);
-            return true;
-        }
-        twin_drop_locked(hit, false, kTwinGoneDead, t.gen);
-    }
-    return false;
+    auto it = g_twin_live.upper_bound(va);
+    const bool any = (it != g_twin_live.begin() && va < std::prev(it)->first + std::prev(it)->second.bytes) ||
+                     (it != g_twin_live.end() && it->first < va + bytes);
+    if (any) g_twin_refused.fetch_add(1, std::memory_order_relaxed);
+    return any;
 }
 
 bool twin_holds_live_locked(std::uint64_t va, std::uint64_t bytes) {
@@ -8710,9 +8743,32 @@ std::string twins_report() {
     return b;
 }
 
+void twins_buffer_gone(std::uint64_t memory, std::uint64_t gen) {
+    if (!g_twins || !memory) return;
+    std::lock_guard<std::mutex> lk(g_twin_cand_mu);
+    if (const auto it = g_twin_cand.find(memory); it != g_twin_cand.end() && it->second.gen == gen) {
+        g_twin_cand.erase(it);
+        g_twin_cand_n.store(g_twin_cand.size(), std::memory_order_relaxed);
+    }
+    g_twin_gone_q.emplace_back(memory, gen);
+    g_twin_gone_n.fetch_add(1, std::memory_order_release);
+}
+
 void twins_buffer_made(std::uint64_t memory, std::uint64_t bytes, std::uint8_t usage, std::uint8_t bind, std::uint64_t gen) {
+    if (!g_twins || !memory || !bytes) return;
+    {
+        // A candidate of an older resource at this memory (its destructor
+        // unseen): that resource is gone.
+        std::lock_guard<std::mutex> lk(g_twin_cand_mu);
+        if (const auto it = g_twin_cand.find(memory); it != g_twin_cand.end() && it->second.gen != gen) {
+            g_twin_gone_q.emplace_back(memory, it->second.gen);
+            g_twin_gone_n.fetch_add(1, std::memory_order_release);
+            g_twin_cand.erase(it);
+            g_twin_cand_n.store(g_twin_cand.size(), std::memory_order_relaxed);
+        }
+    }
     // Type buffer (the caller's), usage default, unordered-access bind.
-    if (!g_twins || !memory || !bytes || usage != 0 || !(bind & 0x80)) return;
+    if (usage != 0 || !(bind & 0x80)) return;
     g_twin_cands.fetch_add(1, std::memory_order_relaxed);
     std::lock_guard<std::mutex> lk(g_twin_cand_mu);
     g_twin_cand[memory] = TwinCandidate{bytes, gen, false};

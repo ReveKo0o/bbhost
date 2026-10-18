@@ -592,7 +592,7 @@ void retire_memory(std::uint64_t memory, std::uint32_t bytes, std::uint64_t gen)
 }
 
 void unregister_holder(std::uint64_t holder) {
-    std::uint64_t memory = 0, buffer_memory = 0, gen = 0;
+    std::uint64_t memory = 0, buffer_memory = 0, gen = 0, buffer_gen = 0;
     std::uint32_t bytes = 0, buffer_bytes = 0;
     {
         std::lock_guard<std::mutex> lk(g_mu);
@@ -609,6 +609,7 @@ void unregister_holder(std::uint64_t holder) {
         } else if (it->second.info.type == 1 && it->second.info.alive) {
             buffer_memory = it->second.info.memory;
             buffer_bytes = it->second.info.bytes;
+            buffer_gen = it->second.info.gen;
         }
         if (auto m = g_by_memory.find(it->second.info.memory); m != g_by_memory.end() && m->second == holder) g_by_memory.erase(m);
         g_by_holder.erase(it);
@@ -621,6 +622,7 @@ void unregister_holder(std::uint64_t holder) {
         // may not tell the mirrors, so their pages over it are copied again -
         // and decide again whether to be watched - before they are read.
         host_gpu_shadow_gx_write(buffer_memory, buffer_bytes);
+        host_gpu_gx_buffer_gone(buffer_memory, buffer_gen);
     }
 }
 
