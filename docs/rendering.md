@@ -50,10 +50,17 @@ Occlusion queries are tokens from GX's Begin and End, measured by the
 renderer's own queries. The packets nothing on the host reads - the cache
 flushes, the context registers, the shader prefetches, the compute stage's
 registers (a dispatch token carries them, and a fallback writes them before
-its packet), the constant engine's - are not written at all
+its packet), the constant engine's counters - are not written at all
 (`BBHOST_CP_DEAD_PACKETS`). Clears and copies come as tokens from GX's own
 calls: a clear names its view, and is made as the next pass's load op, or as a
 transfer clear when something reads the image first.
+
+**Host command lists.** What the command processor acts on in those buffers -
+the tokens, labels and waits, which our versions of Gnm's packet writers write -
+can be recorded as it is written, a list per chunk of command buffer, so that a
+submitted range reaches the command processor as its list's packets instead
+of all its bytes (`BBHOST_HOST_LISTS=1`; `=2` records the lists and checks
+them against the walk, range by range; off by default).
 
 **Recording.** The command processor leaves the Vulkan calls to a thread of
 its own, `bb-record`. Each draw goes into a packet, and most of its other
