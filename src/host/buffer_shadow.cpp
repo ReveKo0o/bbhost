@@ -76,7 +76,15 @@ constexpr std::uint32_t kPagesPerChunk = static_cast<std::uint32_t>(kChunkBytes 
 // such as a compute shader's store through the GPU page table.
 const bool g_verify = [] {
     const char* e = std::getenv("BBHOST_SHADOW_VERIFY");
-    return e && e[0] == '1';
+    return e && (e[0] == '1' || e[0] == '2');
+}();
+// BBHOST_SHADOW_VERIFY=2: told pages are write-watched as well (their faults
+// change nothing but the census's - BBHOST_RESOURCE_CENSUS=1 - which classes
+// them as told and lists their writers): who writes the pages GX's calls
+// tell, the writes the calls tell and those they do not.
+const bool g_verify_watch_told = [] {
+    const char* e = std::getenv("BBHOST_SHADOW_VERIFY");
+    return e && e[0] == '2';
 }();
 std::uint64_t g_verify_cursor = 0, g_verify_checked = 0, g_verify_stale = 0;
 // Verify mode: each page's contents when copied, so a stale page's report
@@ -884,8 +892,9 @@ void drain_gx_writes_locked() {
 // part, a texture or buffer of YEBIS's own device, a Scaleform texture,
 // nothing) times what handed it out (a Map, the upload pool, the ring,
 // nothing GX said), as owner * (kHandKinds + 1) + handed.
-constexpr unsigned kFaultHanders = kHandKinds + 1, kFaultOwners = 5, kFaultClasses = kFaultOwners * kFaultHanders;
-const char* const kFaultGxName[kFaultOwners] = {"GX buffers'", "a GX resource's in part", "YEBIS's", "Scaleform's", "nobody's"};
+constexpr unsigned kFaultHanders = kHandKinds + 1, kFaultOwners = 6, kFaultClasses = kFaultOwners * kFaultHanders;
+const char* const kFaultGxName[kFaultOwners] = {"GX buffers'", "a GX resource's in part", "YEBIS's", "Scaleform's", "nobody's",
+                                                "a told page's (BBHOST_SHADOW_VERIFY=2)"};
 const char* const kFaultHandName[kFaultHanders] = {"Maps hand out", "the upload pool hands out", "the ring hands out", "YEBIS's discard Maps hand out",
                                                     "nothing GX hands out"};
 std::uint64_t g_fault_census_seq = 0, g_fault_census_other = 0;
@@ -916,7 +925,13 @@ void census_faults_locked() {
             }
         }
         const int mw = gx_middleware_at(page, 0x1000);
-        const unsigned gx = gx_buffers_cover(page, 0x1000)                 ? 0
+        bool told_page = false;
+        if (known && g_verify_watch_told) {
+            const Mirror& tm = g_mirrors[phys >> gcn::kDmemChunkShift];
+            if (!tm.pages.empty()) told_page = tm.pages[(phys & (kChunkBytes - 1)) >> kPageShift].told;
+        }
+        const unsigned gx = told_page                                      ? 5
+                            : gx_buffers_cover(page, 0x1000)                 ? 0
                             : gx_resource_overlapping(page, 0x1000, nullptr) ? 1
                             : mw                                             ? 1 + static_cast<unsigned>(mw)
                                                                              : 4;
@@ -930,7 +945,7 @@ void census_faults_locked() {
 // The census on lines of its own (a log line holds 1024 bytes, which the
 // shadow's report fills by itself): the faults by class at every report, and
 // every twelfth (about a minute) each class with its four first writers.
-const char* const kFaultGxCode[kFaultOwners] = {"gx-buffers", "gx-part", "yebis", "scaleform", "nobody"};
+const char* const kFaultGxCode[kFaultOwners] = {"gx-buffers", "gx-part", "yebis", "scaleform", "nobody", "told"};
 const char* const kFaultHandCode[kFaultHanders] = {"map", "pool", "ring", "yebis-rename", "none"};
 void log_fault_census() {
     static unsigned calls = 0;
@@ -956,7 +971,7 @@ void log_fault_census() {
         std::vector<std::pair<std::uint64_t, std::uint64_t>> top(g_fault_writers[c].begin(), g_fault_writers[c].end());
         std::sort(top.begin(), top.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
         std::string w;
-        for (std::size_t k = 0; k < top.size() && k < 6; ++k) {
+        for (std::size_t k = 0; k < top.size() && k < (c / kFaultHanders == 5 ? 16u : 6u); ++k) {
             char buf[64];
             std::snprintf(buf, sizeof(buf), "%s0x%llx x%llu", k ? ", " : "", static_cast<unsigned long long>(top[k].first ? gx_guest_to_bn(top[k].first) : 0),
                           static_cast<unsigned long long>(top[k].second));
@@ -1213,11 +1228,19 @@ void shadow_locate_locked(std::uint64_t va, std::uint64_t bytes, Located& loc) {
         // page GX buffers cover is told of its writes instead (told_written).
         const std::uint64_t lo = std::max(page_va, map_lo), hi = std::min(page_va + kPageBytes, map_hi);
         const bool told = told_class[p - p0] ? told_class[p - p0] == 1 : page_told(p);
-        if (told) {
+        if (told && !g_verify_watch_told) {
             pg.watch = WriteWatch{};
             pg.alias_watch = WriteWatch{};
             pg.alias_va = 0;
             ++g_told_copies;
+        } else if (told) {
+            // Watched for the census only (BBHOST_SHADOW_VERIFY=2): told all the same.
+            ++g_told_copies;
+            pg.watch = WriteWatch{};
+            pg.watch.owner = kWatchOwnerMirror;
+            if (!(prearmed[p - p0] & 1)) hle_kernel_write_watch(lo, hi - lo, pg.watch);
+            pg.alias_watch = WriteWatch{};
+            pg.alias_va = 0;
         } else {
             if (g_shadow_gx) ++(gx_resource_overlapping(lo, hi - lo, nullptr) ? g_watched_partial : g_watched_none);
             pg.watch.owner = pg.alias_watch.owner = kWatchOwnerMirror;
