@@ -26,6 +26,7 @@ void decomp_gnmx_cue_add();            // gnmx/cue.cpp: Gnmx's constant update e
 void decomp_yebis_gnm_add();           // yebis/gnm.cpp: YEBIS's Gnm draw and dispatch wrappers
 void decomp_yebis_context_add();       // yebis/context.cpp: YEBIS's D3D11-shaped context: targets, draws, flushes, waits
 void decomp_yebis_ppfx_add();          // yebis/ppfx.cpp: PPFX's entry points - the post-processing chain as one call
+void decomp_yebis_clear_add();         // yebis/clear.cpp: ClearRenderTargetView and its compute clear
 void decomp_game_memcpy_add();         // memory/game_memcpy.cpp: the eboot's memcpy
 void decomp_ez_copy_add();             // memory/ez_copy.cpp: the streamed data's parallel copy
 void decomp_sfx_ribbons_add();         // sfx/ribbons.cpp: the effect ribbons' writers
@@ -54,6 +55,7 @@ void decomp_add_areas() {
     decomp_yebis_gnm_add();
     decomp_yebis_context_add();
     decomp_yebis_ppfx_add();
+    decomp_yebis_clear_add();
     decomp_game_memcpy_add();
     decomp_ez_copy_add();
     decomp_sfx_ribbons_add();

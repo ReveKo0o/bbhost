@@ -378,6 +378,7 @@ set(BBHOST_DECOMP_SOURCES
   src/decomp/yebis/gnm.cpp
   src/decomp/yebis/context.cpp
   src/decomp/yebis/ppfx.cpp
+  src/decomp/yebis/clear.cpp
   src/decomp/memory/game_memcpy.cpp
   src/decomp/memory/ez_copy.cpp
   src/decomp/sfx/ribbons.cpp
@@ -580,6 +581,7 @@ if(UNIX)
   bbhost_decomp_test(yebis_context SOURCES src/core/thunk.cpp src/core/portable.cpp src/hle/sysv_va.cpp src/host/main_wait.cpp)
   bbhost_decomp_test(yebis_ppfx)
   bbhost_decomp_test(gnmx_cue)
+  bbhost_decomp_test(yebis_clear)
   # The host command lists without the game (tests/host_lists_test.cpp), in shadow mode.
   add_executable(host_lists_test tests/host_lists_test.cpp src/core/portable.cpp)
   target_include_directories(host_lists_test PRIVATE src include)
