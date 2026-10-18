@@ -5925,8 +5925,8 @@ void defer_destroy_image(VkImage image, const ImageMemory& m) {
 }
 
 // A whole GX texture copied as memory (src_gen / dst_gen, a CopyResource)
-// goes by its resources' images (BBHOST_COPY_BY_RESOURCE, on unless 0; it
-// covers textures.cpp's copy-image sides and binds by resource too):
+// goes by its resources' images (BBHOST_COPY_BY_RESOURCE; it covers
+// textures.cpp's copy-image sides and binds by resource too):
 // [0] the source's target, its generation's, copied as an image (the
 // render-target path); [1] the source's surface a shader or copy wrote,
 // copied image to image (textures_copy_resource_locked); [2] a target at the
@@ -5935,13 +5935,22 @@ void defer_destroy_image(VkImage image, const ImageMemory& m) {
 // source's memory its content: copied as memory; [4] of those, ones into a
 // destination the host draws into as a target, which keeps its pixels (a
 // census: not seen so far); [5] targets copied into, relabelled the
-// destination's generation.
-const bool g_copy_by_resource = [] {
+// destination's generation; [6] sources a shader or copy wrote, copied as
+// their stale memory because =2 is not set.
+// 1 (the default): targets go by their resources (relabelled, another
+// resource's not used); a source whose surface a shader wrote is still copied
+// as its memory - the guest memory under such a surface is never written
+// back, so that copy is stale, but copying the image changes how dark scenes
+// look (the Hunter's Nightmare, Central Yharnam: a lighter veil; three copies
+// a frame at the 12 places, two 1920x1080 RGBA8 textures and one 960x540
+// half-float a compute pass writes just before) and which is the game's look
+// is the owner's call. 2: those image to image too. 0: by addresses.
+const int g_copy_by_resource = [] {
     const char* e = std::getenv("BBHOST_COPY_BY_RESOURCE");
-    return !(e && e[0] == '0');
+    return e && *e ? std::atoi(e) : 1;
 }();
-std::atomic<std::uint64_t> g_copy_res[6] = {};
-bool copy_by_resource_on() { return g_copy_by_resource && res_identity_on(); }
+std::atomic<std::uint64_t> g_copy_res[7] = {};
+bool copy_by_resource_on() { return g_copy_by_resource > 0 && res_identity_on(); }
 
 std::string image_heap_report() {
     VkDeviceSize used = 0;
@@ -5957,13 +5966,15 @@ std::string image_heap_report() {
     if (const std::string sites = view_epoch_sites_report(); !sites.empty()) host_log("  %s", sites.c_str());
     host_log("  %s", image_reuse_report_locked().c_str());
     host_log("  %s", draw_gen_report_locked().c_str());
-    host_log("  whole textures copied as memory, by their resources%s: the source's target as an image %llu, its surface image to image %llu, "
-             "another resource's target at the source - its memory copied %llu, its memory its content %llu (into a destination drawn as a "
-             "target, which keeps its pixels, %llu), targets copied into made the destination's %llu; image to image: %s",
+    host_log("  whole textures copied as memory, by their resources%s: the source's target as an image %llu, its surface image to image %llu "
+             "(GPU-written ones copied as their stale memory, BBHOST_COPY_BY_RESOURCE=2 not set, %llu), another resource's target at the "
+             "source - its memory copied %llu, its memory its content %llu (into a destination drawn as a target, which keeps its pixels, %llu), "
+             "targets copied into made the destination's %llu; image to image: %s",
              g_copy_by_resource ? "" : " (BBHOST_COPY_BY_RESOURCE=0: by address)", static_cast<unsigned long long>(g_copy_res[0].load()),
-             static_cast<unsigned long long>(g_copy_res[1].load()), static_cast<unsigned long long>(g_copy_res[2].load()),
-             static_cast<unsigned long long>(g_copy_res[3].load()), static_cast<unsigned long long>(g_copy_res[4].load()),
-             static_cast<unsigned long long>(g_copy_res[5].load()), textures_resource_copy_report().c_str());
+             static_cast<unsigned long long>(g_copy_res[1].load()), static_cast<unsigned long long>(g_copy_res[6].load()),
+             static_cast<unsigned long long>(g_copy_res[2].load()), static_cast<unsigned long long>(g_copy_res[3].load()),
+             static_cast<unsigned long long>(g_copy_res[4].load()), static_cast<unsigned long long>(g_copy_res[5].load()),
+             textures_resource_copy_report().c_str());
     {
         VkDeviceSize free_vram = 0, free_host = 0;
         for (const HeapBlock& b : g_heap) {
@@ -8597,17 +8608,20 @@ bool host_gpu_copy_guest(std::uint64_t dst, std::uint64_t src, std::size_t bytes
     if (by_resource) {
         HostImageRef ref;
         if (host_image_by_resource_locked(src, src_gen, &ref)) {
-            if (!ref.target && textures_copy_resource_locked(src, src_gen, dst, dst_gen)) {
-                // Image to image: the destination's memory is not written, so
-                // its surfaces are not marked (its own image took the copy).
-                g_copy_res[1].fetch_add(1, std::memory_order_relaxed);
-                return true;
-            }
             if (ref.target) {
                 g_copy_res[0].fetch_add(1, std::memory_order_relaxed);
+            } else if (ref.gpu_written && g_copy_by_resource < 2) {
+                g_copy_res[6].fetch_add(1, std::memory_order_relaxed);  // as before: by address (=2: as its image)
             } else {
                 skip_target = true;  // the source is its surface: a target at its memory is another resource's
-                g_copy_res[3].fetch_add(1, std::memory_order_relaxed);
+                if (textures_copy_resource_locked(src, src_gen, dst, dst_gen)) {
+                    // Image to image: the destination's memory is not written, so
+                    // its surfaces are not marked (its own image took the copy).
+                    g_copy_res[1].fetch_add(1, std::memory_order_relaxed);
+                    return true;
+                } else {
+                    g_copy_res[3].fetch_add(1, std::memory_order_relaxed);
+                }
             }
         } else if (RtImage* rt = find_render_target(src); rt && rt->gx_gen && static_cast<std::uint32_t>(rt->gx_gen) != static_cast<std::uint32_t>(src_gen)) {
             skip_target = true;
