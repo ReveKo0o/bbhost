@@ -8216,7 +8216,7 @@ struct Twin {
 std::map<std::uint64_t, Twin> g_twin_live;  // by memory, under g.mu
 enum { kTwinGoneWalk, kTwinGoneEdge, kTwinGoneDead, kTwinGoneFill, kTwinGoneTexture, kTwinGoneCpuMapped, kTwinGoneWhys };
 std::atomic<std::uint64_t> g_twin_cands{0}, g_twin_made{0}, g_twin_made_bytes{0}, g_twin_served{0}, g_twin_addresses{0},
-    g_twin_refused{0}, g_twin_partial{0}, g_twin_edge_in_pass{0}, g_twin_gone[kTwinGoneWhys], g_twin_copy_cands{0},
+    g_twin_refused{0}, g_twin_partial{0}, g_twin_edge_in_pass{0}, g_twin_edge_ended_pass{0}, g_twin_gone[kTwinGoneWhys], g_twin_copy_cands{0},
     g_twin_cpu_mapped_n{0};
 std::uint64_t g_twin_live_bytes = 0;  // under g.mu
 
@@ -8432,10 +8432,11 @@ bool twin_locate_locked(std::uint64_t va, std::uint64_t bytes, Located& out, VkD
     if (n_edge) {
         // A range across a twin's edge: the twin cannot serve it whole, and
         // guest memory may not be read past a live twin - copied back and let
-        // go. With a render pass open a copy back would end it mid-draw: one
-        // live twin holding the range's start serves what it holds (the rest
-        // reads past it), and anything else is counted and read from guest
-        // memory as it stands.
+        // go. With a render pass open, one live twin holding the range's start
+        // serves what it holds (the rest reads past it: a V# with more records
+        // than its buffer); anything else ends the pass for a binding (below)
+        // and, for a device address, is counted and read from guest memory as
+        // it stands.
         const bool pass = render_pass_open_locked();
         if (pass && n_edge == 1 && edge[0] <= va && g_twin_live.count(edge[0])) {
             std::lock_guard<std::mutex> lk(g_twin_cand_mu);
@@ -8449,6 +8450,11 @@ bool twin_locate_locked(std::uint64_t va, std::uint64_t bytes, Located& out, VkD
             }
         }
         if (!inside) {
+            // A binding (no device address asked) may end the pass, as a
+            // binding across a copy version's edge does: the twins are copied
+            // back and let go before the draw, so guest memory is current.
+            const bool end_pass = pass && !address;
+            bool ended = false;
             for (int k = 0; k < n_edge; ++k) {
                 if (const auto lt = g_twin_live.find(edge[k]); lt != g_twin_live.end()) {
                     // Which path asks across an edge, and how (logged a few times).
@@ -8456,10 +8462,21 @@ bool twin_locate_locked(std::uint64_t va, std::uint64_t bytes, Located& out, VkD
                     if (logs.fetch_add(1, std::memory_order_relaxed) < 12) {
                         host_log("gpu: twins: %s asks for 0x%llx + 0x%llx across the edge of a twin at 0x%llx + 0x%llx%s", t_import_site ? t_import_site : "a path",
                                  static_cast<unsigned long long>(va), static_cast<unsigned long long>(bytes), static_cast<unsigned long long>(edge[k]),
-                                 static_cast<unsigned long long>(lt->second.bytes), pass ? " inside a render pass: read from guest memory" : ": copied back, let go");
+                                 static_cast<unsigned long long>(lt->second.bytes),
+                                 end_pass ? " inside a render pass: the pass ends, copied back, let go"
+                                 : pass   ? " inside a render pass: read from guest memory"
+                                          : ": copied back, let go");
                     }
-                    if (pass) g_twin_edge_in_pass.fetch_add(1, std::memory_order_relaxed);
-                    else twin_drop_locked(edge[k], true, kTwinGoneEdge);
+                    if (end_pass && !ended) {
+                        render_end_pass_locked();
+                        ended = true;
+                    }
+                    if (pass && !end_pass) {
+                        g_twin_edge_in_pass.fetch_add(1, std::memory_order_relaxed);
+                    } else {
+                        if (pass) g_twin_edge_ended_pass.fetch_add(1, std::memory_order_relaxed);
+                        twin_drop_locked(edge[k], true, kTwinGoneEdge);
+                    }
                 } else {
                     std::lock_guard<std::mutex> lk(g_twin_cand_mu);
                     if (auto c = g_twin_cand.find(edge[k]); c != g_twin_cand.end()) c->second.let_go = true;
@@ -8642,14 +8659,14 @@ std::string twins_report() {
     std::snprintf(b, sizeof(b),
                   "gpu: GX buffers the GPU writes as device resources (BBHOST_GX_TWINS=%d): %llu candidates seen made, %llu more at a GPU copy, %zu kept; %llu "
                   "twins made (%llu KiB), %zu live (%llu KiB) in %zu pool blocks; served %llu bindings (%llu across an edge, in part) and %llu device addresses; CPU copies refused %llu; "
-                  "let go after copying back: page-table walks %llu, ranges across an edge %llu (%llu more inside a render pass, read from guest memory), a texture over one %llu; dropped with "
+                  "let go after copying back: page-table walks %llu, ranges across an edge %llu (%llu of them ending a pass; %llu more inside a pass read from guest memory), a texture over one %llu; dropped with "
                   "their resource %llu; never made (no guest bytes or no memory) %llu; mapped in place by the CPU %llu (%llu of them candidates)",
                   g_twins, static_cast<ull>(g_twin_cands.load()), static_cast<ull>(g_twin_copy_cands.load()), cands, static_cast<ull>(g_twin_made.load()),
                   static_cast<ull>(g_twin_made_bytes.load() >> 10), live, static_cast<ull>(live_bytes >> 10), blocks,
                   static_cast<ull>(g_twin_served.load()), static_cast<ull>(g_twin_partial.load()), static_cast<ull>(g_twin_addresses.load()),
                   static_cast<ull>(g_twin_refused.load()),
                   static_cast<ull>(g_twin_gone[kTwinGoneWalk].load()), static_cast<ull>(g_twin_gone[kTwinGoneEdge].load()),
-                  static_cast<ull>(g_twin_edge_in_pass.load()),
+                  static_cast<ull>(g_twin_edge_ended_pass.load()), static_cast<ull>(g_twin_edge_in_pass.load()),
                   static_cast<ull>(g_twin_gone[kTwinGoneTexture].load()), static_cast<ull>(g_twin_gone[kTwinGoneDead].load()),
                   static_cast<ull>(g_twin_gone[kTwinGoneFill].load()), static_cast<ull>(cpu_mapped), static_cast<ull>(g_twin_cpu_mapped_n.load()));
     return b;
