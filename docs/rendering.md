@@ -63,17 +63,17 @@ of all its bytes (`BBHOST_HOST_LISTS=1`, the default; a range no list covers
 is walked, counted by reason; `=0` walks every range as before, `=2` records
 the lists and checks them against the walk, range by range).
 
-**Labels.** The completions are GPU fills of guest memory at the end of
-their submission's command buffer. With `BBHOST_LABEL_LANDING=1` (off by
-default while it is measured) a submission carries its labels instead, and a
-thread of the host's, `bb-labels`, writes them into guest memory in the order
-the command processor made them once the timeline semaphore says the
-submission has run: the queue's order holds without barriers between fills,
-and a label's memory needs no import. A submission counts as completed for
-the rest of bbhost only once its labels are in memory, and the command
-arena's acquire, waiting for a chunk, looks again as each label lands. The
-thread waits in the driver, or polls on Windows (`BBHOST_LABEL_WAIT`), where
-NVIDIA's driver holds its lock through that wait.
+**Labels.** A submission carries its labels, and a thread of the host's,
+`bb-labels`, writes them into guest memory in the order the command processor
+made them once the timeline semaphore says the submission has run: the
+queue's order holds without barriers between fills, and a label's memory
+needs no import. A submission counts as completed for the rest of bbhost only
+once its labels are in memory, and the command arena's acquire, waiting for a
+chunk, looks again as each label lands. The thread waits in the driver, or
+polls on Windows (`BBHOST_LABEL_WAIT`), where NVIDIA's driver holds its lock
+through that wait; there the labels are still GPU fills at the end of their
+submission's command buffer unless `BBHOST_LABEL_LANDING=1` (`=0` keeps the
+fills anywhere).
 
 **Recording.** The command processor leaves the Vulkan calls to a thread of
 its own, `bb-record`. Each draw goes into a packet, and most of its other
@@ -200,7 +200,7 @@ path at all:
 | Clears and target copies | native: tokens from GX's calls, in the view's terms |
 | Occlusion queries | native: tokens from GX's calls, measured by the renderer's own queries |
 | Pipeline drains | native: barrier tokens from GX's calls |
-| Labels and fences the game waits on | emulated: written by the command processor on the GPU's timeline |
+| Labels and fences the game waits on | emulated: recorded by the command processor, written by the host once their submission has run (GPU fills on Windows for now) |
 | Shaders | decompiled (lifted) to SPIR-V; a few refused programs translated (see below) |
 | Resource identity | GX's resources by their objects and generations; what GX does not create (YEBIS's and Scaleform's textures, vertex and index copies) by address, with write tracking |
 

@@ -1,6 +1,7 @@
 // The command processor's labels written by the host once their submission
-// has run (BBHOST_LABEL_LANDING=1), instead of as GPU fills into imported
-// guest memory at the end of the submission's command buffer.
+// has run (BBHOST_LABEL_LANDING=1, the default but on Windows), instead of as
+// GPU fills into imported guest memory at the end of the submission's command
+// buffer (BBHOST_LABEL_LANDING=0).
 //
 // A label - EVENT_WRITE_EOP, EVENT_WRITE_EOS, RELEASE_MEM: four or eight
 // bytes that say "the work before this is done" - is read by the CPU (the
@@ -47,7 +48,7 @@ struct Hooks {
     void (*thread_start)() = nullptr;                               // names the thread, sets its class
 };
 
-bool on();                       // BBHOST_LABEL_LANDING=1
+bool on();                       // BBHOST_LABEL_LANDING (default 1, 0 on Windows)
 void start(const Hooks& hooks);  // the landing thread (bb-labels), once
 // At submit (under the renderer's lock): the writes submission `serial`
 // carries, in the order they were made.

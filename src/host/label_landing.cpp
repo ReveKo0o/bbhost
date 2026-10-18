@@ -15,9 +15,17 @@
 namespace label_landing {
 namespace {
 
+// BBHOST_LABEL_LANDING: 1 lands, 0 keeps the GPU fills. By default it lands,
+// but on Windows, where the thread polls (below) and no Windows machine has
+// measured that yet.
 const bool g_on = [] {
     const char* e = std::getenv("BBHOST_LABEL_LANDING");
-    return e && e[0] == '1';
+    if (e && e[0]) return e[0] == '1';
+#if defined(_WIN32)
+    return false;
+#else
+    return true;
+#endif
 }();
 
 // BBHOST_LABEL_WAIT=block|poll: how the thread waits for the GPU. Block (the

@@ -143,9 +143,10 @@ const bool g_submit_thread_on = [] {
 std::atomic<std::uint64_t> g_stream_submitted{0};
 std::atomic<std::uint64_t> g_foreign_submitted{0};
 std::atomic<bool> g_timeline_on{false};  // Gpu::timeline made: set once, before any submission
-// BBHOST_LABEL_LANDING=1, with a timeline semaphore to say when a submission
-// has run: the command processor's labels are written by the host then
-// (label_landing.h); without one they stay GPU fills.
+// BBHOST_LABEL_LANDING (on by default but on Windows), with a timeline
+// semaphore to say when a submission has run: the command processor's labels
+// are written by the host then (label_landing.h); without one, or with
+// BBHOST_LABEL_LANDING=0, they stay GPU fills.
 bool landing_on() { return label_landing::on() && g_timeline_on.load(std::memory_order_relaxed); }
 void start_label_landing();  // once the timeline is made (init_locked)
 constexpr std::uint64_t kForeignTicket = 1ull << 63;  // host_gpu_submit_presenter's tickets for a kForeignSubmit
