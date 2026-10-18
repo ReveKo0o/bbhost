@@ -169,7 +169,13 @@ dispatch fills - in device memory, as a copy made at the buffer's first GPU
 use that every GPU use reads and writes from then on; nothing copies their
 guest bytes on the CPU after that, and anything that would read them from
 guest memory (a page-table walk, a texture over one) has the copy written
-back first.
+back first. `BBHOST_GX_TWINS=2` adds the buffers GX writes with GPU copies:
+a dynamic buffer's renamed bytes written back to its own address, a constant
+buffer's update (a world has about 3,800 of them, 4 MB, kept in shared
+device-memory blocks). With window imports a copy's source the CPU wrote is
+copied through upload staging, as copy versions' bytes are, rather than read
+through an import. The exit report lists what still reads or writes guest
+memory in place, by the path that asked.
 Textures are detiled on the GPU. A texture's image, a render target's and a
 copy's belong to the GX resource they were made for, by that resource's
 generation: GX's own calls change them - the resource's creation, upload and
