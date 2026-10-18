@@ -165,11 +165,19 @@ state objects - so the hooks speak its terms.
   which target, and what read it later. A plugin can name the passes,
   capture a pass's targets, run a pass of its own between two of the game's
   (an effect after the scene and before the menus), or leave one out.
+- **Per frame.** Called where a frame ends, in the swap chain's present:
+  how many frames the game may run ahead of the display (two display
+  buffers, so at most two flips in flight) and what it waits for before it
+  hands a frame over are decided there. A plugin can run a pass of its own
+  over the final image, capture it, or pace frames another way.
 
 Hooks cost nothing while no plugin registers one. A registered one runs for
 every draw on the engine's render threads, so it must be fast, thread-safe
-and never wait. YEBIS's post-processing passes are covered where they reach
-Gnm; the Scaleform menus and the flip are not, until that code is source too.
+and never wait. YEBIS's post-processing passes are covered as the D3D11
+calls its own context takes (the targets each pass binds, its draws, its
+flushes) and where they reach Gnm, and the whole chain as the two calls the
+engine runs it with (`ppfxBindFramebuffer`, `ppfxApplyEffects`); the
+Scaleform menus are not, until that code is source too.
 
 ## Text
 
