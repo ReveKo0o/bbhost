@@ -4357,9 +4357,27 @@ thread_local std::uint64_t t_replay_key = 0;  // the content key create_gfx_pipe
 constexpr std::size_t kRecipeMax = 16384;
 constexpr std::uint64_t kRecipeMaxBytes = 64ull << 20;
 constexpr std::uint32_t kRecipeIdleRuns = 16;
+// A compute pipeline a dispatch used (gpu.cpp recipe_note_compute): built at
+// the dispatch - a shader GX never created through the hook, or one whose
+// bound images differ from the creation's guess - or taken from one compiled
+// at creation. What its key (compute_key) was made from, so a start builds it
+// on a precompile worker (precompile_compute_recorded) before the dispatch
+// asks: the title's own compute shaders included, which nothing else does on a
+// first start. A list names the program by hash, as it names the others.
+struct ComputeRecipe {
+    std::uint64_t key = 0;  // compute_key at the dispatch
+    std::string name;
+    std::vector<std::uint32_t> words;
+    std::uint32_t rsrc1 = 0, rsrc2 = 0, threads[3] = {};
+    std::vector<std::pair<std::uint32_t, bool>> dims;
+    std::vector<bool> modes;
+    std::uint32_t uses = 0, last_run = 0, order = 0;
+    bool listed = false;  // from a shipped list
+};
 struct PipelineManifest {
     std::mutex mu;
     std::unordered_map<std::uint64_t, std::shared_ptr<PipelineRecipe>> by_key;  // under mu
+    std::unordered_map<std::uint64_t, std::shared_ptr<ComputeRecipe>> compute;  // under mu: by compute_key
     std::uint32_t run = 1;  // this start's number (the file's + 1)
     bool dirty = false;     // under mu
     // Pipelines built from recipes at this start, by content key; never erased
@@ -4369,6 +4387,7 @@ struct PipelineManifest {
     std::atomic<std::uint64_t> loaded{0}, queued{0}, done{0}, failed{0}, relinked{0}, build_us{0}, recorded{0};
     std::atomic<std::uint64_t> taken{0}, not_ready{0}, layout_differs{0}, unrecordable{0}, dropped{0};
     std::atomic<std::uint64_t> wait_us{0};
+    std::atomic<std::uint64_t> compute_loaded{0}, compute_built{0}, compute_failed{0}, compute_recorded{0};
     std::atomic<std::uint32_t> next_order{0};
     std::chrono::steady_clock::time_point loaded_at{};
     std::atomic<bool> done_logged{false};
@@ -4578,6 +4597,46 @@ void recipe_note_created(GfxPipeline& pl, std::uint64_t key) {
         }
     }
 }
+}  // namespace
+// A dispatch's compute pipeline (gpu.cpp pipeline_for): one it built itself
+// joins the manifest when the manifest lacks it; one it took counts the
+// record's use, where there is a record.
+void recipe_note_compute(const std::string& name, const std::vector<std::uint32_t>& words, std::uint64_t key, std::uint32_t rsrc1,
+                         std::uint32_t rsrc2, const std::uint32_t threads[3], const std::vector<std::pair<std::uint32_t, bool>>& dims,
+                         const std::vector<bool>& modes, bool built_here) {
+    if (!g_pmanifest.recording.load(std::memory_order_relaxed) || words.empty()) return;
+    std::lock_guard<std::mutex> lk(g_pmanifest.mu);
+    if (!built_here && !g_pmanifest.compute.count(key)) return;
+    std::shared_ptr<ComputeRecipe>& c = g_pmanifest.compute[key];
+    if (c) {
+        if (c->last_run != g_pmanifest.run) {
+            c->last_run = g_pmanifest.run;
+            c->order = g_pmanifest.next_order.fetch_add(1, std::memory_order_relaxed);
+            c->uses += 1;
+            g_pmanifest.dirty = true;
+        }
+        return;
+    }
+    c = std::make_shared<ComputeRecipe>();
+    c->key = key;
+    c->name = name;
+    c->words = words;
+    c->rsrc1 = rsrc1;
+    c->rsrc2 = rsrc2;
+    std::copy(threads, threads + 3, c->threads);
+    c->dims = dims;
+    c->modes = modes;
+    c->uses = 1;
+    c->last_run = g_pmanifest.run;
+    c->order = g_pmanifest.next_order.fetch_add(1, std::memory_order_relaxed);
+    g_pmanifest.dirty = true;
+    const std::uint64_t n = g_pmanifest.compute_recorded.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (g_log_new_recipes) {
+        host_log("render: pipeline manifest: new compute recipe %016llx %s (%llu in this run) at flip %llu", static_cast<unsigned long long>(key),
+                 name.c_str(), static_cast<unsigned long long>(n), static_cast<unsigned long long>(hle_video_flip_count()));
+    }
+}
+namespace {
 // Its first draw queued the optimized relink: the specialization that took.
 void recipe_note_relink(const GfxPipeline& pl) {
     if (!pl.recipe) return;
@@ -5996,6 +6055,7 @@ struct PrecompileJob {
     std::uint64_t flip = 0;   // when GX created it
     std::shared_ptr<const ManifestStage> manifest;  // type 7: a stage from the manifest
     std::shared_ptr<const PipelineRecipe> recipe;   // type 8: a pipeline from the pipeline manifest
+    std::shared_ptr<const ComputeRecipe> compute;   // type 9: a compute pipeline from the pipeline manifest
     // The shader sweep's (types 1, 2, 4 from the game's bundles): into the
     // caches only, nothing kept in this run (precompile_ps, precompile_vs).
     bool sweep = false;
@@ -6177,7 +6237,7 @@ Precompiler& precompiler() {
                     while (!g.ok) std::this_thread::sleep_for(std::chrono::milliseconds(50));
                     // The HLSL compiles behind the game take what earlier
                     // starts drew before what GX only created.
-                    hlsl_lane(job.type == 7 || job.type == 8 || job.type == 0 ? kHlslLaneManifest
+                    hlsl_lane(job.type == 7 || job.type == 8 || job.type == 9 || job.type == 0 ? kHlslLaneManifest
                               : job.twin || job.sweep                         ? kHlslLaneLater
                                                                               : kHlslLaneCreated);
                     if (job.type == 4) {
@@ -6190,6 +6250,11 @@ Precompiler& precompiler() {
                         precompile_manifest(*job.manifest);
                     } else if (job.type == 8) {
                         replay_recipe(*w, job.recipe);
+                    } else if (job.type == 9) {
+                        const ComputeRecipe& c = *job.compute;
+                        (precompile_compute_recorded(c.name, c.words, c.rsrc1, c.rsrc2, c.threads, c.dims, c.modes) ? g_pmanifest.compute_built
+                                                                                                                     : g_pmanifest.compute_failed)
+                            .fetch_add(1, std::memory_order_relaxed);
                     } else {
                         precompile_ps(*w, job);
                     }
@@ -6197,7 +6262,7 @@ Precompiler& precompiler() {
                     std::lock_guard<std::mutex> lk(w->mu);
                     if (--w->running[job.name] == 0) w->running.erase(job.name);
                     ++w->burst_jobs;
-                    ++w->burst_type[job.type >= 0 && job.type <= 8 ? job.type : 2];
+                    ++w->burst_type[job.type == 9 ? 4 : job.type >= 0 && job.type <= 8 ? job.type : 2];
                     if (w->busy && w->jobs.empty() && w->later.empty() && w->running.empty()) {
                         w->busy = false;
                         // How long a run of compiles took the workers, wall
@@ -7625,7 +7690,9 @@ bool read(Reader& r, ManifestStage& m) {
 
 namespace recipe_file {
 constexpr std::uint32_t kMagic = 0x4d504242;  // "BBPM"
-constexpr std::uint32_t kVersion = 3;  // 2: tessellated pipelines; 3: the host tessellator's LS passes (a 2 is read as well)
+constexpr std::uint32_t kVersion = 4;  // 2: tessellated pipelines; 3: the host tessellator's LS passes; 4: compute records (2 and 3 read as well)
+// A record's flags: a compute record (ComputeRecipe) rather than a pipeline's.
+constexpr std::uint32_t kComputeRecord = 1u << 30;
 using manifest_file::Reader;
 using manifest_file::Writer;
 // What made the file: the translator and the device, for the report (the
@@ -7805,6 +7872,18 @@ void write(Writer& out, const PipelineRecipe& rc) {
     out.u32(static_cast<std::uint32_t>(w.out.size()));
     out.out.insert(out.out.end(), w.out.begin(), w.out.end());
 }
+// A program a list names (tools/pipeline_list.py: name, word count, hash):
+// its words from the game's own files - its bundles, or the eboot for the
+// eboot's own - patched as the game's draws read them; they must hash the same.
+bool program_from_game(const std::string& name, std::uint32_t count, std::uint64_t hash, std::vector<std::uint32_t>& out) {
+    const std::shared_ptr<const std::vector<std::uint8_t>> c = shader_program_container(name);
+    gcn::ShaderCode code;
+    if (!c || !gcn::shader_code(*c, code)) return false;
+    shader_patch_apply(name, code.words);
+    if (code.words.size() != count || fnv1a(code.words.data(), code.words.size() * 4) != hash) return false;
+    out = std::move(code.words);
+    return true;
+}
 bool read(Reader& in, PipelineRecipe& rc) {
     const std::uint32_t n = in.count(1);
     if (!in.ok) return false;
@@ -7862,15 +7941,7 @@ bool read(Reader& in, PipelineRecipe& rc) {
         words(r, rc.ps_words);
     }
     if (!str(r, rc.vs_name) || !str(r, rc.ps_name)) return false;
-    const auto from_bundle = [](const std::string& name, std::uint32_t count, std::uint64_t hash, std::vector<std::uint32_t>& out) {
-        const std::shared_ptr<const std::vector<std::uint8_t>> c = shader_program_container(name);
-        gcn::ShaderCode code;
-        if (!c || !gcn::shader_code(*c, code)) return false;
-        shader_patch_apply(name, code.words);
-        if (code.words.size() != count || fnv1a(code.words.data(), code.words.size() * 4) != hash) return false;
-        out = std::move(code.words);
-        return true;
-    };
+    const auto from_bundle = &program_from_game;
     if (vs_ref && !from_bundle(rc.vs_name, vs_count, vs_hash, rc.vs_words)) return false;
     if (ps_ref && !from_bundle(rc.ps_name, ps_count, ps_hash, rc.ps_words)) return false;
     dims(r, rc.vs_dims);
@@ -7988,6 +8059,58 @@ bool read(Reader& in, PipelineRecipe& rc) {
     if (!rc.has_ls_fetch) s.ls_fetch_va = 0;
     return r.ok && r.p == r.end && !rc.vs_words.empty() && rc.key != 0;
 }
+// A compute record: the flags (kComputeRecord; 256 when a list names the
+// program), key and use as a pipeline's record has them, the program, the
+// resource registers, the thread counts and the images and samplers its key
+// was made from.
+void write(Writer& out, const ComputeRecipe& c) {
+    Writer w;
+    w.u32(kComputeRecord);
+    pod(w, c.key);
+    w.u32(c.uses);
+    w.u32(c.last_run);
+    w.u32(c.order);
+    words(w, c.words);
+    str(w, c.name);
+    for (std::uint32_t v : {c.rsrc1, c.rsrc2, c.threads[0], c.threads[1], c.threads[2]}) w.u32(v);
+    dims(w, c.dims);
+    modes(w, c.modes);
+    out.u32(static_cast<std::uint32_t>(w.out.size()));
+    out.out.insert(out.out.end(), w.out.begin(), w.out.end());
+}
+bool read(Reader& in, ComputeRecipe& c) {
+    const std::uint32_t n = in.count(1);
+    if (!in.ok) return false;
+    Reader r{in.p, in.p + n};
+    in.p += n;
+    const std::uint32_t f = r.u32();
+    if (!(f & kComputeRecord)) return false;
+    pod(r, c.key);
+    c.uses = r.u32();
+    c.last_run = r.u32();
+    c.order = r.u32();
+    std::uint32_t count = 0;
+    std::uint64_t hash = 0;
+    if (f & 256) {
+        count = r.u32();
+        pod(r, hash);
+    } else {
+        words(r, c.words);
+    }
+    if (!str(r, c.name)) return false;
+    for (std::uint32_t* v : {&c.rsrc1, &c.rsrc2, &c.threads[0], &c.threads[1], &c.threads[2]}) *v = r.u32();
+    dims(r, c.dims);
+    modes(r, c.modes);
+    if ((f & 256) && !program_from_game(c.name, count, hash, c.words)) return false;
+    return r.ok && !c.words.empty();
+}
+// Whether the record at the reader is a compute record (its flags, past its length).
+bool next_is_compute(const Reader& r) {
+    std::uint32_t f = 0;
+    if (r.end - r.p < 8) return false;
+    std::memcpy(&f, r.p + 4, 4);
+    return (f & kComputeRecord) != 0;
+}
 }  // namespace recipe_file
 
 void precompile_report() {
@@ -8004,13 +8127,16 @@ void precompile_report() {
         }
         host_log("render: pipeline manifest: %llu pipelines from earlier runs, %llu built at start (%.1f s of worker time, %llu relinked), "
                  "%llu failed and dropped; pipeline builds that took one %llu (one recorded but not built yet %llu, another layout %llu); "
-                 "%llu recorded in this run, %zu kept, %llu left out for the size limit; %s",
+                 "%llu recorded in this run, %zu kept, %llu left out for the size limit; compute pipelines: %llu from records built at the start "
+                 "(%llu not: failed, or built first by another), %llu recorded in this run; %s",
                  static_cast<unsigned long long>(g_pmanifest.loaded.load()), static_cast<unsigned long long>(g_pmanifest.done.load()),
                  g_pmanifest.build_us.load() / 1e6, static_cast<unsigned long long>(g_pmanifest.relinked.load()),
                  static_cast<unsigned long long>(g_pmanifest.failed.load()), static_cast<unsigned long long>(g_pmanifest.taken.load()),
                  static_cast<unsigned long long>(g_pmanifest.not_ready.load()), static_cast<unsigned long long>(g_pmanifest.layout_differs.load()),
                  static_cast<unsigned long long>(g_pmanifest.recorded.load()), kept,
-                 static_cast<unsigned long long>(g_pmanifest.dropped.load()), ls_pass_report().c_str());
+                 static_cast<unsigned long long>(g_pmanifest.dropped.load()), static_cast<unsigned long long>(g_pmanifest.compute_built.load()),
+                 static_cast<unsigned long long>(g_pmanifest.compute_failed.load()),
+                 static_cast<unsigned long long>(g_pmanifest.compute_recorded.load()), ls_pass_report().c_str());
     }
     if (!precompile_enabled()) return;
     Precompiler& w = precompiler();
@@ -20485,13 +20611,14 @@ void stage_manifest_save(const std::string& path) {
 // One recipe file: this player's manifest or a shipped list. False when it is
 // not one this build reads.
 bool read_recipe_file(const std::string& path, std::uint32_t& run, recipe_file::Origin& origin,
-                      std::vector<std::shared_ptr<PipelineRecipe>>& recipes, std::uint32_t& unread) {
+                      std::vector<std::shared_ptr<PipelineRecipe>>& recipes, std::vector<std::shared_ptr<ComputeRecipe>>& computes,
+                      std::uint32_t& unread) {
     std::ifstream in(path, std::ios::binary);
     if (!in) return false;
     const std::vector<std::uint8_t> data((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
     manifest_file::Reader r{data.data(), data.data() + data.size()};
     const std::uint32_t magic = data.size() >= 12 ? r.u32() : 0, version = data.size() >= 12 ? r.u32() : 0;
-    if (magic != recipe_file::kMagic || (version != recipe_file::kVersion && version != 2)) {
+    if (magic != recipe_file::kMagic || version < 2 || version > recipe_file::kVersion) {
         if (!data.empty()) host_log("render: pipeline manifest: %s is not one this build reads", path.c_str());
         return false;
     }
@@ -20499,6 +20626,15 @@ bool read_recipe_file(const std::string& path, std::uint32_t& run, recipe_file::
     if (!recipe_file::read_origin(r, origin)) return false;
     const std::uint32_t n = r.u32();
     for (std::uint32_t k = 0; k < n && k < kRecipeMax && r.ok; ++k) {
+        if (recipe_file::next_is_compute(r)) {
+            auto c = std::make_shared<ComputeRecipe>();
+            if (recipe_file::read(r, *c)) {
+                computes.push_back(std::move(c));
+            } else {
+                ++unread;
+            }
+            continue;
+        }
         auto rc = std::make_shared<PipelineRecipe>();
         if (recipe_file::read(r, *rc)) {
             rc->loaded = true;
@@ -20533,7 +20669,8 @@ void pipeline_manifest_load(const std::string& path, const std::string& list_pat
     std::uint32_t run = 0, unread = 0;
     recipe_file::Origin theirs = ours;
     std::vector<std::shared_ptr<PipelineRecipe>> recipes;
-    const bool have_own = read_recipe_file(path, run, theirs, recipes, unread);
+    std::vector<std::shared_ptr<ComputeRecipe>> computes;
+    const bool have_own = read_recipe_file(path, run, theirs, recipes, computes, unread);
     // The last start's in the order its draws first took them, which this
     // start's draws likely follow, then the older ones, the most recent first.
     std::stable_sort(recipes.begin(), recipes.end(), [](const auto& a, const auto& b) {
@@ -20541,12 +20678,16 @@ void pipeline_manifest_load(const std::string& path, const std::string& list_pat
     });
     std::size_t own = 0, listed = 0, list_unread = 0;
     std::vector<std::shared_ptr<PipelineRecipe>> queue;
+    std::vector<std::shared_ptr<ComputeRecipe>> compute_queue;
     {
         std::lock_guard<std::mutex> lk(g_pmanifest.mu);
         g_pmanifest.run = run + 1;
         g_pmanifest.next_order.store(0);  // this start's order of first use (recipe_note_created, take_prebuilt)
         for (const auto& rc : recipes) {
             if (g_pmanifest.by_key.emplace(rc->key, rc).second) queue.push_back(rc);
+        }
+        for (const auto& c : computes) {
+            if (g_pmanifest.compute.emplace(c->key, c).second) compute_queue.push_back(c);
         }
         if (unread) g_pmanifest.dirty = true;
         own = queue.size();
@@ -20555,7 +20696,8 @@ void pipeline_manifest_load(const std::string& path, const std::string& list_pat
         std::uint32_t list_run = 0, bad = 0;
         recipe_file::Origin list_origin;
         std::vector<std::shared_ptr<PipelineRecipe>> list;
-        if (read_recipe_file(list_path, list_run, list_origin, list, bad)) {
+        std::vector<std::shared_ptr<ComputeRecipe>> list_computes;
+        if (read_recipe_file(list_path, list_run, list_origin, list, list_computes, bad)) {
             std::lock_guard<std::mutex> lk(g_pmanifest.mu);
             std::stable_sort(list.begin(), list.end(), [](const auto& a, const auto& b) { return a->order < b->order; });
             for (auto& rc : list) {
@@ -20564,16 +20706,33 @@ void pipeline_manifest_load(const std::string& path, const std::string& list_pat
                 rc->last_run = 0;
                 if (g_pmanifest.by_key.emplace(rc->key, rc).second) queue.push_back(rc);
             }
+            std::stable_sort(list_computes.begin(), list_computes.end(), [](const auto& a, const auto& b) { return a->order < b->order; });
+            for (auto& c : list_computes) {
+                c->listed = true;
+                c->uses = 0;
+                c->last_run = 0;
+                if (g_pmanifest.compute.emplace(c->key, c).second) compute_queue.push_back(c);
+            }
             listed = queue.size() - own;
             list_unread = bad;
         }
     }
     g_pmanifest.loaded.store(queue.size());
     g_pmanifest.queued.store(queue.size());
-    if (!queue.empty()) {
+    g_pmanifest.compute_loaded.store(compute_queue.size());
+    if (!queue.empty() || !compute_queue.empty()) {
         Precompiler& w = precompiler();
         {
             std::lock_guard<std::mutex> lk(w.mu);
+            // The compute records first: few, and most are the title's, which
+            // dispatches them in its first seconds.
+            for (const auto& c : compute_queue) {
+                PrecompileJob job;
+                job.name = c->name;
+                job.type = 9;
+                job.compute = c;
+                w.jobs.push_back(std::move(job));
+            }
             for (const auto& rc : queue) {
                 PrecompileJob job;
                 job.name = rc->vs_name + "+" + rc->ps_name;
@@ -20592,6 +20751,7 @@ void pipeline_manifest_load(const std::string& path, const std::string& list_pat
         list_note = "; " + std::to_string(listed) + " more from the list " + list_path +
                     (list_unread ? " (" + std::to_string(list_unread) + " of its entries not in this game's bundles or unreadable)" : "");
     }
+    if (!compute_queue.empty()) list_note += "; " + std::to_string(compute_queue.size()) + " compute pipelines ahead of them (their records)";
     host_log("render: pipeline manifest: %zu pipelines from earlier runs (run %u)%s queued for their build%s%s%s%s", own, g_pmanifest.run,
              list_note.c_str(), unread ? (", " + std::to_string(unread) + " unreadable dropped").c_str() : "",
              !have_own || same_translator ? "" : "; recorded with another translator: every stage is translated again",
@@ -20613,6 +20773,7 @@ void pipeline_manifest_save(const std::string& path) {
         std::uint32_t last_run, uses;
     };
     std::vector<Kept> keep;
+    std::vector<std::shared_ptr<ComputeRecipe>> keep_compute;
     std::uint32_t run = 0;
     {
         std::lock_guard<std::mutex> lk(g_pmanifest.mu);
@@ -20624,7 +20785,14 @@ void pipeline_manifest_save(const std::string& path) {
             if (rc->listed && rc->last_run != run) continue;  // the list has it: the player's own file keeps only what was used
             keep.push_back({rc, rc->last_run, rc->uses});
         }
+        for (const auto& [key, c] : g_pmanifest.compute) {
+            if (c->last_run + kRecipeIdleRuns < run || (c->listed && c->last_run != run)) continue;  // as the pipelines'
+            keep_compute.push_back(c);
+        }
     }
+    std::sort(keep_compute.begin(), keep_compute.end(), [](const auto& a, const auto& b) {
+        return a->last_run != b->last_run ? a->last_run > b->last_run : a->order < b->order;
+    });
     std::sort(keep.begin(), keep.end(), [](const Kept& a, const Kept& b) {
         return a.last_run != b.last_run ? a.last_run > b.last_run : a.uses > b.uses;
     });
@@ -20640,6 +20808,10 @@ void pipeline_manifest_save(const std::string& path) {
                 g_pmanifest.dropped.fetch_add(1, std::memory_order_relaxed);
                 continue;
             }
+            ++count;
+        }
+        for (const auto& c : keep_compute) {
+            recipe_file::write(body, *c);
             ++count;
         }
     }

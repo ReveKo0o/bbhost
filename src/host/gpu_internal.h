@@ -784,6 +784,21 @@ bool compute_precompile_enabled();
 bool note_compute_created(const std::string& name, std::uint64_t flip);
 void precompile_compute(const std::string& name, const std::vector<std::uint8_t>& container, std::uint64_t created_flip);
 void compute_precompile_report();
+// The pipeline manifest's compute records (render.cpp): a compute pipeline a
+// dispatch had to build itself (built_here: a shader GX never created through
+// the hook, or one whose bound images differ from the creation's guess) with
+// what its key was made from, so a start builds it before the dispatch; a
+// dispatch that took one (built_here false) only counts the record's use - the
+// shaders GX creates are compiled at their creation already.
+void recipe_note_compute(const std::string& name, const std::vector<std::uint32_t>& words, std::uint64_t key, std::uint32_t rsrc1,
+                         std::uint32_t rsrc2, const std::uint32_t threads[3], const std::vector<std::pair<std::uint32_t, bool>>& dims,
+                         const std::vector<bool>& modes, bool built_here);
+// On a precompile worker: a compute record's pipeline, as precompile_compute
+// builds one from a container but with the record's images and samplers.
+// False when it failed (or another build had its key).
+bool precompile_compute_recorded(const std::string& name, const std::vector<std::uint32_t>& words, std::uint32_t rsrc1, std::uint32_t rsrc2,
+                                 const std::uint32_t threads[3], const std::vector<std::pair<std::uint32_t, bool>>& dims,
+                                 const std::vector<bool>& modes);
 // Where guest bytes [va, va + bytes) are, in imported memory: one buffer
 // holds them all (imported now when they are direct memory the GPU may reach),
 // avail bytes of it from the offset. A null buffer otherwise.

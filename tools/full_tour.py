@@ -571,9 +571,9 @@ def merge_union(union, manifest):
         origin = origin or o
         run = max(run, r)
         for rc in recipes:
-            have = merged.get(rc.key)
+            have = merged.get((rc.compute, rc.key))
             if have is None or rc.last_run > have.last_run:
-                merged[rc.key] = rc
+                merged[(rc.compute, rc.key)] = rc
     tmp = str(union) + ".new"
     pipeline_list.write_file(tmp, run, origin, list(merged.values()))
     os.replace(tmp, union)
@@ -1385,10 +1385,31 @@ def recipe_ranks(run_dirs):
     return ranks
 
 
+R_CS_HERE = re.compile(r"\] gpu: compute pipelines built at the dispatch instead: .*?;((?: \S+ \([^)]*\);)*)")
+
+
+def built_at_dispatch(run_dirs):
+    """The compute programs the chunks' dispatches had to build themselves
+    (gpu.cpp's exit line, its notes): the ones nothing else precompiles."""
+    names = set()
+    for runs in run_dirs:
+        for log in sorted(Path(runs).glob("c*/run.log")):
+            for m in R_CS_HERE.finditer(log.read_text(errors="replace")):
+                names.update(re.findall(r" (\S+) \(", m.group(1)))
+    return names
+
+
 def do_list(args):
     runs = [Path(r) for r in args.runs]
     union = runs[-1] / "union-manifest.bin"
     run, origin, recipes = pipeline_list.read_file(union)
+    # The compute records the dispatches had to build (a union recorded before
+    # recipe_note_compute kept to those holds the ones GX's creation compiles
+    # too, which only crowd the start).
+    here = built_at_dispatch(runs)
+    computes = [rc for rc in recipes if rc.compute]
+    if here and computes:
+        recipes = [rc for rc in recipes if not rc.compute or rc.name in here]
     progs = pipeline_list.bundle_programs(args.app0)
     if not progs:
         print("full_tour: no shader bundles under %s" % args.app0, file=sys.stderr)
@@ -1413,18 +1434,20 @@ def do_list(args):
     unknown = 0
     if args.order == "story":
         far = (len(STORY) + 1, 0)
-        def where(rc):
-            return ranks.get(rc.key, far)
-        unknown = sum(1 for rc in out if rc.key not in ranks)
+        def where(rc):  # the compute records first: few, and mostly the title's
+            return (-1, rc.order) if rc.compute else ranks.get(rc.key, far)
+        unknown = sum(1 for rc in out if not rc.compute and rc.key not in ranks)
         out.sort(key=where)
         for k, rc in enumerate(out):
             rc.order = k  # bbhost builds a list's records in this order (pipeline_manifest_load)
     pipeline_list.write_file(args.out, 0, origin, out)
     size = Path(args.out).stat().st_size
-    fetch_bytes = sum(len(rc.fetch or b"") + len(rc.ls_fetch or b"") + sum(len(e["fetch"] or b"") for e in rc.lsps) for rc in out)
-    print("%s: %d of %d pipelines (%.1f KiB; programs named, %d as the game's files have them, %d as bbhost patches them; "
-          "%.1f KiB of fetch shaders' words); order %s%s" % (args.out, len(out), len(recipes), size / 1024.0, plain, patched, fetch_bytes / 1024.0,
-                                                           args.order, " (%d not found in the logs, last)" % unknown if unknown else ""))
+    fetch_bytes = sum(len(rc.fetch or b"") + len(rc.ls_fetch or b"") + sum(len(e["fetch"] or b"") for e in rc.lsps) for rc in out if not rc.compute)
+    computes = sum(1 for rc in out if rc.compute)
+    print("%s: %d of %d pipelines, %d of them compute (%.1f KiB; programs named, %d as the game's files have them, %d as bbhost patches them; "
+          "%.1f KiB of fetch shaders' words); order %s%s" % (args.out, len(out), len(recipes), computes, size / 1024.0, plain, patched,
+                                                           fetch_bytes / 1024.0, args.order,
+                                                           " (%d not found in the logs, last)" % unknown if unknown else ""))
     for why, n in left.most_common():
         print("  left out: %d with %s" % (n, why))
     return 0

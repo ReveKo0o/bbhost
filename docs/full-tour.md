@@ -105,7 +105,11 @@ need them (the engine's, made at run time; `--no-fetch-words` leaves those
 records out), so tessellated pipelines are in it too, with the host
 tessellator's LS passes: a tessellated recipe records the LS compute
 pipeline of every pass its draws ran (recipe file version 3), and the start
-builds those as well.
+builds those as well. Compute pipelines are recorded too (version 4): each
+one a dispatch used, with the images and samplers its key was made from, so
+the start builds them first - the title's own compute shaders among them,
+which the game never creates through the hook bbhost compiles at, so nothing
+else builds them before their first dispatch.
 
 ## What the report counts
 

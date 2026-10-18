@@ -4466,6 +4466,7 @@ ComputePipeline& pipeline_for(const GpuDispatch& d, std::uint64_t key, const std
     switch (take_precompiled_compute(key, d, name, dims, sampler_modes, pl)) {
     case Precompiled::kTaken:
         g.translated.fetch_add(1);
+        recipe_note_compute(name, words, key, d.rsrc1, d.rsrc2, d.threads, dims, sampler_modes, false);  // a compute record's: its use counted
         return pl;
     case Precompiled::kPending:
         pl.pending = pl.failed = true;
@@ -4578,6 +4579,9 @@ ComputePipeline& pipeline_for(const GpuDispatch& d, std::uint64_t key, const std
                  name.c_str(), prog.insts.size(), pl.meta.images.size(), pl.meta.samplers.size(), d.threads[0],
                  d.threads[1], d.threads[2], static_cast<long long>(ms), pl.standin ? " (unoptimized, standing in)" : "");
     }
+    // Built here, on the command processor: the next start (or a list's
+    // first start) builds it on a precompile worker instead.
+    if (pl.pipeline) recipe_note_compute(name, words, key, d.rsrc1, d.rsrc2, d.threads, dims, sampler_modes, true);
     return pl;
 }
 
@@ -4608,37 +4612,15 @@ bool note_compute_created(const std::string& name, std::uint64_t flip) {
     return fresh;
 }
 
-// On a precompile worker: the pipeline a dispatch of this shader would build,
-// from what its container gives.
-void precompile_compute(const std::string& name, const std::vector<std::uint8_t>& c, std::uint64_t created_flip) {
-    const auto t0 = std::chrono::steady_clock::now();
-    const auto fail = [&](const std::string& why) {  // before the key is known: no dispatch can be waiting
-        std::lock_guard<std::mutex> lk(g_cs_pre.mu);
-        PrecompiledCompute::Record& r = g_cs_pre.records[name];
-        r.state = PrecompiledCompute::kFailed;
-        r.why = why;
-        g_cs_pre.failed += 1;
-    };
-    std::size_t shdr = 0;
-    while (shdr + 0x60 <= c.size() && shdr < 0x100 && std::memcmp(c.data() + shdr, "Shdr", 4) != 0) ++shdr;
-    gcn::ShaderCode code;
-    if (shdr + 0x60 > c.size() || shdr >= 0x100 || !gcn::shader_code(c, code) || code.type != 4) return fail("not a compute container");
-    std::uint32_t regs[16];
-    std::memcpy(regs, c.data() + shdr + 16, sizeof(regs));
-    const std::uint32_t rsrc1 = regs[4], rsrc2 = regs[5];  // CsStageRegs: pgm_lo, pgm_hi, rsrc1, rsrc2, num_thread_x/y/z
-    const std::uint32_t threads[3] = {regs[6], regs[7], regs[8]};
-    const gcn::Program prog = gcn::decode(code.words.data(), code.words.size());
-    if (!prog.errors.empty()) return fail("decode");
-    gcn::TranslateOptions paths_options;  // as paths_for
-    paths_options.stage = gcn::Stage::Compute;
-    paths_options.rsrc1 = rsrc1;
-    paths_options.rsrc2 = rsrc2;
-    const gcn::TranslateResult paths = translate_cached(prog, paths_options, TranslationUse::kPaths);
-    offer_paths(code.words, paths);  // the first dispatch's paths_for takes them instead of translating on the command processor
-    std::vector<std::pair<std::uint32_t, bool>> dims;
-    for (const gcn::PredictedImage& p : gcn::predict_image_dims(prog, paths)) dims.emplace_back(p.dim, p.arrayed);
-    const std::vector<bool> modes(paths.samplers.size(), false);
-    const std::uint64_t key = compute_key(fnv1a(code.words.data(), code.words.size() * 4), rsrc1, rsrc2, threads, dims, modes);
+namespace {
+// The pipeline a dispatch of this program would build under its key, on a
+// precompile worker: from a container (precompile_compute) or a compute
+// record (precompile_compute_recorded). False when it failed or another build
+// had the key.
+bool precompile_compute_key(const std::string& name, const std::vector<std::uint32_t>& words, const gcn::Program& prog, std::uint32_t rsrc1,
+                            std::uint32_t rsrc2, const std::uint32_t threads[3], const std::vector<std::pair<std::uint32_t, bool>>& dims,
+                            const std::vector<bool>& modes, std::uint64_t created_flip, std::chrono::steady_clock::time_point t0) {
+    const std::uint64_t key = compute_key(fnv1a(words.data(), words.size() * 4), rsrc1, rsrc2, threads, dims, modes);
     {
         std::lock_guard<std::mutex> lk(g_cs_pre.mu);
         PrecompiledCompute::Record& r = g_cs_pre.records[name];
@@ -4651,7 +4633,7 @@ void precompile_compute(const std::string& name, const std::vector<std::uint8_t>
         if (!g_cs_pre.by_key.emplace(key, PrecompiledCompute::Entry{}).second) {  // a dispatch built it first
             r.state = PrecompiledCompute::kDone;
             g_cs_pre.skipped += 1;
-            return;
+            return false;
         }
         r.state = PrecompiledCompute::kCompiling;
     }
@@ -4672,7 +4654,7 @@ void precompile_compute(const std::string& name, const std::vector<std::uint8_t>
             }
             // The program too, for `gcndis --raw` and `gcn2spv --raw ... cs <rsrc1> <rsrc2>`.
             if (FILE* f = std::fopen(("build/spv/" + name + "-cs.bin").c_str(), "wb")) {
-                std::fwrite(code.words.data(), 4, code.words.size(), f);
+                std::fwrite(words.data(), 4, words.size(), f);
                 std::fclose(f);
             }
             if (FILE* f = std::fopen(("build/spv/" + name + "-cs.txt").c_str(), "w")) {
@@ -4749,6 +4731,58 @@ void precompile_compute(const std::string& name, const std::vector<std::uint8_t>
                  static_cast<unsigned long long>(us / 1000), standin ? " (unoptimized, standing in)" : "", why.empty() ? "" : ", failed: ",
                  why.c_str());
     }
+    return why.empty();
+}
+}  // namespace
+
+// On a precompile worker: the pipeline a dispatch of this shader would build,
+// from what its container gives.
+void precompile_compute(const std::string& name, const std::vector<std::uint8_t>& c, std::uint64_t created_flip) {
+    const auto t0 = std::chrono::steady_clock::now();
+    const auto fail = [&](const std::string& why) {  // before the key is known: no dispatch can be waiting
+        std::lock_guard<std::mutex> lk(g_cs_pre.mu);
+        PrecompiledCompute::Record& r = g_cs_pre.records[name];
+        r.state = PrecompiledCompute::kFailed;
+        r.why = why;
+        g_cs_pre.failed += 1;
+    };
+    std::size_t shdr = 0;
+    while (shdr + 0x60 <= c.size() && shdr < 0x100 && std::memcmp(c.data() + shdr, "Shdr", 4) != 0) ++shdr;
+    gcn::ShaderCode code;
+    if (shdr + 0x60 > c.size() || shdr >= 0x100 || !gcn::shader_code(c, code) || code.type != 4) return fail("not a compute container");
+    std::uint32_t regs[16];
+    std::memcpy(regs, c.data() + shdr + 16, sizeof(regs));
+    const std::uint32_t rsrc1 = regs[4], rsrc2 = regs[5];  // CsStageRegs: pgm_lo, pgm_hi, rsrc1, rsrc2, num_thread_x/y/z
+    const std::uint32_t threads[3] = {regs[6], regs[7], regs[8]};
+    const gcn::Program prog = gcn::decode(code.words.data(), code.words.size());
+    if (!prog.errors.empty()) return fail("decode");
+    gcn::TranslateOptions paths_options;  // as paths_for
+    paths_options.stage = gcn::Stage::Compute;
+    paths_options.rsrc1 = rsrc1;
+    paths_options.rsrc2 = rsrc2;
+    const gcn::TranslateResult paths = translate_cached(prog, paths_options, TranslationUse::kPaths);
+    offer_paths(code.words, paths);  // the first dispatch's paths_for takes them instead of translating on the command processor
+    std::vector<std::pair<std::uint32_t, bool>> dims;
+    for (const gcn::PredictedImage& p : gcn::predict_image_dims(prog, paths)) dims.emplace_back(p.dim, p.arrayed);
+    const std::vector<bool> modes(paths.samplers.size(), false);
+    precompile_compute_key(name, code.words, prog, rsrc1, rsrc2, threads, dims, modes, created_flip, t0);
+}
+
+// On a precompile worker: a compute record's pipeline (the pipeline manifest's,
+// a list's), under the key its dispatch made - the record's images and
+// samplers, not a guess from the program.
+bool precompile_compute_recorded(const std::string& name, const std::vector<std::uint32_t>& words, std::uint32_t rsrc1, std::uint32_t rsrc2,
+                                 const std::uint32_t threads[3], const std::vector<std::pair<std::uint32_t, bool>>& dims,
+                                 const std::vector<bool>& modes) {
+    const auto t0 = std::chrono::steady_clock::now();
+    const gcn::Program prog = gcn::decode(words.data(), words.size());
+    if (!prog.errors.empty()) return false;
+    gcn::TranslateOptions paths_options;  // as paths_for
+    paths_options.stage = gcn::Stage::Compute;
+    paths_options.rsrc1 = rsrc1;
+    paths_options.rsrc2 = rsrc2;
+    offer_paths(words, translate_cached(prog, paths_options, TranslationUse::kPaths));
+    return precompile_compute_key(name, words, prog, rsrc1, rsrc2, threads, dims, modes, 0, t0);
 }
 
 void compute_compiling_report() {
