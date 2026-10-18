@@ -470,7 +470,7 @@ bool wrapper_complete_inputs(std::uint64_t cb, GpuDrawInputs& in, std::uint32_t*
 // clear, s[2:3] loaded but overwritten before any read. Shadowed over a world
 // soak: 0 of 38,363 dispatches differ in what the program reads; the
 // records' user data, tables included, 0 of 848,260 dwords and table entries
-// (2026-10-14, notes/docs/gx-layer.md).
+// (2026-10-14).
 const int g_native_dispatch = [] {
     const char* e = std::getenv("BBHOST_GX_NATIVE_DISPATCH");
     return e && e[0] ? std::atoi(e) : 2;

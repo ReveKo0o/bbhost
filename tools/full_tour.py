@@ -84,7 +84,9 @@ import msb as msbmod  # noqa: E402
 import pipeline_list  # noqa: E402
 import world_baseline  # noqa: E402
 
-GATE = Path("/mnt/security/projects/bloodborne/recomp/tmp/gpu-window")
+# A test box can gate runs on a file holding the end of its GPU window (epoch seconds):
+# BBHOST_GPU_WINDOW names it. Without it every chunk may run.
+GATE = Path(os.environ["BBHOST_GPU_WINDOW"]) if os.environ.get("BBHOST_GPU_WINDOW") else None
 TIME_FLAGS = (9800, 9801, 9802)
 TIME_BITS = (0, 4, 6, 7)  # world time 0..3 as flags 9800-9802, the first the top bit (0x4d25010)
 MAIN_BLOCKS = ["m24_01_00_00", "m24_00_00_00", "m24_02_00_00", "m22_00_00_00", "m23_00_00_00", "m25_00_00_00", "m27_00_00_00",
@@ -518,6 +520,8 @@ def safe(s):
 # --- running one chunk ------------------------------------------------------------------
 
 def gate_open():
+    if GATE is None:
+        return True
     try:
         return time.time() < float(GATE.read_text().split()[0])
     except (OSError, ValueError, IndexError):
