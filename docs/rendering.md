@@ -170,9 +170,14 @@ resource is destroyed, so memory the game gives to a new resource with texels
 of its own never hands it the old image. A target, or an image only shaders
 wrote, goes instead to a texture the game makes over the same memory without
 data, as the console's memory carries it over: the game re-creates its targets
-at an area load and may only clear and copy from them. Only what GX does not
-create - YEBIS's and Scaleform's own textures, and the device-local copies of
-vertex and index data - is still noticed by write-protecting its pages.
+at an area load and may only clear and copy from them. YEBIS's and
+Scaleform's own textures are known the same way, from those libraries' own
+creation and release calls, and their writes from their own Map, update and
+unmap calls. The device-local copies of vertex and index data are told what
+changed by GX's calls as well: the renamed copy a Map hands out is copied
+again until GX writes it back or frees it, and a creation with data marks the
+memory it fills. Only memory no call tells of - the engine's own rings outside
+GX, YEBIS's buffers - is still noticed by write-protecting its pages.
 Render targets are Vulkan images sized from the engine's own views, and can be
 re-created at any resolution while the game runs, the way the PC engine's GX
 device resizes.
@@ -202,7 +207,7 @@ path at all:
 | Pipeline drains | native: barrier tokens from GX's calls |
 | Labels and fences the game waits on | emulated: recorded by the command processor, written by the host once their submission has run (GPU fills on Windows for now) |
 | Shaders | decompiled (lifted) to SPIR-V; a few refused programs translated (see below) |
-| Resource identity | GX's resources by their objects and generations; what GX does not create (YEBIS's and Scaleform's textures, vertex and index copies) by address, with write tracking |
+| Resource identity | GX's, YEBIS's and Scaleform's textures by their objects and generations; vertex and index copies told by GX's Map calls; memory no call tells of (YEBIS's buffers, the engine's own rings) by address, with write tracking |
 
 ## Shader lifting
 
@@ -421,9 +426,8 @@ the default, and nothing waits on DXC:
 
 ## What comes next
 
-- The rest of resource identity: the device-local copies of vertex and index
-  data told what changed by GX's Map calls, and the textures YEBIS and
-  Scaleform make known by their own creation calls, so write tracking can go.
+- The rest of resource identity: draws that name their targets' generation,
+  and copies between resources made image to image.
 - The completions the game waits on (GX's block pools and command arena, Map,
   query results) from the host's own submission timeline rather than labels,
   after which the PM4 command processor only orders work.
