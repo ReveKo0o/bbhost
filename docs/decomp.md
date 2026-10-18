@@ -475,11 +475,17 @@ argument bits the original tests, the floating-point operations in their order
 
 ## Next
 
-- **The other writers outside GX**: YEBIS's own submissions, Gnmx's
-  lightweight context's submit (Scaleform's), and the flip pass itself
-  (`0x25d5f80`, one large function: each frame's post-processing parameters
-  handed to PPFX, its Gnmx draw, its label and wait and its submit inline) -
-  each a small surface for its subsystem's mods (the HUD, the final image).
+- **The other writers outside GX**: the flip pass itself (`0x25d5f80`, one
+  large function: each frame's post-processing parameters handed to PPFX, its
+  Gnmx draw, its label and wait and its submit inline) - its two natural hook
+  points, PPFX's entry points and the swap chain's present, are source; the
+  parameter setters it calls are next. YEBIS's own submissions (`0x15faff0`,
+  `0x15fb220`, `0x15fb2c0` and the list they build, `0x15fb070`) and Gnmx's
+  lightweight context's submit (`0x149bc90`, Scaleform's and two engine
+  paths') are left as they are: nothing in the sessions checked showed them
+  running - YEBIS's flushes, the only callers of its submission, never wrote
+  their labels in the writers' census, nor did Scaleform's path into Gnmx's -
+  so as source they would open no surface.
 
 - **Items in and out**: `EquipGameData::AddItem`, through which every item
   enters the inventory (it creates item instances, so a compare must follow the
