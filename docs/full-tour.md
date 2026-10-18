@@ -66,10 +66,13 @@ python3 tools/full_tour.py report --plan PLAN --runs RUNS
 python3 tools/full_tour.py list --runs RUNS [RUNS2 ...] --app0 <game folder> --eboot <eboot> --out pipeline-list.bin
 ```
 
-- `--navmesh-tools` is a folder holding a `worldmap` package with `navmesh.py`
-  (`faces(data)`: the polygons of a Havok 2014 navmesh packfile) and `msb.py`
-  (`MSB`, `part_matrix`), the same module `tools/mapval_blocks.py` takes as
-  `MAPVAL_NAVMESH_TOOLS`. Only `plan` needs it.
+- `--navmesh-tools` (default `$MAPVAL_NAVMESH_TOOLS`) is a folder holding a
+  `worldmap` package with `navmesh.py` (`faces(data)`: the polygons of a Havok
+  2014 navmesh packfile) and `msb.py` (`MSB`, `part_matrix`), the same module
+  `tools/mapval_blocks.py` takes. It is not part of bbhost, and only `plan`
+  imports it (with numpy), when it runs: without it `plan` stops and names
+  what is missing. `run`, `report`, `compare`, `refall` and `list` need
+  neither, and no package carries them.
 - The config gives only `[paths]` (app0, eboot); each chunk gets its own
   offline config, data folder and `BBHOST_CONFIG_DIR`.
 - `--live` should be a RAM disk: the chunk's data, its caches and its frame

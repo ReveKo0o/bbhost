@@ -247,13 +247,32 @@ def do_inventory(args):
 
 # --- stops -----------------------------------------------------------------------
 
-def navmesh_faces(app0, block, tools):
-    """The block's navmesh face centroids in the MSB's frame (the warps' frame),
-    via the worldmap module (its Havok reader and MSB transform)."""
-    import numpy as np
+NAVMESH_NEEDS = ("the worldmap navmesh module: a folder holding a worldmap package with navmesh.py (faces(data): the polygons of a "
+                 "Havok 2014 navmesh packfile) and msb.py (MSB, part_matrix), as tools/mapval_blocks.py takes it (MAPVAL_NAVMESH_TOOLS); "
+                 "give it with --navmesh-tools")
+
+
+def navmesh_module(tools):
+    """(navmesh, MSB, part_matrix) from the worldmap package under tools, or an
+    error naming what is missing. Only `plan` needs it, for the blocks' stops."""
+    if not tools:
+        return None, "plan needs " + NAVMESH_NEEDS
     sys.path.insert(0, str(tools))
-    from worldmap import navmesh  # noqa: E402
-    from worldmap.msb import MSB, part_matrix  # noqa: E402
+    try:
+        import numpy  # noqa: F401
+        from worldmap import navmesh  # noqa: E402
+        from worldmap.msb import MSB, part_matrix  # noqa: E402
+    except ImportError as e:
+        return None, "plan needs %s - %s under %s: %s" % (NAVMESH_NEEDS, "numpy" if "numpy" in str(e) else "worldmap", tools, e)
+    return (navmesh, MSB, part_matrix), None
+
+
+def navmesh_faces(app0, block, nav):
+    """The block's navmesh face centroids in the MSB's frame (the warps' frame),
+    via the worldmap module (its Havok reader and MSB transform): nav is
+    navmesh_module's (navmesh, MSB, part_matrix)."""
+    import numpy as np
+    navmesh, MSB, part_matrix = nav
     root = Path(app0) / "dvdroot_ps4" / "map"
     msb = MSB((root / "mapstudio" / (block + ".msb.dcx")).read_bytes())
     path = root / block / (block + ".nvmhktbnd.dcx")
@@ -324,6 +343,10 @@ def item_estimate(it):
 
 
 def do_plan(args):
+    nav, why = navmesh_module(args.navmesh_tools)
+    if not nav:
+        print("full_tour: " + why, file=sys.stderr)
+        return 2
     import numpy as np
     app0 = args.app0
     rng = random.Random(args.seed)
@@ -344,7 +367,7 @@ def do_plan(args):
     for b in MAIN_BLOCKS:
         if args.blocks and b not in args.blocks.split(","):
             continue
-        pts = navmesh_faces(app0, b, args.navmesh_tools)
+        pts = navmesh_faces(app0, b, nav)
         parts = msb_parts(app0, b)
         pts = anchored(pts, parts, args.anchor)
         picks = spread(pts, args.radius, args.max_stops, rng, min_n=args.min_stops)
@@ -1415,7 +1438,9 @@ def main(argv=None):
     p.add_argument("--out")
     p = sub.add_parser("plan")
     p.add_argument("--app0", required=True)
-    p.add_argument("--navmesh-tools", required=True, type=Path, help="the folder holding the worldmap module (navmesh.py, msb.py)")
+    p.add_argument("--navmesh-tools", type=Path, default=os.environ.get("MAPVAL_NAVMESH_TOOLS") or None,
+                   help="the folder holding the worldmap navmesh module (navmesh.py, msb.py); default $MAPVAL_NAVMESH_TOOLS. "
+                        "Only plan reads it, for the blocks' stops")
     p.add_argument("--out", required=True)
     p.add_argument("--blocks", help="only these blocks (comma list)")
     p.add_argument("--radius", type=float, default=60.0)
