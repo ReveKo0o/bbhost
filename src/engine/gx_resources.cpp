@@ -253,21 +253,30 @@ std::atomic<std::uint64_t> g_yebis_rt{0}, g_yebis_depth{0}, g_yebis_destroyed{0}
 std::atomic<std::uint64_t> g_yebis_maps[5][6] = {}, g_yebis_map_own{0}, g_yebis_map_other{0}, g_yebis_updates[5] = {};
 std::atomic<std::uint64_t> g_yebis_renamed[5] = {};  // Maps that moved the resource's memory, by kind
 std::atomic<int> g_yebis_logged[5] = {}, g_yebis_map_logged{0};
-// BBHOST_RES_YEBIS=1: YEBIS's 2D textures are registered as resources from
-// its creator and destructor (key kYebisKey | the object), and its Map,
-// Unmap and UpdateSubresource of one tell the texture cache it was written.
-bool g_res_yebis = false;
+// YEBIS's 2D textures are registered as resources from its creator and
+// destructor (key kYebisKey | the object), and its Map, Unmap and
+// UpdateSubresource of one tell the texture cache it was written. On unless
+// BBHOST_RES_YEBIS=0: a 12-place tour's images on YEBIS's memory then had
+// no identity, and the address rule retired ~145 targets and ~140
+// shader-written textures a pass as newer objects took their memory; known,
+// YEBIS's re-created targets keep their images (taken by the texture made
+// over their memory without data, ~400 a pass) and a destroyed one's goes
+// once idle.
+bool g_res_yebis = true;
 constexpr std::uint64_t kYebisKey = 0x4000000000000000ull;
 std::atomic<std::uint64_t> g_yebis_registered{0}, g_yebis_unregistered{0}, g_yebis_told{0};
 // Scaleform's textures (census): initialized, their planes and bytes, failed.
 std::atomic<std::uint64_t> g_sf_inits{0}, g_sf_planes{0}, g_sf_bytes{0}, g_sf_failed{0};
 std::atomic<int> g_sf_logged{0};
-// BBHOST_RES_SCALEFORM=1: Scaleform's texture planes are registered as 2D
-// resources from Initialize (key kScaleformKey | texture << 2 | plane), told
-// of the CPU's writes when the manager's unmapTexture returns, and dropped at
-// ReleaseHWTextures - but for a plane on memory a live GX resource already
-// holds (a texture Scaleform wraps), which stays that resource's.
-bool g_res_scaleform = false;
+// Scaleform's texture planes are registered as 2D resources from Initialize
+// (key kScaleformKey | texture << 2 | plane), told of the CPU's writes when
+// the manager's unmapTexture returns, and dropped at ReleaseHWTextures - but
+// for a plane on memory a live GX resource already holds (a texture Scaleform
+// wraps), which stays that resource's. Almost every Scaleform texture wraps
+// one of the game's (Initialize takes its T#: no memory of its own); the few
+// it allocates - the glyph cache (1024x1024, 8-bit) among them - the write
+// watch and the hashes followed before. On unless BBHOST_RES_SCALEFORM=0.
+bool g_res_scaleform = true;
 constexpr std::uint64_t kScaleformKey = 0x2000000000000000ull;
 std::uint64_t scaleform_key(std::uint64_t texture, unsigned plane) { return kScaleformKey | (texture << 2) | plane; }
 std::atomic<std::uint64_t> g_sf_registered{0}, g_sf_unregistered{0}, g_sf_told{0}, g_sf_wrapped{0};
@@ -1407,22 +1416,24 @@ void gx_resources_install(ElfImage* image) {
     if (g_trace || g_census) hook(kRing, kRingPrologue, sizeof(kRingPrologue), reinterpret_cast<void*>(&ring_hook), 0);
     g_res_yebis = [] {
         const char* e = std::getenv("BBHOST_RES_YEBIS");
-        return e && e[0] == '1';
+        return !(e && e[0] == '0');
     }();
     if (g_census || g_res_yebis) {
         if (g_res_yebis) hook(kYebisUnmap, kYebisUnmapPrologue, sizeof(kYebisUnmapPrologue), reinterpret_cast<void*>(&yebis_unmap_hook), 0);
         hook(kYebisCreate2D, kYebisCreate2DPrologue, sizeof(kYebisCreate2DPrologue), reinterpret_cast<void*>(&yebis_create_hook<3>), 0);
-        hook(kYebisCreate1D, kYebisCreate13Prologue, sizeof(kYebisCreate13Prologue), reinterpret_cast<void*>(&yebis_create_hook<2>), 0);
-        hook(kYebisCreate3D, kYebisCreate13Prologue, sizeof(kYebisCreate13Prologue), reinterpret_cast<void*>(&yebis_create_hook<4>), 0);
-        hook(kYebisCreateBuffer, kYebisCreateBufferPrologue, sizeof(kYebisCreateBufferPrologue), reinterpret_cast<void*>(&yebis_create_hook<1>),
-             0);
+        if (g_census) {  // the registry takes YEBIS's 2D textures only
+            hook(kYebisCreate1D, kYebisCreate13Prologue, sizeof(kYebisCreate13Prologue), reinterpret_cast<void*>(&yebis_create_hook<2>), 0);
+            hook(kYebisCreate3D, kYebisCreate13Prologue, sizeof(kYebisCreate13Prologue), reinterpret_cast<void*>(&yebis_create_hook<4>), 0);
+            hook(kYebisCreateBuffer, kYebisCreateBufferPrologue, sizeof(kYebisCreateBufferPrologue),
+                 reinterpret_cast<void*>(&yebis_create_hook<1>), 0);
+        }
         hook(kYebisMap, kYebisMapPrologue, sizeof(kYebisMapPrologue), reinterpret_cast<void*>(&yebis_map_hook), 0);
         hook(kYebisUpdate, kYebisUpdatePrologue, sizeof(kYebisUpdatePrologue), reinterpret_cast<void*>(&yebis_update_hook), 0);
         dtor_with(kYebisTex2DDelete, kYebisTex2DVtable, reinterpret_cast<void*>(&yebis_tex2d_dtor_hook));
     }
     g_res_scaleform = [] {
         const char* e = std::getenv("BBHOST_RES_SCALEFORM");
-        return e && e[0] == '1';
+        return !(e && e[0] == '0');
     }();
     if (g_census || g_res_scaleform) {
         hook(kScaleformTexInit, kPrologue58, sizeof(kPrologue58), reinterpret_cast<void*>(&scaleform_init_hook), 0);
