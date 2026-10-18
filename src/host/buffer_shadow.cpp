@@ -487,15 +487,16 @@ std::atomic<std::uint64_t> g_written_by_gx{0}, g_written_not_gx{0}, g_written_no
 //     context's upload pool: a Map hands one out (types 3 and 4) and the CPU
 //     writes it until the context's map resolves, which copies it back to
 //     the buffer on the GPU (0x2aadf50 / 0x2ad1090 through 0x2ab2810 and
-//     0x2ab2670); a dynamic UpdateSubresource (0x2aadb90) copies its bytes
-//     into a fresh one before it returns. A page with renamed copies on it is
-//     told (host_gpu_shadow_gx_handed, _settled), not watched: a hand-out
+//     0x2ab2670), or until a later discard Map of the buffer in the same
+//     context frees it. A page with renamed copies on it is told
+//     (host_gpu_shadow_gx_handed, _settled), not watched: a hand-out
 //     invalidates it, and while a copy over it is outstanding - handed out,
-//     not yet written back - a copy of the page holds for its recording
-//     only. Once GX writes the copies back they are final, and the page's
-//     copy holds until the next hand-out (BBHOST_SHADOW_HANDED=0: watched as
-//     before). The draw tables the pool also holds are written without a
-//     word, and no draw reads them as vertex data;
+//     neither written back nor freed - a copy of the page holds for its
+//     recording only. Once the copies are done, the page's copy holds until
+//     the next hand-out (BBHOST_SHADOW_HANDED=0: watched as before). What
+//     else the pool holds - constant buffers' copies (their Maps and every
+//     dynamic UpdateSubresource), the draw tables the commits copy in - is
+//     written without a word, and no draw reads it as vertex data;
 //   - a page GX buffers cover whole changes only when a creation writes it
 //     (host_gpu_shadow_gx_write): told, not watched;
 //   - the rest - memory no GX buffer covers whole: the engine's own rings,
@@ -513,14 +514,13 @@ struct GxWrite {
     int kind;  // kGxWrite, or 1 + a hand-out's kind (host_gpu_shadow_gx_handed)
 };
 // A write; a GX resource made over the range (a write, and no longer handed
-// out); a renamed copy written whole (UpdateSubresource's); a renamed copy
-// written back by GX (no longer outstanding).
-constexpr int kGxWrite = 0, kGxCreate = 8, kGxUpdate = 9, kGxSettle = 10;
+// out); a renamed copy GX wrote back or freed (no longer outstanding).
+constexpr int kGxWrite = 0, kGxCreate = 8, kGxSettle = 10;
 // What GX handed the CPU to write (host_gpu_shadow_gx_handed): a bit per 4 KiB
-// of direct memory by physical address - [kHandMap] GX's renamed copies (a
-// Map's, UpdateSubresource's) and, with the census, [kHandPool] the upload
-// pool's blocks, [kHandRing] ring allocations and [kHandYebis] the memory
-// YEBIS's discard Maps rename its resources into.
+// of direct memory by physical address - [kHandMap] the renamed copies Maps
+// hand out and, with the census, [kHandPool] the upload pool's blocks,
+// [kHandRing] ring allocations and [kHandYebis] the memory YEBIS's discard
+// Maps rename its resources into.
 enum : unsigned { kHandMap = 0, kHandPool = 1, kHandRing = 2, kHandYebis = 3, kHandKinds = 4 };
 constexpr std::uint64_t kHand4k = (std::uint64_t{gcn::kDmemChunks} << gcn::kDmemChunkShift) >> 12;
 std::vector<std::uint64_t> g_hand_bits[kHandKinds];  // under g.mu, made at the first hand-out
@@ -659,17 +659,15 @@ bool phys_at(std::uint64_t va, std::uint64_t& phys, std::uint64_t& span) {
     return false;
 }
 
-// A hand-out: its 4 KiB pages marked. GX's renamed copies (a Map's, handed
-// out and written until GX writes them back; UpdateSubresource's, written
-// whole) also invalidate the mirror pages over them - told pages for the
-// submissions after the hand-out, watched ones at their next check - and a
-// Map's stays outstanding until it is written back (settle_locked).
+// A hand-out: its 4 KiB pages marked. A renamed copy a Map hands out also
+// invalidates the mirror pages over it - told pages for the submissions
+// after the hand-out, watched ones at their next check - and stays
+// outstanding until GX writes it back or frees it (settle_locked).
 void mark_handed_locked(const GxWrite& w) {
-    const bool update = w.kind == kGxUpdate;
-    const unsigned k = update ? kHandMap : static_cast<unsigned>(w.kind - 1);
+    const unsigned k = static_cast<unsigned>(w.kind - 1);
     if (k >= kHandKinds) return;
     if (g_hand_bits[k].empty()) g_hand_bits[k].assign(kHand4k / 64, 0);
-    if (k == kHandMap && !update) {
+    if (k == kHandMap) {
         std::uint64_t phys = 0, span = 0;
         if (phys_at(w.va, phys, span)) {
             g_map_in_pool += handed(kHandPool, phys);
@@ -709,7 +707,7 @@ void mark_handed_locked(const GxWrite& w) {
         }
         va += (span + 0xfff) & ~0xfffull;
     }
-    if (!act || update) return;
+    if (!act) return;
     std::uint64_t phys = 0, span = 0;
     if (!phys_at(w.va, phys, span)) return;
     Outstanding& o = g_outstanding[phys];
@@ -718,8 +716,8 @@ void mark_handed_locked(const GxWrite& w) {
     g_outstanding_most = std::max<std::uint64_t>(g_outstanding_most, g_outstanding.size());
 }
 
-// GX wrote renamed copies in [w.va, +w.bytes) back to their buffers: their CPU
-// writes are over, and the pages under them settle. Copies left outstanding
+// GX wrote renamed copies in [w.va, +w.bytes) back to their buffers, or freed
+// them: their CPU writes are over, and the pages under them settle. Copies left outstanding
 // past kOutstandingAgeMs were written back unseen (by a resolve these hooks
 // miss) and settle too, counted.
 void settle_locked(const GxWrite& w) {
@@ -2233,9 +2231,7 @@ void host_gpu_shadow_gx_created(std::uint64_t va, std::size_t bytes) {
 void host_gpu_shadow_gx_handed(std::uint64_t va, std::size_t bytes, int kind) {
     using namespace gpu;
     if (!(g_shadow_gx || g_map_census) || !va || !bytes) return;
-    // kind 4: UpdateSubresource's renamed copy, written whole.
-    const bool update = kind == 4;
-    const unsigned k = update ? kHandMap : static_cast<unsigned>(kind);
+    const unsigned k = static_cast<unsigned>(kind);
     if (k >= kHandKinds) return;
     // The census's hand-outs come in runs through the same pages (a ring, a
     // pool's blocks): one record per span of 4 KiB pages a thread repeats.
@@ -2252,7 +2248,7 @@ void host_gpu_shadow_gx_handed(std::uint64_t va, std::size_t bytes, int kind) {
         g_hand_dropped.fetch_add(1, std::memory_order_relaxed);
         if (g_shadow_handed) g_gx_writes_overflow.store(true, std::memory_order_release);
     } else {
-        g_gx_writes.push_back({va, bytes, hle_gnm_submitted_total(), update ? kGxUpdate : static_cast<int>(k) + 1});
+        g_gx_writes.push_back({va, bytes, hle_gnm_submitted_total(), static_cast<int>(k) + 1});
         last_lo[k] = lo;
         last_hi[k] = hi;
     }

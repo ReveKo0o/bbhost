@@ -86,15 +86,14 @@ constexpr std::uint64_t kRing = 0x2adb1b0;  // the dynamic ring allocator: (ring
 // of these blocks for UpdateSubresource's dynamic copies (0x2aadb90) and some
 // 200 sites of the draw-state code.
 constexpr std::uint64_t kPoolBlock = 0x2aa9d50;
-// GX's dynamic UpdateSubresource (0x2aadb90(map, ctx, ?, holder, data)) takes a
-// fresh renamed copy from the context's upload pool (0x2aaddc0, the call
-// returning to 0x2aadbde), copies the bytes in (0x2aadc00) and returns: the
-// copy is written whole by then. The pool's allocator is hooked for that one
-// caller, the update's return tells the buffer shadow.
-constexpr std::uint64_t kPoolAlloc = 0x2aaddc0, kPoolAllocFromUpdate = 0x2aadbde, kUpdateDynamic = 0x2aadb90;
-// push rbp; mov rbp, rsp; push r15; push r14; push rbx; push rax; mov rbx, rdx; mov r15, rsi
-constexpr std::uint8_t kPoolAllocPrologue[16] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56,
-                                                 0x53, 0x50, 0x48, 0x89, 0xd3, 0x49, 0x89, 0xf7};
+// GX's UpdateSubresource (0x2568a20) renames only a constant buffer (bind
+// flags +0x3b & 4, which D3D11 lets no other flag join): 0x2aadb90 copies the
+// bytes into a fresh copy from the upload pool (0x2aaddc0). Every other
+// buffer is updated by a compute copy in command order - a GPU write. So the
+// pool's memory takes constants from updates and draw tables from the
+// commits, neither ever read as vertex data, and the buffer shadow hears only
+// of the renamed copies of buffers a draw can read: Maps of buffers that are
+// not constant buffers.
 // push rbp; mov rbp, rsp; push r15; push r14; push rbx; push rax; mov r14, rsi; mov rbx, rdi
 constexpr std::uint8_t kPoolBlockPrologue[16] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56,
                                                  0x53, 0x50, 0x49, 0x89, 0xf6, 0x48, 0x89, 0xfb};
@@ -145,7 +144,6 @@ constexpr std::uint8_t kYebisUpdatePrologue[20] = {BB_PUSH6, 0x48, 0x81, 0xec, 0
 // - a cache-flush command; the writes after Map went to the memory itself.
 constexpr std::uint64_t kYebisUnmap = 0x15d99c0;
 constexpr std::uint8_t kYebisUnmapPrologue[16] = {0x48, 0x8b, 0xbf, 0xa0, 0x0a, 0x00, 0x00, 0xbe, 0x38, 0x00, 0x00, 0x00, 0x31, 0xd2, 0x31, 0xc9};
-constexpr std::uint8_t kUpdateDynamicPrologue[17] = {BB_PUSH6, 0x48, 0x83, 0xec, 0x28};  // sub rsp, 0x28
 // Scaleform's PS4 Texture::Initialize (0x7a1d30, slot 2 of vtable 0x55bbf20;
 // its prologue is kPrologue58's): true when it made the hardware texture, an
 // array (+0x60) of +0x45 planes of 0x58 bytes - size (+0), T# (+4), memory
@@ -160,7 +158,7 @@ constexpr std::uint8_t kDtorHead[9] = {0x55, 0x48, 0x89, 0xe5, 0x53, 0x50, 0x48,
 
 enum Kind : std::uint8_t {
     kBuffer = 1, kTexture = 2, kTexture3D = 3, kMapCall = 4, kTsharp = 5, kResource1D = 6, kObject = 7, kPoolCall = 8,
-    kYebisCreate = 9, kYebisMapCall = 10, kScaleformInit = 11, kYebisUpdateCall = 12, kUpdateAlloc = 13, kUpdateCall = 14
+    kYebisCreate = 9, kYebisMapCall = 10, kScaleformInit = 11, kYebisUpdateCall = 12
 };
 
 struct Pending {
@@ -214,6 +212,17 @@ std::atomic<std::uint64_t> g_map_unknown{0}, g_map_moved{0};
 // [0] the buffer's own memory, [1] another live GX buffer's, [2] a live GX
 // texture's, [3] no live resource's; and the maps that failed.
 std::atomic<std::uint64_t> g_map_where[5][4] = {}, g_map_failed[5] = {};
+// The shadow's: Maps whose renamed copy it hears of, constant buffers' it does
+// not, and copies freed by a later discard Map of their buffer in the same
+// context (0x2ad0d30 frees the old block: never written back, its CPU writes
+// long over) - settled then. The last copy each buffer has in each context,
+// under g_mu, dropped with the holder.
+std::atomic<std::uint64_t> g_maps_told{0}, g_maps_constant{0}, g_copies_freed{0};
+struct LastCopy {
+    std::uint64_t ctx = 0, va = 0;
+    std::uint32_t bytes = 0;
+};
+std::unordered_map<std::uint64_t, std::vector<LastCopy>> g_last_copy;
 std::atomic<int> g_map_where_logged{0};
 // BBHOST_RESOURCE_CENSUS=1: the ring allocator is hooked too, and what it
 // hands out told to the buffer shadow's census (host_gpu_shadow_gx_handed).
@@ -572,6 +581,7 @@ void unregister_holder(std::uint64_t holder) {
         }
         if (auto m = g_by_memory.find(it->second.info.memory); m != g_by_memory.end() && m->second == holder) g_by_memory.erase(m);
         g_by_holder.erase(it);
+        g_last_copy.erase(holder);
     }
     retire_memory(memory, bytes, gen);
     if (buffer_memory && buffer_bytes) {
@@ -585,7 +595,7 @@ void unregister_holder(std::uint64_t holder) {
 
 // A Map on the holder: the resource is about to be written by the CPU. Its
 // memory may have been renamed (type 3/4): re-read +0x20 and re-index.
-void note_map(std::uint64_t holder, std::uint64_t type, std::uint64_t mapped_out, std::uint32_t result) {
+void note_map(std::uint64_t holder, std::uint64_t type, std::uint64_t mapped_out, std::uint32_t result, std::uint64_t ctx) {
     std::uint64_t memory = 0;
     rd(holder + 0x20, &memory);
     std::uint64_t mapped = 0;
@@ -594,6 +604,8 @@ void note_map(std::uint64_t holder, std::uint64_t type, std::uint64_t mapped_out
     std::uint32_t texture_bytes = 0;
     std::uint32_t buffer_bytes = 0, moved_bytes = 0;
     std::uint64_t moved_from = 0;
+    bool constant = false;
+    LastCopy freed;
     {
         std::lock_guard<std::mutex> lk(g_mu);
         auto it = g_by_holder.find(holder);
@@ -621,6 +633,22 @@ void note_map(std::uint64_t holder, std::uint64_t type, std::uint64_t mapped_out
         }
         if (e.info.type == 1) {
             buffer_bytes = e.info.bytes;
+            constant = e.info.bind == 0x4;
+            // A discard (type 3) renames the buffer again in this context:
+            // the copy it had there is freed, its writes over.
+            if (result == 0 && mapped && !constant && type == 3) {
+                std::vector<LastCopy>& v = g_last_copy[holder];
+                LastCopy* slot = nullptr;
+                for (LastCopy& c : v) {
+                    if (c.ctx == ctx) slot = &c;
+                }
+                if (!slot) {
+                    v.push_back(LastCopy{ctx, 0, 0});
+                    slot = &v.back();
+                }
+                if (slot->va && slot->va != mapped) freed = *slot;
+                *slot = LastCopy{ctx, mapped, e.info.bytes};
+            }
             if (result != 0 || !mapped) {
                 g_map_failed[mt].fetch_add(1, std::memory_order_relaxed);
             } else {
@@ -652,7 +680,20 @@ void note_map(std::uint64_t holder, std::uint64_t type, std::uint64_t mapped_out
     // GPU when the rename resolves (the buffer shadow sees that copy as a GPU
     // write). The copy's memory is handed out again and again: the buffer
     // shadow is told so (it is written without a call to say when).
-    if (buffer_bytes && mapped) host_gpu_shadow_gx_handed(mapped, buffer_bytes, 0);
+    if (buffer_bytes && mapped) {
+        // A constant buffer's copy holds constants, never vertex data: the
+        // shadow need not hear of it (D3D11 joins no other bind flag to it).
+        if (constant) {
+            g_maps_constant.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            g_maps_told.fetch_add(1, std::memory_order_relaxed);
+            if (freed.va && freed.bytes) {
+                g_copies_freed.fetch_add(1, std::memory_order_relaxed);
+                host_gpu_shadow_gx_settled(freed.va, freed.bytes);
+            }
+            host_gpu_shadow_gx_handed(mapped, buffer_bytes, 0);
+        }
+    }
     // A discard moved the buffer: the memory it leaves is no buffer's now.
     if (moved_from && moved_bytes) host_gpu_shadow_gx_write(moved_from, moved_bytes);
     // A texture mapped (none is, in any run so far): the CPU writes it next,
@@ -713,7 +754,9 @@ GUEST_ABI std::int64_t view_create_hook(std::uint64_t id, const std::uint64_t* s
 
 // Map: rdx = holder, r8 = type, r9 = mapped*.
 GUEST_ABI std::int64_t map_hook(std::uint64_t, const std::uint64_t* saved) {
-    t_pending.push_back({saved[6], kMapCall, saved[0], saved[3], saved[1]});
+    Pending p{saved[6], kMapCall, saved[0], saved[3], saved[1]};
+    p.extra = saved[5];  // the context
+    t_pending.push_back(p);
     const_cast<std::uint64_t*>(saved)[6] = reinterpret_cast<std::uint64_t>(&gx_res_ret);
     return 0;
 }
@@ -721,25 +764,6 @@ GUEST_ABI std::int64_t map_hook(std::uint64_t, const std::uint64_t* saved) {
 // The T# builder: rsi = the T# out.
 GUEST_ABI std::int64_t tsharp_hook(std::uint64_t, const std::uint64_t* saved) {
     t_pending.push_back({saved[6], kTsharp, saved[4], 0, 0});
-    const_cast<std::uint64_t*>(saved)[6] = reinterpret_cast<std::uint64_t>(&gx_res_ret);
-    return 0;
-}
-
-// The upload pool's allocator, for UpdateSubresource's call only (rdx =
-// bytes, the memory back in rax), and UpdateSubresource itself: at its
-// return the renamed copy is written whole.
-std::uint64_t g_ret_pool_from_update = 0;  // kPoolAllocFromUpdate, slid
-thread_local std::uint64_t t_update_copy = 0, t_update_bytes = 0;
-std::atomic<std::uint64_t> g_update_copies{0};
-GUEST_ABI std::int64_t pool_alloc_hook(std::uint64_t, const std::uint64_t* saved) {
-    if (saved[6] != g_ret_pool_from_update) return 0;
-    t_pending.push_back({saved[6], kUpdateAlloc, 0, 0, saved[3]});
-    const_cast<std::uint64_t*>(saved)[6] = reinterpret_cast<std::uint64_t>(&gx_res_ret);
-    return 0;
-}
-GUEST_ABI std::int64_t update_dynamic_hook(std::uint64_t, const std::uint64_t* saved) {
-    t_update_copy = 0;
-    t_pending.push_back({saved[6], kUpdateCall, 0, 0, 0});
     const_cast<std::uint64_t*>(saved)[6] = reinterpret_cast<std::uint64_t>(&gx_res_ret);
     return 0;
 }
@@ -1059,7 +1083,7 @@ extern "C" GUEST_ABI std::uint64_t gx_res_after(std::uint64_t result) {
     }
     if (p.kind == kMapCall) {
         if (!p.ring) {
-            note_map(p.holder, p.type, p.out, static_cast<std::uint32_t>(result));
+            note_map(p.holder, p.type, p.out, static_cast<std::uint32_t>(result), p.extra);
         } else if (g_census) {
             std::uint64_t ptr = 0;
             if (p.out && rd(p.out, &ptr) && ptr && p.ring_bytes) {
@@ -1078,15 +1102,6 @@ extern "C" GUEST_ABI std::uint64_t gx_res_after(std::uint64_t result) {
         } else {
             g_yebis_failed[what].fetch_add(1, std::memory_order_relaxed);
         }
-    } else if (p.kind == kUpdateAlloc) {
-        t_update_copy = result;
-        t_update_bytes = p.type;
-    } else if (p.kind == kUpdateCall) {
-        if (t_update_copy && t_update_bytes) {
-            g_update_copies.fetch_add(1, std::memory_order_relaxed);
-            host_gpu_shadow_gx_handed(t_update_copy, t_update_bytes, 4);
-        }
-        t_update_copy = 0;
     } else if (p.kind == kScaleformInit) {
         if (result & 0xff) note_scaleform_texture(p.holder);
         else g_sf_failed.fetch_add(1, std::memory_order_relaxed);
@@ -1275,19 +1290,7 @@ void gx_resources_install(ElfImage* image) {
         dtor_with(kYebisTex2DDelete, kYebisTex2DVtable, reinterpret_cast<void*>(&yebis_tex2d_dtor_hook));
         if (g_census) hook(kScaleformTexInit, kPrologue58, sizeof(kPrologue58), reinterpret_cast<void*>(&scaleform_init_hook), 0);
     }
-    // The pool's blocks are the census's; UpdateSubresource's renamed copies
-    // are the buffer shadow's (BBHOST_SHADOW_GX, BBHOST_SHADOW_HANDED).
-    const bool shadow_handed = [] {
-        const char* g = std::getenv("BBHOST_SHADOW_GX");
-        const char* h = std::getenv("BBHOST_SHADOW_HANDED");
-        return !(g && g[0] == '0') && !(h && h[0] == '0');
-    }();
     if (g_census) hook(kPoolBlock, kPoolBlockPrologue, sizeof(kPoolBlockPrologue), reinterpret_cast<void*>(&pool_hook), 0);
-    if (shadow_handed) {
-        g_ret_pool_from_update = at(kPoolAllocFromUpdate);
-        hook(kPoolAlloc, kPoolAllocPrologue, sizeof(kPoolAllocPrologue), reinterpret_cast<void*>(&pool_alloc_hook), 0);
-        hook(kUpdateDynamic, kUpdateDynamicPrologue, sizeof(kUpdateDynamicPrologue), reinterpret_cast<void*>(&update_dynamic_hook), 0);
-    }
     hook(kCreateInputLayout, kInputLayoutPrologue, sizeof(kInputLayoutPrologue), reinterpret_cast<void*>(&object_create_hook), 0);
     hook(kCreateRtv, kPrologue58, sizeof(kPrologue58), reinterpret_cast<void*>(&view_create_hook), 1);
     hook(kCreateDsv, kDsvPrologue, sizeof(kDsvPrologue), reinterpret_cast<void*>(&view_create_hook), 2);
@@ -1485,6 +1488,14 @@ bool gx_view_resource(std::uint64_t view, GxResourceInfo* out) {
     return view && rd(view + 0x08, &holder) && gx_resource_by_holder(holder, out);
 }
 
+bool gx_constant_buffer_at(std::uint64_t memory) {
+    std::lock_guard<std::mutex> lk(g_mu);
+    auto m = g_by_memory.find(memory);
+    if (m == g_by_memory.end()) return false;
+    auto h = g_by_holder.find(m->second);
+    return h != g_by_holder.end() && h->second.info.alive && h->second.info.type == 1 && h->second.info.bind == 0x4;
+}
+
 int gx_middleware_at(std::uint64_t va, std::size_t bytes) {
     if (!bytes) return 0;
     std::lock_guard<std::mutex> lk(g_mu);
@@ -1605,7 +1616,9 @@ void gx_resources_report() {
                           m, w[0], w[1], w[2], w[3], static_cast<ull>(g_map_failed[m].load()));
             where += buf;
         }
-        host_log("gx-resources: dynamic UpdateSubresource's renamed copies told %llu", static_cast<ull>(g_update_copies.load()));
+        host_log("gx-resources: buffer Maps told to the shadow %llu, constant buffers' not %llu; a renamed copy freed by its buffer's next "
+                 "discard Map in the same context, settled %llu",
+                 static_cast<ull>(g_maps_told.load()), static_cast<ull>(g_maps_constant.load()), static_cast<ull>(g_copies_freed.load()));
         host_log("gx-resources: where a buffer's Map hands the CPU its writes:%s ring allocations seen %llu (%llu MiB), upload pool "
                  "blocks %llu (%llu MiB)",
                  where.empty() ? " none;" : where.c_str(), static_cast<ull>(g_ring_calls.load()), static_cast<ull>(g_ring_bytes.load() >> 20),

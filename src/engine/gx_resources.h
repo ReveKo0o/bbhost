@@ -73,6 +73,9 @@ bool gx_resource_overlapping(std::uint64_t va, std::size_t bytes, GxResourceInfo
 // device made (1) or a Scaleform texture's plane (2) - not GX's - holds any
 // of [va, va + bytes); 0 for neither, and without the census.
 int gx_middleware_at(std::uint64_t va, std::size_t bytes);
+// Whether the live GX buffer whose memory starts at `memory` is a constant
+// buffer (bind flags exactly 4): its renamed copies hold constants only.
+bool gx_constant_buffer_at(std::uint64_t memory);
 // The registry's write sequence now (bumped by every creation with data and
 // every Map), and the latest of the live resources overlapping [va, va +
 // bytes) (0: none overlaps) - whether GX wrote any of them since a moment

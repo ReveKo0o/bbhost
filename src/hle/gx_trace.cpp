@@ -2531,15 +2531,16 @@ std::atomic<std::uint64_t> g_copy_calls{0}, g_copy_tokens{0}, g_copy_ranges{0}, 
 std::uint64_t native_copy(Kind kind, const std::uint64_t* f) {
     // The sources are renamed copies GX writes back (or CopyResource's
     // source): the CPU is done with them, which the buffer shadow's mirrors
-    // over them wait for (host_gpu_shadow_gx_settled).
+    // over them wait for (host_gpu_shadow_gx_settled) - but for a constant
+    // buffer's, which the shadow never heard of.
     if (kind == kCopyBuffers) {
         const std::uint64_t entries = f[2];
         const std::uint32_t count = static_cast<std::uint32_t>(f[1]);
         for (std::uint32_t i = 0; entries && i < count; ++i) {
             const std::uint64_t e = entries + 0x18ull * i;
-            host_gpu_shadow_gx_settled(rd64(e + 8), rd32(e + 0x10));
+            if (!gx_constant_buffer_at(rd64(e))) host_gpu_shadow_gx_settled(rd64(e + 8), rd32(e + 0x10));
         }
-    } else {
+    } else if (!gx_constant_buffer_at(f[4])) {
         host_gpu_shadow_gx_settled(f[2], f[0] & 0xffffffffull);
     }
     if (!g_native_copies || g_native != 2 || g_backend != 1) return 0;
