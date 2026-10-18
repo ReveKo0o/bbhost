@@ -837,6 +837,7 @@ bool twin_locate_locked(std::uint64_t va, std::uint64_t bytes, Located& out, VkD
 bool twin_covers_locked(std::uint64_t va, std::uint64_t bytes);
 bool twin_candidate_holds(std::uint64_t va, std::uint64_t bytes);  // a twin holds it, or will at its first binding
 bool twin_holds_live_locked(std::uint64_t va, std::uint64_t bytes);  // inside a live twin: its stores leave guest memory as it was
+bool twin_candidate_straddles(std::uint64_t va, std::uint64_t bytes);  // runs across a candidate's edge
 void twins_release_locked(std::uint64_t va, std::uint64_t bytes, int why);
 void twins_buffer_made(std::uint64_t memory, std::uint64_t bytes, std::uint8_t usage, std::uint8_t bind, std::uint64_t gen);
 std::string twins_report();

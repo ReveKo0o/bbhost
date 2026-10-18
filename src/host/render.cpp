@@ -12482,6 +12482,7 @@ bool plan_vertex_input(const std::vector<std::uint32_t>& fetch_words, std::uint6
         }
         const std::uint64_t va = (static_cast<std::uint64_t>(w[0]) | (static_cast<std::uint64_t>(w[1] & 0xff) << 32)) + fe.offset;
         const std::uint64_t need = w[2] ? static_cast<std::uint64_t>(w[2] - 1) * stride + bytes : bytes;
+        std::uint64_t placed_need = need;  // what loc must hold (less than need only where a twin's edge cut it, below)
         Located loc;
         const int version = copy_version_lookup_locked(va, need, &loc);
         if (version == kCopyVersionStraddles) copy_versions_put_in_place_locked(kCvStraddle);
@@ -12526,11 +12527,21 @@ bool plan_vertex_input(const std::vector<std::uint32_t>& fetch_words, std::uint6
                                       : version != kCopyVersionNone                ? "a vertex buffer (a copy version straddled)"
                                       : gpu_writes_pending_locked(rec_va, rec_bytes) ? "a vertex buffer (a GPU write pending)"
                                                                                    : "a vertex buffer (neither mirrored nor snapshotted)");
-                loc = locate(va, need);
+                // A record whose extent runs on into a GX buffer kept as a
+                // device-local twin (BBHOST_GX_TWINS=1) - a V# with more records
+                // than its buffer holds: the bytes the draw reads, when known,
+                // which stop short of it (else the twin is let go, or inside a
+                // pass its part is read from guest memory as it stands).
+                if (twins_on() && twin_candidate_straddles(va, need)) {
+                    if (std::int64_t last = 0; draw_last_vertex(last) && last >= 0) {
+                        placed_need = std::min<std::uint64_t>(need, static_cast<std::uint64_t>(last) * stride + bytes);
+                    }
+                }
+                loc = locate(va, placed_need);
             }
         }
         if (g_import_audit) audit_range(va, need, kUseMirror);
-        if (!loc.buffer || loc.avail < need) {
+        if (!loc.buffer || loc.avail < placed_need) {
             t_vertex_input_refusal = kVsWhyPlacement;
             return keep("vertex data not within one imported buffer");
         }

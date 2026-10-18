@@ -606,6 +606,45 @@ void note_import_asker_locked(std::uint64_t bytes) {
     ++a.n;
     a.bytes += bytes;
 }
+// Guest memory served in place, by the path (t_import_site): each locate()
+// or device address an import answered - what still reads or writes guest
+// memory on the GPU, whoever made the import (the makers' census above counts
+// only the first asker of a window).
+struct SiteUse {
+    const char* site = nullptr;
+    std::uint64_t n = 0, bytes = 0;
+};
+SiteUse g_site_uses[64];  // under g.mu
+void note_site_use_locked(std::uint64_t bytes) {
+    const char* const site = t_import_site ? t_import_site : "other";
+    for (SiteUse& u : g_site_uses) {
+        if (!u.site) u.site = site;
+        if (u.site != site) continue;
+        ++u.n;
+        u.bytes += bytes;
+        return;
+    }
+}
+// The GX buffers GPU copies wrote (copy tokens' destinations, copy versions'):
+// by generation, with their usage, bind flags and size - candidates for a
+// device-local twin of their own when the CPU never writes them.
+struct CopiedBuffer {
+    std::uint8_t usage = 0, bind = 0;
+    std::uint32_t bytes = 0;
+    std::uint64_t copies = 0;
+};
+std::unordered_map<std::uint64_t, CopiedBuffer> g_copied_buffers;  // under g.mu
+std::uint64_t g_copied_other = 0;                                // under g.mu: into no GX buffer
+void note_copied_locked(std::uint64_t dst) {
+    GxResourceInfo info;
+    if (!gx_resource_at(dst, 1, &info) || info.type != 1) {
+        ++g_copied_other;
+        return;
+    }
+    CopiedBuffer& c = g_copied_buffers[info.gen];
+    c.usage = info.usage, c.bind = info.bind, c.bytes = info.bytes;
+    ++c.copies;
+}
 std::atomic<std::uint64_t> g_import_who_n[kImportWhos], g_import_who_bytes[kImportWhos];
 std::atomic<std::uint64_t> g_imports_retired{0}, g_import_retired_bytes{0};
 std::atomic<std::uint64_t> g_dispatch_read_imports{0}, g_dispatch_untraced{0};  // window imports of what dispatches read
@@ -2017,6 +2056,7 @@ Located located_in(const GuestMapInfo& mi, std::uint64_t va, std::uint64_t bytes
         const Chunk* c = dmem_import(chunk, in, std::min<std::uint64_t>({bytes, mi.len - off, reach > in ? reach - in : 1}), true);
         t_import_va = 0;
         if (!c) return out;
+        note_site_use_locked(bytes);
         out.buffer = c->buffer;
         out.offset = in - c->lo;
         out.avail = std::min(mi.len - off, c->size - out.offset);
@@ -8392,6 +8432,20 @@ bool twin_holds_live_locked(std::uint64_t va, std::uint64_t bytes) {
     return va >= it->first && va + bytes <= it->first + it->second.bytes;
 }
 
+bool twin_candidate_straddles(std::uint64_t va, std::uint64_t bytes) {
+    if (!g_twins || !bytes || !g_twin_cand_n.load(std::memory_order_relaxed)) return false;
+    std::lock_guard<std::mutex> lk(g_twin_cand_mu);
+    auto it = g_twin_cand.upper_bound(va);
+    if (it != g_twin_cand.begin()) {
+        const auto prev = std::prev(it);
+        if (!prev->second.let_go && va < prev->first + prev->second.bytes && va + bytes > prev->first + prev->second.bytes) return true;
+    }
+    for (; it != g_twin_cand.end() && it->first < va + bytes; ++it) {
+        if (!it->second.let_go) return true;
+    }
+    return false;
+}
+
 bool twin_candidate_holds(std::uint64_t va, std::uint64_t bytes) {
     if (!g_twins || !bytes || !g_twin_cand_n.load(std::memory_order_relaxed)) return false;
     std::lock_guard<std::mutex> lk(g_twin_cand_mu);
@@ -8666,6 +8720,7 @@ VkDeviceAddress guest_device_address(std::uint64_t va, std::size_t bytes) {
             const Chunk* c = chunk < gcn::kDmemChunks ? dmem_import(static_cast<std::uint32_t>(chunk), in, bytes, true) : nullptr;
             t_import_va = 0;
             t_import_who = who;
+            if (c) note_site_use_locked(bytes);
             return c ? c->address + (in - c->lo) : 0;
         }
         auto it = g.anon_imports.find(mi.va);
@@ -9067,6 +9122,10 @@ bool host_gpu_counter_fill(std::uint64_t dst, std::uint32_t value, std::size_t b
 // Copy tokens whose source was a render target, copied as images.
 std::atomic<std::uint64_t> g_guest_copy_targets{0};
 std::uint64_t host_gpu_guest_copy_targets() { return g_guest_copy_targets.load(std::memory_order_relaxed); }
+// Copy tokens' sources copied into upload staging (window imports), at most
+// this much a token (a bigger one reads its import).
+constexpr std::size_t kStagedCopyMax = 4u << 20;
+std::atomic<std::uint64_t> g_copy_src_staged{0}, g_copy_src_staged_bytes{0};
 
 bool host_gpu_copy_guest(std::uint64_t dst, std::uint64_t src, std::size_t bytes, std::uint64_t src_gen, std::uint64_t dst_gen) {
     std::lock_guard<GpuMutex> lock(g.mu);
@@ -9135,13 +9194,35 @@ bool host_gpu_copy_guest(std::uint64_t dst, std::uint64_t src, std::size_t bytes
     // to finish every draw before it (~1.5% of the command processor).
     std::optional<DrawCmds> own;
     if (!DrawCmds::open() && !stream_on()) own.emplace(!g.profile && !g.has_checkpoints);  // with the stream, ops of their own
+    // Window imports: a source the CPU wrote with no GPU write still to land
+    // on it (GX's renamed ring bytes copied back, copies too big for a copy
+    // version) is copied into upload staging here, as a copy version's is -
+    // its bytes as this point in the stream has them, the pending versions
+    // laid over guest memory's - and needs no import.
+    Located staged;
+    if (!imports_whole() && bytes <= kStagedCopyMax && !twin_covers_locked(src, bytes) && !gpu_writes_pending_locked(src, bytes) &&
+        !find_render_target(src) && !surfaces_may_cover_locked(src, bytes)) {
+        DevBuffer sb;
+        VkDeviceSize so = 0;
+        if (acquire_staging_locked(sb, bytes, so)) {
+            auto* to = static_cast<std::uint8_t*>(sb.map);
+            std::memcpy(to, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(src)), bytes);
+            copy_versions_overlay_locked(src, bytes, to);
+            staged = {sb.buffer, so, bytes};
+            g_copy_src_staged.fetch_add(1, std::memory_order_relaxed);
+            g_copy_src_staged_bytes.fetch_add(bytes, std::memory_order_relaxed);
+        }
+    }
     for (std::size_t done = 0; done < bytes;) {
         Located d, s;
         {
             const ImportSite site("a copy token's destination");
             d = locate(dst + done, bytes - done);
+            if (!done) note_copied_locked(dst);
         }
-        {
+        if (staged.buffer) {
+            s = {staged.buffer, staged.offset + done, bytes - done};
+        } else {
             const ImportSite site("a copy token's source");
             s = locate(src + done, bytes - done);
         }
@@ -9295,6 +9376,7 @@ bool copy_version_make_locked(std::uint64_t dst, std::uint64_t src, std::uint64_
     if (find_render_target(src) || find_render_target(dst)) return refuse(kCvTarget);
     const Located canon = locate(dst, bytes);
     if (!canon.buffer || canon.avail < bytes) return refuse(kCvImport);
+    note_copied_locked(dst);
     // The source as this point in the stream has it: an earlier version
     // holding all of it, else guest memory. Part of one: the GPU copy, after
     // the pass's own copies.
@@ -9526,6 +9608,50 @@ void host_gpu_report() {
                 host_log("gpu:   %s: %llu (%llu MiB), the first at 0x%llx in the mapping 0x%llx + %llu MiB (prot 0x%x)", kind.c_str(),
                          static_cast<ull>(a.n), static_cast<ull>(a.bytes >> 20), static_cast<ull>(a.first_va), static_cast<ull>(a.map_va),
                          static_cast<ull>(a.map_len >> 20), a.map_prot);
+            }
+        }
+        {
+            std::vector<SiteUse> uses;
+            std::vector<std::pair<std::string, std::pair<std::uint64_t, std::uint64_t>>> copied;  // kind -> buffers, bytes
+            std::uint64_t copied_other = 0, copies_total = 0;
+            {
+                std::lock_guard<GpuMutex> lock(g.mu);
+                for (const SiteUse& u : g_site_uses) {
+                    if (u.site) uses.push_back(u);
+                }
+                std::map<std::string, std::pair<std::uint64_t, std::uint64_t>> by;
+                for (const auto& [gen, c] : g_copied_buffers) {
+                    static const char* const usages[] = {"default", "immutable", "dynamic", "staging"};
+                    char k[48];
+                    std::snprintf(k, sizeof(k), "%s bind 0x%x", c.usage < 4 ? usages[c.usage] : "?", c.bind);
+                    auto& e = by[k];
+                    ++e.first;
+                    e.second += c.bytes;
+                    copies_total += c.copies;
+                }
+                copied.assign(by.begin(), by.end());
+                copied_other = g_copied_other;
+            }
+            std::sort(uses.begin(), uses.end(), [](const SiteUse& a, const SiteUse& b) { return a.n > b.n; });
+            if (!uses.empty()) {
+                host_log("gpu: guest memory served in place (a locate or device address an import answered), by the path that asked, %zu paths:",
+                         uses.size());
+                for (const SiteUse& u : uses) {
+                    host_log("gpu:   %s: %llu (%llu MiB asked)", u.site, static_cast<ull>(u.n), static_cast<ull>(u.bytes >> 20));
+                }
+            }
+            std::string cb;
+            for (const auto& [k, e] : copied) {
+                char b[96];
+                std::snprintf(b, sizeof(b), "%s%s %llu (%llu KiB)", cb.empty() ? "" : "; ", k.c_str(), static_cast<ull>(e.first),
+                              static_cast<ull>(e.second >> 10));
+                cb += b;
+            }
+            host_log("gpu: GX buffers GPU copies wrote (copy tokens, copy versions; %llu copies): %s; copies into no GX buffer %llu",
+                     static_cast<ull>(copies_total), cb.empty() ? "none" : cb.c_str(), static_cast<ull>(copied_other));
+            if (!g_import_whole) {
+                host_log("gpu: copy tokens' sources copied into upload staging (window imports): %llu (%llu MiB)",
+                         static_cast<ull>(g_copy_src_staged.load()), static_cast<ull>(g_copy_src_staged_bytes.load() >> 20));
             }
         }
         if (const std::string tw = twins_report(); !tw.empty()) host_log("%s", tw.c_str());
