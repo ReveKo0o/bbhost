@@ -86,6 +86,15 @@ constexpr std::uint64_t kRing = 0x2adb1b0;  // the dynamic ring allocator: (ring
 // of these blocks for UpdateSubresource's dynamic copies (0x2aadb90) and some
 // 200 sites of the draw-state code.
 constexpr std::uint64_t kPoolBlock = 0x2aa9d50;
+// GX's dynamic UpdateSubresource (0x2aadb90(map, ctx, ?, holder, data)) takes a
+// fresh renamed copy from the context's upload pool (0x2aaddc0, the call
+// returning to 0x2aadbde), copies the bytes in (0x2aadc00) and returns: the
+// copy is written whole by then. The pool's allocator is hooked for that one
+// caller, the update's return tells the buffer shadow.
+constexpr std::uint64_t kPoolAlloc = 0x2aaddc0, kPoolAllocFromUpdate = 0x2aadbde, kUpdateDynamic = 0x2aadb90;
+// push rbp; mov rbp, rsp; push r15; push r14; push rbx; push rax; mov rbx, rdx; mov r15, rsi
+constexpr std::uint8_t kPoolAllocPrologue[16] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56,
+                                                 0x53, 0x50, 0x48, 0x89, 0xd3, 0x49, 0x89, 0xf7};
 // push rbp; mov rbp, rsp; push r15; push r14; push rbx; push rax; mov r14, rsi; mov rbx, rdi
 constexpr std::uint8_t kPoolBlockPrologue[16] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56,
                                                  0x53, 0x50, 0x49, 0x89, 0xf6, 0x48, 0x89, 0xfb};
@@ -136,6 +145,7 @@ constexpr std::uint8_t kYebisUpdatePrologue[20] = {BB_PUSH6, 0x48, 0x81, 0xec, 0
 // - a cache-flush command; the writes after Map went to the memory itself.
 constexpr std::uint64_t kYebisUnmap = 0x15d99c0;
 constexpr std::uint8_t kYebisUnmapPrologue[16] = {0x48, 0x8b, 0xbf, 0xa0, 0x0a, 0x00, 0x00, 0xbe, 0x38, 0x00, 0x00, 0x00, 0x31, 0xd2, 0x31, 0xc9};
+constexpr std::uint8_t kUpdateDynamicPrologue[17] = {BB_PUSH6, 0x48, 0x83, 0xec, 0x28};  // sub rsp, 0x28
 // Scaleform's PS4 Texture::Initialize (0x7a1d30, slot 2 of vtable 0x55bbf20;
 // its prologue is kPrologue58's): true when it made the hardware texture, an
 // array (+0x60) of +0x45 planes of 0x58 bytes - size (+0), T# (+4), memory
@@ -150,7 +160,7 @@ constexpr std::uint8_t kDtorHead[9] = {0x55, 0x48, 0x89, 0xe5, 0x53, 0x50, 0x48,
 
 enum Kind : std::uint8_t {
     kBuffer = 1, kTexture = 2, kTexture3D = 3, kMapCall = 4, kTsharp = 5, kResource1D = 6, kObject = 7, kPoolCall = 8,
-    kYebisCreate = 9, kYebisMapCall = 10, kScaleformInit = 11, kYebisUpdateCall = 12
+    kYebisCreate = 9, kYebisMapCall = 10, kScaleformInit = 11, kYebisUpdateCall = 12, kUpdateAlloc = 13, kUpdateCall = 14
 };
 
 struct Pending {
@@ -715,6 +725,25 @@ GUEST_ABI std::int64_t tsharp_hook(std::uint64_t, const std::uint64_t* saved) {
     return 0;
 }
 
+// The upload pool's allocator, for UpdateSubresource's call only (rdx =
+// bytes, the memory back in rax), and UpdateSubresource itself: at its
+// return the renamed copy is written whole.
+std::uint64_t g_ret_pool_from_update = 0;  // kPoolAllocFromUpdate, slid
+thread_local std::uint64_t t_update_copy = 0, t_update_bytes = 0;
+std::atomic<std::uint64_t> g_update_copies{0};
+GUEST_ABI std::int64_t pool_alloc_hook(std::uint64_t, const std::uint64_t* saved) {
+    if (saved[6] != g_ret_pool_from_update) return 0;
+    t_pending.push_back({saved[6], kUpdateAlloc, 0, 0, saved[3]});
+    const_cast<std::uint64_t*>(saved)[6] = reinterpret_cast<std::uint64_t>(&gx_res_ret);
+    return 0;
+}
+GUEST_ABI std::int64_t update_dynamic_hook(std::uint64_t, const std::uint64_t* saved) {
+    t_update_copy = 0;
+    t_pending.push_back({saved[6], kUpdateCall, 0, 0, 0});
+    const_cast<std::uint64_t*>(saved)[6] = reinterpret_cast<std::uint64_t>(&gx_res_ret);
+    return 0;
+}
+
 // The upload pool's block source: rsi = bytes, the block comes back in rax.
 GUEST_ABI std::int64_t pool_hook(std::uint64_t, const std::uint64_t* saved) {
     t_pending.push_back({saved[6], kPoolCall, 0, 0, saved[4]});
@@ -1049,6 +1078,15 @@ extern "C" GUEST_ABI std::uint64_t gx_res_after(std::uint64_t result) {
         } else {
             g_yebis_failed[what].fetch_add(1, std::memory_order_relaxed);
         }
+    } else if (p.kind == kUpdateAlloc) {
+        t_update_copy = result;
+        t_update_bytes = p.type;
+    } else if (p.kind == kUpdateCall) {
+        if (t_update_copy && t_update_bytes) {
+            g_update_copies.fetch_add(1, std::memory_order_relaxed);
+            host_gpu_shadow_gx_handed(t_update_copy, t_update_bytes, 4);
+        }
+        t_update_copy = 0;
     } else if (p.kind == kScaleformInit) {
         if (result & 0xff) note_scaleform_texture(p.holder);
         else g_sf_failed.fetch_add(1, std::memory_order_relaxed);
@@ -1237,13 +1275,19 @@ void gx_resources_install(ElfImage* image) {
         dtor_with(kYebisTex2DDelete, kYebisTex2DVtable, reinterpret_cast<void*>(&yebis_tex2d_dtor_hook));
         if (g_census) hook(kScaleformTexInit, kPrologue58, sizeof(kPrologue58), reinterpret_cast<void*>(&scaleform_init_hook), 0);
     }
-    // The pool's blocks are memory the buffer shadow binds from host memory
-    // (it is rewritten every frame or so) unless BBHOST_SHADOW_GX=0.
-    const bool shadow_gx = [] {
-        const char* e = std::getenv("BBHOST_SHADOW_GX");
-        return !(e && e[0] == '0');
+    // The pool's blocks are the census's; UpdateSubresource's renamed copies
+    // are the buffer shadow's (BBHOST_SHADOW_GX, BBHOST_SHADOW_HANDED).
+    const bool shadow_handed = [] {
+        const char* g = std::getenv("BBHOST_SHADOW_GX");
+        const char* h = std::getenv("BBHOST_SHADOW_HANDED");
+        return !(g && g[0] == '0') && !(h && h[0] == '0');
     }();
-    if (g_census || shadow_gx) hook(kPoolBlock, kPoolBlockPrologue, sizeof(kPoolBlockPrologue), reinterpret_cast<void*>(&pool_hook), 0);
+    if (g_census) hook(kPoolBlock, kPoolBlockPrologue, sizeof(kPoolBlockPrologue), reinterpret_cast<void*>(&pool_hook), 0);
+    if (shadow_handed) {
+        g_ret_pool_from_update = at(kPoolAllocFromUpdate);
+        hook(kPoolAlloc, kPoolAllocPrologue, sizeof(kPoolAllocPrologue), reinterpret_cast<void*>(&pool_alloc_hook), 0);
+        hook(kUpdateDynamic, kUpdateDynamicPrologue, sizeof(kUpdateDynamicPrologue), reinterpret_cast<void*>(&update_dynamic_hook), 0);
+    }
     hook(kCreateInputLayout, kInputLayoutPrologue, sizeof(kInputLayoutPrologue), reinterpret_cast<void*>(&object_create_hook), 0);
     hook(kCreateRtv, kPrologue58, sizeof(kPrologue58), reinterpret_cast<void*>(&view_create_hook), 1);
     hook(kCreateDsv, kDsvPrologue, sizeof(kDsvPrologue), reinterpret_cast<void*>(&view_create_hook), 2);
@@ -1561,6 +1605,7 @@ void gx_resources_report() {
                           m, w[0], w[1], w[2], w[3], static_cast<ull>(g_map_failed[m].load()));
             where += buf;
         }
+        host_log("gx-resources: dynamic UpdateSubresource's renamed copies told %llu", static_cast<ull>(g_update_copies.load()));
         host_log("gx-resources: where a buffer's Map hands the CPU its writes:%s ring allocations seen %llu (%llu MiB), upload pool "
                  "blocks %llu (%llu MiB)",
                  where.empty() ? " none;" : where.c_str(), static_cast<ull>(g_ring_calls.load()), static_cast<ull>(g_ring_bytes.load() >> 20),

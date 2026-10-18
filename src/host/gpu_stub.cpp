@@ -87,6 +87,7 @@ void host_gpu_texture_written(std::uint64_t, std::size_t) {}
 void host_gpu_shadow_gx_write(std::uint64_t, std::size_t) {}
 void host_gpu_shadow_gx_created(std::uint64_t, std::size_t) {}
 void host_gpu_shadow_gx_handed(std::uint64_t, std::size_t, int) {}
+void host_gpu_shadow_gx_settled(std::uint64_t, std::size_t) {}
 std::string host_gpu_target_copy_report() { return {}; }
 std::string host_gpu_ps_wave_report() { return {}; }
 std::string host_gpu_memory_budget_report() { return {}; }

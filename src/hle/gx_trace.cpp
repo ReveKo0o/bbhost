@@ -2529,6 +2529,19 @@ std::atomic<std::uint64_t> g_copy_calls{0}, g_copy_tokens{0}, g_copy_ranges{0}, 
 // usage, source, usage, size) is one such copy, and CopyResource's. Both
 // shaders copy size >> 2 whole dwords.
 std::uint64_t native_copy(Kind kind, const std::uint64_t* f) {
+    // The sources are renamed copies GX writes back (or CopyResource's
+    // source): the CPU is done with them, which the buffer shadow's mirrors
+    // over them wait for (host_gpu_shadow_gx_settled).
+    if (kind == kCopyBuffers) {
+        const std::uint64_t entries = f[2];
+        const std::uint32_t count = static_cast<std::uint32_t>(f[1]);
+        for (std::uint32_t i = 0; entries && i < count; ++i) {
+            const std::uint64_t e = entries + 0x18ull * i;
+            host_gpu_shadow_gx_settled(rd64(e + 8), rd32(e + 0x10));
+        }
+    } else {
+        host_gpu_shadow_gx_settled(f[2], f[0] & 0xffffffffull);
+    }
     if (!g_native_copies || g_native != 2 || g_backend != 1) return 0;
     if (!(g_copy_kinds & (kind == kCopyBuffers ? 1 : 2))) return 0;
     const std::uint64_t cb = f[5];
