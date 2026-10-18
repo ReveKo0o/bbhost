@@ -147,8 +147,19 @@ constexpr std::uint8_t kYebisUnmapPrologue[16] = {0x48, 0x8b, 0xbf, 0xa0, 0x0a, 
 // Scaleform's PS4 Texture::Initialize (0x7a1d30, slot 2 of vtable 0x55bbf20;
 // its prologue is kPrologue58's): true when it made the hardware texture, an
 // array (+0x60) of +0x45 planes of 0x58 bytes - size (+0), T# (+4), memory
-// (+0x50, from the HAL's memory manager). Census only.
-constexpr std::uint64_t kScaleformTexInit = 0x7a1d30;
+// (+0x50, from the HAL's memory manager); an image to start from is copied in
+// before it returns. Its CPU writes after that all end in the texture
+// manager's unmapTexture (0x7a3270, slot +0xd8 of vtable 0x55bc030:
+// (manager, texture, ...)): Texture::Update (0x7a24e0, slot +0x90 - the glyph
+// cache's) maps through mapTexture (+0xc8, 0x7a3140: pointers into the planes'
+// own memory, from the T#) and unmaps there, as Texture::Unmap (0x7a24b0)
+// does. ReleaseHWTextures (0x7a2160, slot +0x60) gives the planes' memory to
+// the manager's deferred free (+0x108) and zeroes the planes.
+constexpr std::uint64_t kScaleformTexInit = 0x7a1d30, kScaleformUnmap = 0x7a3270, kScaleformRelease = 0x7a2160;
+// push rbp; mov rbp, rsp; push r14; push rbx; mov r14, rdi; mov rbx, [rsi + 0x50]
+constexpr std::uint8_t kScaleformUnmapPrologue[14] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x56, 0x53, 0x49, 0x89, 0xfe, 0x48, 0x8b, 0x5e, 0x50};
+// push rbp; mov rbp, rsp; push r15; push r14; push r12; push rbx; sub rsp, 0x60
+constexpr std::uint8_t kScaleformReleasePrologue[15] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x54, 0x53, 0x48, 0x83, 0xec, 0x60};
 #undef BB_PUSH6
 // push rbp; mov rbp, rsp; push r15; push r14; push rbx; push rax; mov r14, rdi; mov rdi, [r14]
 constexpr std::uint8_t kBufferReleasePrologue[16] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56,
@@ -158,7 +169,7 @@ constexpr std::uint8_t kDtorHead[9] = {0x55, 0x48, 0x89, 0xe5, 0x53, 0x50, 0x48,
 
 enum Kind : std::uint8_t {
     kBuffer = 1, kTexture = 2, kTexture3D = 3, kMapCall = 4, kTsharp = 5, kResource1D = 6, kObject = 7, kPoolCall = 8,
-    kYebisCreate = 9, kYebisMapCall = 10, kScaleformInit = 11, kYebisUpdateCall = 12
+    kYebisCreate = 9, kYebisMapCall = 10, kScaleformInit = 11, kYebisUpdateCall = 12, kScaleformUnmapCall = 13
 };
 
 struct Pending {
@@ -251,6 +262,15 @@ std::atomic<std::uint64_t> g_yebis_registered{0}, g_yebis_unregistered{0}, g_yeb
 // Scaleform's textures (census): initialized, their planes and bytes, failed.
 std::atomic<std::uint64_t> g_sf_inits{0}, g_sf_planes{0}, g_sf_bytes{0}, g_sf_failed{0};
 std::atomic<int> g_sf_logged{0};
+// BBHOST_RES_SCALEFORM=1: Scaleform's texture planes are registered as 2D
+// resources from Initialize (key kScaleformKey | texture << 2 | plane), told
+// of the CPU's writes when the manager's unmapTexture returns, and dropped at
+// ReleaseHWTextures - but for a plane on memory a live GX resource already
+// holds (a texture Scaleform wraps), which stays that resource's.
+bool g_res_scaleform = false;
+constexpr std::uint64_t kScaleformKey = 0x2000000000000000ull;
+std::uint64_t scaleform_key(std::uint64_t texture, unsigned plane) { return kScaleformKey | (texture << 2) | plane; }
+std::atomic<std::uint64_t> g_sf_registered{0}, g_sf_unregistered{0}, g_sf_told{0}, g_sf_wrapped{0};
 std::atomic<std::uint64_t> g_lookups{0}, g_lookup_hits{0};
 std::atomic<std::uint64_t> g_peak_live{0};
 // New resources made over part of a live one's memory: [old type][new type].
@@ -866,6 +886,37 @@ GUEST_ABI std::int64_t scaleform_init_hook(std::uint64_t, const std::uint64_t* s
     return 0;
 }
 
+// A Scaleform texture plane as a resource of the registry's
+// (BBHOST_RES_SCALEFORM): a 2D texture over [memory, +size) with its data in,
+// a new generation - unless a live GX resource holds that memory already.
+void register_scaleform_plane(std::uint64_t texture, unsigned plane, std::uint64_t memory, std::uint32_t size) {
+    const std::uint64_t key = scaleform_key(texture, plane);
+    {
+        std::lock_guard<std::mutex> lk(g_mu);
+        auto m = g_by_memory.upper_bound(memory);
+        if (m != g_by_memory.begin() && (--m)->second != key) {
+            const auto h = g_by_holder.find(m->second);
+            if (h != g_by_holder.end() && h->second.info.alive && h->second.info.memory + h->second.info.bytes >= memory + size) {
+                g_sf_wrapped.fetch_add(1, std::memory_order_relaxed);
+                return;
+            }
+        }
+    }
+    Entry e;
+    e.holder = key;
+    e.created_flip = hle_video_flip_count();
+    e.info.created_flip = e.created_flip;
+    e.info.memory = memory;
+    e.info.bytes = size;
+    e.info.type = 3;
+    e.info.gen = g_gen_next.fetch_add(1, std::memory_order_relaxed);
+    e.info.created_submit = hle_gnm_submitted_total();
+    e.info.initial_data = true;
+    e.info.write_seq = g_write_seq.fetch_add(1, std::memory_order_relaxed) + 1;
+    g_sf_registered.fetch_add(1, std::memory_order_relaxed);
+    register_entry(e.holder, e);
+}
+
 // A Scaleform texture made its hardware planes: each one's memory and size.
 void note_scaleform_texture(std::uint64_t texture) {
     std::uint8_t planes = 0;
@@ -886,9 +937,73 @@ void note_scaleform_texture(std::uint64_t texture) {
                      i, (t[2] & 0x3fff) + 1, ((t[2] >> 14) & 0x3fff) + 1, (t[1] >> 20) & 0x3f, static_cast<unsigned long long>(memory), size);
         }
         if (!memory || memory == ~0ull || !size) continue;
+        if (g_res_scaleform) register_scaleform_plane(texture, i, memory, size);
+        if (!g_census) continue;
         std::lock_guard<std::mutex> lk(g_mu);
         g_yebis_by_memory[memory] = YebisObject{texture, size, 8};
     }
+}
+
+// The planes of a texture the registry holds (BBHOST_RES_SCALEFORM), by key.
+std::vector<std::uint64_t> scaleform_registered(std::uint64_t texture) {
+    std::vector<std::uint64_t> keys;
+    std::lock_guard<std::mutex> lk(g_mu);
+    for (unsigned i = 0; i < 4; ++i) {
+        if (g_by_holder.count(scaleform_key(texture, i))) keys.push_back(scaleform_key(texture, i));
+    }
+    return keys;
+}
+
+// The manager's unmapTexture returned: the CPU's writes into the texture's
+// planes since its map are in (Update's rectangles, a Map's), and the texture
+// cache uploads them again at their next use.
+void scaleform_unmapped(std::uint64_t texture) {
+    if (!texture) return;
+    for (const std::uint64_t key : scaleform_registered(texture)) {
+        std::uint64_t memory = 0;
+        std::uint32_t bytes = 0;
+        {
+            std::lock_guard<std::mutex> lk(g_mu);
+            auto it = g_by_holder.find(key);
+            if (it == g_by_holder.end() || !it->second.info.alive) continue;
+            it->second.info.write_seq = g_write_seq.fetch_add(1, std::memory_order_relaxed) + 1;
+            memory = it->second.info.memory;
+            bytes = it->second.info.bytes;
+        }
+        g_sf_told.fetch_add(1, std::memory_order_relaxed);
+        if (memory && bytes) host_gpu_texture_written(memory, bytes);
+    }
+}
+
+GUEST_ABI std::int64_t scaleform_unmap_hook(std::uint64_t, const std::uint64_t* saved) {
+    Pending p{saved[6], kScaleformUnmapCall, 0, saved[4], 0};
+    t_pending.push_back(p);
+    const_cast<std::uint64_t*>(saved)[6] = reinterpret_cast<std::uint64_t>(&gx_res_ret);
+    return 0;
+}
+
+// ReleaseHWTextures: the planes' memory goes back to Scaleform's manager.
+GUEST_ABI std::int64_t scaleform_release_hook(std::uint64_t, const std::uint64_t* saved) {
+    const std::uint64_t texture = saved[5];
+    if (!texture) return 0;
+    if (g_res_scaleform) {
+        for (const std::uint64_t key : scaleform_registered(texture)) {
+            unregister_holder(key);
+            g_sf_unregistered.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    if (!g_census) return 0;
+    std::uint8_t planes = 0;
+    std::uint64_t array = 0;
+    if (!rd(texture + 0x45, &planes) || !rd(texture + 0x60, &array) || !array || planes > 4) return 0;
+    std::lock_guard<std::mutex> lk(g_mu);
+    for (unsigned i = 0; i < planes; ++i) {
+        std::uint64_t memory = 0;
+        if (!rd(array + i * 0x58ull + 0x50, &memory) || !memory) continue;
+        if (auto m = g_yebis_by_memory.find(memory); m != g_yebis_by_memory.end() && m->second.object == texture && m->second.kind == 8)
+            g_yebis_by_memory.erase(m);
+    }
+    return 0;
 }
 
 // A YEBIS 2D texture as a resource of the registry's (BBHOST_RES_YEBIS): its
@@ -1105,6 +1220,8 @@ extern "C" GUEST_ABI std::uint64_t gx_res_after(std::uint64_t result) {
     } else if (p.kind == kScaleformInit) {
         if (result & 0xff) note_scaleform_texture(p.holder);
         else g_sf_failed.fetch_add(1, std::memory_order_relaxed);
+    } else if (p.kind == kScaleformUnmapCall) {
+        scaleform_unmapped(p.holder);
     } else if (p.kind == kYebisUpdateCall) {
         g_yebis_updates[yebis_kind(p.extra)].fetch_add(1, std::memory_order_relaxed);
         yebis_written(p.extra);
@@ -1288,7 +1405,16 @@ void gx_resources_install(ElfImage* image) {
         hook(kYebisMap, kYebisMapPrologue, sizeof(kYebisMapPrologue), reinterpret_cast<void*>(&yebis_map_hook), 0);
         hook(kYebisUpdate, kYebisUpdatePrologue, sizeof(kYebisUpdatePrologue), reinterpret_cast<void*>(&yebis_update_hook), 0);
         dtor_with(kYebisTex2DDelete, kYebisTex2DVtable, reinterpret_cast<void*>(&yebis_tex2d_dtor_hook));
-        if (g_census) hook(kScaleformTexInit, kPrologue58, sizeof(kPrologue58), reinterpret_cast<void*>(&scaleform_init_hook), 0);
+    }
+    g_res_scaleform = [] {
+        const char* e = std::getenv("BBHOST_RES_SCALEFORM");
+        return e && e[0] == '1';
+    }();
+    if (g_census || g_res_scaleform) {
+        hook(kScaleformTexInit, kPrologue58, sizeof(kPrologue58), reinterpret_cast<void*>(&scaleform_init_hook), 0);
+        hook(kScaleformRelease, kScaleformReleasePrologue, sizeof(kScaleformReleasePrologue), reinterpret_cast<void*>(&scaleform_release_hook), 0);
+        if (g_res_scaleform)
+            hook(kScaleformUnmap, kScaleformUnmapPrologue, sizeof(kScaleformUnmapPrologue), reinterpret_cast<void*>(&scaleform_unmap_hook), 0);
     }
     if (g_census) hook(kPoolBlock, kPoolBlockPrologue, sizeof(kPoolBlockPrologue), reinterpret_cast<void*>(&pool_hook), 0);
     hook(kCreateInputLayout, kInputLayoutPrologue, sizeof(kInputLayoutPrologue), reinterpret_cast<void*>(&object_create_hook), 0);
@@ -1655,6 +1781,11 @@ void gx_resources_report() {
                      static_cast<ull>(g_yebis_registered.load()), static_cast<ull>(g_yebis_unregistered.load()), static_cast<ull>(g_yebis_told.load()));
         host_log("gx-resources: Scaleform's textures initialized %llu (%llu planes, %llu MiB), failed %llu", static_cast<ull>(g_sf_inits.load()),
                  static_cast<ull>(g_sf_planes.load()), static_cast<ull>(g_sf_bytes.load() >> 20), static_cast<ull>(g_sf_failed.load()));
+        if (g_res_scaleform)
+            host_log("gx-resources: Scaleform's texture planes as resources (BBHOST_RES_SCALEFORM): registered %llu (%llu on a GX resource's memory, "
+                     "left to it), released %llu, told of CPU writes at an unmap %llu",
+                     static_cast<ull>(g_sf_registered.load()), static_cast<ull>(g_sf_wrapped.load()), static_cast<ull>(g_sf_unregistered.load()),
+                     static_cast<ull>(g_sf_told.load()));
         host_log("gx-resources: YEBIS's own device made%s 2D render targets %llu, depth %llu; 2D destroyed %llu (%llu it had not seen made); live "
                  "YEBIS and Scaleform objects %zu (%llu MiB); by resource:%s Map's pointer its memory %llu, elsewhere %llu",
                  made.empty() ? " nothing;" : made.c_str(), static_cast<ull>(g_yebis_rt.load()), static_cast<ull>(g_yebis_depth.load()),
