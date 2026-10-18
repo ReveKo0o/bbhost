@@ -801,6 +801,17 @@ bool imports_whole();
 // it is not: for what the shaders reach through the page table, which needs
 // the pages mapped but no one buffer over them.
 void import_windows(std::uint64_t va, std::uint64_t bytes);
+// The path whose locate() or import_windows() is under way (a vertex buffer,
+// a label's write, a copy token...), for the exit report's census of what
+// still takes window imports: set for the call's length, nullptr outside one.
+extern thread_local const char* t_import_site;
+struct ImportSite {
+    const char* prev;
+    explicit ImportSite(const char* site) : prev(t_import_site) { t_import_site = site; }
+    ~ImportSite() { t_import_site = prev; }
+    ImportSite(const ImportSite&) = delete;
+    ImportSite& operator=(const ImportSite&) = delete;
+};
 // BBHOST_IMPORT_AUDIT=1 (gpu.cpp): counts the GPU side's resolutions per guest
 // mapping - kind 0 locate, 1 a device address, 2 a vertex/index mirror source.
 extern const bool g_import_audit;

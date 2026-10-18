@@ -55,6 +55,7 @@ namespace gpu {
 
 Gpu g;
 std::atomic<std::uint64_t> g_validation_messages{0};  // warnings and errors the validation layer reported
+thread_local const char* t_import_site = nullptr;     // gpu_internal.h: the window imports' census
 
 void device_lost_locked(const char* where, bool declared = false);  // below, with the reports it makes
 bool take_marked_start(std::string& why);    // the same: a start after a lost device runs with markers
@@ -566,30 +567,42 @@ VkResult dmabuf_span(Chunk& c, std::uint64_t offset, std::uint64_t size) {
 // GX resource's memory (bb-import), the whole spans.
 enum ImportWho { kIwBinding, kIwAddress, kIwWalk, kIwPrefetch, kIwSpan, kImportWhos };
 thread_local int t_import_who = kIwBinding;
-// The guest address whose locate() or device address asked for the import
-// under way (the census of what still needs window imports: by the GX
-// resource there - no GX object, a buffer by its usage and bind flags, a
-// texture - counted when a binding or a device address makes a new import).
+// The guest address whose locate(), device address, walk or prefetch asked
+// for the import under way (the census of what still needs window imports:
+// by the path that asked - t_import_site, gpu_internal.h - and the GX
+// resource there: no GX object, a buffer by its usage and bind flags, a
+// texture - counted when a window import is made).
 thread_local std::uint64_t t_import_va = 0;
 struct ImportAsker {
     std::uint64_t n = 0, bytes = 0, first_va = 0;
+    std::uint64_t map_va = 0, map_len = 0;  // the guest mapping the first lies in
+    int map_prot = 0;
 };
 std::map<std::string, ImportAsker> g_import_askers;  // under g.mu
 void note_import_asker_locked(std::uint64_t bytes) {
-    if (!t_import_va || (t_import_who != kIwBinding && t_import_who != kIwAddress)) return;
+    if (!t_import_va || t_import_who == kIwSpan) return;
+    static const char* const whos[] = {"binding", "device address", "walk", "prefetch"};
+    const char* const who = whos[t_import_who];
+    const char* const site = t_import_site ? t_import_site : "other";
     GxResourceInfo info;
-    char kind[96];
+    char kind[160];
     if (!gx_resource_overlapping(t_import_va, 1, &info)) {
-        std::snprintf(kind, sizeof(kind), "%s, no GX object", t_import_who == kIwBinding ? "binding" : "device address");
+        std::snprintf(kind, sizeof(kind), "%s (%s), no GX object", who, site);
     } else if (info.type == 1) {
         static const char* const usages[] = {"default", "immutable", "dynamic", "staging"};
-        std::snprintf(kind, sizeof(kind), "%s, buffer %s bind 0x%x", t_import_who == kIwBinding ? "binding" : "device address",
-                      info.usage < 4 ? usages[info.usage] : "?", info.bind);
+        std::snprintf(kind, sizeof(kind), "%s (%s), buffer %s bind 0x%x", who, site, info.usage < 4 ? usages[info.usage] : "?", info.bind);
     } else {
-        std::snprintf(kind, sizeof(kind), "%s, texture", t_import_who == kIwBinding ? "binding" : "device address");
+        std::snprintf(kind, sizeof(kind), "%s (%s), texture", who, site);
     }
     ImportAsker& a = g_import_askers[kind];
-    if (!a.n) a.first_va = t_import_va;
+    if (!a.n) {
+        a.first_va = t_import_va;
+        for (const GuestMapInfo& mi : g.maps) {
+            if (t_import_va < mi.va || t_import_va >= mi.va + mi.len) continue;
+            a.map_va = mi.va, a.map_len = mi.len, a.map_prot = mi.prot;
+            break;
+        }
+    }
     ++a.n;
     a.bytes += bytes;
 }
@@ -895,6 +908,7 @@ const Chunk* dmem_import(std::uint32_t index, std::uint64_t in, std::uint64_t by
 
 void import_windows(std::uint64_t va, std::uint64_t bytes) {
     const int who = t_import_who;
+    const std::uint64_t asked = t_import_va;
     t_import_who = kIwWalk;
     const std::uint64_t end = va + bytes;
     for (const GuestMapInfo& mi : g.maps) {
@@ -902,10 +916,12 @@ void import_windows(std::uint64_t va, std::uint64_t bytes) {
         const std::uint64_t lo = std::max(va, mi.va), hi = std::min(end, mi.va + mi.len);
         for (std::uint64_t at = lo; at < hi;) {
             const std::uint64_t phys = static_cast<std::uint64_t>(mi.phys) + (at - mi.va);
+            t_import_va = at;
             dmem_import(static_cast<std::uint32_t>(phys >> gcn::kDmemChunkShift), phys & (kChunkBytes - 1), 1);
             at += (1ull << kImportWindowShift) - (phys & ((1ull << kImportWindowShift) - 1));  // the next window
         }
     }
+    t_import_va = asked;
     t_import_who = who;
 }
 
@@ -938,6 +954,7 @@ std::atomic<std::uint64_t> g_pf_asked{0}, g_pf_known{0}, g_pf_checked{0}, g_pf_i
 void prefetch_thread() {
     host_thread_set_name("bb-import");
     t_import_who = kIwPrefetch;
+    t_import_site = "a GX buffer made";
     constexpr std::uint64_t kWindow = 1ull << kImportWindowShift;
     // This thread's own view: the mappings (refreshed when they change) and
     // the windows it has seen imported - an import is only ever replaced by a
@@ -1036,6 +1053,9 @@ void prefetch_thread() {
             g_pf_bytes.fetch_add(c->size, std::memory_order_relaxed);
             d.imports.push_back(std::move(c));
             install_import_locked(r.chunk, d.imports.back().get());
+            t_import_va = job.va;  // the census: by the buffer the job is for
+            note_import_asker_locked(d.imports.back()->size);
+            t_import_va = 0;
             for (std::uint64_t w = r.lo >> kImportWindowShift; w <= (r.hi - 1) >> kImportWindowShift; ++w) known[r.chunk] |= 1ull << w;
         }
     }
@@ -7314,7 +7334,10 @@ bool host_gpu_dispatch(const GpuDispatch& d_in) {
         if (base && !twin_candidate_holds(base, span)) import_windows(base, span);
     };
     if (!g_import_whole) {
-        for (const gcn::ResourcePath& p : pl.meta.store_buffers) import_path(p, false, 16);
+        {
+            const ImportSite site("a dispatch's stores");
+            for (const gcn::ResourcePath& p : pl.meta.store_buffers) import_path(p, false, 16);
+        }
         // BBHOST_VB_RACE=1: what the dispatch reads and never stores to, as
         // the draws' constants are checked (render.cpp).
         if (vb_race_on()) {
@@ -7331,6 +7354,7 @@ bool host_gpu_dispatch(const GpuDispatch& d_in) {
             }
         }
         if (pl.meta.gds_counters) {
+            const ImportSite site("a GDS counter word");
             for (const GpuDispatch::GdsCounter& c : d.gds) {
                 if (c.word) import_windows(c.word, 4);
                 if (c.start == GpuDispatch::kGdsCopy && c.from) import_windows(c.from, 4);
@@ -7438,8 +7462,9 @@ bool host_gpu_dispatch(const GpuDispatch& d_in) {
         params.gds_base = d.gds_base;
         // The words by their device addresses: the shader takes them as such,
         // not through the page table - their place in the import, or in a GX
-        // buffer's device-local copy (gx_twins.cpp). 0 (not reachable): the
+        // buffer's device-local twin (gx twins, below). 0 (not reachable): the
         // counter does nothing, where the page table gave the sink page.
+        const ImportSite site("a GDS counter word");
         for (std::uint32_t k = 0; k < GpuDispatch::kGdsCounters; ++k)
             params.gds_counter[k] = d.gds[k].word ? guest_device_address(d.gds[k].word, 4) : 0;
     }
@@ -7506,10 +7531,12 @@ bool host_gpu_dispatch(const GpuDispatch& d_in) {
     if (!g_import_whole) {
         const gcn::TranslateResult& walks = lean ? lean->meta : pl.meta;
         if (!lean) {
+            const ImportSite site("a walking dispatch's buffers");
             for (const gcn::BufferBinding& b : pl.meta.buffers) import_path(b.path, b.pointer, std::max<std::uint64_t>(b.max_dw * 4ull, 16));
             // (Its stores too: a twin they would have gone to was let go above.)
             for (const gcn::ResourcePath& p : pl.meta.store_buffers) import_path(p, false, 16);
         } else {
+            const ImportSite site("a dispatch's stores");
             for (const gcn::ResourcePath& p : lean->meta.store_buffers) import_path(p, false, 16);
         }
         for (const gcn::TranslateResult::BufferRead& r : walks.read_buffers) {
@@ -7546,6 +7573,7 @@ bool host_gpu_dispatch(const GpuDispatch& d_in) {
     VkDeviceSize args_offset = 0;
     if (d.indirect_va) {
         if (g_import_audit) audit_range(d.indirect_va, 12, kUseIndex);
+        const ImportSite site("a dispatch's indirect arguments");
         const Located loc = locate(d.indirect_va, 12);
         if (!loc.buffer || loc.avail < 12) {
             g.failures.fetch_add(1);
@@ -8441,6 +8469,7 @@ std::atomic<std::uint64_t> g_arena_retires_ordered{0};
 // wins, as it did on the command processor.
 void flush_deferred_writes_locked() {
     if (g.deferred_writes.empty()) return;
+    const ImportSite site("a label or CP write, deferred");
     // Each ordinary run of transfers shares one barrier pair; this one starts
     // its own, so nothing recorded before it can land after it.
     transfer_flush_locked();
@@ -8760,6 +8789,7 @@ bool host_gpu_mem_write(std::uint64_t va, const void* data, std::size_t bytes) {
 
 bool host_gpu_mem_write_serial(std::uint64_t va, const void* data, std::size_t bytes, std::uint64_t* serial) {
     std::lock_guard<GpuMutex> lock(g.mu);
+    const ImportSite site("a label or CP write");
     if (!g.ok || bytes > 65536) return false;
     if (serial) *serial = g.flushes;  // the submission this write is recorded into
     if (hle_gnm_arena_monitor() && hle_gx_arena_covers_marker(va, bytes)) {
@@ -8820,6 +8850,7 @@ bool host_gpu_mem_write_serial(std::uint64_t va, const void* data, std::size_t b
 
 bool host_gpu_mem_write_ordered(std::uint64_t va, const void* data, std::size_t bytes, std::uint64_t* serial) {
     std::lock_guard<GpuMutex> lock(g.mu);
+    const ImportSite site("a label or CP write, ordered");
     if (!g.ok || !bytes || bytes > 65536) return false;
     if (surfaces_may_cover_locked(va, bytes) || find_render_target(va)) return false;
     Located loc;
@@ -8902,6 +8933,7 @@ void host_gpu_texture_written(std::uint64_t base, std::size_t bytes) {
 
 bool host_gpu_mem_fill(std::uint64_t va, std::uint32_t value, std::size_t bytes) {
     std::lock_guard<GpuMutex> lock(g.mu);
+    const ImportSite site("a CP fill");
     if (!g.ok) return false;
     Located loc;
     if (!locate_range(va, bytes, loc)) return false;
@@ -8915,6 +8947,7 @@ bool host_gpu_mem_fill(std::uint64_t va, std::uint32_t value, std::size_t bytes)
 
 bool host_gpu_mem_copy(std::uint64_t dst, std::uint64_t src, std::size_t bytes) {
     std::lock_guard<GpuMutex> lock(g.mu);
+    const ImportSite site("a CP copy");
     if (!g.ok) return false;
     if (dst < src + bytes && src < dst + bytes) return false;  // overlapping: memmove on the host
     Located d, sr;
@@ -8934,6 +8967,7 @@ namespace {
 // (GpuDispatch::gds): a set count filled into the word, or another word's
 // copied in, in the open transfer batch.
 bool counter_start_locked(const GpuDispatch::GdsCounter& c) {
+    const ImportSite site("a GDS counter's start");
     Located dst;
     if (!locate_range(c.word, 4, dst)) return false;
     Located src;
@@ -8958,6 +8992,7 @@ std::atomic<std::uint64_t> g_counter_copies{0}, g_counter_fills{0};
 
 bool host_gpu_counter_copy(std::uint64_t dst, std::uint64_t src, std::size_t bytes) {
     std::lock_guard<GpuMutex> lock(g.mu);
+    const ImportSite site("a counter copy");
     if (!g.ok || !bytes) return false;
     if (dst < src + bytes && src < dst + bytes) return false;
     import_windows(src, bytes);
@@ -8977,6 +9012,7 @@ bool host_gpu_counter_copy(std::uint64_t dst, std::uint64_t src, std::size_t byt
 
 bool host_gpu_counter_fill(std::uint64_t dst, std::uint32_t value, std::size_t bytes) {
     std::lock_guard<GpuMutex> lock(g.mu);
+    const ImportSite site("a counter fill");
     if (!g.ok || !bytes) return false;
     import_windows(dst, bytes);
     Located d;
@@ -8997,6 +9033,7 @@ std::uint64_t host_gpu_guest_copy_targets() { return g_guest_copy_targets.load(s
 
 bool host_gpu_copy_guest(std::uint64_t dst, std::uint64_t src, std::size_t bytes, std::uint64_t src_gen, std::uint64_t dst_gen) {
     std::lock_guard<GpuMutex> lock(g.mu);
+    const ImportSite site("a copy token");
     if (!g.ok) return false;
     if (!bytes) return true;
     if (dst < src + bytes && src < dst + bytes) return false;
@@ -9210,6 +9247,7 @@ bool copy_version_make_locked(std::uint64_t dst, std::uint64_t src, std::uint64_
     if ((dst < src + bytes && src < dst + bytes) || g_copy_versions.size() >= kCopyVersionsPending) return refuse(kCvOther);
     if (!hle_kernel_va_mapped(dst, bytes) || !hle_kernel_va_mapped(src, bytes) || !rebuild_page_tables()) return refuse(kCvOther);
     if (surfaces_may_cover_locked(dst, bytes)) return refuse(kCvSurfaces);
+    const ImportSite site("a copy version");
     if (find_render_target(src) || find_render_target(dst)) return refuse(kCvTarget);
     const Located canon = locate(dst, bytes);
     if (!canon.buffer || canon.avail < bytes) return refuse(kCvImport);
@@ -9428,14 +9466,21 @@ void host_gpu_report() {
                      static_cast<ull>(g_dispatch_read_imports.load()), static_cast<ull>(g_dispatch_untraced.load()));
         }
         if (!g_import_whole && !g_import_askers.empty()) {
+            // The most bytes first; the mapping the first import of a kind lay in.
+            std::vector<std::pair<std::uint64_t, const std::string*>> order;
+            for (const auto& [kind, a] : g_import_askers) order.emplace_back(a.bytes, &kind);
+            std::sort(order.begin(), order.end(), [](const auto& x, const auto& y) { return x.first > y.first; });
             std::string by;
-            for (const auto& [kind, a] : g_import_askers) {
-                char b[192];
-                std::snprintf(b, sizeof(b), "%s%s %llu (%llu MiB, first at 0x%llx)", by.empty() ? "" : "; ", kind.c_str(),
-                              static_cast<ull>(a.n), static_cast<ull>(a.bytes >> 20), static_cast<ull>(a.first_va));
+            for (const auto& [bytes, kind] : order) {
+                const ImportAsker& a = g_import_askers[*kind];
+                char b[320];
+                std::snprintf(b, sizeof(b), "%s%s %llu (%llu MiB, first at 0x%llx in 0x%llx + %llu MiB, prot 0x%x)", by.empty() ? "" : "; ",
+                              kind->c_str(), static_cast<ull>(a.n), static_cast<ull>(a.bytes >> 20), static_cast<ull>(a.first_va),
+                              static_cast<ull>(a.map_va), static_cast<ull>(a.map_len >> 20), a.map_prot);
                 by += b;
             }
-            host_log("gpu: window imports a binding or a device address made, by what lies at the address that asked: %s", by.c_str());
+            host_log("gpu: window imports by the path that asked (binding, device address, walk, prefetch; the site) and what lies at its address: %s",
+                     by.c_str());
         }
         if (const std::string tw = twins_report(); !tw.empty()) host_log("%s", tw.c_str());
     }

@@ -1168,6 +1168,7 @@ bool upload_surface(Surface& sf, VkImageAspectFlags aspect, bool first) {
     if (!imports_whole() && !staged_src) g_staged_src_pending.fetch_add(1, std::memory_order_relaxed);
     DevBuffer src_stage;
     VkDeviceSize src_stage_off = 0;
+    const ImportSite site("a texture's source");
     if (g_gpu_untile == 1 && g_untile_vram && !g_untile_check && sf.base != tex_probe_base() && untile_gpu_available_locked() &&
         (staged_src || guest_device_address(sf.base, sf.total_src))) {
         if (staged_src) {

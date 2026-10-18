@@ -11539,7 +11539,10 @@ void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t
             (b.written || t_draw_windows.empty() || !(in_window = draw_window_locked(base, bytes, loc)))) {
             copy_only = !imports_whole() && snapshots_on && !b.written && bytes && bytes <= (1u << 20) &&
                         !gpu_writes_pending_locked(base, bytes) && hle_kernel_va_mapped(base, bytes) && !twin_covers_locked(base, bytes);
-            if (!copy_only) loc = locate(base, std::min<std::uint64_t>(bytes, g.ssbo_max_range ? g.ssbo_max_range : bytes));
+            if (!copy_only) {
+                const ImportSite site(b.written ? "a shader's buffer, stored to" : "a shader's buffer, read");
+                loc = locate(base, std::min<std::uint64_t>(bytes, g.ssbo_max_range ? g.ssbo_max_range : bytes));
+            }
         }
         if (g_import_audit && base) audit_range(base, bytes, loc.buffer && loc.avail >= bytes ? kUseBound : kUsePageTable);
         if (resolved && !base && bytes <= g.sink.size) {  // a null V#'s stride does not matter: every read lands in the sink page
@@ -11822,7 +11825,10 @@ void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t
             // The shader walks the page table over the V#'s range: its windows
             // imported, and any copy-back still in its copy put in place first.
             if (base && copy_version_lookup_locked(base, bytes, nullptr) != kCopyVersionNone) copy_versions_put_in_place_locked(kCvPageTable);
-            if (base) import_windows(base, std::min<std::uint64_t>(bytes, 64ull << 20));
+            if (base) {
+                const ImportSite site("a shader's buffer it walks to (not bound)");
+                import_windows(base, std::min<std::uint64_t>(bytes, 64ull << 20));
+            }
             // Logged once per binding and outcome, 32 at most. A binding the
             // stage's user data was not built for (the no-fallback variant does
             // not read it) fails here at every draw, so what was logged is
@@ -12509,7 +12515,10 @@ bool plan_vertex_input(const std::vector<std::uint32_t>& fetch_words, std::uint6
                     }
                 }
             }
-            if (!windowed && !mirrored && !snapped) loc = locate(va, need);
+            if (!windowed && !mirrored && !snapped) {
+                const ImportSite site("a vertex buffer");
+                loc = locate(va, need);
+            }
         }
         if (g_import_audit) audit_range(va, need, kUseMirror);
         if (!loc.buffer || loc.avail < need) {
@@ -15388,6 +15397,7 @@ bool tess_ls_pass_locked(const GpuDraw& d, TessDraw& t) {
     if (!imports_whole()) {
         // Window imports: the LS pass walks the page table for everything it
         // reads and stores, so those windows (and the draw's indices) first.
+        const ImportSite site("the LS pass");
         const auto import_path = [&](const gcn::ResourcePath& path, bool pointer, std::uint64_t min_bytes) {
             std::uint32_t v[4]{};
             if (!resolve_resource(path, user, pointer ? 2 : 4, v)) return;
@@ -18630,6 +18640,7 @@ static bool draw_impl(const GpuDraw& d) {
         const int version = copy_version_lookup_locked(d.index_va, index_bytes, &loc);  // a straddle ended the pass above
         // (Window imports: the mirror first, so the indices need no import.)
         if (version != kCopyVersionInside && (imports_whole() || d.indirect_va || !shadow_mirror_locked(d.index_va, index_bytes, loc))) {
+            const ImportSite site("an index buffer");
             loc = locate(d.index_va, index_bytes);
             if (!d.indirect_va) shadow_locate_locked(d.index_va, index_bytes, loc);
         }
@@ -18678,7 +18689,10 @@ static bool draw_impl(const GpuDraw& d) {
         if (g_import_audit) audit_range(d.indirect_va, 20, kUseIndex);
         Located loc;
         const int version = copy_version_lookup_locked(d.indirect_va, 20, &loc);  // a straddle ended the pass above
-        if (version != kCopyVersionInside) loc = locate(d.indirect_va, 20);
+        if (version != kCopyVersionInside) {
+            const ImportSite site("a draw's indirect arguments");
+            loc = locate(d.indirect_va, 20);
+        }
         if (!loc.buffer) {
             if (!g.profile_passes) profile_end_locked();
             static std::atomic<int> logs{0};
