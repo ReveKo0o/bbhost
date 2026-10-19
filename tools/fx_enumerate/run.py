@@ -2,7 +2,7 @@
 """Play every effect animation of bosses and log their effects, one game run a boss.
 
     tools/fx_enumerate/run.py --bbhost BUILD --config TEST.toml --seed DATA --out DIR
-        [--boss N|NAME ...] [--fps 60] [--anims attacks|all] [--env BBHOST_X=Y ...]
+        [--boss N|NAME ...] [--fps 60] [--anims attacks|all] [--first N] [--env BBHOST_X=Y ...]
 
 Each boss: plan.py's plan of it, a run of tools/area_check.py's machinery
 whose tour is only `god` and a hold long enough for the plan, plugins/boss_rush
@@ -47,6 +47,8 @@ def one(a, rnd, name, model, fog, dlc, plugin, app0):
     path, _types, anims = fxplan.plan(app0, model)
     if a.anims != 'all':
         anims = {k: v for k, v in anims.items() if 3000 <= k < 4000}
+    if a.first:
+        anims = dict(list(anims.items())[:a.first])
     if not anims:
         print('%2d %s: no effect animations to play - skipped' % (rnd, name))
         return True
@@ -103,6 +105,7 @@ def main():
     ap.add_argument('--boss', action='append', default=[], help='a round number or a name (substring); default every boss')
     ap.add_argument('--fps', type=int, default=60)
     ap.add_argument('--anims', choices=('attacks', 'all'), default='attacks', help='attacks: 3000-3999 (default)')
+    ap.add_argument('--first', type=int, default=0, help='only the first N animations of each boss (a short check of the tool)')
     ap.add_argument('--env', action='append', default=[])
     ap.add_argument('--numa-node', default='0')
     ap.add_argument('--p2p-port', type=int, default=9811)

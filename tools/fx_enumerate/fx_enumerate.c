@@ -3,8 +3,10 @@
  * effect request the game's effect system holds - made, retired, gone, and
  * how long each lived - for tools/fx_enumerate/report.py. Never shipped.
  *
- * plugins/boss_rush (one round, the boss's) leaves the player at the fog
- * wall (FXE_FOG=x,y,z): Cross there until the player is through. Then the
+ * plugins/boss_rush (one round, the boss's) stands the player 1 m short of
+ * the fog wall, facing it (FXE_FOG=x,y,z: that stand): Cross there until the
+ * player is through - 1.5 m on from where it first pressed, the way it faced
+ * there (the traversal takes it ~1.8 m, past the wall's plane). Then the
  * debug menu's CHR DBG flags (0x593e880..): Player No Dead (0x593e888), All
  * No Dead (0x593e890) and All No Update Ai (0x593e895; FXE_AI=1 leaves it
  * off) - the boss plays only what it is made to; the player is placed
@@ -131,7 +133,7 @@ static void request(const char* tag, int n, const char* line) {
 
 enum { FOG, THROUGH, PLAY, TAIL, DONE };
 static int stage = FOG, presses = 0, near_frames = 0;
-static float fog[3], pressed_at[3];
+static float fog[3], pressed_at[3], pressed_yaw;
 static double stage_t, played_t, next_press;
 
 static void play(const BbChr* b, int i, double t) {
@@ -162,16 +164,19 @@ static void on_frame(void* user) {
     BbChr list[128];
     if (stage == FOG) {
         const float dx = at[0] - fog[0], dz = at[2] - fog[2], d2 = dx * dx + dz * dz;
-        if (presses && d2 > 9.0f) {
+        /* the way on from the first press along the facing then, (-sin, -cos) of the yaw: the traversal never
+         * takes the player 3 m from the stand, so distance alone never says it is through */
+        const float on = presses ? (at[0] - pressed_at[0]) * -sinf(pressed_yaw) + (at[2] - pressed_at[2]) * -cosf(pressed_yaw) : 0.0f;
+        if (presses && (d2 > 9.0f || on > 1.5f)) {
             stage = THROUGH;
             stage_t = t;
-            api->log("fxe: f%llu through the fog after %d presses", (unsigned long long)frames, presses);
+            api->log("fxe: f%llu through the fog after %d presses (%.1f %.1f %.1f)", (unsigned long long)frames, presses, at[0], at[1], at[2]);
             return;
         }
         if (d2 > 4.0f) { near_frames = 0; return; }
         if (++near_frames < 60 || t < next_press || presses >= 8) return;
         request("fog", presses, "tap cross 300\n");
-        if (!presses) memcpy(pressed_at, at, sizeof pressed_at);
+        if (!presses) { memcpy(pressed_at, at, sizeof pressed_at); pressed_yaw = yaw; }
         ++presses;
         next_press = t + 3.0;
         api->log("fxe: f%llu Cross at the fog (%d)", (unsigned long long)frames, presses);
