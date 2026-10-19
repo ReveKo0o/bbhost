@@ -86,13 +86,19 @@ inline bool held() {
 // A node on such a frame: what 0x2c4df80 does with its state machine, its
 // definitions and its set-up left out - the container updates it makes and
 // the time adds (of a step of 0) in their places. A dead node (+0x78 bit 2)
-// says so, to be freed; an inactive one (bit 0 clear) is left alone; a
-// staged one (bit 3) runs its container once, a plain one twice (before its
-// definition's time add at +0xe0, and at the end), each with a copy of the
-// step and the render context.
+// is kept for the next whole step's update to free: a container update marks
+// a node dead in state 3 once its last pending render items are out and its
+// +0xa0 module, if any, is done (0x2c4ccf1), and the node update frees it
+// only at its next entry - at 30 the next update, 1/30 s
+// later; freed on the frame after, its instance and request retired 1/30 -
+// 1/fps early (Ebrietas's 1251701 and 1251721, 2026-10-19: 17 ms at 60, 25
+// at 120). An inactive one (bit 0 clear) is left alone; a staged one (bit 3)
+// runs its container once, a plain one twice (before its definition's time
+// add at +0xe0, and at the end), each with a copy of the step and the render
+// context.
 inline u8 node_held(u64 node, const float* step, u64 definition, u64 context) {
     const u32 flags = load<u32>(node + 0x78);
-    if (flags & 4) return 0;
+    if (flags & 4) return MUTANT(8) ? 0 : 1;
     if (!(flags & 1)) return 1;
     const auto container = game_function<ContainerFn>(kContainerUpdate);
     if (!(flags & 8) && !MUTANT(2)) {
@@ -112,7 +118,7 @@ inline u8 node_held(u64 node, const float* step, u64 definition, u64 context) {
 // bit 2) loses its node tree; an active one (bit 0) scales the step by +0x8,
 // steps its controllers (+0x80, next +0x20) and then its nodes (+0x78) with
 // its definition (+0x38), freeing the dead. On a held frame the controllers
-// are skipped and each node runs node_held().
+// are skipped and each node runs node_held(), which frees none.
 DECOMP_LEAF u8 sfx_instance_update(u64 instance, u64 context, float step) {
     const u32 flags = load<u32>(instance + 0x88);
     if (!held() || (flags & 4) || !(flags & 1)) return reinterpret_cast<InstanceUpdate>(g_game_instance)(instance, context, step);

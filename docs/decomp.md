@@ -384,7 +384,7 @@ instead of ~60%.
 |---|---|---|---|
 | effect ribbon tail, facing the eye (`sub_2cce7b0`) | `0x2cce7b0` | the last one to three points of an effect ribbon as vertices, the strip turned to the camera | 400,000 random strips against the game's own code; 21 calls compared in a world session: 0 differences |
 | effect ribbon tail, along normals (`sub_2cceec0`) | `0x2cceec0` | the same for a ribbon laid along its points' normals | 400,000 random strips; 426 calls compared in a world session: 0 differences |
-| effect instance update (`sub_2c4ff30`) | `0x2c4ff30` | steps an effect's controllers and its nodes; on a frame bbhost puts between whole effect steps, only the nodes' containers - the follow, the render items | 40,000 generated instances against the game's own code with its node update held, 40,000 nodes against the game's node update; 4 mutants caught |
+| effect instance update (`sub_2c4ff30`) | `0x2c4ff30` | steps an effect's controllers and its nodes; on a frame bbhost puts between whole effect steps, only the nodes' containers - the follow, the render items - with a dead node kept for the next whole step to free | 40,000 generated instances against the game's own code with its node update held, 40,000 nodes against the game's node update; 5 mutants caught |
 | FFX light module update (`sub_131e660`) | `0x131e660` | a light effect's colour, radius, place and flicker; on such a frame with its flicker phase and blend held | 40,000 generated modules against the game's own run with the two held; 3 mutants caught |
 
 The two ribbon writers are rewritten for Windows. The game's versions keep
@@ -408,7 +408,10 @@ update, and a light's flicker phase adds its age every call. On such a frame
 (bbhost's, not the game's own still frame) the instance update runs only its
 nodes' containers and the light module runs as the game's with its phase
 rate and its blend held; every other frame, and a creation's pre-roll, is
-the game's code.
+the game's code. A node a container update marked dead (state 3, its last
+render items out) waits on such a frame for the next whole step's update to
+free it, as at 30, where the next update comes 1/30 s later: freed at once,
+its effect ended up to one step early.
 
 ### Replaced outside the list
 

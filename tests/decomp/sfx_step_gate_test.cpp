@@ -3,10 +3,11 @@
 //   - a node on a held frame (node_held) against the game's node update,
 //     0x2c4df80: the same container calls, step adds and answer for a node
 //     whose update changes nothing else (a staged node staying in state 3, a
-//     plain one whose conditions pick no new definition, a dead one, an
-//     inactive one), and for a node in a state whose update would move it
-//     (2, 6, 7, 5, 0) the same container call with its state, emission and
-//     definition fields left as they were;
+//     plain one whose conditions pick no new definition, an inactive one),
+//     for a dead one the game's answer of 0 (free it) against ours of 1 (kept
+//     for the next whole step), neither touching it, and for a node in a
+//     state whose update would move it (2, 6, 7, 5, 0) the same container
+//     call with its state, emission and definition fields left as they were;
 //   - the instance update, 0x2c4ff30: ours on a frame not held against the
 //     game's (the trampoline's place); on a held frame against the game's
 //     with its node update node_held and its controllers recorded - the same
@@ -184,7 +185,11 @@ int check_nodes(int cases) {
         std::memcpy(after_ours.data(), reinterpret_cast<void*>(n), 0x100);
         bool ok;
         std::string why;
-        if (kind != 4) {
+        if (kind == 2) {
+            // dead: the game's says free it (0); ours keeps it for the next whole step (1); neither calls or writes
+            ok = r_game == 0 && calls_game.empty() && after_game == before && r_ours == 1 && calls_ours.empty() && after_ours == before;
+            if (!ok) why = r_ours != 1 ? "a dead node's answer (freed on a held frame)" : "a dead node";
+        } else if (kind != 4) {
             ok = r_game == r_ours && same_calls(calls_game, calls_ours) && after_game == after_ours;
             if (!ok) why = r_game != r_ours ? "answer" : !same_calls(calls_game, calls_ours) ? "calls" : "memory";
         } else {
@@ -543,7 +548,7 @@ int main() {
     // node_held's mutants against the game's own node update, while it is still there.
     int missed = 0;
     g_quiet = true;
-    for (const int m : {2, 3}) {
+    for (const int m : {2, 3, 8}) {
         g_sfx_gate_mutant = m;
         g_rng.specials = false;
         if (!check_nodes(2000)) {
@@ -583,6 +588,6 @@ int main() {
         }
     }
     g_sfx_gate_mutant = 0;
-    std::printf("decomp_sfx_step_gate: %d of 7 mutants caught\n", 7 - missed);
+    std::printf("decomp_sfx_step_gate: %d of 8 mutants caught\n", 8 - missed);
     return missed ? 1 : 0;
 }
