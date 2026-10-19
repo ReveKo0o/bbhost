@@ -68,6 +68,11 @@
  *                                             slot (0-6) holds its map id and is
  *                                             the one in use, then the lamp travel
  *                                             to 2902950 enters it
+ *     bits <first> <n> <hex>                  n event flags from first written as
+ *                                             one number, the first flag its top
+ *                                             bit (as the game reads them): a Root
+ *                                             dungeon's altar slot, say, before its
+ *                                             chalice step
  *     remo <id> <mode> <skip s> <max s>       a cutscene, as the event scripts'
  *                                             2002[03] asks for one (0x171a9f0);
  *                                             Options pressed (the game's skip)
@@ -129,7 +134,7 @@ static double loading_t0;  /* when the screen came up */
 /* --- the tour ------------------------------------------------------------ */
 
 enum { S_WARP, S_KILL, S_FALL, S_WAIT, S_TRAVEL, S_WALK, S_HOLD, S_MARK, S_CAMERA, S_QUIET, S_DUMP, S_CAPTURE, S_F12,
-       S_GOD, S_TURN, S_FLAGS, S_FLAGLOG, S_REMO, S_MOVIE, S_EXIT };
+       S_GOD, S_TURN, S_FLAGS, S_FLAGLOG, S_REMO, S_MOVIE, S_EXIT, S_BITS };
 #define MAX_STEPS 4096
 typedef struct {
     int kind;
@@ -285,6 +290,9 @@ static void load_tour(const char* path) {
         }
         else if (!strcmp(kind, "flaglog") && sscanf(line, "%*s %u %d", &s.flags[0], &s.team) == 2)
             s.kind = S_FLAGLOG, strcpy(s.name, "flaglog");
+        else if (!strcmp(kind, "bits") && sscanf(line, "%*s %u %d %x", &s.flags[0], &s.team, &s.dungeon) == 3 && s.team > 0 &&
+                 s.team <= 32)
+            s.kind = S_BITS, strcpy(s.name, "bits"); /* flags[0]: the first flag, team: how many, dungeon: the value */
         else if (!strcmp(kind, "chalice") && sscanf(line, "%*s %x %d %63s", &s.dungeon, &s.nflags, s.name) == 3 && s.nflags >= 0 &&
                  s.nflags < 7) {
             /* the travel to the dungeon's lamp; nflags: the altar slot */
@@ -655,6 +663,10 @@ static void begin(int i, double t) {
         }
     } else if (s->kind == S_FLAGLOG) {
         api->log("mapval flags %u+%d %.3f = %lld", s->flags[0], s->team, t, (long long)flags_value(s->flags[0], s->team));
+    } else if (s->kind == S_BITS) {
+        int bad = flags_write(s->flags[0], s->team, s->dungeon);
+        api->log("mapval bits %u+%d %.3f = %08x%s (reads %08x)", s->flags[0], s->team, t, s->dungeon, bad ? " REFUSED" : "",
+                 (uint32_t)flags_value(s->flags[0], s->team));
     } else if (s->kind == S_REMO) {
         BbCallRegs regs;
         memset(&regs, 0, sizeof regs);
@@ -960,7 +972,7 @@ static void tick(double t) {
     } else if (s->kind == S_EXIT) {
         if (el > 30) next = 1; /* the host ends the run before this */
     } else if (s->kind == S_MARK || s->kind == S_CAMERA || s->kind == S_QUIET || s->kind == S_DUMP || s->kind == S_CAPTURE ||
-               s->kind == S_F12 || s->kind == S_GOD || s->kind == S_FLAGS || s->kind == S_FLAGLOG) {
+               s->kind == S_F12 || s->kind == S_GOD || s->kind == S_FLAGS || s->kind == S_FLAGLOG || s->kind == S_BITS) {
         next = 1; /* done in begin() */
     } else if (el >= s->hold) {
         next = 1;
