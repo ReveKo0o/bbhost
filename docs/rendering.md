@@ -209,7 +209,17 @@ guest memory (a page-table walk, a texture over one) has the copy written
 back first. `BBHOST_GX_TWINS=2` adds the buffers GX writes with GPU copies:
 a dynamic buffer's renamed bytes written back to its own address, a constant
 buffer's update (a world has about 3,800 of them, 4 MB, kept in shared
-device-memory blocks). With window imports a copy's source the CPU wrote is
+device-memory blocks). The GPU particles' buffers alone are kept that way by
+default on a discrete GPU (`BBHOST_PARTICLE_TWINS`: `0` keeps them in guest
+memory, `1` makes them twins on any GPU): a buffer becomes one once a
+dispatch that counts in GDS binds it - its records, and whatever else that
+dispatch reads and stores - from the next command buffer on; the counter
+words, past the records, stay in guest memory. In guest memory the particle
+update read and wrote its 176-byte records across the bus at about 0.2 µs a
+particle: 7.4 ms of an RTX 4070 a frame in Vicar Amelia's room (73 fps
+uncapped at 1080p), against 0.14 ms as twins (161 fps). An integrated GPU's
+device memory is the host's own, so there they stay in guest memory, as they
+do under a capture. With window imports a copy's source the CPU wrote is
 copied through upload staging, as copy versions' bytes are, rather than read
 through an import. The exit report lists what still reads or writes guest
 memory in place, by the path that asked.
