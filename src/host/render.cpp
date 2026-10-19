@@ -20905,14 +20905,23 @@ bool write_target_image(const TargetPixels& t) {
     // finite value and how many texels are infinite or NaN.
     float fmax[3] = {0.f, 0.f, 0.f};
     std::uint64_t finf[3] = {}, fnan[3] = {};
+    // BBHOST_F12_NAN=1 (a diagnostic): a texel with a NaN channel is magenta.
+    static const bool nan_magenta = [] {
+        const char* e = std::getenv("BBHOST_F12_NAN");
+        return e && e[0] == '1';
+    }();
+    bool texel_nan = false;
     auto note_float = [&](int k, float v) {
-        if (std::isnan(v)) ++fnan[k];
-        else if (std::isinf(v)) ++finf[k];
+        if (std::isnan(v)) {
+            ++fnan[k];
+            texel_nan = true;
+        } else if (std::isinf(v)) ++finf[k];
         else fmax[k] = std::max(fmax[k], v);
     };
     std::vector<std::uint8_t> row(static_cast<std::size_t>(t.width) * 3);
     for (std::uint32_t y = 0; y < t.height; ++y) {
         for (std::uint32_t x = 0; x < t.width; ++x) {
+            texel_nan = false;
             const std::uint8_t* p = t.data() + (static_cast<std::size_t>(y) * t.width + x) * t.bpp;
             if (rgba8) {
                 row[x * 3 + 0] = bgra ? p[2] : p[0];
@@ -20958,9 +20967,15 @@ bool write_target_image(const TargetPixels& t) {
             } else if (fmt == VK_FORMAT_R32_SFLOAT) {
                 float fv;
                 std::memcpy(&fv, p, 4);
+                note_float(0, fv);
                 row[x * 3 + 0] = row[x * 3 + 1] = row[x * 3 + 2] = tone8(fv);
             } else {
                 row[x * 3 + 0] = row[x * 3 + 1] = row[x * 3 + 2] = p[0];
+            }
+            if (nan_magenta && texel_nan) {
+                row[x * 3 + 0] = 255;
+                row[x * 3 + 1] = 0;
+                row[x * 3 + 2] = 255;
             }
         }
         f.row(row.data());
@@ -20997,7 +21012,8 @@ bool write_target_image(const TargetPixels& t) {
                      static_cast<unsigned long long>(at_one), static_cast<unsigned long long>(at_zero));
         }
     }
-    if (fmt == VK_FORMAT_R16G16B16A16_SFLOAT || fmt == VK_FORMAT_R16G16_SFLOAT || fmt == VK_FORMAT_B10G11R11_UFLOAT_PACK32) {
+    if (fmt == VK_FORMAT_R16G16B16A16_SFLOAT || fmt == VK_FORMAT_R16G16_SFLOAT || fmt == VK_FORMAT_B10G11R11_UFLOAT_PACK32 ||
+        (fmt == VK_FORMAT_R32_SFLOAT && !t.depth)) {
         host_log("render: %s float channels: max %g %g %g, infinite %llu %llu %llu, NaN %llu %llu %llu", t.path.c_str(), fmax[0], fmax[1],
                  fmax[2], static_cast<unsigned long long>(finf[0]), static_cast<unsigned long long>(finf[1]),
                  static_cast<unsigned long long>(finf[2]), static_cast<unsigned long long>(fnan[0]),

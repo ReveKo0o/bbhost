@@ -192,7 +192,10 @@ the rendering bugs found so far. The images are PPM, which costs nothing to
 write; `BBHOST_F12_PNG=1` writes PNG instead, which any image viewer opens, a
 fifth of the size on disk, written over a few seconds in the background.
 `BBHOST_F12_TEXTURES=1` adds every texture the frame sampled, and the game
-pauses while it writes them.
+pauses while it writes them. `BBHOST_F12_NAN=1` paints every texel of a
+float target with a NaN channel magenta, so a black blob that is a NaN shows
+where it is; the log counts each float target's NaN and infinite texels
+either way.
 
 **Black or broken image in the world, or slow on a card with little video
 memory.** bbhost follows the driver's video memory budget as the game runs:
