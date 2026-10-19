@@ -277,7 +277,13 @@ a new rate in that range every S seconds, `jitter:LO:HI` every frame, and
 still, as a variable-refresh display or a busy scene makes it.
 `BBHOST_FIXED_TICK=<address>:<bytes>[,...]` (a test switch, same rates) runs
 a game function as a 30 Hz tick - once every other frame at 60, and so on, with
-the remainder carried - for logic that counts frames (`engine/frame_tick.h`). The start of the log says which rate
+the remainder carried - for logic that counts frames (`engine/frame_tick.h`). `BBHOST_SFX_SIM_FPS=N`
+(a test switch, 30-1000, with effect steps 30 or 60) lays out the effects'
+whole steps as at N fps whatever the frame's time - the carry grows 1/N a
+frame - so a renderer far below N (lavapipe) runs the cadence N has, 1/30, 0,
+1/30, 0 ... at 60 with whole 1/30 s steps; the rest of the game keeps the
+frame's time (1/30 s a frame below 30 fps), so the effects run N/30 times
+slower than it. The start of the log says which rate
 runs and how many values and code sites were converted (`frame rate:` lines),
 and names any site whose bytes were not the expected ones (that rate is then
 refused: 90, 120 or uncapped falls back to 60).

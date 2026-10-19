@@ -766,6 +766,14 @@ std::atomic<bool> g_scale_by_step{false};
 std::uint64_t g_sfx_step_va = 0;
 double g_sfx_carry = 0.0;
 double g_sfx_steps_a_second = 60.0;
+// BBHOST_SFX_SIM_FPS=N (a test mode, 30 to 1000): the effects' step schedule
+// of N frames a second whatever the frame's own time - the carry grows 1/N a
+// frame - so a renderer far below N (lavapipe, ~3 fps) runs the whole steps
+// and the frames between them as at N: at N 60 with whole 1/30 s steps,
+// 1/30, 0, 1/30, 0 ... The rest of the game keeps the frame's time, which
+// below 30 fps is 1/30 s a frame, so the effects run N/30 times slower than
+// it.
+double g_sfx_sim_frame = 0.0;
 // The redirected loads' slots (kDtLoads): one per constant, kind and width,
 // 16 bytes each in the image's tail, rewritten every frame from the constant
 // as it is then (a .data tunable the debug menu edits keeps working).
@@ -1396,7 +1404,7 @@ void each_frame(const SprjFlipper* f) {
             // The step in whole 1/30 s or 1/60 s (at most one 1/30, or two
             // 1/60), the rest carried.
             const double rate = g_sfx_steps_a_second;
-            g_sfx_carry += static_cast<double>(step);
+            g_sfx_carry += g_sfx_sim_frame > 0.0 ? g_sfx_sim_frame : static_cast<double>(step);
             const double n = std::floor(g_sfx_carry * rate + 1e-6);
             g_sfx_carry -= n / rate;
             put<float>(g_sfx_step_va, static_cast<float>(n / rate));
@@ -1738,6 +1746,17 @@ int apply_rate(ElfImage* image, int want) {
                 host_log("frame rate: effect steps frame: the effects and the wind step by the frame's time");
             } else if (holds(kSfxStepLoad, kSfxStepLoadSixty)) {
                 g_sfx_steps_a_second = steps;
+                if (const char* e = std::getenv("BBHOST_SFX_SIM_FPS"); e && *e) {
+                    const int n = std::atoi(e);
+                    if (n >= 30 && n <= 1000) {
+                        g_sfx_sim_frame = 1.0 / n;
+                        host_log("frame rate: BBHOST_SFX_SIM_FPS=%d: the effects' steps fall as at %d frames a second, counted in frames "
+                                 "whatever the frame's time (a test mode)",
+                                 n, n);
+                    } else {
+                        host_log("frame rate: BBHOST_SFX_SIM_FPS=%s is not 30 to 1000; the frames' own time counts", e);
+                    }
+                }
                 g_sfx_step_va = va(static_cast<std::uint32_t>(sfx_bn));
                 put<float>(g_sfx_step_va, steps == 30 ? kThirtieth : kSixtieth);
                 std::uint8_t disp[4];
