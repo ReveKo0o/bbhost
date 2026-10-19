@@ -20457,6 +20457,15 @@ bool write_target_image(const TargetPixels& t) {
                     note_float(k, half_to_float(h[k]));
                     row[x * 3 + k] = tone8(half_to_float(h[k]));
                 }
+            } else if (fmt == VK_FORMAT_R16G16_SFLOAT) {
+                // Two channels (the water wave target): red and green.
+                std::uint16_t h[2];
+                std::memcpy(h, p, 4);
+                for (int k = 0; k < 2; ++k) {
+                    note_float(k, half_to_float(h[k]));
+                    row[x * 3 + k] = tone8(half_to_float(h[k]));
+                }
+                row[x * 3 + 2] = 0;
             } else if (fmt == VK_FORMAT_B10G11R11_UFLOAT_PACK32) {
                 std::uint32_t v;
                 std::memcpy(&v, p, 4);
@@ -20520,7 +20529,7 @@ bool write_target_image(const TargetPixels& t) {
                      static_cast<unsigned long long>(at_one), static_cast<unsigned long long>(at_zero));
         }
     }
-    if (fmt == VK_FORMAT_R16G16B16A16_SFLOAT || fmt == VK_FORMAT_B10G11R11_UFLOAT_PACK32) {
+    if (fmt == VK_FORMAT_R16G16B16A16_SFLOAT || fmt == VK_FORMAT_R16G16_SFLOAT || fmt == VK_FORMAT_B10G11R11_UFLOAT_PACK32) {
         host_log("render: %s float channels: max %g %g %g, infinite %llu %llu %llu, NaN %llu %llu %llu", t.path.c_str(), fmax[0], fmax[1],
                  fmax[2], static_cast<unsigned long long>(finf[0]), static_cast<unsigned long long>(finf[1]),
                  static_cast<unsigned long long>(finf[2]), static_cast<unsigned long long>(fnan[0]),
