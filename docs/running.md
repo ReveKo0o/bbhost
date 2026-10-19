@@ -153,6 +153,12 @@ bbhost logs to standard error. The packages' `run-bbhost.bat` (Windows) and
 `run-bbhost.sh` (Linux) write each session's log to `logs/`. A bug report is
 most useful with that log attached.
 
+The game's own prints go to the console too. A line it prints over and over
+(YEBIS's depth-of-field error in parts of Cainhurst comes every frame) is
+written once, then as a count every ten seconds while it keeps coming and at
+exit: "the game printed this N more times". `BBHOST_GUEST_PRINTS=all` writes
+every line as it comes.
+
 ## Troubleshooting
 
 **The eboot is refused.** It is not the 1.09 build. Use the update's

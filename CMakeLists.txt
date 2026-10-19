@@ -135,6 +135,7 @@ add_executable(bbhost
   src/host/foreign_hooks.cpp
   src/hle/runtime.cpp
   src/hle/libc.cpp
+  src/hle/guest_console.cpp
   src/hle/sysv_va.cpp
   src/hle/pthread.cpp
   src/hle/sync.cpp
@@ -424,6 +425,13 @@ if(WIN32 AND CMAKE_CROSSCOMPILING AND NOT CMAKE_CROSSCOMPILING_EMULATOR)
   set_property(TARGET libc_errno_test PROPERTY CROSSCOMPILING_EMULATOR wine)
 endif()
 add_test(NAME libc_errno_test COMMAND libc_errno_test)
+add_executable(guest_console_test tests/guest_console_test.cpp src/hle/guest_console.cpp)
+target_include_directories(guest_console_test PRIVATE src)
+target_compile_features(guest_console_test PRIVATE cxx_std_17)
+if(WIN32 AND CMAKE_CROSSCOMPILING AND NOT CMAKE_CROSSCOMPILING_EMULATOR)
+  set_property(TARGET guest_console_test PROPERTY CROSSCOMPILING_EMULATOR wine)
+endif()
+add_test(NAME guest_console_test COMMAND guest_console_test)
 add_executable(libc_wide_test tests/libc_wide_test.cpp src/hle/sysv_va.cpp)
 target_include_directories(libc_wide_test PRIVATE src)
 if(WIN32 AND CMAKE_CROSSCOMPILING AND NOT CMAKE_CROSSCOMPILING_EMULATOR)
