@@ -17,11 +17,11 @@ The 1.09 executable has about 169,000 functions. In a default run today:
 
 | | Functions |
 |---|---|
-| Rewritten as source, on the decomp list (`src/decomp/`) | 192 |
+| Rewritten as source, on the decomp list (`src/decomp/`) | 195 |
 | Replaced by bbhost code outside the list (written before the list existed) | 4, and the YEBIS resource builder bypassed |
 | Hooked at the entry or at call sites (GX's writers and passes, the resource registry, live resolution, settings, key prompts, menus) | 110 |
-| **Taken over in all** | **306** |
-| With any code byte changed (including byte patches and redirected calls) | 327; 409 at 60 fps |
+| **Taken over in all** | **309** |
+| With any code byte changed (including byte patches and redirected calls) | 330; 412 at 60 fps |
 | The game's own code | everything else |
 
 The TLS rewrite also changes one instruction at each of 17,127 sites in about
@@ -386,6 +386,7 @@ instead of ~60%.
 | effect ribbon tail, along normals (`sub_2cceec0`) | `0x2cceec0` | the same for a ribbon laid along its points' normals | 400,000 random strips; 426 calls compared in a world session: 0 differences |
 | effect instance update (`sub_2c4ff30`) | `0x2c4ff30` | steps an effect's controllers and its nodes; on a frame bbhost puts between whole effect steps, only the nodes' containers - the follow, the render items - with a dead node kept for the next whole step to free | 40,000 generated instances against the game's own code with its node update held, 40,000 nodes against the game's node update; 5 mutants caught |
 | FFX light module update (`sub_131e660`) | `0x131e660` | a light effect's colour, radius, place and flicker; on such a frame with its flicker phase and blend held | 40,000 generated modules against the game's own run with the two held; 3 mutants caught |
+| wobble motion updates (`sub_2e89d10`, `sub_2e8e430`, `sub_2e896f0`) | `0x2e89d10`, `0x2e8e430`, `0x2e896f0` | an effect motion that turns its direction by a random angle every few updates (motion classes `0x570e6d0`, `0x570e690`, `0x570e8d0`) and, for `0x570e690`, lags toward what it follows by a factor an update; on such a frame only its base motion runs - no count, re-roll or lerp | 40,000 generated motions against the game's own code (its base motions and the effects' random numbers the test's); 4 mutants caught |
 
 The two ribbon writers are rewritten for Windows. The game's versions keep
 their arguments in the 128 bytes below the stack pointer - the red zone, which
@@ -411,7 +412,12 @@ rate and its blend held; every other frame, and a creation's pre-roll, is
 the game's code. A node a container update marked dead (state 3, its last
 render items out) waits on such a frame for the next whole step's update to
 free it, as at 30, where the next update comes 1/30 s later: freed at once,
-its effect ended up to one step early.
+its effect ended up to one step early. The wobble motions count their own
+updates, in the container calls such a frame still makes: every few updates
+they turn their direction by two angles from the effects' random numbers,
+and one of them lags toward what it follows by a factor an update. On such
+a frame they run only their base motion, so they turn and close in 30 times
+a second at any frame rate, as at 30, not once a frame.
 
 ### Replaced outside the list
 
