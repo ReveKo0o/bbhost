@@ -148,10 +148,13 @@ exists on the host. A geometry shader that stores at an offset its compiler
 counts per lane (the standard particles') keeps that ring as an array in the
 invocation. The pipeline is built on the pipeline workers, so a system draws
 from the frame its pipeline is ready, and is recorded with its two extra
-programs in the stage manifest (format 5) for the next start. A geometry
-shader the lift refuses is drawn as before, as its export and pixel shaders,
-which draw nothing; the exit report counts those draws by program and the
-refusals by reason. `BBHOST_GX_GS=0` draws every one that way. Vicar Amelia's
+programs in the stage manifest (format 5) for the next start. A draw the
+path refuses - its pipeline still being built, or a geometry shader the lift
+does not take - is not drawn: as its export and pixel shaders, as before, it
+would draw nothing and only store the export shader's ring through a buffer
+its draw's tables name. The exit report counts the refusals by reason.
+`BBHOST_GX_GS=0` draws every one as before, the exit report counting those
+draws by program. Vicar Amelia's
 room draws ~37,500 particles a frame; on an RTX 4070 they cost nothing
 measurable (uncapped, 72.2 fps with them against 71.8 without).
 
@@ -288,7 +291,7 @@ Every shader the game creates goes through the lifter. One it refuses is transla
 | Pixel | 3,206 of 3,209 | 100% | FXAA3HQ, which needs a whole-wave proof; two debug shaders whose result depends on how the PS4 packs pixels into waves (no exact PC form). None is drawn at the 12 places. |
 | Vertex | all 10,116 | 100% | - |
 | Tessellation: local, hull, domain | all; the 141 mesh hull sets as native pipelines | 100% | - |
-| Geometry, with its export shader | the effects' 4 particle geometry shaders of their 7; none of the models' 1,694 | 100% once its pipeline is built (the first sight of each goes as before) | The models' geometry shaders (cube-map depth, a face a layer) and the effects' two array shaders write a layer, which the lift does not take; the effects' point sprite reads its vertices through a fetch shader. None is drawn at the 12 places. |
+| Geometry, with its export shader | the effects' 4 particle geometry shaders of their 7; none of the models' 1,694 | 100% once its pipeline is built (its draws until then are not drawn) | The models' geometry shaders (cube-map depth, a face a layer) and the effects' two array shaders write a layer, which the lift does not take; the effects' point sprite reads its vertices through a fetch shader. None is drawn at the 12 places. |
 | Compute | all 38 in the bundles, and the 6 of the executable's own (GX's and YEBIS's) that the 12 places dispatch | 100% of dispatches | The executable carries 24 more, lifted when first dispatched; none is dispatched at the 12 places. |
 
 A draw whose setup the lifter hasn't seen still falls back to the translator. The exit report counts those by reason, and `BBHOST_LIFT_TESS` and the other switches turn the lifted paths off for comparison.

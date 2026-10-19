@@ -837,9 +837,9 @@ std::atomic<std::uint64_t> g_tess_hull_draws{0}, g_tess_hull_patches{0};
 // worker built their native pipeline (queue_native_pipeline).
 std::atomic<std::uint64_t> g_tess_native_refusals{0}, g_tess_native_waits{0};
 // Draws that bind a geometry shader (gs_draw): drawn with their GS as its own
-// pipeline; the attempts refused, by reason (which then went as VS/PS); and
-// every one drawn as VS/PS - refused, or BBHOST_GX_GS=0 - by its GS program
-// and ES, which draws nothing (the ES exports no position).
+// pipeline; the attempts refused, by reason (not drawn); and every one drawn
+// as VS/PS - BBHOST_GX_GS=0 - by its GS program and ES, which draws nothing
+// (the ES exports no position).
 std::atomic<std::uint64_t> g_gs_drawn{0};
 std::mutex g_gs_mu;
 std::map<std::string, std::uint64_t> g_gs_refused, g_gs_as_vs;  // under g_gs_mu
@@ -9181,7 +9181,7 @@ void queue_native_pipeline(std::uint64_t key, const DrawState& s, const std::vec
 }
 // Under g.mu: a geometry-shader pipeline (DrawState::gs) built by a worker the
 // same way - its lifts and its compile off the command processor, no stall at
-// its first sight; until the worker is done its draws go as VS/PS (gs_draw).
+// its first sight; until the worker is done its draws are not drawn (gs_draw).
 // False where its programs are not known (the draw is refused).
 bool queue_gs_pipeline(std::uint64_t key, const DrawState& s, const std::vector<std::uint32_t>& vs_words, const std::vector<std::uint32_t>& ps_words,
                        const std::string& vs_name, const std::string& ps_name, const std::vector<std::pair<std::uint32_t, bool>>& vs_dims,
@@ -10538,8 +10538,8 @@ void render_report() {
             std::string refused, as_vs;
             for (const auto& [why, n] : g_gs_refused) refused += (refused.empty() ? "" : ", ") + why + " x" + std::to_string(n);
             for (const auto& [prog, n] : g_gs_as_vs) as_vs += (as_vs.empty() ? "" : ", ") + prog + " x" + std::to_string(n);
-            host_log("render: draws that bind a geometry shader: %llu drawn with it (%zu pipelines); refused: %s; drawn as VS/PS (nothing "
-                     "drawn), by program: %s",
+            host_log("render: draws that bind a geometry shader: %llu drawn with it (%zu pipelines); refused, not drawn: %s; drawn as VS/PS "
+                     "(nothing drawn; BBHOST_GX_GS=0), by program: %s",
                      static_cast<unsigned long long>(g_gs_drawn.load()), g_gs_pipelines.size(), refused.empty() ? "none" : refused.c_str(),
                      as_vs.empty() ? "none" : as_vs.c_str());
         }
@@ -16377,8 +16377,12 @@ bool host_gpu_draw(const GpuDraw& d) {
         }
         if (!(gi ? gi->stages & 0x7 : d.ctx[0x2d5] & 0x7)) {
             // A draw that binds a geometry shader (BBHOST_GX_GS): as a pipeline
-            // of its own, or - refused (a stage the lift does not take, a
-            // buffer that does not bind) - as GX's VS and PS, as before.
+            // of its own, or - refused (its pipeline still being built, a
+            // stage the lift does not take, a buffer that does not bind) - not
+            // at all. As GX's VS and PS, as before, it would draw nothing (the
+            // ES exports no position) and only store the ES's ring through a
+            // buffer from a V# in the draw's tables, wherever those point by
+            // then. BBHOST_GX_GS=0 draws every one that way.
             if (d.gx && d.gx_render && !d.gx_partial && d.gx->gs && d.gx_objects && d.gx_objects->shader[3]) {
                 t_gs_draw = true;
                 t_gs_refusal = nullptr;
@@ -16391,7 +16395,8 @@ bool host_gpu_draw(const GpuDraw& d) {
                     return ok;
                 }
                 std::lock_guard<std::mutex> lk(g_gs_mu);
-                if (g_gs_refused[why]++ == 0) host_log("render: a draw that binds a geometry shader goes as VS/PS: %s", why);
+                if (g_gs_refused[why]++ == 0) host_log("render: a draw that binds a geometry shader is not drawn: %s", why);
+                return true;
             }
             return draw_impl(d);
         }
@@ -17307,7 +17312,7 @@ static bool draw_impl(const GpuDraw& d) {
         if (built && built->building) return tess_native_wait();
     }
     // A geometry-shader pipeline is its own no-fallback variant, lifted: built by
-    // a worker (queue_gs_pipeline), the draw going as VS/PS until it is.
+    // a worker (queue_gs_pipeline), the draw not drawn until it is.
     const bool gs_native = s.gs;
     if (gs_native) {
         GfxPipeline* const built = gfx_lookup(key);
@@ -18560,7 +18565,7 @@ static bool draw_impl(const GpuDraw& d) {
     // A geometry-shader pipeline's set 4: the ES's params block and constant
     // buffers, its user data from its GX records (GX's VS's, slot 0) over what
     // the draw's inputs hold. Every buffer of its three stages binds, or the
-    // draw goes as VS/PS (gs_draw).
+    // draw is not drawn (gs_draw).
     if (pl.gs_native) {
         if (!all_bound) return gs_refuse("a constant buffer of its GS or pixel shader does not bind");
         const GxStageRecords* es_rec = gx_records ? &gx_records->stage[0] : nullptr;
