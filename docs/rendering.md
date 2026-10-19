@@ -56,8 +56,10 @@ Occlusion queries are tokens from GX's Begin and End, measured by the
 renderer's own queries. The packets nothing on the host reads - the cache
 flushes, the context registers, the shader prefetches, the compute stage's
 registers (a dispatch token carries them, and a fallback writes them before
-its packet), the constant engine's counters - are not written at all
-(`BBHOST_CP_DEAD_PACKETS`). Clears and copies come as tokens from GX's own
+its packet), the counter steps between the constant and draw engines - are
+not written at all (`BBHOST_CP_DEAD_PACKETS`). The constant engine's wait is:
+the game writes a NOP over it when a draw leaves the engine unused, so a
+writer whose packet its caller rewinds over or edits cannot write nothing. Clears and copies come as tokens from GX's own
 calls: a clear names its view, and is made as the next pass's load op, or as a
 transfer clear when something reads the image first.
 

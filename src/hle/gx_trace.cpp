@@ -6710,12 +6710,14 @@ void hle_gx_trace_arm(GuestMemory* mem) {
         host_log("gx: the compute stage's packets (its program, user data and indirect base) are %s",
                  g_cs_packets_dead ? "not written: every dispatch is a token, and a fallback writes their image before its packet"
                                    : "written");
-        // The constant engine's: nothing dumps its RAM while YEBIS's tables
-        // come from its own state (its binder and its compute passes ours)
-        // and Gnmx's draws are tokens (decomp/gx/constant_engine.cpp).
+        // The constant engine's counter steps: nothing dumps its RAM while
+        // YEBIS's tables come from its own state (its binder and its compute
+        // passes ours) and Gnmx's draws are tokens. Its waits stay the game's
+        // packets - their callers NOP over them (decomp/gx/constant_engine.cpp).
         const bool ce_dead = g_cs_packets_dead && yebis_bind::mode() == 1 && g_yebis_dispatch == 2 && g_native_yebis == 5;
         gnm_ce_configure(ce_dead);
-        host_log("gx: the constant engine's packets are %s", ce_dead ? "not written: nothing dumps its RAM" : "written");
+        host_log("gx: the constant engine's counter steps are %s",
+                 ce_dead ? "not written (nothing dumps its RAM); its waits, RAM writes and dumps are written" : "written, as all its packets");
         std::size_t ours = 0, nothing = 0, kept = 0;
         for (std::size_t i = 0; i < kDeadWriterCount; ++i) {
             if (!gnm_dead_writer_placed(i)) continue;
