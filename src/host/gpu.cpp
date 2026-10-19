@@ -3707,6 +3707,7 @@ gcn::TranslateOptions compute_options(std::uint32_t rsrc1, std::uint32_t rsrc2, 
     gcn::TranslateOptions o;
     o.stage = gcn::Stage::Compute;
     o.gds_counters = host_gpu_gds_counters();
+    o.gds_subgroup = host_gpu_gds_subgroup();
     o.rsrc1 = rsrc1;
     o.rsrc2 = rsrc2;
     o.image_dims = dims;
@@ -7205,6 +7206,17 @@ bool host_gpu_gds_counters() {
     return on;
 }
 
+// BBHOST_GDS_SUBGROUP (on; =0 off): a lifted compute shader steps a GDS
+// counter once a subgroup, as GCN does once a wave (gcn::TranslateOptions::
+// gds_subgroup), not once an invocation.
+bool host_gpu_gds_subgroup() {
+    static const bool on = [] {
+        const char* e = std::getenv("BBHOST_GDS_SUBGROUP");
+        return !(e && e[0] == '0');
+    }();
+    return on;
+}
+
 thread_local std::uint32_t t_dispatch_user_reads = 0xffff;
 std::uint32_t host_gpu_dispatch_user_reads() { return t_dispatch_user_reads; }
 
@@ -7742,6 +7754,7 @@ bool host_gpu_dispatch(const GpuDispatch& d_in) {
         cd.translate.set("rsrc1", json::hex(d.rsrc1));
         cd.translate.set("rsrc2", json::hex(d.rsrc2));
         cd.translate.set("gds_counters", host_gpu_gds_counters());
+        cd.translate.set("gds_subgroup", host_gpu_gds_subgroup());
         cd.translate.set("exec_known", g.exec_known);
         cd.translate.set("max_lds_bytes", g.max_lds_bytes);
         cd.translate.set("lifted", pl.lifted);  // the captured module is the program's lift (gcn::lift_compute_shader)

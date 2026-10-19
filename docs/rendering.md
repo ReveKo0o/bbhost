@@ -163,9 +163,12 @@ page-table walk. GCN's loops that run until every lane's execution bit
 clears become structured per-invocation loops, a block GCN branches over
 where no lane needs it becomes a selection an invocation skips where its own
 bit is clear, and the GPU particles' wave-wide counter idiom (`ds_append`/`ds_consume` in GDS, each lane's rank
-from `v_mbcnt`) becomes one atomic add per invocation, on the counter word
-the dispatch hands over by its device address, so no compute lift needs
-subgroup operations or the page table for it. A barrier is accepted only where every invocation
+from `v_mbcnt`) becomes one atomic add per subgroup, as GCN steps the counter
+once a wave and as the translation does: an elected invocation adds the count
+of the invocations stepping together and each takes the base plus (append)
+or minus (consume) its rank among them, on the counter word the dispatch
+hands over by its device address, with no page-table walk
+(`BBHOST_GDS_SUBGROUP=0` keeps an atomic an invocation). A barrier is accepted only where every invocation
 of the workgroup provably reaches it, and LDS, which no game compute shader
 uses, is refused. `BBHOST_LIFT_COMPUTE=0` keeps every compute shader
 translated. A compute shader reads its constant buffers, tables and typed
