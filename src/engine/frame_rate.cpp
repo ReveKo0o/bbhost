@@ -3,6 +3,7 @@
 #include "engine/frame_rate_step.h"
 #include "engine/uncapped_limit.h"
 #include "engine/frame_tick.h"
+#include "engine/sfx_schedule.h"
 #include "engine/np_test.h"
 #include "engine/event_flags.h"
 #include "engine/player_data.h"
@@ -765,7 +766,7 @@ std::atomic<bool> g_scale_by_step{false};
 // 1/60 s (effect steps 60) or whole 1/30 s (30, which the wind's loads read too).
 std::uint64_t g_sfx_step_va = 0;
 double g_sfx_carry = 0.0;
-double g_sfx_steps_a_second = 60.0;
+int g_sfx_steps_a_second = 60;
 // BBHOST_SFX_SIM_FPS=N (a test mode, 30 to 1000): the effects' step schedule
 // of N frames a second whatever the frame's own time - the carry grows 1/N a
 // frame - so a renderer far below N (lavapipe, ~3 fps) runs the whole steps
@@ -1402,12 +1403,10 @@ void each_frame(const SprjFlipper* f) {
         }
         if (g_sfx_step_va) {
             // The step in whole 1/30 s or 1/60 s (at most one 1/30, or two
-            // 1/60), the rest carried.
-            const double rate = g_sfx_steps_a_second;
-            g_sfx_carry += g_sfx_sim_frame > 0.0 ? g_sfx_sim_frame : static_cast<double>(step);
-            const double n = std::floor(g_sfx_carry * rate + 1e-6);
-            g_sfx_carry -= n / rate;
-            put<float>(g_sfx_step_va, static_cast<float>(n / rate));
+            // 1/60), the rest carried (engine/sfx_schedule.h).
+            const sfx_schedule::Frame sf =
+                sfx_schedule::next(g_sfx_carry, g_sfx_sim_frame > 0.0 ? g_sfx_sim_frame : static_cast<double>(step), g_sfx_steps_a_second);
+            put<float>(g_sfx_step_va, sf.seconds);
         }
     }
     const float floor_s = g_dt_unfloored ? kShortestFrame : std::max(f->target_frame_seconds, 1.0f / static_cast<float>(kUncappedMaxFps));
