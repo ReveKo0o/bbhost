@@ -251,19 +251,20 @@ the same speed at every rate (`engine/frame_rate.cpp`, from Kyo's FPS++ lists
 and yogesh1239's high-FPS fixes). The play time adds each frame's milliseconds
 with the fractions kept (the game drops them: its clock ran 4% slow at 60 and
 120). The effects - fire, lamps', candles' and braziers' flicker, blood,
-magic, every effect the game's effect manager runs - step in whole 1/60 s
-above 60 (60 updates a second), and the wind that sways grass and trees by
-the frame's time. `[video] effect_steps = 30` steps both in whole 1/30 s, as
-many times a second as at 30 (every other frame at 60, every fourth at 120),
-the flicker and the sway keeping the cadence the game has at 30. The frames
-between whole steps still run the effects' update, so effects follow what
-they ride on and are drawn every frame, but with what the game counts in
-updates held for the next whole step - a node's state, its emissions and the
-definitions its conditions pick, the controllers, a light's flicker phase
+magic, every effect the game's effect manager runs - and the wind that sways
+grass and trees step in whole 1/30 s above 30, as many times a second as at
+30 (every other frame at 60, every fourth at 120), the flicker and the sway
+keeping the cadence the game has at 30. The frames between whole steps still
+run the effects' update, so effects follow what they ride on and are drawn
+every frame, but with what the game counts in updates held for the next
+whole step - a node's state, its emissions and the definitions its
+conditions pick, the controllers, a light's flicker phase
 (`decomp/sfx/step_gate.cpp`; `BBHOST_SFX_GATE=0` lets them count, as when
 Ebrietas's attacks left sparks that never ended at 60, and `=1` holds them
-with 60 too). Not yet the default, while its checks run. `frame` steps both
-by the frame's time; `BBHOST_SFX_STEP=30|60|frame` overrides the setting. Above 60 and Uncapped the game paces itself
+with 60 too). `[video] effect_steps = 60` steps the effects in whole 1/60 s
+instead (60 updates a second above 60) and the wind by the frame's time;
+`frame` steps both by the frame's time; `BBHOST_SFX_STEP=30|60|frame`
+overrides the setting. Above 60 and Uncapped the game paces itself
 and its frames are shown as they come, so 90 on a 60 Hz display shows 60 of
 them a second; a rate the machine cannot hold runs slower than real time in
 the few places that count frames.

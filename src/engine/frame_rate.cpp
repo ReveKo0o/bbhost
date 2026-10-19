@@ -497,21 +497,24 @@ static_assert(sizeof(kStepLoadWas) - 1 == 2 * 21, "the cave's three instructions
 // 60, where the step holds a steady 1/60 (2026-10-13; his old
 // "60 FPS + (deltatime)" list, a fixed 1/60, "fixes ebrietas' sfx crash").
 // The steady step is ours: the task step in whole steps, the rest carried to
-// the next frame. By default it is 1/60 - 0, 1/60 at 120 - so the effects run
-// 60 updates a second at every rate above 60. Effect steps 30 (whole 1/30 s:
-// 0, 1/30 at 60; 0, 0, 0, 1/30 at 120) gives every effect the 30 updates a
-// second it makes at 30, each one data frame long - the lamps', candles' and
-// braziers' flicker changing 30 times a second as on the PS4, not 60 or 120,
-// and everything else the effect manager steps with it, character, map and
-// magic effects alike, which share this one step. But the frames between
-// whole steps still run the manager's whole update with a step of 0, and the
-// game's effects count part of their lives in updates: with 1/30 steps at 60
-// about 1 in 6 of Ebrietas's attacks' 1251721 never ended (cpretire's forced
-// attacks, 2026-10-19), as with 1/60 steps at 120 and uncapped. With 30 those
-// frames now hold what the effects count (decomp/sfx/step_gate.cpp, told by
-// each_frame; BBHOST_SFX_GATE=0|1 either way); 30 waits for the gate's checks
-// before it is the default, 60 stays it, and frame steps both by the frame's
-// time ([video] effect_steps, or BBHOST_SFX_STEP).
+// the next frame. By default it is 1/30 (effect steps 30: 0, 1/30 at 60; 0,
+// 0, 0, 1/30 at 120), which gives every effect the 30 updates a second it
+// makes at 30, each one data frame long - the lamps', candles' and braziers'
+// flicker changing 30 times a second as on the PS4, not 60 or 120, and
+// everything else the effect manager steps with it, character, map and magic
+// effects alike, which share this one step. The frames between whole steps
+// still run the manager's whole update with a step of 0, and the game's
+// effects count part of their lives in updates: left to count them there,
+// 1/30 steps at 60 left about 1 in 6 of Ebrietas's attacks' 1251721 never
+// ending (forced-attack runs, 2026-10-19), as 1/60 steps did at 120
+// and uncapped. With 30 those frames hold what the effects count
+// (decomp/sfx/step_gate.cpp, told by each_frame; BBHOST_SFX_GATE=0|1 either
+// way), and her effects live as at 30 (the same day: 1251701 2.76 s at 60
+// and 2.73-2.75 s at 120 against 2.77 at 30, 1251721 4.23-4.24 s and 4.22 s
+// against 4.27, none left). Effect steps 60 (whole 1/60 s: 0, 1/60 at 120 -
+// 60 updates a second at every rate above 60, the frames between left to
+// count) and frame (both by the frame's time) remain ([video] effect_steps,
+// or BBHOST_SFX_STEP).
 constexpr std::uint32_t kSfxStepLoad = 0x2377d4a;
 constexpr char kSfxStepLoadSixty[] = "c5fa1005b62b3e03";  // vmovss xmm0,[0x575a908], as the 60 FPS++ sites leave it
 
@@ -765,10 +768,11 @@ double g_play_ms_carry = 0.0;
 std::uint64_t g_step_va = 0;
 std::atomic<bool> g_scale_by_step{false};
 // The effects' step (kSfxStepLoad) and the part of a step carried: whole
-// 1/60 s (effect steps 60) or whole 1/30 s (30, which the wind's loads read too).
+// 1/30 s (effect steps 30, the default, which the wind's loads read too) or
+// whole 1/60 s (60).
 std::uint64_t g_sfx_step_va = 0;
 double g_sfx_carry = 0.0;
-int g_sfx_steps_a_second = 60;
+int g_sfx_steps_a_second = 30;
 // BBHOST_SFX_SIM_FPS=N (a test mode, 30 to 1000): the effects' step schedule
 // of N frames a second whatever the frame's own time - the carry grows 1/N a
 // frame - so a renderer far below N (lavapipe, ~3 fps) runs the whole steps
@@ -1527,10 +1531,11 @@ int wanted_fps() {
     return mode_of(host_settings().frame_cap);
 }
 
-// The effects' and the wind's step above 30 fps: 60 (whole 1/60 s for the
-// effects, the frame's time for the wind; the default), 30 (whole 1/30 s for
-// both, the effects track's) or 0 for frame (both by the frame's time).
-// BBHOST_SFX_STEP=30|60|frame wins over the config's [video] effect_steps.
+// The effects' and the wind's step above 30 fps: 30 (whole 1/30 s for both,
+// the frames between holding the effects' counts; the default), 60 (whole
+// 1/60 s for the effects, the frame's time for the wind) or 0 for frame (both
+// by the frame's time). BBHOST_SFX_STEP=30|60|frame wins over the config's
+// [video] effect_steps.
 int effect_steps() {
     std::string v;
     const char* from = "BBHOST_SFX_STEP";
@@ -1540,11 +1545,11 @@ int effect_steps() {
         v = config_value("video.effect_steps");
         from = "[video] effect_steps";
     }
-    if (v.empty() || v == "60") return 60;
-    if (v == "30") return 30;
+    if (v.empty() || v == "30") return 30;
+    if (v == "60") return 60;
     if (v == "frame") return 0;
-    host_log("frame rate: %s = %s is none of 60, 30 and frame; 60 runs", from, v.c_str());
-    return 60;
+    host_log("frame rate: %s = %s is none of 30, 60 and frame; 30 runs", from, v.c_str());
+    return 30;
 }
 
 // The follow camera's tuning above 30 fps: the game's own (Original) unless

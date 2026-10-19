@@ -399,15 +399,16 @@ those effects). The rewrites keep nothing below the stack pointer. Linux
 skips the red zone when it delivers a signal, so only Windows crashed.
 
 The other two are the effects' frames between whole steps. Above 30 fps with
-effect steps 30 (`docs/running.md`) the effect manager runs its whole update
-every frame - a frame between whole 1/30 s steps with a step of 0 - so effects
-follow what they ride on and their render data is fresh. The game's effects
-count part of their lives in updates, though: a node's state edges, its
-emissions and the definitions its conditions pick move once an update, and a
-light's flicker phase adds its age every call. On such a frame (bbhost's, not
-the game's own still frame) the instance update runs only its nodes'
-containers and the light module runs as the game's with its phase rate and its
-blend held; every other frame, and a creation's pre-roll, is the game's code.
+effect steps 30, the default (`docs/running.md`), the effect manager runs its
+whole update every frame - a frame between whole 1/30 s steps with a step of
+0 - so effects follow what they ride on and their render data is fresh. The
+game's effects count part of their lives in updates, though: a node's state
+edges, its emissions and the definitions its conditions pick move once an
+update, and a light's flicker phase adds its age every call. On such a frame
+(bbhost's, not the game's own still frame) the instance update runs only its
+nodes' containers and the light module runs as the game's with its phase
+rate and its blend held; every other frame, and a creation's pre-roll, is
+the game's code.
 
 ### Replaced outside the list
 
