@@ -496,6 +496,14 @@ argument bits the original tests, the floating-point operations in their order
   their labels in the writers' census, nor did Scaleform's path into Gnmx's -
   so as source they would open no surface.
 
+- **GX's command lists resolved where they are finished**: with
+  FinishCommandList and ExecuteCommandList(s) as source, each list's draws
+  could be resolved and recorded into Vulkan secondary command buffers on the
+  thread that finished it, the command processor only checking and stitching
+  the lists in order. The design note in [rendering](rendering.md#resolving-draws-where-their-command-lists-are-finished-a-design-note)
+  says what it could take off the command processor, what must stay serial,
+  its risks, and why it waits for a faster main loop.
+
 - **Items in and out**: `EquipGameData::AddItem`, through which every item
   enters the inventory (it creates item instances, so a compare must follow the
   calls it makes instead of running it twice).
