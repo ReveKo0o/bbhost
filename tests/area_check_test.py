@@ -104,8 +104,8 @@ def area_lines(area, t, block, window_intervals, view=None, settle_events=(), du
 
 class TourTest(unittest.TestCase):
     def test_places_and_views(self):
-        self.assertEqual(len(ac.AREAS), 12)
-        self.assertEqual(len({a.id for a in ac.AREAS}), 12)
+        self.assertEqual(len(ac.AREAS), 15)
+        self.assertEqual(len({a.id for a in ac.AREAS}), 15)
         cy = ac.AREA_BY_ID["central-yharnam"]
         self.assertEqual(cy.block_hex(), "18010000")
         self.assertIsNone(cy.view())

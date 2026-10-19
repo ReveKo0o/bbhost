@@ -203,6 +203,15 @@ AREAS = (
     # comes within 7 m of it.
     Area("laurence-staircase", "Hunter's Nightmare: the staircase up to the Nightmare Grand Cathedral", "m34_00_00_00", 3402950,
          stand=(-462.9, 1530.7, -313.47, -150.0), dlc=True),
+    # The GPU particles' places, after the twelve so their travels stay as they were. Vicar Amelia's room from the fog
+    # wall at the top of the stairs, facing in: the heaviest particle simulation measured. The Cleric Beast's arena:
+    # the same particles with a steadier window. Logarius' Seat on Cainhurst's roof: the snow; a fresh arrival plays
+    # the castle's cutscene over the window, so its numbers are noisy.
+    Area("vicar-amelia", "Grand Cathedral: Vicar Amelia's room", "m24_00_00_00", 2402950,
+         fog=(51.51, 35.71, 311.57, -150.0)),
+    Area("cleric-beast", "Central Yharnam bridge: the Cleric Beast's arena", "m24_01_00_00", 2412951,
+         fog=(-154.14, -27.02, 35.16, -135.0)),
+    Area("cainhurst-roof", "Forsaken Cainhurst Castle: Logarius' Seat", "m25_00_00_00", 2502951),
 )
 AREA_BY_ID = {a.id: a for a in AREAS}
 
