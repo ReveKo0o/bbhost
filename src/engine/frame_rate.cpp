@@ -495,16 +495,20 @@ static_assert(sizeof(kStepLoadWas) - 1 == 2 * 21, "the cave's three instructions
 // 60, where the step holds a steady 1/60 (2026-10-13; his old
 // "60 FPS + (deltatime)" list, a fixed 1/60, "fixes ebrietas' sfx crash").
 // The steady step is ours: the task step in whole steps, the rest carried to
-// the next frame. By default the step is 1/30 - 0, 1/30 at 60; 0, 0, 0, 1/30
-// at 120 - so every effect makes the 30 updates a second it makes at 30, each
-// one data frame long: the lamps', candles' and braziers' flicker (FFX on this
-// clock, lights among them) changes 30 times a second as on the PS4, not 60
-// or 120, and so does everything else the effect manager steps - character,
-// map and magic effects alike, which share this one step. A 0 between is the
-// still frame the effect manager makes itself (its +0x5ce zeroes the step and
-// runs the whole update). The effect steps setting ([video] effect_steps, or
-// BBHOST_SFX_STEP) picks 60 for whole 1/60 s steps (60 updates a second at
-// every rate above it, the default before), or frame for the frame's time.
+// the next frame. By default it is 1/60 - 0, 1/60 at 120 - so the effects run
+// 60 updates a second at every rate above 60. Effect steps 30 (whole 1/30 s:
+// 0, 1/30 at 60; 0, 0, 0, 1/30 at 120) gives every effect the 30 updates a
+// second it makes at 30, each one data frame long - the lamps', candles' and
+// braziers' flicker changing 30 times a second as on the PS4, not 60 or 120,
+// and everything else the effect manager steps with it, character, map and
+// magic effects alike, which share this one step. But the frames between
+// whole steps still run the manager's whole update with a step of 0, and the
+// game's effects count part of their lives in updates: with 1/30 steps at 60
+// about 1 in 6 of Ebrietas's attacks' 1251721 never ended (cpretire's forced
+// attacks, 2026-10-19), as with 1/60 steps at 120 and uncapped. So 30 waits,
+// as the default, for those frames to stop counting (the effects track); 60
+// stays it, and frame steps both by the frame's time ([video] effect_steps,
+// or BBHOST_SFX_STEP).
 constexpr std::uint32_t kSfxStepLoad = 0x2377d4a;
 constexpr char kSfxStepLoadSixty[] = "c5fa1005b62b3e03";  // vmovss xmm0,[0x575a908], as the 60 FPS++ sites leave it
 
@@ -761,7 +765,7 @@ std::atomic<bool> g_scale_by_step{false};
 // 1/60 s (effect steps 60) or whole 1/30 s (30, which the wind's loads read too).
 std::uint64_t g_sfx_step_va = 0;
 double g_sfx_carry = 0.0;
-double g_sfx_steps_a_second = 30.0;
+double g_sfx_steps_a_second = 60.0;
 // The redirected loads' slots (kDtLoads): one per constant, kind and width,
 // 16 bytes each in the image's tail, rewritten every frame from the constant
 // as it is then (a .data tunable the debug menu edits keeps working).
@@ -1509,10 +1513,10 @@ int wanted_fps() {
     return mode_of(host_settings().frame_cap);
 }
 
-// The effects' and the wind's step above 30 fps: 30 (whole 1/30 s, the
-// default), 60 (whole 1/60 s for the effects, the frame's time for the wind)
-// or 0 for frame (both by the frame's time). BBHOST_SFX_STEP=30|60|frame wins
-// over the config's [video] effect_steps.
+// The effects' and the wind's step above 30 fps: 60 (whole 1/60 s for the
+// effects, the frame's time for the wind; the default), 30 (whole 1/30 s for
+// both, the effects track's) or 0 for frame (both by the frame's time).
+// BBHOST_SFX_STEP=30|60|frame wins over the config's [video] effect_steps.
 int effect_steps() {
     std::string v;
     const char* from = "BBHOST_SFX_STEP";
@@ -1522,11 +1526,11 @@ int effect_steps() {
         v = config_value("video.effect_steps");
         from = "[video] effect_steps";
     }
-    if (v.empty() || v == "30") return 30;
-    if (v == "60") return 60;
+    if (v.empty() || v == "60") return 60;
+    if (v == "30") return 30;
     if (v == "frame") return 0;
-    host_log("frame rate: %s = %s is none of 30, 60 and frame; 30 runs", from, v.c_str());
-    return 30;
+    host_log("frame rate: %s = %s is none of 60, 30 and frame; 60 runs", from, v.c_str());
+    return 60;
 }
 
 // The follow camera's tuning above 30 fps: the game's own (Original) unless

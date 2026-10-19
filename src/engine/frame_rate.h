@@ -24,11 +24,13 @@
 //    frame time every frame; code immediates and frame counts take the rate's
 //    value. Above 60 the cloth's six constraint caves (ninety_fps_sites.inc)
 //    scale its stiffness by (60 dt)^2. The play time adds each frame's
-//    milliseconds with the remainder carried (the game truncates them), and
-//    the effects - the lamps' flicker among them - and the wind on grass and
-//    trees step in whole 1/30 s the same way, 30 times a second as at 30
-//    ([video] effect_steps or BBHOST_SFX_STEP: 60 for whole 1/60 s effects
-//    and the wind by the frame's time, frame for both by the frame's time).
+//    milliseconds with the remainder carried (the game truncates them), the
+//    effects - the lamps' flicker among them - step in whole 1/60 s the same
+//    way and the wind on grass and trees by the frame's time ([video]
+//    effect_steps or BBHOST_SFX_STEP: 30 for both in whole 1/30 s, 30 times
+//    a second as at 30 - not the default while the frames between whole
+//    steps still count in the effects' lives - frame for both by the frame's
+//    time).
 //    The follow camera keeps Kyo's 60 fps retune (Camera tuning FPS++, the
 //    default) or runs the game's own values (Original), either converted to
 //    each frame's length.
