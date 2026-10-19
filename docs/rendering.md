@@ -470,6 +470,39 @@ the default, and nothing waits on DXC:
 - Editable source beyond replacing one stage's HLSL: edits read again while
   the game runs.
 
+### Window imports and the textures' sources (a design note)
+
+The game's GPU-visible memory can be imported a 16 MB window at a time
+(`BBHOST_IMPORT_WINDOWS=1`, or `import_windows = true` under `[gpu]`) instead
+of whole. About 1.0-1.3 GB stays imported instead of 5 GB, the driver spends
+0.27 s importing instead of 1.27 s (RTX 4070), and the command processor's
+time in play is the same. The Steam Deck kit uses it. On the desktop it waits
+on the area arrivals, measured at Central Yharnam, Cathedral Ward, the Hunter's
+Nightmare, Laurence's staircase, Lumenwood and Astral:
+
+- With windows, three copies the GPU made from the whole import became CPU
+  copies into upload staging: the buffer shadow's mirror pages (8,552 pages,
+  534 MB at Nightmare of Mensis' arrival), copy tokens' sources (about 2 GB a
+  run), and texture uploads' tiled bytes (copied by the prep pool besides being
+  hashed).
+- The first hitch after a load (130-160 ms) was the mirror pages, copied on
+  the command processor. On threads of their own (`bb-pagecopy`,
+  `BBHOST_SHADOW_COPY_THREADS`) that first frame came back to whole imports'
+  42-62 ms.
+- What is left are copies a submission needs at once. The command processor
+  waits for the texture preps whose staged sources the next submission reads:
+  350-450 waits and 150-180 ms a run, against about 45 and 4 ms with whole
+  imports; more prep threads do not shorten it. It also waits for copy
+  tokens' sources copied just before a submission. Window mode then counts
+  one to three more arrival stalls a place than whole imports, and 32-36 a
+  12-place tour against 25.
+- The remedy is to let the GPU read those sources again: windows imported
+  ahead of the upload, off the command processor, at the GX resource's
+  creation (as the import prefetch does for buffers), and retired once idle so
+  that the imports stay near a gigabyte, with staging only where no window is
+  there yet. It belongs to the step that makes GX textures Vulkan images at
+  their creation, which removes most of these imports anyway.
+
 ### Resolving draws where their command lists are finished (a design note)
 
 The command processor limits the uncapped frame rate at the heaviest scenes -
