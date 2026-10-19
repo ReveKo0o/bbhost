@@ -4,6 +4,7 @@
 #include "engine/uncapped_limit.h"
 #include "engine/frame_tick.h"
 #include "engine/sfx_schedule.h"
+#include "decomp/sfx/step_gate.h"
 #include "engine/np_test.h"
 #include "engine/event_flags.h"
 #include "engine/player_data.h"
@@ -506,10 +507,11 @@ static_assert(sizeof(kStepLoadWas) - 1 == 2 * 21, "the cave's three instructions
 // whole steps still run the manager's whole update with a step of 0, and the
 // game's effects count part of their lives in updates: with 1/30 steps at 60
 // about 1 in 6 of Ebrietas's attacks' 1251721 never ended (cpretire's forced
-// attacks, 2026-10-19), as with 1/60 steps at 120 and uncapped. So 30 waits,
-// as the default, for those frames to stop counting (the effects track); 60
-// stays it, and frame steps both by the frame's time ([video] effect_steps,
-// or BBHOST_SFX_STEP).
+// attacks, 2026-10-19), as with 1/60 steps at 120 and uncapped. With 30 those
+// frames now hold what the effects count (decomp/sfx/step_gate.cpp, told by
+// each_frame; BBHOST_SFX_GATE=0|1 either way); 30 waits for the gate's checks
+// before it is the default, 60 stays it, and frame steps both by the frame's
+// time ([video] effect_steps, or BBHOST_SFX_STEP).
 constexpr std::uint32_t kSfxStepLoad = 0x2377d4a;
 constexpr char kSfxStepLoadSixty[] = "c5fa1005b62b3e03";  // vmovss xmm0,[0x575a908], as the 60 FPS++ sites leave it
 
@@ -775,6 +777,10 @@ int g_sfx_steps_a_second = 60;
 // below 30 fps is 1/30 s a frame, so the effects run N/30 times slower than
 // it.
 double g_sfx_sim_frame = 0.0;
+// The frames between whole effect steps hold the effects' counts
+// (decomp/sfx/step_gate.cpp): on with effect steps 30, BBHOST_SFX_GATE=0|1
+// either way.
+bool g_sfx_gate = false;
 // The redirected loads' slots (kDtLoads): one per constant, kind and width,
 // 16 bytes each in the image's tail, rewritten every frame from the constant
 // as it is then (a .data tunable the debug menu edits keeps working).
@@ -1407,6 +1413,7 @@ void each_frame(const SprjFlipper* f) {
             const sfx_schedule::Frame sf =
                 sfx_schedule::next(g_sfx_carry, g_sfx_sim_frame > 0.0 ? g_sfx_sim_frame : static_cast<double>(step), g_sfx_steps_a_second);
             put<float>(g_sfx_step_va, sf.seconds);
+            decomp_sfx_gate_frame(g_sfx_gate && sf.whole == 0);
         }
     }
     const float floor_s = g_dt_unfloored ? kShortestFrame : std::max(f->target_frame_seconds, 1.0f / static_cast<float>(kUncappedMaxFps));
@@ -1756,6 +1763,13 @@ int apply_rate(ElfImage* image, int want) {
                         host_log("frame rate: BBHOST_SFX_SIM_FPS=%s is not 30 to 1000; the frames' own time counts", e);
                     }
                 }
+                g_sfx_gate = steps == 30;
+                if (const char* e = std::getenv("BBHOST_SFX_GATE"); e && (e[0] == '0' || e[0] == '1')) g_sfx_gate = e[0] == '1';
+                host_log("frame rate: the frames between whole effect steps %s (BBHOST_SFX_GATE=%d to %s)",
+                         g_sfx_gate ? "run the effects' update without counting - their nodes' state, emission and definitions, "
+                                      "their controllers, the lights' flicker phase wait for the next whole step (decomp/sfx/step_gate.cpp)"
+                                    : "run the effects' whole update with a step of 0, as before",
+                         g_sfx_gate ? 0 : 1, g_sfx_gate ? "let them count" : "hold the counts");
                 g_sfx_step_va = va(static_cast<std::uint32_t>(sfx_bn));
                 put<float>(g_sfx_step_va, steps == 30 ? kThirtieth : kSixtieth);
                 std::uint8_t disp[4];

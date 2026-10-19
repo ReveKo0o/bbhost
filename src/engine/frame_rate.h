@@ -28,9 +28,9 @@
 //    effects - the lamps' flicker among them - step in whole 1/60 s the same
 //    way and the wind on grass and trees by the frame's time ([video]
 //    effect_steps or BBHOST_SFX_STEP: 30 for both in whole 1/30 s, 30 times
-//    a second as at 30 - not the default while the frames between whole
-//    steps still count in the effects' lives - frame for both by the frame's
-//    time).
+//    a second as at 30, the frames between holding what the effects count in
+//    updates (decomp/sfx/step_gate.cpp, BBHOST_SFX_GATE) - not the default
+//    while its checks run - frame for both by the frame's time).
 //    The follow camera keeps Kyo's 60 fps retune (Camera tuning FPS++, the
 //    default) or runs the game's own values (Original), either converted to
 //    each frame's length.
