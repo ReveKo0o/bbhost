@@ -890,8 +890,11 @@ static void tick(double t) {
         }
         if (have) memcpy(travel_last, p, sizeof travel_last);
         /* In the block with the loading screen gone, and still for ~3 s (90
-         * frames at 30 fps, and 2 s however fast the frames come). */
-        if (travel_still > 90 && t - travel_still_t >= 2.0 && (fabsf(p[0]) > 0.01f || fabsf(p[2]) > 0.01f)) { /* not the (0, y, 0) a load starts at */
+         * frames at 30 fps, and 2 s however fast the frames come) - or, where
+         * frames come slower than ~7 a second (lavapipe: a chalice dungeon
+         * draws one frame in ~2 s), still for 12 s over at least 8 frames. */
+        int still = (travel_still > 90 && t - travel_still_t >= 2.0) || (travel_still > 8 && t - travel_still_t >= 12.0);
+        if (still && (fabsf(p[0]) > 0.01f || fabsf(p[2]) > 0.01f)) { /* not the (0, y, 0) a load starts at */
             api->log("mapval travel-done %s %.3f %08x %.3f %.3f %.3f after %.1f s, %.1f s of it loading", s->name, t, b, p[0], p[1], p[2],
                      el, travel_loading);
             memcpy(good_pos, p, sizeof good_pos);

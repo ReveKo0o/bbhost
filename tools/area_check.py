@@ -321,6 +321,7 @@ def tour(areas, opts, kind):
             lines.append("hold 1.0")
             for name, x, y, z, deg in a.looks:
                 lines.append("warp %s:%s %.3f %.3f %.3f %.4f 1.0" % (a.id, name, x, y, z, math.radians(deg)))
+                lines.append("camera")
                 lines.append("hold %.1f" % opts["dump_gap"])
                 lines.append("dump %s-%s" % (a.id, name))
                 lines.append("hold 1.0")
@@ -394,7 +395,8 @@ def pass_budget(areas, opts, kind):
     per = 150 + 35 + 10
     per += (opts["settle"] + opts["measure"] + opts["dumps"] * (opts["dump_gap"] + 2) + 3 if kind == "perf"
             else opts["capture_settle"] + opts["capture_window"] + 60)
-    return 300 + opts["start"] + per * len(areas) + 60
+    looks = sum(len(a.looks) for a in areas) * (30 + opts["dump_gap"] + 3) if kind == "perf" else 0
+    return 300 + opts["start"] + per * len(areas) + looks + 60
 
 
 def estimate(areas, opts, kind):
@@ -402,7 +404,8 @@ def estimate(areas, opts, kind):
     per = 25 + (3 if any(a.view() for a in areas) else 0)
     per += (opts["settle"] + opts["measure"] + opts["dumps"] * opts["dump_gap"] + 1 if kind == "perf"
             else opts["capture_settle"] + opts["capture_window"])
-    return 60 + opts["start"] + per * len(areas)
+    looks = sum(len(a.looks) for a in areas) * (opts["dump_gap"] + 3) if kind == "perf" else 0
+    return 60 + opts["start"] + per * len(areas) + looks
 
 
 # --- the log --------------------------------------------------------------------
