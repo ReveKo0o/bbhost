@@ -4341,6 +4341,10 @@ struct PipelineRecipe {
         std::uint32_t rsrc1 = 0, rsrc2 = 0, window = 0, control_points = 0;
     };
     std::vector<LsPassRecord> ls_passes;
+    // A geometry-shader pipeline's ES and copy shader, as the build read them
+    // (gs_program; a recipe's build reads these copies).
+    bool has_gs = false;
+    CachedProgram gs_es, gs_copy;
     // The optimized relink's specialization by its first draw (queue_library_relink).
     bool relink = false;
     std::uint32_t spec_w3[2][16] = {}, spec_stride[2][16] = {};
@@ -4397,7 +4401,7 @@ const FetchProgram* tess_ls_fetch_safe(const DrawState& s) {
 // programs, if it has any, can be read where it is built (a worker reads only
 // the copies it was given).
 bool recipe_recordable(const DrawState& s) {
-    if (s.gs) return false;  // a geometry-shader pipeline is not recorded: built at first sight
+    if (s.gs) return !t_pipeline_worker || (t_gs_programs[0] && t_gs_programs[1]);  // its ES and copy shader, as tessellation's programs
     if (!recipe_tessellated(s)) return true;
     return !t_pipeline_worker || t_tess_native_programs[0] || t_tess_native_programs[1];
 }
@@ -4499,6 +4503,14 @@ std::uint64_t pipeline_content_key(const GfxPipeline& pl, const DrawState& s, co
         r.back = f.back;
         k = fnv1a(&r, sizeof(r), k ^ 0x7710);
     }
+    if (s.gs) {
+        // A geometry-shader pipeline's ES (the GS and its copy shader are in vs_key).
+        const CachedProgram* es = gs_program(s, 0);
+        const std::uint64_t es_hash = es ? es->hash : 0;
+        const std::uint32_t es_regs[3] = {s.es_rsrc1, s.es_rsrc2, s.gs_es_dwords};
+        k = fnv1a(&es_hash, sizeof(es_hash), k ^ 0x65e5);
+        k = fnv1a(es_regs, sizeof(es_regs), k);
+    }
     if (recipe_tessellated(s)) {
         // What the tessellation stages are made from: the draw's state for
         // them and the programs (their words' hashes).
@@ -4581,6 +4593,17 @@ void recipe_note_build(GfxPipeline& pl, const DrawState& s, const std::vector<st
             pl.recipe.reset();
             return;
         }
+    }
+    if (s.gs) {
+        const CachedProgram* es = gs_program(s, 0);
+        const CachedProgram* copy = gs_program(s, 1);
+        if (!es || !copy) {
+            pl.recipe.reset();
+            return;
+        }
+        r->has_gs = true;
+        r->gs_es = *es;
+        r->gs_copy = *copy;
     }
     for (int t = 0; t < 8; ++t) r->color_format[t] = s.color[t] ? static_cast<std::uint32_t>(s.color[t]->format) : 0u;
     r->depth_format = s.depth ? static_cast<std::uint32_t>(s.depth->format) : 0u;
@@ -6788,11 +6811,14 @@ void replay_recipe(Precompiler& w, const std::shared_ptr<const PipelineRecipe>& 
     t_tess_native_programs[0] = r.has_ls ? &r.ls : nullptr;
     t_tess_native_programs[1] = r.has_hs ? &r.hs : nullptr;
     t_tess_ls_fetch = r.has_ls_fetch ? &r.ls_fetch : nullptr;
+    t_gs_programs[0] = r.has_gs ? &r.gs_es : nullptr;
+    t_gs_programs[1] = r.has_gs ? &r.gs_copy : nullptr;
     build_gfx_pipeline(*pl, s, r.vs_words, r.fetch_words, r.ps_words, r.vs_name, r.ps_name, r.vs_dims, r.ps_dims, r.vs_modes, r.ps_modes,
                        r.cb_no_fallback, vi, false, r.layout_only);
     bool ok = !pl->failed && create_gfx_pipeline(*pl, s, vi, r.fetch_words.size());
     const std::uint64_t key = t_replay_key;
     t_tess_native_programs[0] = t_tess_native_programs[1] = nullptr;
+    t_gs_programs[0] = t_gs_programs[1] = nullptr;
     t_tess_ls_fetch = nullptr;
     t_library_owner = nullptr;
     t_replaying = false;
@@ -7900,7 +7926,8 @@ bool read(Reader& r, ManifestStage& m) {
 
 namespace recipe_file {
 constexpr std::uint32_t kMagic = 0x4d504242;  // "BBPM"
-constexpr std::uint32_t kVersion = 4;  // 2: tessellated pipelines; 3: the host tessellator's LS passes; 4: compute records (2 and 3 read as well)
+constexpr std::uint32_t kVersion = 5;  // 2: tessellated pipelines; 3: the host tessellator's LS passes; 4: compute records; 5: geometry-shader
+                                       // pipelines (flag 4096: their ES and copy shader); 2-4 read as well
 // A record's flags: a compute record (ComputeRecipe) rather than a pipeline's.
 constexpr std::uint32_t kComputeRecord = 1u << 30;
 using manifest_file::Reader;
@@ -8048,7 +8075,7 @@ void write(Writer& out, const PipelineRecipe& rc) {
     // LS and the hull as it names the others: flags 1024 and 2048).
     w.u32((s.tess_hw ? 1u : 0u) | (s.tess_attrs ? 2u : 0u) | (s.tess_hull ? 4u : 0u) | (s.tess_quads ? 8u : 0u) | (s.tess_cw ? 16u : 0u) |
           (s.tess_native ? 32u : 0u) | (rc.has_ls ? 64u : 0u) | (rc.has_hs ? 128u : 0u) | (rc.has_ls_fetch ? 256u : 0u) |
-          (!rc.ls_passes.empty() ? 1024u : 0u));
+          (!rc.ls_passes.empty() ? 1024u : 0u) | (rc.has_gs ? 4096u : 0u));
     for (std::uint32_t v : {s.tess_control_points, s.tess_attr_vec4s, s.ls_rsrc1, s.ls_rsrc2, s.hs_rsrc1, s.hs_rsrc2, s.tess_window,
                             static_cast<std::uint32_t>(s.tess_spacing), s.domain_level}) {
         w.u32(v);
@@ -8079,6 +8106,20 @@ void write(Writer& out, const PipelineRecipe& rc) {
             if (p.has_fetch) words(w, p.fetch.words);
         }
     }
+    if (rc.has_gs) {
+        // A geometry-shader pipeline (version 5, flag 4096): flags (1 its ES
+        // named, 2 its copy shader named: a list's), the ES's registers, the
+        // rings' shapes and the programs' addresses, then the ES and the copy
+        // shader as the others are.
+        w.u32(0u);
+        for (std::uint32_t v : {s.es_rsrc1, s.es_rsrc2, s.gs_out_prim, s.gs_vertex_dwords, s.gs_max_vertices, s.gs_es_dwords}) w.u32(v);
+        pod(w, s.es_va);
+        pod(w, s.gs_copy_va);
+        for (const CachedProgram* cp : {&rc.gs_es, &rc.gs_copy}) {
+            words(w, cp->words);
+            str(w, cp->name);
+        }
+    }
     out.u32(static_cast<std::uint32_t>(w.out.size()));
     out.out.insert(out.out.end(), w.out.begin(), w.out.end());
 }
@@ -8092,6 +8133,33 @@ bool program_from_game(const std::string& name, std::uint32_t count, std::uint64
     shader_patch_apply(name, code.words);
     if (code.words.size() != count || fnv1a(code.words.data(), code.words.size() * 4) != hash) return false;
     out = std::move(code.words);
+    return true;
+}
+// A geometry shader's copy shader a list names (by its container's name, as
+// its footer names it): the program after the container's first footer, as
+// long as its own footer says, patched as the GS's would be.
+bool copy_program_from_game(const std::string& name, std::uint32_t count, std::uint64_t hash, std::vector<std::uint32_t>& out) {
+    const std::shared_ptr<const std::vector<std::uint8_t>> c = shader_program_container(name);
+    gcn::ShaderCode code;
+    if (!c || !gcn::shader_code(*c, code)) return false;
+    const std::vector<std::uint8_t>& d = *c;
+    const std::size_t at = code.footer + 0x1c;
+    std::size_t second = 0;
+    for (std::size_t i = at; i + 28 <= d.size(); i += 4) {
+        if (std::memcmp(d.data() + i, "OrbShdr", 7) == 0) {
+            second = i;
+            break;
+        }
+    }
+    if (!second) return false;
+    std::uint32_t lenfield;
+    std::memcpy(&lenfield, d.data() + second + 8, 4);
+    const std::size_t length = lenfield >> 8;
+    if (!length || length % 4 || at + length > second) return false;
+    std::vector<std::uint32_t> w(length / 4);
+    std::memcpy(w.data(), d.data() + at, length);
+    if (w.size() != count || fnv1a(w.data(), w.size() * 4) != hash) return false;
+    out = std::move(w);
     return true;
 }
 bool read(Reader& in, PipelineRecipe& rc) {
@@ -8261,6 +8329,32 @@ bool read(Reader& in, PipelineRecipe& rc) {
             p.fetch.hash = fnv1a(p.fetch.words.data(), p.fetch.words.size() * 4);
         }
         rc.ls_passes.push_back(std::move(p));
+    }
+    // A geometry-shader pipeline (version 5, flag 4096).
+    if (tf & 4096) {
+        const std::uint32_t gf = r.u32();
+        for (std::uint32_t* v : {&s.es_rsrc1, &s.es_rsrc2, &s.gs_out_prim, &s.gs_vertex_dwords, &s.gs_max_vertices, &s.gs_es_dwords}) *v = r.u32();
+        pod(r, s.es_va);
+        pod(r, s.gs_copy_va);
+        for (CachedProgram* cp : {&rc.gs_es, &rc.gs_copy}) {
+            const bool ref = cp == &rc.gs_es ? (gf & 1) : (gf & 2);
+            std::uint32_t count = 0;
+            std::uint64_t hash = 0;
+            if (ref) {
+                count = r.u32();
+                pod(r, hash);
+            } else {
+                words(r, cp->words);
+            }
+            if (!str(r, cp->name)) return false;
+            if (ref && !(cp == &rc.gs_es ? from_bundle(cp->name, count, hash, cp->words) : copy_program_from_game(cp->name, count, hash, cp->words)))
+                return false;
+            cp->hash = fnv1a(cp->words.data(), cp->words.size() * 4);
+            cp->fetch_sgpr = -1;
+            std::memset(cp->head, 0, sizeof(cp->head));
+        }
+        s.gs = true;
+        rc.has_gs = true;
     }
     // The addresses the build tests for a program are the run's that recorded
     // it; the recipe's build takes the copies (tess_program).
