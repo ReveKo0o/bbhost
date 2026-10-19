@@ -17,6 +17,7 @@
 #include "engine/change_appearance.h"
 #include "engine/rebirth.h"
 
+#include "core/config.h"
 #include "core/elf.h"
 #include "core/memory.h"
 #include "core/host_clock.h"
@@ -493,14 +494,32 @@ static_assert(sizeof(kStepLoadWas) - 1 == 2 * 21, "the cave's three instructions
 // effects broke and her rock debris spawned without end, as they did not at
 // 60, where the step holds a steady 1/60 (2026-10-13; his old
 // "60 FPS + (deltatime)" list, a fixed 1/60, "fixes ebrietas' sfx crash").
-// Ours is that steady 1/60: the task step in whole 1/60 s, the rest carried
-// to the next frame - 0, 1/60, 1/60 at 90; 0, 1/60 at 120 - so the effects
-// run at 60 updates a second at every rate above it. A 0 between is the
+// The steady step is ours: the task step in whole steps, the rest carried to
+// the next frame. By default the step is 1/30 - 0, 1/30 at 60; 0, 0, 0, 1/30
+// at 120 - so every effect makes the 30 updates a second it makes at 30, each
+// one data frame long: the lamps', candles' and braziers' flicker (FFX on this
+// clock, lights among them) changes 30 times a second as on the PS4, not 60
+// or 120, and so does everything else the effect manager steps - character,
+// map and magic effects alike, which share this one step. A 0 between is the
 // still frame the effect manager makes itself (its +0x5ce zeroes the step and
-// runs the whole update). BBHOST_SFX_STEP=frame steps them by the frame's
-// time again.
+// runs the whole update). The effect steps setting ([video] effect_steps, or
+// BBHOST_SFX_STEP) picks 60 for whole 1/60 s steps (60 updates a second at
+// every rate above it, the default before), or frame for the frame's time.
 constexpr std::uint32_t kSfxStepLoad = 0x2377d4a;
 constexpr char kSfxStepLoadSixty[] = "c5fa1005b62b3e03";  // vmovss xmm0,[0x575a908], as the 60 FPS++ sites leave it
+
+// The wind on grass, trees and the other things that sway: sub_2713870, from
+// every model's draw (model_mesh_draw, 0x216f9d0), moves each model's wind -
+// its gusts and turbulence, what its shaders read as WindForceAndTime and
+// PointWindForce - on a fixed step a frame: 1/30, or 1/60 while the GX
+// device's +0x100 is 1 (two loads at 0x2713dad and 0x2713db7, and 0x2715d71's
+// for the point winds). The 60 FPS++ sites point all three at the frame-time
+// slot (0x575a908), so above 30 the wind changed every frame. With effect
+// steps 30 they read the effects' whole-1/30 step instead, and the wind
+// changes 30 times a second, as at 30; 60 and frame leave them on the frame's
+// time. Each is the rel32 of a vmovss whose instruction ends 4 bytes later.
+constexpr std::uint32_t kWindStepDisps[] = {0x2713db1, 0x2713dbb, 0x2715d75};
+constexpr std::uint32_t kFrameTimeSlot = 0x575a908;
 
 // The Bloodletter's transformed L2 (a146.tae anim 46000; the three
 // Bloodletters' behaviorVariationId 2900) gives its wielder a frenzy aura
@@ -738,9 +757,11 @@ double g_play_ms_carry = 0.0;
 // scale scales the step, not the frames' pace.
 std::uint64_t g_step_va = 0;
 std::atomic<bool> g_scale_by_step{false};
-// The effects' step (kSfxStepLoad) and the part of a 1/60 s carried.
+// The effects' step (kSfxStepLoad) and the part of a step carried: whole
+// 1/60 s (effect steps 60) or whole 1/30 s (30, which the wind's loads read too).
 std::uint64_t g_sfx_step_va = 0;
 double g_sfx_carry = 0.0;
+double g_sfx_steps_a_second = 30.0;
 // The redirected loads' slots (kDtLoads): one per constant, kind and width,
 // 16 bytes each in the image's tail, rewritten every frame from the constant
 // as it is then (a .data tunable the debug menu edits keeps working).
@@ -1368,11 +1389,13 @@ void each_frame(const SprjFlipper* f) {
             put<std::int32_t>(g_play_ms_va, ms);
         }
         if (g_sfx_step_va) {
-            // The step in whole 1/60 s (at most 2), the rest carried.
+            // The step in whole 1/30 s or 1/60 s (at most one 1/30, or two
+            // 1/60), the rest carried.
+            const double rate = g_sfx_steps_a_second;
             g_sfx_carry += static_cast<double>(step);
-            const double n = std::floor(g_sfx_carry * 60.0 + 1e-6);
-            g_sfx_carry -= n / 60.0;
-            put<float>(g_sfx_step_va, static_cast<float>(n / 60.0));
+            const double n = std::floor(g_sfx_carry * rate + 1e-6);
+            g_sfx_carry -= n / rate;
+            put<float>(g_sfx_step_va, static_cast<float>(n / rate));
         }
     }
     const float floor_s = g_dt_unfloored ? kShortestFrame : std::max(f->target_frame_seconds, 1.0f / static_cast<float>(kUncappedMaxFps));
@@ -1484,6 +1507,26 @@ GUEST_ABI std::int64_t frame_manager_hook(std::uint64_t, const std::uint64_t* sa
 int wanted_fps() {
     if (const char* e = std::getenv("BBHOST_GAME_FPS"); e && *e) return mode_of(std::atoi(e));
     return mode_of(host_settings().frame_cap);
+}
+
+// The effects' and the wind's step above 30 fps: 30 (whole 1/30 s, the
+// default), 60 (whole 1/60 s for the effects, the frame's time for the wind)
+// or 0 for frame (both by the frame's time). BBHOST_SFX_STEP=30|60|frame wins
+// over the config's [video] effect_steps.
+int effect_steps() {
+    std::string v;
+    const char* from = "BBHOST_SFX_STEP";
+    if (const char* e = std::getenv("BBHOST_SFX_STEP"); e && *e) {
+        v = e;
+    } else {
+        v = config_value("video.effect_steps");
+        from = "[video] effect_steps";
+    }
+    if (v.empty() || v == "30") return 30;
+    if (v == "60") return 60;
+    if (v == "frame") return 0;
+    host_log("frame rate: %s = %s is none of 30, 60 and frame; 30 runs", from, v.c_str());
+    return 30;
 }
 
 // The follow camera's tuning above 30 fps: the game's own (Original) unless
@@ -1686,20 +1729,48 @@ int apply_rate(ElfImage* image, int want) {
             } else {
                 host_log("frame rate: 0x%x does not hold the play time's add; the game's stays", kPlayTimeAdd);
             }
-            const char* sfx_env = std::getenv("BBHOST_SFX_STEP");
-            if (sfx_env && std::strcmp(sfx_env, "frame") == 0) {
-                host_log("frame rate: BBHOST_SFX_STEP=frame: the effects step by the frame's time");
+            const int steps = effect_steps();
+            if (steps == 0) {
+                host_log("frame rate: effect steps frame: the effects and the wind step by the frame's time");
             } else if (holds(kSfxStepLoad, kSfxStepLoadSixty)) {
+                g_sfx_steps_a_second = steps;
                 g_sfx_step_va = va(static_cast<std::uint32_t>(sfx_bn));
-                put<float>(g_sfx_step_va, kSixtieth);
+                put<float>(g_sfx_step_va, steps == 30 ? kThirtieth : kSixtieth);
                 std::uint8_t disp[4];
                 le(sfx_disp, disp);
                 write(kSfxStepLoad + 4, disp, sizeof(disp));
-                host_log("frame rate: the effects step in whole 1/60 s, the rest carried (SprjSfx::Update's load at 0x%x)",
-                         kSfxStepLoad);
+                host_log("frame rate: the effects step in whole 1/%d s, the rest carried (SprjSfx::Update's load at 0x%x; effect steps "
+                         "%d, [video] effect_steps or BBHOST_SFX_STEP: 30, 60 or frame)",
+                         steps, kSfxStepLoad, steps);
+                if (steps == 30) {
+                    // The wind's three loads, at the frame-time slot by the 60
+                    // FPS++ sites, to the effects' step: each checked first.
+                    std::size_t moved = 0;
+                    for (const std::uint32_t at : kWindStepDisps) {
+                        std::int32_t d;
+                        std::memcpy(&d, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(va(at))), 4);
+                        if (static_cast<std::int64_t>(at) + 4 + d != static_cast<std::int64_t>(kFrameTimeSlot)) continue;
+                        const std::int64_t to = static_cast<std::int64_t>(sfx_bn) - static_cast<std::int64_t>(at + 4);
+                        if (!rel32(to)) continue;
+                        std::uint8_t now[4];
+                        le(to, now);
+                        write(at, now, sizeof(now));
+                        ++moved;
+                    }
+                    if (moved == sizeof(kWindStepDisps) / sizeof(kWindStepDisps[0])) {
+                        host_log("frame rate: the wind on grass and trees steps in whole 1/30 s with the effects (sub_2713870's %zu loads)",
+                                 moved);
+                    } else {
+                        host_log("frame rate: %zu of sub_2713870's %zu wind loads read the frame-time slot and now the effects' step; "
+                                 "the rest are not the 60 FPS++ sites' loads and stay",
+                                 moved, sizeof(kWindStepDisps) / sizeof(kWindStepDisps[0]));
+                    }
+                } else {
+                    host_log("frame rate: the wind on grass and trees steps by the frame's time (effect steps %d)", steps);
+                }
             } else {
-                host_log("frame rate: 0x%x is not the 60 FPS++ sites' load of the frame-time slot; the effects step by the "
-                         "frame's time",
+                host_log("frame rate: 0x%x is not the 60 FPS++ sites' load of the frame-time slot; the effects and the wind step by "
+                         "the frame's time",
                          kSfxStepLoad);
             }
         }
