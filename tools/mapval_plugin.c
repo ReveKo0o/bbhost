@@ -52,10 +52,11 @@
  *                                             $BBHOST_MAPVAL_CAPTURES/<name>; 0 stops
  * (the last two ask the host through BBHOST_TEST_REQUESTS, hle/video.cpp),
  * and for tools/full_tour.py, which tours every map:
- *     god [hide]                              the debug menu's Player No Dead
+ *     god [hide|off]                          the debug menu's Player No Dead
  *                                             (CHR DBG, 0x593e888) on, and with
  *                                             "hide" Player Hide (0x593e88e): the
- *                                             enemies do not notice the player
+ *                                             enemies do not notice the player;
+ *                                             "off": both off again
  *     turn <n> <s>                            the follow camera through 360
  *                                             degrees in n headings, s seconds
  *                                             each (its yaw, ChrExFollowCam
@@ -274,7 +275,7 @@ static void load_tour(const char* path) {
         else if (!strcmp(kind, "god")) {
             char opt[16] = "";
             s.kind = S_GOD, strcpy(s.name, "god");
-            s.team = sscanf(line, "%*s %15s", opt) == 1 && !strcmp(opt, "hide");
+            if (sscanf(line, "%*s %15s", opt) == 1) s.team = !strcmp(opt, "hide") ? 1 : !strcmp(opt, "off") ? 2 : 0;
         }
         else if (!strcmp(kind, "turn") && sscanf(line, "%*s %d %f", &s.team, &s.hold) == 2 && s.team > 0)
             s.kind = S_TURN, strcpy(s.name, "turn");
@@ -647,10 +648,10 @@ static void begin(int i, double t) {
     } else if (s->kind == S_QUIET) {
         quiet(s->hold, t);
     } else if (s->kind == S_GOD) {
-        uint8_t one = 1;
-        int r = api->write(0x593e888, &one, 1);
-        if (s->team) r |= api->write(0x593e88e, &one, 1);
-        api->log("mapval god %.3f no-dead%s -> %s", t, s->team ? " hide" : "", r ? "REFUSED" : "on");
+        uint8_t v = s->team == 2 ? 0 : 1;
+        int r = api->write(0x593e888, &v, 1);
+        if (s->team) r |= api->write(0x593e88e, &v, 1);
+        api->log("mapval god %.3f no-dead%s -> %s", t, s->team ? " hide" : "", r ? "REFUSED" : v ? "on" : "off");
     } else if (s->kind == S_TURN) {
         uint64_t cam = ex_follow_cam();
         turn_k = -1;
