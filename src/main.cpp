@@ -971,11 +971,8 @@ int main(int argc, char** argv) {
     host_options_load();
     // Initialize Discord Rich Presence if enabled in options
     if (host_opt_get("discord_rpc")) {
-        InitDiscordRPC();
-        // Get actual current map name and player level from game state instead of hardcoded values
-        const char* currentMap = hle_get_current_map_name() ? hle_get_current_map_name() : "Bloodborne";
-        int currentLevel = hle_get_player_level() > 0 ? hle_get_player_level() : 1;
-        UpdatePlayerPresence(currentMap, currentLevel);
+        discord_rpc::InitDiscordRPC();
+        discord_rpc::UpdatePlayerPresence("Bloodborne PC", 1);
     }
     }
     config_set_skip_intro(host_settings().skip_logos);
