@@ -2737,6 +2737,25 @@ bool init_locked() {
     // the EXEC mask. Tessellation is the one commonly left out, and the host's
     // tessellator needs to know rather than find out from a driver crash.
     g.subgroup_stages = subp.supportedStages;
+    // The translator and the lifter emit subgroup operations only in those
+    // stages, and only with the basic, ballot and shuffle operations there:
+    // elsewhere an invocation runs as a wave of its own (gcn::subgroup_ops_in).
+    // Lavapipe has them in fragment and compute shaders alone, and its vertex
+    // stages - the host tessellator's LS, the particles' export shaders - took
+    // ballots the validation layer refuses (VUID-RuntimeSpirv-None-06343).
+    // BBHOST_SUBGROUP_GATE=0: every stage, as before.
+    {
+        const VkSubgroupFeatureFlags need = VK_SUBGROUP_FEATURE_BASIC_BIT | VK_SUBGROUP_FEATURE_BALLOT_BIT | VK_SUBGROUP_FEATURE_SHUFFLE_BIT;
+        const char* e = std::getenv("BBHOST_SUBGROUP_GATE");
+        const bool gate = !(e && e[0] == '0');
+        const std::uint32_t stages = !gate ? 0x7fffffffu : (subp.supportedOperations & need) == need ? subp.supportedStages : 0u;
+        gcn::set_subgroup_stages(stages);
+        if (gate && (stages & 0x3f) != 0x3f) {
+            host_log("gpu: subgroup operations in the stages 0x%x only (operations 0x%x): the others' shaders run each invocation as a wave of "
+                     "its own (BBHOST_SUBGROUP_GATE=0: every stage)",
+                     stages, subp.supportedOperations);
+        }
+    }
     {
         // Shader-level compile paths: D3D11 titles compile
         // each stage once when it is created and keep state separate; these are

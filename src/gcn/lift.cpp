@@ -4501,6 +4501,7 @@ private:
     std::size_t swizzles = 0, block_swizzles = 0;  // block_swizzles: inside a whole-quad block over a varying EXEC
     Id quad_right = 0, quad_bottom = 0;  // this invocation's column and row in its quad
     void quad_caps() {
+        if (!subgroup_ops_in(opt)) reject("a quad operation in a stage the device runs no subgroup operations in");
         m.capability(spv::CapGroupNonUniform);
         m.capability(spv::CapGroupNonUniformQuad);
     }
@@ -5190,6 +5191,7 @@ private:
     // and ifs take one arm in every lane).
     std::size_t gds_lane_ops = 0, wave_ranks = 0, ranks_folded = 0, first_lane_reads = 0;
     void subgroup_caps() {
+        if (!subgroup_ops_in(opt)) reject("a subgroup operation in a stage the device runs none in");
         m.capability(spv::CapGroupNonUniform);
         m.capability(spv::CapGroupNonUniformBallot);
     }
@@ -5330,14 +5332,17 @@ private:
             const Id base = m.emit(spv::OpGroupNonUniformBroadcastFirst, t_u32, {cu(spv::ScopeSubgroup), got});
             return ibin(append ? spv::OpIAdd : spv::OpISub, base, rank);
         };
-        const char* const how = opt.gds_subgroup ? " per subgroup" : " per invocation";
+        // A stage without subgroup operations (gcn::subgroup_ops_in) steps an
+        // invocation at a time.
+        const bool per_subgroup = opt.gds_subgroup && subgroup_ops_in(opt);
+        const char* const how = per_subgroup ? " per subgroup" : " per invocation";
         if (vgpr_unread_after(index, 256 + in.dst)) {
-            where_exec_value(run, [&] { return opt.gds_subgroup ? subgroup_step(false) : add(step); });
+            where_exec_value(run, [&] { return per_subgroup ? subgroup_step(false) : add(step); });
             ++gds_lane_ops;
             note += std::string(" ") + (append ? "+1" : "-1") + how + " (value unread)";
             return;
         }
-        const Id own = where_exec_value(run, [&] { return opt.gds_subgroup ? subgroup_step(true) : add(step); });
+        const Id own = where_exec_value(run, [&] { return per_subgroup ? subgroup_step(true) : add(step); });
         Val b = word(own);
         b.wave_part = append ? 1 : 2;
         b.part_mask = e.constant ? 0 : e.id;

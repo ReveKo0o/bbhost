@@ -15,6 +15,23 @@
 namespace gcn {
 
 namespace {
+std::atomic<std::uint32_t> g_subgroup_stages{0x7fffffffu};  // set_subgroup_stages: every stage until the host says
+}  // namespace
+void set_subgroup_stages(std::uint32_t vk_stages) { g_subgroup_stages.store(vk_stages, std::memory_order_relaxed); }
+std::uint32_t subgroup_stages() { return g_subgroup_stages.load(std::memory_order_relaxed); }
+std::uint32_t vk_stage_of(const TranslateOptions& o) {
+    if (o.gs_role == TranslateOptions::GsRole::Geometry) return 0x8;  // VK_SHADER_STAGE_GEOMETRY_BIT
+    switch (o.stage) {
+    case Stage::Vertex: return 0x1;       // VK_SHADER_STAGE_VERTEX_BIT
+    case Stage::TessControl: return 0x2;  // TESSELLATION_CONTROL
+    case Stage::TessEval: return 0x4;     // TESSELLATION_EVALUATION
+    case Stage::Pixel: return 0x10;       // FRAGMENT
+    case Stage::Compute: return 0x20;     // COMPUTE
+    }
+    return 0x20;
+}
+
+namespace {
 std::atomic<bool> g_runtime_sample_offsets{false};
 }  // namespace
 void set_runtime_sample_offsets(bool on) { g_runtime_sample_offsets.store(on, std::memory_order_relaxed); }
@@ -317,7 +334,10 @@ struct Translator {
     bool block_terminated = false;
     std::set<std::string> reported;
 
-    Translator(const Program& p, const TranslateOptions& o) : prog(p), opt(o) {}
+    Translator(const Program& p, const TranslateOptions& o) : prog(p), opt(o), subgroups(subgroup_ops_in(o)) {}
+    // The stage may run subgroup operations (gcn::subgroup_ops_in); without
+    // them each invocation is a wave of its own.
+    const bool subgroups;
 
     void error(const std::string& what) {
         char buf[32];
@@ -415,10 +435,22 @@ struct Translator {
     }
     // Ballot of a per-lane bool -> (lo, hi).
     void ballot(Id cond, Id& lo, Id& hi) {
+        if (!subgroups) {  // a wave of one: lane 0's bit
+            lo = m.emit(spv::OpSelect, t_u32, {cond, c_one_u, c_zero_u});
+            hi = c_zero_u;
+            return;
+        }
         const Id b = m.emit(spv::OpGroupNonUniformBallot, t_v4u, {cu(spv::ScopeSubgroup), cond});
         lo = m.emit(spv::OpCompositeExtract, t_u32, {b, 0});
         hi = m.emit(spv::OpCompositeExtract, t_u32, {b, 1});
     }
+    // The subgroup operations a wave of one makes its own value (shuffle,
+    // broadcast) or the invocation itself (election).
+    Id shuffle(Id v, Id src_lane) {
+        return subgroups ? m.emit(spv::OpGroupNonUniformShuffle, t_u32, {cu(spv::ScopeSubgroup), v, src_lane}) : v;
+    }
+    Id broadcast_first(Id v) { return subgroups ? m.emit(spv::OpGroupNonUniformBroadcastFirst, t_u32, {cu(spv::ScopeSubgroup), v}) : v; }
+    Id elect() { return subgroups ? m.emit(spv::OpGroupNonUniformElect, t_bool, {cu(spv::ScopeSubgroup)}) : m.const_bool(true); }
     Id exec_bit() { return ldb(v_exec_bit); }
     Id vcc_bit() { return ldb(v_vcc_bit); }
     void refresh_exec_bit() { m.store(v_exec_bit, mask_bit(ld(v_exec_lo), ld(v_exec_hi))); }
@@ -1409,7 +1441,7 @@ struct Translator {
                 v = ld(spill_cell(in.src0 - 256, cell_lane));  // a spilled scalar: the cell its v_writelane_b32 filled
             } else {
                 const Id lane_sel = iand(s1, cu(63));
-                v = m.emit(spv::OpGroupNonUniformShuffle, t_u32, {cu(spv::ScopeSubgroup), s0, lane_sel});
+                v = shuffle(s0, lane_sel);
             }
             write_s(in.dst, v);
             if (cell) note_copy(in.dst, cell_def(in.src0 - 256, cell_lane));
@@ -1576,7 +1608,7 @@ struct Translator {
         case 0: return true;  // v_nop
         case 1: return done_u(s0);
         case 2: {  // v_readfirstlane_b32
-            const Id v = m.emit(spv::OpGroupNonUniformBroadcastFirst, t_u32, {cu(spv::ScopeSubgroup), s0});
+            const Id v = broadcast_first(s0);
             write_s(in.dst, v);
             return true;
         }
@@ -3223,7 +3255,7 @@ struct Translator {
                 const Id sw = ixor(ior(iand(in_group, and_mask), or_mask), xor_mask);
                 src_lane = ior(iand(l, cu(32)), sw);
             }
-            write_v(in.dst, m.emit(spv::OpGroupNonUniformShuffle, t_u32, {cu(spv::ScopeSubgroup), v, src_lane}));
+            write_v(in.dst, shuffle(v, src_lane));
             break;
         }
         case 61: case 62: {  // ds_consume / ds_append: counter at M0 base + offset
@@ -3244,7 +3276,7 @@ struct Translator {
             const Id below_hi = iand(bhi, sel(lt32, c_zero_u, isub(shl(c_one_u, isub(l, cu(32))), c_one_u)));
             const Id rank = iadd(popcnt(below_lo), popcnt(below_hi));
             const Id result = m.local_variable(p_fn_u32, c_zero_u);
-            Id first = m.emit(spv::OpGroupNonUniformElect, t_bool, {cu(spv::ScopeSubgroup)});
+            Id first = elect();
             // A counter past the buffer's end is left alone (0 comes back).
             if (lds_in_buffer) {
                 if (const Id ok = lds_buffer_at(base).second) first = band(first, ok);
@@ -3255,7 +3287,7 @@ struct Translator {
                 const Id r = m.emit(spv::OpAtomicIAdd, t_u32, {p, cu(spv::ScopeWorkgroup), cu(spv::MsNone), delta});
                 m.store(result, r);
             });
-            const Id broadcast = m.emit(spv::OpGroupNonUniformBroadcastFirst, t_u32, {cu(spv::ScopeSubgroup), ld(result)});
+            const Id broadcast = broadcast_first(ld(result));
             if (opt.gds_counters) {
                 write_v(in.dst, broadcast);  // GCN hands every lane the value from before; the shader adds its rank
             } else {
@@ -3296,13 +3328,13 @@ struct Translator {
         const Id hi = m.load(t_u32, m.access_chain(p_uni_u32, ubo_var, {cu(gds_member), shr(at, cu(2)), iand(iadd(at, c_one_u), cu(3))}));
         const Id bound = band(inside, ine(ior(lo, hi), c_zero_u));
         const Id result = m.local_variable(p_fn_u32, c_zero_u);
-        const Id first = m.emit(spv::OpGroupNonUniformElect, t_bool, {cu(spv::ScopeSubgroup)});
+        const Id first = elect();
         if_then(band(first, bound), [&] {
             const Id delta = in.op == 62 ? total : isub(c_zero_u, total);
             const Id r = m.emit(spv::OpAtomicIAdd, t_u32, {host_ptr(make_u64(lo, hi)), cu(spv::ScopeDevice), cu(spv::MsNone), delta});
             m.store(result, r);
         });
-        write_v(in.dst, m.emit(spv::OpGroupNonUniformBroadcastFirst, t_u32, {cu(spv::ScopeSubgroup), ld(result)}));
+        write_v(in.dst, broadcast_first(ld(result)));
     }
 
     // ---- images
@@ -3843,9 +3875,11 @@ struct Translator {
     void run() {
         m.capability(spv::CapShader);
         m.capability(spv::CapInt64);
-        m.capability(spv::CapGroupNonUniform);
-        m.capability(spv::CapGroupNonUniformBallot);
-        m.capability(spv::CapGroupNonUniformShuffle);
+        if (subgroups) {
+            m.capability(spv::CapGroupNonUniform);
+            m.capability(spv::CapGroupNonUniformBallot);
+            m.capability(spv::CapGroupNonUniformShuffle);
+        }
         m.capability(spv::CapPhysicalStorageBufferAddresses);
         m.extension("SPV_KHR_physical_storage_buffer");
         m.memory_model(5348 /* PhysicalStorageBuffer64 */, 1 /* GLSL450 */);
@@ -3989,7 +4023,7 @@ struct Translator {
         }
 
         // Built-in inputs
-        in_subgroup_lane = builtin_in(p_in_u32, spv::BiSubgroupLocalInvocationId, "lane_id");
+        if (subgroups) in_subgroup_lane = builtin_in(p_in_u32, spv::BiSubgroupLocalInvocationId, "lane_id");
         if (opt.stage == Stage::Vertex) {
             in_vertex_index = builtin_in(p_in_u32, spv::BiVertexIndex, "vertex_index");
             in_instance_index = builtin_in(p_in_u32, spv::BiInstanceIndex, "instance_index");
@@ -4096,7 +4130,7 @@ struct Translator {
             m.emit_void(spv::OpKill, {});
             m.label(l_on);
         }
-        m.store(v_lane, m.load(t_u32, in_subgroup_lane));
+        m.store(v_lane, subgroups ? m.load(t_u32, in_subgroup_lane) : c_zero_u);
         {
             Id lo, hi;
             ballot(m.const_bool(true), lo, hi);

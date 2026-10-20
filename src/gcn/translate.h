@@ -428,6 +428,24 @@ struct TranslateOptions {
     bool gds_subgroup = true;
 };
 
+// The Vulkan shader stages (VkShaderStageFlagBits) that may run subgroup
+// operations: VkPhysicalDeviceSubgroupProperties::supportedStages where the
+// device has the basic, ballot and shuffle operations (none where it lacks
+// one), set once by the host before its first translation, as
+// set_native_half_rtz; every stage until then. A translation for a stage
+// outside it runs each invocation as a wave of its own - lane 0, EXEC and the
+// comparisons' masks its one bit, a ballot that bit, a shuffle, broadcast or
+// election the invocation itself - which is what a 64-lane wave split across
+// smaller subgroups already is, taken to one lane; a lift takes no subgroup
+// operation there (its GDS counters step an invocation at a time, a lane rank
+// is refused). Part of every translation's key where it applies
+// (translation_cache.cpp), so a device with them everywhere keeps its keys.
+void set_subgroup_stages(std::uint32_t vk_stages);
+std::uint32_t subgroup_stages();
+// The Vulkan stage a translation or lift with these options runs in.
+std::uint32_t vk_stage_of(const TranslateOptions& o);
+inline bool subgroup_ops_in(const TranslateOptions& o) { return (subgroup_stages() & vk_stage_of(o)) != 0; }
+
 // The ps_input_map entry of an input whose SPI_PS_INPUT_CNTL_n is `cntl`: the
 // param register OFFSET names (bits 0-4) or, with `defaults`, GCN's default
 // constant where OFFSET has bit 5 (TranslateOptions::kPsInputDefault |

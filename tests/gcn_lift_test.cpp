@@ -3795,7 +3795,34 @@ void clip_discard() {
     CHECK(clip_input && !early);
 }
 
+// A device without subgroup operations in vertex shaders (lavapipe;
+// gcn::set_subgroup_stages): the translation runs each invocation as a wave of
+// one - no subgroup instruction, capability or lane built-in - and the lift,
+// which takes none here, is unchanged.
+void subgroup_gate() {
+    const std::vector<std::uint32_t> words = program();
+    const gcn::TranslateOptions o = options(0, 0, true);
+    const Lifted all = lift_vs(words, o);
+    gcn::set_subgroup_stages(0x30);  // fragment and compute, as lavapipe
+    const Lifted gated = lift_vs(words, o);
+    gcn::set_subgroup_stages(0x7fffffffu);
+    CHECK(all.ref.ok() && gated.ref.ok());
+    CHECK(count_op(all.ref.spirv, 339) > 0);  // the EXEC mask's OpGroupNonUniformBallot
+    for (std::uint32_t op = 333; op <= 366; ++op) CHECK(count_op(gated.ref.spirv, op) == 0);
+    std::size_t lane_builtins = 0, group_caps = 0;
+    for (std::size_t i = 5; i < gated.ref.spirv.size() && (gated.ref.spirv[i] >> 16);) {
+        const std::uint32_t n = gated.ref.spirv[i] >> 16, op = gated.ref.spirv[i] & 0xffff;
+        if (op == 71 && n >= 4 && gated.ref.spirv[i + 2] == 11 && gated.ref.spirv[i + 3] == 41) ++lane_builtins;  // BuiltIn SubgroupLocalInvocationId
+        if (op == 17 && n >= 2 && gated.ref.spirv[i + 1] >= 61 && gated.ref.spirv[i + 1] <= 68) ++group_caps;      // OpCapability GroupNonUniform*
+        i += n;
+    }
+    CHECK(lane_builtins == 0 && group_caps == 0);
+    CHECK(spirv_valid(gated.ref.spirv));
+    CHECK(all.lift.ok() && gated.lift.ok() && all.lift.spirv == gated.lift.spirv);
+}
+
 void run() {
+    subgroup_gate();
     formats();
     clip_distances();
     clip_discard();
@@ -4380,6 +4407,19 @@ void run() {
         CHECK(count_op(e.spirv, 339) == 0);  // no OpGroupNonUniformBallot
         CHECK(count_op(e.spirv, 333) == 0);
         CHECK(count_op(e.spirv, 234) == 1);  // one OpAtomicIAdd
+        // A device without subgroup operations in compute shaders
+        // (gcn::set_subgroup_stages): the default's lift steps an invocation at
+        // a time, and the translation runs each invocation as a wave of one.
+        gcn::set_subgroup_stages(0x1f);
+        const gcn::LiftResult g = lift(append(false), options(threads));
+        const Asm ap = append(false);
+        const gcn::TranslateResult t = gcn::translate(gcn::decode(ap.w.data(), ap.w.size()), options(threads));
+        gcn::set_subgroup_stages(0x7fffffffu);
+        CHECK(lifted_valid(g, "append idiom without subgroup operations"));
+        CHECK(count_op(g.spirv, 339) == 0 && count_op(g.spirv, 333) == 0 && count_op(g.spirv, 338) == 0);
+        CHECK(count_op(g.spirv, 234) == 1);
+        CHECK(t.ok() && spirv_valid(t.spirv));
+        for (std::uint32_t op = 333; op <= 366; ++op) CHECK(count_op(t.spirv, op) == 0);  // no OpGroupNonUniform*
     }
     CHECK(rejected_with(lift(append(true)), "used other than added to its lanes' ranks"));
     {
