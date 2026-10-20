@@ -257,6 +257,15 @@ addresses).
 Render targets are Vulkan images sized from the engine's own views, and can be
 re-created at any resolution while the game runs, the way the PC engine's GX
 device resizes.
+A colour target a draw writes no channel of - its write mask, the game's cut to
+what the pixel shader exports, is empty - gets no blend state either. The game
+leaves blending on for targets a shader does not export: the G-buffer's puddle
+decals export six of the seven targets bound and blend into the seventh too,
+and the effects' soft sprites export one of two. The shader's output for such a
+target is undefined and Vulkan writes nothing through an empty mask, so the
+state is dead where a driver honours the mask; a driver may blend the undefined
+output in anyway, and with the state zeroed there is nothing to blend
+(`BBHOST_MASKED_BLEND=0` keeps the game's blend state).
 
 **Native passes.** Several parts of the frame no longer run the game's GPU
 path at all:

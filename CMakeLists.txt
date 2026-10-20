@@ -608,6 +608,10 @@ if(UNIX)
   target_link_libraries(host_lists_test PRIVATE pthread)
   add_test(NAME host_lists_test COMMAND host_lists_test)
   set_tests_properties(host_lists_test PROPERTIES ENVIRONMENT "BBHOST_HOST_LISTS=2")
+  # The blend state of a colour target a draw writes no channel of (tests/masked_blend_test.cpp).
+  add_executable(masked_blend_test tests/masked_blend_test.cpp)
+  target_include_directories(masked_blend_test PRIVATE src)
+  add_test(NAME masked_blend_test COMMAND masked_blend_test)
   # The constant-buffer proof's copies and compares without the game (tests/cb_proof_test.cpp).
   add_executable(cb_proof_test tests/cb_proof_test.cpp)
   target_include_directories(cb_proof_test PRIVATE src include)

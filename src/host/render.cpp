@@ -8,6 +8,7 @@
 #include "engine/gx_resources.h"
 #include "engine/gx_state.h"
 #include "host/gpu_internal.h"
+#include "host/masked_blend.h"
 #include "host/shader_bundles.h"
 #include "host/shader_patch.h"
 #include "host/tess_lds.h"
@@ -2727,7 +2728,19 @@ void fixed_raster_depth(const DrawState& s, GfxFixedState& f) {
     }
 }
 
+// BBHOST_MASKED_BLEND (host/masked_blend.h), on unless 0: a colour target a
+// draw writes no channel of gets no blend state. What the last fixed_state on
+// this thread zeroed - targets whose state it changed, and of those, the ones
+// the game blended into - for create_gfx_pipeline's count.
+const bool g_masked_blend = [] {
+    const char* e = std::getenv("BBHOST_MASKED_BLEND");
+    return !(e && e[0] == '0');
+}();
+thread_local std::uint32_t t_masked_blend_changed = 0, t_masked_blend_blending = 0;
+std::atomic<std::uint64_t> g_masked_blend_pipelines{0}, g_masked_blend_blending{0};
+
 GfxFixedState fixed_state(const DrawState& s) {
+    t_masked_blend_changed = t_masked_blend_blending = 0;
     GfxFixedState f;
     fixed_raster_depth(s, f);
     const bool stencil_aspect = s.depth && s.depth->format != VK_FORMAT_D32_SFLOAT && s.depth->format != VK_FORMAT_D16_UNORM;
@@ -2778,7 +2791,13 @@ GfxFixedState fixed_state(const DrawState& s) {
         // The target's write mask where the pixel shader exports (draw_impl
         // makes it from either source; they agree on every draw compared).
         b.colorWriteMask = s.color_mask[t] & 0xf;
-        f.blends.push_back(b);
+        // None of it written: no blend state either (masked_blend_state).
+        const VkPipelineColorBlendAttachmentState kept = masked_blend_state(b, g_masked_blend);
+        if (std::memcmp(&kept, &b, sizeof(b)) != 0) {
+            ++t_masked_blend_changed;
+            if (b.blendEnable) ++t_masked_blend_blending;
+        }
+        f.blends.push_back(kept);
         f.color_formats.push_back(s.color[t]->format);
         f.color_slots.push_back(t);
     }
@@ -8854,6 +8873,10 @@ bool create_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const VertexInputP
         g.gfx_pipelines.fetch_add(1);
         return true;
     }
+    if (t_masked_blend_changed) {  // built here: one whose blend state BBHOST_MASKED_BLEND zeroed for a target
+        g_masked_blend_pipelines.fetch_add(1, std::memory_order_relaxed);
+        if (t_masked_blend_blending) g_masked_blend_blending.fetch_add(1, std::memory_order_relaxed);
+    }
     ia.topology = pl.tess_hw ? VK_PRIMITIVE_TOPOLOGY_PATCH_LIST : f.topology;
     ia.primitiveRestartEnable = VK_FALSE;
     VkPipelineTessellationStateCreateInfo ts{VK_STRUCTURE_TYPE_PIPELINE_TESSELLATION_STATE_CREATE_INFO};
@@ -14299,6 +14322,11 @@ std::string host_gpu_clear_view_report() {
                  "clears of HTILE words without the stencil state kept a stencil the fill path cleared",
                  static_cast<unsigned long long>(g_cv_stencil_by_htile), static_cast<unsigned long long>(g_cv_depth_by_htile),
                  static_cast<unsigned long long>(g_cv_stencil_kept));
+    }
+    if (g_masked_blend_pipelines.load()) {
+        host_log("render: %llu pipelines built with a blend state for a colour target they write no channel of, zeroed (%llu of them "
+                 "blending into it; BBHOST_MASKED_BLEND=0 keeps the game's)",
+                 static_cast<unsigned long long>(g_masked_blend_pipelines.load()), static_cast<unsigned long long>(g_masked_blend_blending.load()));
     }
     if (g_vc_set) {
         host_log("render: lazy clears: %llu owed, taken as a pass's load op %llu, made by transfer %llu (%llu of them for a draw that "
