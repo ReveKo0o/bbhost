@@ -973,7 +973,7 @@ int main(int argc, char** argv) {
     if (host_opt_get("discord_rpc")) {
         DiscordEventHandlers handlers;
         std::memset(&handlers, 0, sizeof(handlers));
-        Discord_Initialize("YOUR_DISCORD_APP_ID", &handlers, 1, nullptr);
+        Discord_Initialize("1562063078466650206", &handlers, 1, nullptr);
 
         DiscordRichPresence presence;
         std::memset(&presence, 0, sizeof(presence));
