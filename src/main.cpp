@@ -968,6 +968,11 @@ int main(int argc, char** argv) {
     // and they seed from bbhost.toml, so a run with no options file behaves
     // exactly as it did.
     host_options_load();
+    // Initialize Discord Rich Presence if enabled in options
+    if (host_opt_get("discord_rpc")) {
+        InitDiscordRPC();
+        UpdatePlayerPresence("Central Yharnam", 1);
+    }
     config_set_skip_intro(host_settings().skip_logos);
     // The PC enhancements are read the same way, once: each installs (or its
     // patch applies) while the guest is prepared, so a change waits for the
