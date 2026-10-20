@@ -103,7 +103,7 @@ jobs:
         env:
           RELEASE_SIGNING_KEY: ${{ github.event_name != 'pull_request' && secrets.RELEASE_SIGNING_KEY || '' }}
         run: |
-          chmod +x tools/ci_windows.sh
+          chmod +x tools/*.sh
           CI_PACMAN=1 CI_CMAKE_ARGS="-DBBHOST_RELEASE=ON" tools/ci_windows.sh
       - uses: actions/upload-artifact@v4
         with:
