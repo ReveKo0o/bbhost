@@ -869,3 +869,5 @@ bool menu_pointer_in_menu() {
     // few frames means none has.
     return menu_open() || now_ms() - g_focus_ms.load(std::memory_order_relaxed) < 400;
 }
+
+bool menu_pointer_front_end() { return front_end(); }

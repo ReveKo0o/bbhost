@@ -53,3 +53,6 @@ std::uint64_t menu_pointer_tick();
 // CSMouseMan switches the same way - a pointer while UI owns the input,
 // mouse-look otherwise - and the camera and the pointer both key off this.
 bool menu_pointer_in_menu();
+
+// True on the title and other front-end screens before the game world loads.
+bool menu_pointer_front_end();

@@ -3,10 +3,15 @@
 #include "core/elf.h"
 #include "core/portable.h"
 #include "engine/addr.h"
+#include "engine/menu_pointer.h"
+#include "bbhost/engine/sprj/game_data_man.hpp"
 #include "net/discord_presence.h"
 #include "log.h"
 
+#include <array>
 #include <cstring>
+#include <string>
+#include <utility>
 
 namespace {
 
@@ -32,7 +37,8 @@ constexpr Stat kStats[] = {
 };
 
 std::uint64_t g_slide = 0;
-bool g_ok = false, g_said = false;
+bool g_ok = false;
+std::string g_last_logged_identity;
 
 std::uint64_t manager() {
     std::uint64_t man = 0;
@@ -96,12 +102,114 @@ bool player_origin(int* origin) {
     return true;
 }
 
+namespace {
+
+std::string utf16_to_utf8(const std::uint16_t* text, std::size_t count) {
+    std::string out;
+    for (std::size_t i = 0; i < count && text[i]; ++i) {
+        std::uint32_t cp = text[i];
+        if (cp >= 0xd800 && cp <= 0xdbff && i + 1 < count && text[i + 1] >= 0xdc00 && text[i + 1] <= 0xdfff) {
+            cp = 0x10000 + ((cp - 0xd800) << 10) + (text[++i] - 0xdc00);
+        } else if (cp >= 0xd800 && cp <= 0xdfff) {
+            continue;
+        }
+        if (cp <= 0x7f) {
+            out.push_back(static_cast<char>(cp));
+        } else if (cp <= 0x7ff) {
+            out.push_back(static_cast<char>(0xc0 | (cp >> 6)));
+            out.push_back(static_cast<char>(0x80 | (cp & 0x3f)));
+        } else if (cp <= 0xffff) {
+            out.push_back(static_cast<char>(0xe0 | (cp >> 12)));
+            out.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3f)));
+            out.push_back(static_cast<char>(0x80 | (cp & 0x3f)));
+        } else {
+            out.push_back(static_cast<char>(0xf0 | (cp >> 18)));
+            out.push_back(static_cast<char>(0x80 | ((cp >> 12) & 0x3f)));
+            out.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3f)));
+            out.push_back(static_cast<char>(0x80 | (cp & 0x3f)));
+        }
+    }
+    return out;
+}
+
+}  // namespace
+
+bool player_character_identity(std::string* name, int* level) {
+    const std::uint64_t man = manager();
+    const std::uint64_t rec = record();
+    if (!man || !rec) return false;
+
+    std::uint32_t live_level = 0;
+    std::uint32_t live_play_time_ms = 0;
+    std::uint64_t summaries = 0;
+    if (!host_read_safe(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(rec + bb::GAME_DATA_MAN_PLAYER_RECORD_LEVEL_OFFSET)),
+                        &live_level, sizeof(live_level)) ||
+        !host_read_safe(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(man + 0x94)), &live_play_time_ms,
+                        sizeof(live_play_time_ms)) ||
+        !host_read_safe(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(man + 0x58)), &summaries,
+                        sizeof(summaries)) ||
+        !summaries || live_level == 0 || live_level > 544) {
+        return false;
+    }
+
+    // The native save summary stores play time in seconds; the live manager
+    // holds the same counter in milliseconds. Require a unique close match so
+    // a different save with the same level is never guessed as the active one.
+    const std::uint32_t live_seconds = live_play_time_ms / 1000;
+    int match = -1;
+    for (std::size_t i = 0; i < bb::GAME_DATA_CHARACTER_SUMMARY_COUNT; ++i) {
+        const std::uint8_t occupied_offset = static_cast<std::uint8_t>(0x10 + i);
+        std::uint8_t occupied = 0;
+        if (!host_read_safe(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(summaries + occupied_offset)),
+                            &occupied, sizeof(occupied)) || !occupied) {
+            continue;
+        }
+        const std::uint64_t summary = summaries + 0x20 + i * bb::GAME_DATA_CHARACTER_SUMMARY_SIZE;
+        std::uint32_t summary_level = 0, summary_time = 0;
+        if (!host_read_safe(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(summary + 0x24)), &summary_level,
+                            sizeof(summary_level)) ||
+            !host_read_safe(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(summary + 0x28)), &summary_time,
+                            sizeof(summary_time))) {
+            return false;
+        }
+        const std::uint32_t time_delta = summary_time > live_seconds ? summary_time - live_seconds : live_seconds - summary_time;
+        if (summary_level == live_level && time_delta <= 10) {
+            if (match >= 0) return false;  // ambiguous summaries are deliberately not guessed
+            match = static_cast<int>(i);
+        }
+    }
+    if (match < 0) return false;
+
+    const std::uint64_t summary = summaries + 0x20 + static_cast<std::size_t>(match) * bb::GAME_DATA_CHARACTER_SUMMARY_SIZE;
+    std::array<std::uint16_t, 17> name_units{};
+    if (!host_read_safe(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(summary)), name_units.data(),
+                        name_units.size() * sizeof(name_units[0]))) {
+        return false;
+    }
+    std::string decoded = utf16_to_utf8(name_units.data(), name_units.size());
+    if (decoded.empty()) return false;
+    if (name) *name = std::move(decoded);
+    if (level) *level = static_cast<int>(live_level);
+    return true;
+}
+
 void player_data_tick() {
-    if (g_said || !g_ok) return;
-    std::int64_t level = 0;
-    if (!player_stat_get("level", &level) || level <= 0) return;  // no character yet
-    net::UpdateDiscordGamePresence(nullptr, static_cast<int>(level));
-    g_said = true;
+    if (!g_ok) return;
+    if (menu_pointer_front_end()) {
+        net::UpdateDiscordMainMenuPresence();
+        g_last_logged_identity.clear();
+        return;
+    }
+    std::string character_name;
+    int level = 0;
+    if (player_character_identity(&character_name, &level)) {
+        net::UpdateDiscordGamePresence(character_name.c_str(), level);
+        const std::string identity = character_name + "#" + std::to_string(level);
+        if (identity == g_last_logged_identity) return;
+        g_last_logged_identity = identity;
+    } else {
+        return;  // wait until the active save can be matched without guessing
+    }
     char line[512];
     std::size_t n = 0;
     for (const Stat& s : kStats) {

@@ -11,6 +11,7 @@
 #pragma once
 
 #include <cstdint>
+#include <string>
 
 struct ElfImage;
 
@@ -29,6 +30,9 @@ bool player_stat_set(const char* name, std::int64_t value);
 // as character creation's own origin list reads it (sub_1f8e6b0). False when
 // no character is loaded.
 bool player_origin(int* origin);
+// Reads the active character name from the game's save-summary table only
+// when its level and play time uniquely match the live local-player record.
+bool player_character_identity(std::string* name, int* level);
 // From the frame-time manager's hook: the one line with the loaded
 // character's numbers, once.
 void player_data_tick();
