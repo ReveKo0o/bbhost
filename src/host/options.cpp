@@ -84,6 +84,7 @@ enum SettingId {
     kModelDetail,
     kResolution,
     kSkipLogos,
+    kDiscordRpc,
     kDebugMenu,
     kDebugCamera,
     kChangeAppearance,
@@ -230,6 +231,10 @@ Setting g_set[kSettingCount] = {
      true},
     {"skip_logos", "Skip company logos", {"Off", "On"}, 0,
      "The three logos before the title screen, and the warning that the last session did not end with Exit Game.", true},
+    // Discord Rich Presence is persisted in bbhost-options.toml and shared by
+    // the launcher and the game's startup path.
+    {"discord_rpc", "Discord Rich Presence", {"Off", "On"}, 0,
+     "Show BBHost and Bloodborne activity on your Discord profile.", false},
     // The old switch for the developers' debug menu, which the Debug Menu
     // plugin replaced (engine/debug_menu.h): no row shows it, and an "On" an
     // older bbhost saved turns the plugin on once (main.cpp).

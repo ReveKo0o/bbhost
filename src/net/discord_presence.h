@@ -2,13 +2,16 @@
 
 namespace net {
 
-	// Launch the discord presence service
-	void InitDiscordRPC();
+// Starts the Discord IPC client once for the current BBHost process.
+void InitDiscordRPC();
 
-	// The player posts their current map and level on Discord
-	void UpdateDiscordPresence(const char* mapName, int playerLevel);
+// Publishes a lightweight status while the setup/launcher window is open.
+void UpdateDiscordLauncherPresence();
 
-	// Terminates the RPC connection upon closing
-	void ShutdownDiscordRPC();
+// Publishes the game's location and loaded character level when available.
+void UpdateDiscordGamePresence(const char* mapName, int playerLevel);
 
-} // namespace net
+// Clears the activity and closes the IPC client.
+void ShutdownDiscordRPC();
+
+}  // namespace net

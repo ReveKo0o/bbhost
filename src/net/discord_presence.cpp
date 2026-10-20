@@ -1,41 +1,53 @@
 #include "net/discord_presence.h"
-#include "discord_rpc.h" // official title within third_party
-#include <chrono>
-#include <string>
+
+#include "discord_rpc.h"
+
 #include <cstring>
+#include <string>
 
 namespace net {
+namespace {
 
-    void InitDiscordRPC() {
-        DiscordEventHandlers handlers;
-        std::memset(&handlers, 0, sizeof(handlers));
+constexpr char kApplicationId[] = "1562063078466650206";
+bool g_initialized = false;
 
-        // Developer Portal Application id (BBHost)
-        Discord_Initialize("1562063078466650206", &handlers, 1, nullptr);
-    }
+void publish(const char* state) {
+    DiscordRichPresence presence{};
+    presence.details = "Bloodborne";
+    presence.state = state;
+    Discord_UpdatePresence(&presence);
+}
 
-    void UpdateDiscordPresence(const char* mapName, int playerLevel) {
-        DiscordRichPresence discordPresence;
-        std::memset(&discordPresence, 0, sizeof(discordPresence));
+}  // namespace
 
-        std::string detailsStr = "Location: " + std::string(mapName);
-        discordPresence.details = detailsStr.c_str();
+void InitDiscordRPC() {
+    if (g_initialized) return;
 
-        std::string stateStr = "Hunter Level: " + std::to_string(playerLevel);
-        discordPresence.state = stateStr.c_str();
+    DiscordEventHandlers handlers{};
+    Discord_Initialize(kApplicationId, &handlers, 1, nullptr);
+    g_initialized = true;
+}
 
-        discordPresence.startTimestamp = std::chrono::duration_cast<std::chrono::seconds>(
-            std::chrono::system_clock::now().time_since_epoch()
-        ).count();
+void UpdateDiscordLauncherPresence() {
+    if (!g_initialized) return;
+    publish("In BBHost Launcher");
+}
 
-        discordPresence.largeImageKey = "bb_logo";
-        discordPresence.largeImageText = "Bloodborne PC (bbhost)";
+void UpdateDiscordGamePresence(const char* mapName, int playerLevel) {
+    if (!g_initialized) return;
 
-        Discord_UpdatePresence(&discordPresence);
-    }
+    // Do not report a character as loaded until the guest exposes a valid level.
+    std::string state = mapName && mapName[0] ? mapName : playerLevel > 0 ? "Character loaded" : "Loading character...";
+    if (playerLevel > 0) state += " · Level " + std::to_string(playerLevel);
+    publish(state.c_str());
+}
 
-    void ShutdownDiscordRPC() {
-        Discord_Shutdown();
-    }
+void ShutdownDiscordRPC() {
+    if (!g_initialized) return;
 
-} // namespace net
+    Discord_ClearPresence();
+    Discord_Shutdown();
+    g_initialized = false;
+}
+
+}  // namespace net

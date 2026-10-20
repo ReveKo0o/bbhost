@@ -9,6 +9,7 @@
 #include "host/plugin_ui.h"
 #include "host/updater.h"
 #include "log.h"
+#include "net/discord_presence.h"
 
 #include "imgui.h"
 #include "backends/imgui_impl_sdl3.h"
@@ -187,6 +188,11 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
     bool debug_camera = host_opt_get("debug_camera");
     // Enable or disable Discord Rich Presence status sharing
     bool discord_rpc = host_opt_get("discord_rpc");
+    bool rpc_was_enabled = discord_rpc;
+    if (discord_rpc) {
+        net::InitDiscordRPC();
+        net::UpdateDiscordLauncherPresence();
+    }
     int frame_cap = host_opt_frame_cap();
     int resolution = host_opt_resolution_index();
     static const char* const kResolutions[] = {"1280x720",         "1600x900",         "1920x1080",        "2560x1440",
@@ -324,6 +330,7 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
         host_opt_set_index("window_mode", fullscreen ? 1 : 0);
         host_opt_set("skip_logos", skip_logos);
         host_opt_set("debug_camera", debug_camera);
+        host_opt_set("discord_rpc", discord_rpc);
         host_opt_set_frame_cap(kCaps[cap_choice]);
         host_opt_set_index("camera_tuning", camera_tuning);
         host_opt_set_resolution_index(resolution);
@@ -629,6 +636,15 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
         if (ImGui::IsItemHovered()) {
         ImGui::SetTooltip("Display your current game status and location on your Discord profile.");
             }
+        if (discord_rpc != rpc_was_enabled) {
+            if (discord_rpc) {
+                net::InitDiscordRPC();
+                net::UpdateDiscordLauncherPresence();
+            } else {
+                net::ShutdownDiscordRPC();
+            }
+            rpc_was_enabled = discord_rpc;
+        }
         ImGui::Checkbox("Debug camera", &debug_camera);
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("Lance McDonald's free camera: hold Interact (E) and press L3 (Left Ctrl). The debug menu's LOAD TEST crashes while it is on.");
@@ -710,6 +726,7 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
     }
 
     if (plugin_seen) plugin_ui_mark_seen(plugin_ui);
+    if (result != LauncherResult::Play) net::ShutdownDiscordRPC();
     ImGui_ImplSDLRenderer3_Shutdown();
     ImGui_ImplSDL3_Shutdown();
     ImGui::DestroyContext();

@@ -3,6 +3,7 @@
 #include "core/elf.h"
 #include "core/portable.h"
 #include "engine/addr.h"
+#include "net/discord_presence.h"
 #include "log.h"
 
 #include <cstring>
@@ -99,6 +100,7 @@ void player_data_tick() {
     if (g_said || !g_ok) return;
     std::int64_t level = 0;
     if (!player_stat_get("level", &level) || level <= 0) return;  // no character yet
+    net::UpdateDiscordGamePresence(nullptr, static_cast<int>(level));
     g_said = true;
     char line[512];
     std::size_t n = 0;
