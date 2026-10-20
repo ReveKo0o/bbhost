@@ -971,8 +971,16 @@ int main(int argc, char** argv) {
     host_options_load();
     // Initialize Discord Rich Presence if enabled in options
     if (host_opt_get("discord_rpc")) {
-        discord_rpc::InitDiscordRPC();
-        discord_rpc::UpdatePlayerPresence("Bloodborne PC", 1);
+        DiscordEventHandlers handlers;
+        std::memset(&handlers, 0, sizeof(handlers));
+        Discord_Initialize("YOUR_DISCORD_APP_ID", &handlers, 1, nullptr);
+
+        DiscordRichPresence presence;
+        std::memset(&presence, 0, sizeof(presence));
+        presence.state = "Exploring";
+        presence.details = "Bloodborne PC";
+        presence.largeImageKey = "logo";
+        Discord_UpdatePresence(&presence);
     }
     }
     config_set_skip_intro(host_settings().skip_logos);
