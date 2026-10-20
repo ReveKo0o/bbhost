@@ -7320,6 +7320,7 @@ GpuStats host_gpu_stats() {
     for (int i = 0; i < 16; ++i) st.draw_fail_why[i] = g.draw_fail_why[i].load(std::memory_order_relaxed);
     st.shader_dispatches = g.shader_dispatches.load(std::memory_order_relaxed);
     st.lifted_dispatches = g.lifted_dispatches.load(std::memory_order_relaxed);
+    st.draws_clip_discard = g.draws_clip_discard.load(std::memory_order_relaxed);
     return st;
 }
 

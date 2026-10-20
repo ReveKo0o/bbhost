@@ -5289,6 +5289,18 @@ std::atomic<std::uint64_t> g_unwritten_inputs_default{0}, g_unwritten_inputs_reg
 // Depth-compare texture binds by what they resolve to: [0] a depth target, [1]
 // a colour target, [2] a snapshot of one, [3] a texture (stage_image_views).
 std::atomic<std::uint64_t> g_compare_binds[4] = {};
+// Pipelines whose pixel shader discards by the vertex stage's clip distances
+// at entry (TranslateOptions::kVsOutCntlClipVarying) - before any implicit-LOD
+// sample, where the PS4's clipper left those pixels helper lanes of their
+// quads: counted and the first named, for the exit report.
+std::atomic<std::uint64_t> g_clip_discard_pipelines{0};
+void note_clip_discard_pipeline(const std::string& name, std::uint32_t clip_discard) {
+    g_clip_discard_pipelines.fetch_add(1, std::memory_order_relaxed);
+    static std::atomic<int> logs{0};
+    if (logs.fetch_add(1, std::memory_order_relaxed) < 24) {
+        host_log("render: pipeline %s: its pixel shader discards where clip distances 0-%u are negative, at entry", name.c_str(), (clip_discard & 0xff) - 1);
+    }
+}
 void note_unwritten_ps_inputs(const GfxPipeline& pl, const DrawState& s) {
     if (pl.ps.meta().spirv.empty() || pl.vs.meta().spirv.empty() || s.tess_hw || s.gs || s.rect) return;
     const std::vector<std::uint32_t> outs = module_locations(pl.vs.meta().spirv, 3), ins = module_locations(pl.ps.meta().spirv, 1);
@@ -5520,6 +5532,7 @@ GfxPipeline& build_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const std::
                                         gcn::vertex_formats_from_params_supported(vs_input->elements);
     pl.vs_formats_from_params = vs_formats_from_params;
     pl.clip_discard = clip_discard;
+    if (clip_discard) note_clip_discard_pipeline(pl.name, clip_discard);
     pl.tess_hw = s.tess_hw;
     pl.tess_control_points = s.tess_control_points;
     const std::uint32_t vs_out_cntl =
@@ -10526,6 +10539,8 @@ void cross_vendor_report() {
              static_cast<ull>(g_compare_binds[3].load()));
     host_log("render: depth-compare texture binds given the far-plane depth dummy (BBHOST_COMPARE_GUARD): %llu",
              static_cast<ull>(g_compare_guarded.load()));
+    host_log("render: pipelines whose pixel shader discards by clip distances at entry (built for draws or from the manifest): %llu",
+             static_cast<ull>(g_clip_discard_pipelines.load()));
     host_log("render: cross-vendor switches: PS input defaults %s (BBHOST_PS_INPUT_DEFAULTS), subgroup stages 0x%x (BBHOST_SUBGROUP_GATE), "
              "barrier masks %s (BBHOST_BARRIER_MASKS), layout fixes %s (BBHOST_LAYOUT_FIXES; copies into a target never made GENERAL %llu), "
              "sampler fixes %s (BBHOST_SAMPLER_FIXES)",
@@ -19186,9 +19201,10 @@ static bool draw_impl(const GpuDraw& d) {
     // pipeline creation. Name it before binding so a hung log says which.
     if (!bind_pl->bound_once && host_tooling()) {
         bind_pl->bound_once = true;
-        const std::string bind_note = bind_pl == &pl ? std::string()
-                                                     : std::string(", no fallback") + (bind_pl->vs.lifted ? ", lifted VS" : "") +
-                                                           (bind_pl->ps.lifted ? ", lifted PS" : "");
+        std::string bind_note = bind_pl == &pl ? std::string()
+                                               : std::string(", no fallback") + (bind_pl->vs.lifted ? ", lifted VS" : "") +
+                                                     (bind_pl->ps.lifted ? ", lifted PS" : "");
+        if (bind_pl->clip_discard) bind_note += ", its pixel shader discarding by clip distances";  // note_clip_discard_pipeline
         host_log("render: first bind of pipeline %s (storage-buffer constants: VS %zu, PS %zu%s)", pl.name.c_str(),
                  pl.vs.meta().buffers.size(), pl.ps.meta().buffers.size(), bind_note.c_str());
         // BBHOST_PIPELINE_STATS: the console's own register counts beside the
@@ -19548,6 +19564,7 @@ static bool draw_impl(const GpuDraw& d) {
     cmds.publish();  // the diagnostics below may record or flush: they come after this draw
     bump(g.draws);  // the one writer, under g.mu: no locked add
     bump(g.draws_ps[draw_ps_kind(*bind_pl)]);
+    if (bind_pl->clip_discard) bump(g.draws_clip_discard);
     const int vs_kind = draw_vs_kind(*bind_pl, use_vertex_input, fetch_words.empty() && !s.tess_hw && !s.domain_level);
     bump(g.draws_vs[vs_kind]);
     if (bind_pl->tess_hw) {

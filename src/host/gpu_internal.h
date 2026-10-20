@@ -521,6 +521,7 @@ struct Gpu {
     std::atomic<std::uint64_t> draws{0}, draw_failures{0}, gfx_pipelines{0};
     // The draws by how their pixel shader ran (DrawPs, gpu.h), beside `draws`.
     std::atomic<std::uint64_t> draws_ps[4] = {};
+    std::atomic<std::uint64_t> draws_clip_discard{0};  // GpuStats::draws_clip_discard
     std::atomic<std::uint64_t> draws_vs[4] = {};  // ... and by how their vertex shader ran (DrawVs)
     std::atomic<std::uint64_t> draws_vs_why[16] = {};  // kDrawVsOther by why (DrawVsWhy)
     std::atomic<std::uint64_t> draws_tess[6] = {};     // the host tessellator's draws by lifted stages (DrawTess)
