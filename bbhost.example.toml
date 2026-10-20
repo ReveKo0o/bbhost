@@ -82,6 +82,8 @@ fps_cap = 30
 # "Exit Game may not have been selected" warning after closing the window.
 # BBHOST_SKIP_INTRO=0 or 1 overrides this setting.
 skip_intro = false
+# Enable or disable Discord Rich Presence
+discord_rpc = true
 # The setup window (paths, server, account, PC enhancements, patches,
 # plugins) before the game: a release opens it at every start, a build from
 # source only when something needs setting or with --setup. Its "Show this
