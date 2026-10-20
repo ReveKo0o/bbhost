@@ -1179,6 +1179,12 @@ std::string image_reuse_report_locked();
 // The draws' and clears' target lookups by their views' resource generations (render.cpp rt_take_generation).
 std::string draw_gen_report_locked();
 RtImage* find_render_target(std::uint64_t base);
+// BBHOST_LAYOUT_FIXES (on unless 0; textures.cpp): a target's every layer and
+// level leaves UNDEFINED before it is used as GENERAL - a copy into a target
+// nothing has made GENERAL yet, a target carried from a texture - which
+// g_layout_fixed[0] counts the first kind of.
+bool render_layout_fixes();
+extern std::atomic<std::uint64_t> g_layout_fixed[4];
 // The view formats a colour target of `format` is created for (at most 5, the
 // format first): its channel layout's other numeric kinds, which keep RADV's
 // delta colour compression (render.cpp).
