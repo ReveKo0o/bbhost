@@ -186,6 +186,8 @@ void hash_options(KeyHasher& h, const gcn::TranslateOptions& o) {
     // A stage the device runs no subgroup operations in (gcn::subgroup_ops_in):
     // waves of one; a device with them in every stage keeps its keys.
     if (!gcn::subgroup_ops_in(o)) h.u32(0x5b01u);
+    // A clip-discarding pixel shader that demotes the pixel rather than ending it.
+    if (o.stage == gcn::Stage::Pixel && o.ps_clip_discard && gcn::clip_demote()) h.u32(0xde40u);
 }
 
 // ---- an entry: the TranslateResult, every field ----

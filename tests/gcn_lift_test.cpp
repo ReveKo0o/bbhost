@@ -166,7 +166,15 @@ struct QuadRun {
     std::string error;
     std::array<float, 4> out{};
 };
-QuadRun run_quad(const std::vector<std::uint32_t>& spv, float x0, float y0, const std::array<float, 4>& attr0) {
+//
+// `clip` (with a clip-discarding shader, TranslateOptions::ps_clip_discard):
+// each invocation's clip distance 0 at the clip location, and the prologue's
+// one selection run per invocation - OpKill ending the invocation as AMD's and
+// Intel's drivers do (what its registers hold afterwards is garbage, which
+// its quad neighbours' quad operations read), OpDemoteToHelperInvocation
+// making it a helper that runs on and writes nothing.
+QuadRun run_quad(const std::vector<std::uint32_t>& spv, float x0, float y0, const std::array<float, 4>& attr0,
+                 const std::array<float, 4>* clip = nullptr, std::uint32_t clip_location = 0) {
     QuadRun run;
     using Vec = std::array<std::uint32_t, 4>;
     std::map<std::uint32_t, std::array<Vec, 4>> val;  // id -> per-invocation value
@@ -177,6 +185,12 @@ QuadRun run_quad(const std::vector<std::uint32_t>& spv, float x0, float y0, cons
         run.error = why;
         return run;
     };
+    // The prologue's selection: the invocations it takes into its block, and
+    // what became of them there.
+    std::array<bool, 4> dead{}, helper{}, taken{};
+    std::uint32_t taken_label = 0, merge_label = 0;
+    bool in_taken = false;
+    constexpr std::uint32_t kGarbage = 0x7fc0dead;  // an ended invocation's registers
     bool in_body = false;
     for (std::size_t i = 5; i < spv.size();) {
         const std::uint32_t n = spv[i] >> 16, op = spv[i] & 0xffff;
@@ -198,7 +212,11 @@ QuadRun run_quad(const std::vector<std::uint32_t>& spv, float x0, float y0, cons
         }
         case 41: constants[a[1]] = 1; continue;     // OpConstantTrue
         case 42: constants[a[1]] = 0; continue;     // OpConstantFalse
-        case 248: in_body = true; continue;         // OpLabel
+        case 248:                                   // OpLabel
+            in_body = true;
+            in_taken = taken_label && a[0] == taken_label;
+            if (merge_label && a[0] == merge_label) taken_label = merge_label = 0;
+            continue;
         default: break;
         }
         if (!in_body) continue;  // types, names, capabilities, the entry point
@@ -214,6 +232,10 @@ QuadRun run_quad(const std::vector<std::uint32_t>& spv, float x0, float y0, cons
                 if (builtin.count(a[2]) && builtin[a[2]] == 15) {  // FragCoord at the pixel's centre
                     const float x = x0 + static_cast<float>(l & 1) + 0.5f, y = y0 + static_cast<float>(l >> 1) + 0.5f;
                     val[a[1]][static_cast<std::size_t>(l)] = {std::bit_cast<std::uint32_t>(x), std::bit_cast<std::uint32_t>(y), 0, 0};
+                } else if (builtin.count(a[2]) && builtin[a[2]] == 23) {  // HelperInvocation: none at the start
+                    val[a[1]][static_cast<std::size_t>(l)] = {0, 0, 0, 0};
+                } else if (clip && storage[a[2]] == 1 && location.count(a[2]) && location[a[2]] == clip_location) {
+                    val[a[1]][static_cast<std::size_t>(l)] = {std::bit_cast<std::uint32_t>((*clip)[static_cast<std::size_t>(l)]), 0, 0, 0};
                 } else if (storage[a[2]] == 1 && location.count(a[2]) && location[a[2]] == 0) {
                     val[a[1]][static_cast<std::size_t>(l)] = {std::bit_cast<std::uint32_t>(attr0[static_cast<std::size_t>(l)]), 0, 0, 0};
                 } else {
@@ -223,7 +245,30 @@ QuadRun run_quad(const std::vector<std::uint32_t>& spv, float x0, float y0, cons
             break;
         case 62:  // OpStore
             if (storage[a[0]] != 3 || !location.count(a[0]) || location[a[0]] != 0) return fail("a store to something other than mrt0");
-            for (int l = 0; l < 4; ++l) outputs[0][static_cast<std::size_t>(l)] = f(get(a[1], l)[0]);
+            for (int l = 0; l < 4; ++l) {
+                if (dead[static_cast<std::size_t>(l)] || helper[static_cast<std::size_t>(l)]) continue;  // ended, or a helper: no output
+                outputs[0][static_cast<std::size_t>(l)] = f(get(a[1], l)[0]);
+            }
+            break;
+        case 247: break;  // OpSelectionMerge
+        case 250:         // OpBranchConditional: the prologue's selection
+            if (taken_label) return fail("a second selection");
+            for (int l = 0; l < 4; ++l) taken[static_cast<std::size_t>(l)] = get(a[0], l)[0] != 0;
+            taken_label = a[1];
+            merge_label = a[2];
+            break;
+        case 249: break;  // OpBranch (to the merge)
+        case 252:         // OpKill: the invocations in the selection end; their registers are garbage from here
+            if (!in_taken) return fail("a kill outside the prologue's selection");
+            for (int l = 0; l < 4; ++l) {
+                if (!taken[static_cast<std::size_t>(l)]) continue;
+                dead[static_cast<std::size_t>(l)] = true;
+                for (auto& [id, lanes] : val) lanes[static_cast<std::size_t>(l)] = {kGarbage, kGarbage, kGarbage, kGarbage};
+            }
+            break;
+        case 5380:  // OpDemoteToHelperInvocation: helpers, running on
+            if (!in_taken) return fail("a demote outside the prologue's selection");
+            for (int l = 0; l < 4; ++l) helper[static_cast<std::size_t>(l)] = helper[static_cast<std::size_t>(l)] || taken[static_cast<std::size_t>(l)];
             break;
         case 81:  // OpCompositeExtract
             for (int l = 0; l < 4; ++l) val[a[1]][static_cast<std::size_t>(l)] = {get(a[2], l)[a[3]], 0, 0, 0};
@@ -278,6 +323,15 @@ QuadRun run_quad(const std::vector<std::uint32_t>& spv, float x0, float y0, cons
         }
         case 253: case 56: break;  // OpReturn, OpFunctionEnd
         default: return fail("unsupported opcode " + std::to_string(op));
+        }
+        // An ended invocation computes nothing more: whatever its registers held.
+        const bool has_result = op == 61 || op == 80 || op == 81 || op == 124 || op == 129 || op == 131 || op == 133 || op == 156 ||
+                                op == 166 || op == 167 || op == 168 || op == 169 || op == 184 || op == 186 || op == 197 || op == 198 ||
+                                op == 199 || op == 365 || op == 366;
+        if (has_result) {
+            for (int l = 0; l < 4; ++l) {
+                if (dead[static_cast<std::size_t>(l)]) val[a[1]][static_cast<std::size_t>(l)] = {kGarbage, kGarbage, kGarbage, kGarbage};
+            }
         }
     }
     if (!outputs.count(0)) return fail("mrt0 is not written");
@@ -635,6 +689,50 @@ void default_inputs() {
             CHECK(r.ok && r.out[0] == attr[0] && r.out[3] == attr[3]);
         }
     }
+}
+
+// The clip prologue (TranslateOptions::ps_clip_discard) and a quad
+// derivative across the clip edge: a pixel the clip distance cuts out reads,
+// on the PS4, as a helper lane of its quad - the clipper left it out of the
+// triangle, its quad's other pixels still take its values. With
+// gcn::clip_demote the translation and the lift demote it to a helper
+// invocation, and its neighbour's quad read gets its value; ended by OpKill
+// (as before), the neighbour reads whatever the ended invocation's registers
+// held on drivers that end it (the interpreter models AMD's and Intel's: a
+// garbage word).
+void clip_demote() {
+    std::vector<std::uint32_t> w;
+    wqm_prologue(w);                                // whole-quad mode, v2 = attr0.x
+    swizzle(w, 3, 2, 0x8000u | 1u | 0u << 2 | 3u << 4 | 2u << 6);  // v3 = the horizontal neighbour's v2: lanes 1 0 3 2
+    push(w, {sopp(12, 0xc07f), sop1(kMovB64, kExec, 2)});
+    export_mrt0(w, 3, 3, 3, 3);
+    w.push_back(kEndpgm);
+    gcn::TranslateOptions o = synthetic_options();
+    o.ps_clip_discard = 1u | 1u << 8;  // clip distance 0, at location 1
+    const std::array<float, 4> attr = {10.0f, 21.0f, 32.0f, 43.0f};
+    const std::array<float, 4> clip = {1.0f, -1.0f, 1.0f, 1.0f};  // the clip edge crosses the quad: lane 1 cut out
+    for (const bool demote : {true, false}) {
+        gcn::set_clip_demote(demote);
+        const Lifted l = lift_words(w, o);
+        for (const std::string& why : l.lift.rejections) std::fprintf(stderr, "clip demote %d: rejected: %s\n", demote ? 1 : 0, why.c_str());
+        CHECK(l.ref.ok() && l.lift.ok());
+        if (!l.ref.ok() || !l.lift.ok()) continue;
+        CHECK(spirv_valid(l.ref.spirv) && spirv_valid(l.lift.spirv));
+        CHECK(count_op(l.lift.spirv, 5380) == (demote ? 1u : 0u) && count_op(l.ref.spirv, 5380) == (demote ? 1u : 0u));  // OpDemoteToHelperInvocation
+        CHECK(count_op(l.lift.spirv, 252) == (demote ? 0u : 1u));                                                        // OpKill
+        const QuadRun r = run_quad(l.lift.spirv, 0.0f, 0.0f, attr, &clip, 1);
+        if (!r.ok) std::fprintf(stderr, "clip demote %d: %s\n", demote ? 1 : 0, r.error.c_str());
+        CHECK(r.ok);
+        if (!r.ok) continue;
+        // The pixels drawn: lane 0 takes its cut-out neighbour's value, 2 and 3 each other's.
+        CHECK(r.out[2] == attr[3] && r.out[3] == attr[2]);
+        if (demote) {
+            CHECK(r.out[0] == attr[1]);
+        } else {
+            CHECK(r.out[0] != attr[1]);  // the ended invocation's garbage
+        }
+    }
+    gcn::set_clip_demote(false);
 }
 
 void packed_exports() {
@@ -4493,6 +4591,7 @@ int main(int argc, char** argv) {
     cndmask_modifiers();
     packed_exports();
     default_inputs();
+    clip_demote();
     synthetic_swizzles();
     swizzles_in_blocks();
     swizzles_and_loops();

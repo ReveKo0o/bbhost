@@ -17,6 +17,11 @@ namespace gcn {
 namespace {
 std::atomic<std::uint32_t> g_subgroup_stages{0x7fffffffu};  // set_subgroup_stages: every stage until the host says
 }  // namespace
+namespace {
+std::atomic<bool> g_clip_demote{false};  // set_clip_demote
+}  // namespace
+void set_clip_demote(bool on) { g_clip_demote.store(on, std::memory_order_relaxed); }
+bool clip_demote() { return g_clip_demote.load(std::memory_order_relaxed); }
 void set_subgroup_stages(std::uint32_t vk_stages) { g_subgroup_stages.store(vk_stages, std::memory_order_relaxed); }
 std::uint32_t subgroup_stages() { return g_subgroup_stages.load(std::memory_order_relaxed); }
 std::uint32_t vk_stage_of(const TranslateOptions& o) {
@@ -4127,7 +4132,16 @@ struct Translator {
             m.emit_void(spv::OpSelectionMerge, {l_on, 0u});
             m.emit_void(spv::OpBranchConditional, {out, l_kill, l_on});
             m.label(l_kill);
-            m.emit_void(spv::OpKill, {});
+            if (clip_demote()) {
+                // The cut-out pixel a helper of its quad, as the clipper leaves
+                // it, not ended: its quad's derivatives need it (gcn::set_clip_demote).
+                m.capability(spv::CapDemoteToHelperInvocation);
+                m.extension("SPV_EXT_demote_to_helper_invocation");
+                m.emit_void(spv::OpDemoteToHelperInvocation, {});
+                m.emit_void(spv::OpBranch, {l_on});
+            } else {
+                m.emit_void(spv::OpKill, {});
+            }
             m.label(l_on);
         }
         m.store(v_lane, subgroups ? m.load(t_u32, in_subgroup_lane) : c_zero_u);

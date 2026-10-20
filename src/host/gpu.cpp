@@ -3197,6 +3197,15 @@ bool init_locked() {
         vkGetPhysicalDeviceFeatures2(g.phys, &qf);
         g.cache_control = q13.pipelineCreationCacheControl == VK_TRUE;
         f13.pipelineCreationCacheControl = q13.pipelineCreationCacheControl;
+        // Also required by Vulkan 1.3: a pixel the clip distances cut out
+        // (TranslateOptions::kVsOutCntlClipVarying) becomes a helper of its
+        // quad, as the PS4's clipper leaves it, rather than ending - the quad's
+        // derivatives need it (gcn::set_clip_demote). BBHOST_CLIP_DEMOTE=0:
+        // OpKill, as before.
+        const char* e = std::getenv("BBHOST_CLIP_DEMOTE");
+        const bool demote = q13.shaderDemoteToHelperInvocation == VK_TRUE && !(e && e[0] == '0');
+        if (demote) f13.shaderDemoteToHelperInvocation = VK_TRUE;
+        gcn::set_clip_demote(demote);
     }
     VkPhysicalDeviceVulkan12Features f12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
     f12.pNext = &f13;

@@ -442,6 +442,18 @@ struct TranslateOptions {
 // (translation_cache.cpp), so a device with them everywhere keeps its keys.
 void set_subgroup_stages(std::uint32_t vk_stages);
 std::uint32_t subgroup_stages();
+// A pixel shader's discard by the vertex stage's clip distances
+// (TranslateOptions::ps_clip_discard) demotes the pixel to a helper invocation
+// (OpDemoteToHelperInvocation) where the device has the feature - as the
+// PS4's clipper leaves a pixel it cut out of a quad's triangle, a helper whose
+// values the quad's derivatives still take - rather than ending it with
+// OpKill, after which the derivatives of a quad the clip edge crosses are
+// undefined (drivers that end such an invocation take them from whatever its
+// registers held). Set once by the host before its first translation, as
+// set_subgroup_stages; off until then. Part of a clip-discarding translation's
+// key (translation_cache.cpp).
+void set_clip_demote(bool on);
+bool clip_demote();
 // The Vulkan stage a translation or lift with these options runs in.
 std::uint32_t vk_stage_of(const TranslateOptions& o);
 inline bool subgroup_ops_in(const TranslateOptions& o) { return (subgroup_stages() & vk_stage_of(o)) != 0; }
