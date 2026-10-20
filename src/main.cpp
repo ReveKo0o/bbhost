@@ -1,3 +1,4 @@
+#include "../third_party/discord-rpc/discord_rpc.h"
 #include "engine/frame_pool.h"
 #include "engine/key_prompts.h"
 #include "decomp/decomp.h"
@@ -971,7 +972,11 @@ int main(int argc, char** argv) {
     // Initialize Discord Rich Presence if enabled in options
     if (host_opt_get("discord_rpc")) {
         InitDiscordRPC();
-        UpdatePlayerPresence("Central Yharnam", 1);
+        // Get actual current map name and player level from game state instead of hardcoded values
+        const char* currentMap = hle_get_current_map_name() ? hle_get_current_map_name() : "Bloodborne";
+        int currentLevel = hle_get_player_level() > 0 ? hle_get_player_level() : 1;
+        UpdatePlayerPresence(currentMap, currentLevel);
+    }
     }
     config_set_skip_intro(host_settings().skip_logos);
     // The PC enhancements are read the same way, once: each installs (or its
