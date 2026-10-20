@@ -223,6 +223,8 @@ struct Located {
 struct Gpu {
     std::uint32_t max_lds_bytes = 32 * 1024;  // maxComputeSharedMemorySize
     float max_anisotropy = 16.0f;             // maxSamplerAnisotropy
+    float max_lod_bias = 15.0f;               // maxSamplerLodBias
+    bool mirror_clamp = false;                // samplerMirrorClampToEdge, enabled
     bool in_transfer = false;                 // a coalesced run of guest-memory transfers is open
     // Fence writes held back to the end of the command buffer (see
     // host_gpu_mem_write): recording them inline broke the render pass and
@@ -1401,6 +1403,11 @@ std::string texture_view_by_id_report();
 // larger than the caches; a draw asks for its views' entries together).
 void texture_view_by_id_prefetch(std::uint32_t id);
 VkSampler sampler_for(const std::uint32_t* ssharp, bool compare);
+// BBHOST_SAMPLER_FIXES (on unless 0; textures.cpp): a sampler's state within
+// what the device allows - MIRROR_CLAMP_TO_EDGE with its feature (else
+// MIRRORED_REPEAT), maxLod at or above minLod, the LOD bias within
+// maxSamplerLodBias.
+bool sampler_fixes_on();
 // spv::Dim of a T# type as the translator is told it: DimCube for a cube, which
 // the translator then declares, and texture_view binds, as a 2D array of faces.
 std::uint32_t tsharp_dim(std::uint32_t type, bool& arrayed);

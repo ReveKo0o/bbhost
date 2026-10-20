@@ -2900,6 +2900,7 @@ bool init_locked() {
     host_log("gpu: stage interface limits: vertex outputs %u, geometry outputs %u, fragment inputs %u components",
              props.limits.maxVertexOutputComponents, props.limits.maxGeometryOutputComponents, props.limits.maxFragmentInputComponents);
     g.max_anisotropy = props.limits.maxSamplerAnisotropy;
+    g.max_lod_bias = props.limits.maxSamplerLodBias;
     g.ssbo_align = props.limits.minStorageBufferOffsetAlignment ? props.limits.minStorageBufferOffsetAlignment : 1;
     g.ssbo_max_range = props.limits.maxStorageBufferRange;
     // BBHOST_CB_SSBO=0: constant buffers stay on the page-table path. =1: they
@@ -3310,6 +3311,13 @@ bool init_locked() {
         if (q12.shaderFloat16) f12.shaderFloat16 = VK_TRUE;
         if (q12.timelineSemaphore && !(std::getenv("BBHOST_TIMELINE") && std::getenv("BBHOST_TIMELINE")[0] == '0'))
             f12.timelineSemaphore = VK_TRUE;
+        // GCN's MIRROR_ONCE_LAST_TEXEL is Vulkan's MIRROR_CLAMP_TO_EDGE, which
+        // a sampler may name only with this feature on (textures.cpp
+        // sampler_for falls back to MIRRORED_REPEAT without it).
+        if (q12.samplerMirrorClampToEdge && sampler_fixes_on()) {
+            f12.samplerMirrorClampToEdge = VK_TRUE;
+            g.mirror_clamp = true;
+        }
         if (supported.shaderInt16) f2.features.shaderInt16 = VK_TRUE;
         g.has_f16_math = q12.shaderFloat16 && supported.shaderInt16;
         gcn::set_native_half_rtz(native);

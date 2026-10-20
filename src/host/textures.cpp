@@ -3060,6 +3060,14 @@ std::string texture_view_by_id_report() {
     return buf;
 }
 
+bool sampler_fixes_on() {
+    static const bool on = [] {
+        const char* e = std::getenv("BBHOST_SAMPLER_FIXES");
+        return !(e && e[0] == '0');
+    }();
+    return on;
+}
+
 VkSampler sampler_for(const std::uint32_t* s, bool compare) {
     // The last sampler made for these words, in front of the map (samplers
     // are never destroyed).
@@ -3080,12 +3088,14 @@ VkSampler sampler_for(const std::uint32_t* s, bool compare) {
         m.sampler = it->second;
         return it->second;
     }
-    auto address = [](std::uint32_t c) {
+    // BBHOST_SAMPLER_FIXES: mirror-once only where the device enabled it.
+    const bool fixes = sampler_fixes_on();
+    auto address = [fixes](std::uint32_t c) {
         switch (c & 7) {
         case 0: return VK_SAMPLER_ADDRESS_MODE_REPEAT;
         case 1: return VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT;
         case 2: return VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-        case 3: return VK_SAMPLER_ADDRESS_MODE_MIRROR_CLAMP_TO_EDGE;
+        case 3: return !fixes || g.mirror_clamp ? VK_SAMPLER_ADDRESS_MODE_MIRROR_CLAMP_TO_EDGE : VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT;
         case 4: case 5: return VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
         default: return VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;
         }
@@ -3109,6 +3119,14 @@ VkSampler sampler_for(const std::uint32_t* s, bool compare) {
     std::int32_t bias = static_cast<std::int32_t>(s[2] & 0x3fff);
     if (bias & 0x2000) bias -= 0x4000;
     sci.mipLodBias = static_cast<float>(bias) / 256.0f;
+    if (fixes) {
+        // Vulkan's limits on the LOD state (GCN takes any): the bias within
+        // maxSamplerLodBias, and maxLod not below minLod - a sampler without
+        // mipmaps (maxLod 0.25 above) whose MIN_LOD is past it keeps its base
+        // level, as GCN's MIP_FILTER none does.
+        sci.mipLodBias = std::clamp(sci.mipLodBias, -g.max_lod_bias, g.max_lod_bias);
+        if (sci.maxLod < sci.minLod) sci.minLod = sci.maxLod;
+    }
     // The comparison only applies to samplers the shader uses with
     // image_sample_c* (Vulkan needs compareEnable for Dref ops and forbids it
     // for plain sampling); DEPTH_COMPARE_FUNC gives the function.

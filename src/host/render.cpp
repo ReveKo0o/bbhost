@@ -10514,6 +10514,11 @@ void cross_vendor_report() {
              static_cast<ull>(g_compare_binds[3].load()));
     host_log("render: depth-compare texture binds given the far-plane depth dummy (BBHOST_COMPARE_GUARD): %llu",
              static_cast<ull>(g_compare_guarded.load()));
+    host_log("render: cross-vendor switches: PS input defaults %s (BBHOST_PS_INPUT_DEFAULTS), subgroup stages 0x%x (BBHOST_SUBGROUP_GATE), "
+             "barrier masks %s (BBHOST_BARRIER_MASKS), layout fixes %s (BBHOST_LAYOUT_FIXES; copies into a target never made GENERAL %llu), "
+             "sampler fixes %s (BBHOST_SAMPLER_FIXES)",
+             g_ps_input_defaults ? "on" : "off", gcn::subgroup_stages(), barrier_masks_fixed() ? "on" : "off", render_layout_fixes() ? "on" : "off",
+             static_cast<ull>(g_layout_fixed[0].load()), sampler_fixes_on() ? "on" : "off");
 }
 
 void render_report() {
