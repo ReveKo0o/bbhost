@@ -1438,6 +1438,13 @@ private:
     }
     Id attr(int a) {
         if (auto it = attr_loads.find(a); it != attr_loads.end()) return it->second;
+        // GCN's default constant where the input map gives it (translate.cpp
+        // in_value): no input variable.
+        if (const std::uint8_t entry = static_cast<std::size_t>(a) < opt.ps_input_map.size() ? opt.ps_input_map[a] : static_cast<std::uint8_t>(a);
+            TranslateOptions::ps_input_is_default(entry)) {
+            const Id rgb = m.const_f32((entry & 3) >= 2 ? 1.0f : 0.0f), alpha = m.const_f32((entry & 1) ? 1.0f : 0.0f);
+            return attr_loads[a] = m.const_composite(t_v4f, {rgb, rgb, rgb, alpha});
+        }
         Id var;
         if (auto it = in_params.find(a); it != in_params.end()) {
             var = it->second;

@@ -3765,14 +3765,25 @@ void check_precompiled_stage(const char* stage, const std::string& name, const g
                  cached.samplers.size(), again.samplers.size(), cached.buffers.size(), again.buffers.size(), checked.load());
     }
 }
+// BBHOST_PS_INPUT_DEFAULTS (on unless 0): a pixel-shader input whose
+// SPI_PS_INPUT_CNTL OFFSET has bit 5 - no vertex output carries its semantic,
+// so GX gave it 0x20 - reads GCN's DEFAULT_VAL constant, as the PS4 does,
+// instead of the location of register 0, which the vertex stage may not write:
+// an input no output writes is undefined in Vulkan (NVIDIA reads zeros, AMD and
+// lavapipe whatever the location held). =0 reads register 0's location again.
+const bool g_ps_input_defaults = [] {
+    const char* e = std::getenv("BBHOST_PS_INPUT_DEFAULTS");
+    return !(e && e[0] == '0');
+}();
 // A pixel shader's input locations (TranslateOptions::ps_input_map), up to the
-// last input it reads: `registers[k]` for inputs it reads, k for the others.
+// last input it reads: `registers[k]` (SPI_PS_INPUT_CNTL_k, or a register
+// predicted from its semantic) for inputs it reads, k for the others.
 std::vector<std::uint8_t> ps_input_locations(std::uint32_t read_inputs, const std::uint32_t* registers) {
     std::vector<std::uint8_t> map;
     for (std::uint32_t k = 0; k < 32; ++k) {
         if (!((read_inputs >> k) & 1)) continue;
         while (map.size() < k) map.push_back(static_cast<std::uint8_t>(map.size()));
-        map.push_back(static_cast<std::uint8_t>(registers[k] & 0x1f));
+        map.push_back(gcn::ps_input_map_entry(registers[k], g_ps_input_defaults));
     }
     return map;
 }
@@ -18949,6 +18960,7 @@ static bool draw_impl(const GpuDraw& d) {
         cd.translate.set("vs_lifted", bind_pl->vs.lifted);
         cd.translate.set("vertex_formats_from_params", bind_pl->vs_formats_from_params);
         cd.translate.set("link_by_register", true);  // gcnlift: identity output links, pixel-shader inputs at SPI_PS_INPUT_CNTL's registers
+        cd.translate.set("ps_input_defaults", g_ps_input_defaults);  // gcnlift: OFFSET bit 5 reads DEFAULT_VAL (gcn::ps_input_map_entry)
         cd.translate.set("vertex_input", use_vertex_input);
         cd.translate.set("vs_out_cntl", json::hex(s.vs_out_cntl));  // with the vertex_input elements, what gcnlift needs for the VS
         // The clip varying (TranslateOptions::kVsOutCntlClipVarying): the pixel

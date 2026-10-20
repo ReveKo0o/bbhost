@@ -171,6 +171,7 @@ QuadRun run_quad(const std::vector<std::uint32_t>& spv, float x0, float y0, cons
     using Vec = std::array<std::uint32_t, 4>;
     std::map<std::uint32_t, std::array<Vec, 4>> val;  // id -> per-invocation value
     std::map<std::uint32_t, std::uint32_t> constants, builtin, location, storage;
+    std::map<std::uint32_t, Vec> composites;  // OpConstantComposite of up to four scalar constants
     std::map<std::uint32_t, std::array<float, 4>> outputs;
     const auto fail = [&](const std::string& why) {
         run.error = why;
@@ -189,6 +190,12 @@ QuadRun run_quad(const std::vector<std::uint32_t>& spv, float x0, float y0, cons
             continue;
         case 59: storage[a[1]] = a[2]; continue;  // OpVariable
         case 43: constants[a[1]] = a[2]; continue;  // OpConstant (low word)
+        case 44: {                                  // OpConstantComposite
+            Vec v{};
+            for (std::uint32_t k = 2; k < n - 1 && k < 6; ++k) v[k - 2] = constants.count(a[k]) ? constants[a[k]] : 0;
+            composites[a[1]] = v;
+            continue;
+        }
         case 41: constants[a[1]] = 1; continue;     // OpConstantTrue
         case 42: constants[a[1]] = 0; continue;     // OpConstantFalse
         case 248: in_body = true; continue;         // OpLabel
@@ -197,6 +204,7 @@ QuadRun run_quad(const std::vector<std::uint32_t>& spv, float x0, float y0, cons
         if (!in_body) continue;  // types, names, capabilities, the entry point
         const auto get = [&](std::uint32_t id, int lane) -> Vec {
             if (const auto c = constants.find(id); c != constants.end()) return {c->second, 0, 0, 0};
+            if (const auto c = composites.find(id); c != composites.end()) return c->second;
             return val[id][static_cast<std::size_t>(lane)];
         };
         const auto f = [](std::uint32_t b) { return std::bit_cast<float>(b); };
@@ -564,6 +572,71 @@ bool has_u32_constant(const std::vector<std::uint32_t>& spv, std::uint32_t value
     }
     return false;
 }
+// Input variables (not built-ins) with a Location: what a vertex output must
+// write for the input to be defined.
+std::size_t located_inputs(const std::vector<std::uint32_t>& spv) {
+    std::set<std::uint32_t> inputs, located;
+    for (std::size_t i = 5; i < spv.size() && (spv[i] >> 16);) {
+        const std::uint32_t n = spv[i] >> 16, op = spv[i] & 0xffff;
+        if (op == 59 && n >= 4 && spv[i + 3] == 1) inputs.insert(spv[i + 2]);  // OpVariable Input
+        if (op == 71 && n >= 4 && spv[i + 2] == 30) located.insert(spv[i + 1]);  // OpDecorate Location
+        i += n;
+    }
+    std::size_t count = 0;
+    for (const std::uint32_t v : inputs) count += located.count(v);
+    return count;
+}
+
+// An input the input map gives GCN's default (SPI_PS_INPUT_CNTL OFFSET bit 5:
+// no vertex output carries its semantic) reads DEFAULT_VAL's constant in the
+// translation and the lift - no input variable, which no vertex output would
+// write - and the map entry comes from SPI_PS_INPUT_CNTL as the renderer
+// builds it (gcn::ps_input_map_entry).
+void default_inputs() {
+    using O = gcn::TranslateOptions;
+    CHECK(gcn::ps_input_map_entry(0x020, true) == O::kPsInputDefault);
+    CHECK(gcn::ps_input_map_entry(0x320, true) == (O::kPsInputDefault | 3));
+    CHECK(gcn::ps_input_map_entry(0x523, true) == (O::kPsInputDefault | 1));  // FLAT_SHADE ignored; OFFSET 0x23 has bit 5
+    CHECK(gcn::ps_input_map_entry(0x020, false) == 0);                         // BBHOST_PS_INPUT_DEFAULTS=0: register 0's location
+    CHECK(gcn::ps_input_map_entry(0x305, true) == 5);                          // a register: its location, DEFAULT_VAL unused
+    const std::array<float, 4> attr = {10.0f, 21.0f, 32.0f, 43.0f};
+    for (std::uint32_t chan : {0u, 3u}) {
+        std::vector<std::uint32_t> w = {vintrp(0, 2, 0, chan, 0), vintrp(1, 2, 0, chan, 1)};  // v2 = attr0.<chan>
+        export_mrt0(w, 2, 2, 2, 2);
+        w.push_back(kEndpgm);
+        for (std::uint32_t v = 0; v < 4; ++v) {
+            gcn::TranslateOptions o = synthetic_options();
+            o.ps_input_map = {static_cast<std::uint8_t>(O::kPsInputDefault | v)};
+            const Lifted l = lift_words(w, o);
+            for (const std::string& why : l.lift.rejections) std::fprintf(stderr, "default input %u: rejected: %s\n", v, why.c_str());
+            CHECK(l.ref.ok() && l.lift.ok());
+            if (!l.ref.ok() || !l.lift.ok()) continue;
+            CHECK(spirv_valid(l.ref.spirv) && spirv_valid(l.lift.spirv));
+            CHECK(located_inputs(l.ref.spirv) == 0 && located_inputs(l.lift.spirv) == 0);
+            CHECK(l.ref.ps_inputs.empty());
+            const float want = chan == 3 ? static_cast<float>(v & 1) : v >= 2 ? 1.0f : 0.0f;
+            const QuadRun r = run_quad(l.lift.spirv, 0.0f, 0.0f, attr);
+            if (!r.ok) std::fprintf(stderr, "default input %u, channel %u: %s\n", v, chan, r.error.c_str());
+            CHECK(r.ok);
+            for (std::size_t k = 0; k < 4 && r.ok; ++k) {
+                if (r.out[k] != want) {
+                    std::fprintf(stderr, "default input %u, channel %u: lane %zu read %g, expected %g\n", v, chan, k, r.out[k], want);
+                    ++g_failures;
+                }
+            }
+        }
+        // The old reading (register 0's location): an input variable at 0, read as the vertex stage left it.
+        gcn::TranslateOptions o = synthetic_options();
+        o.ps_input_map = {gcn::ps_input_map_entry(0x020, false)};
+        const Lifted l = lift_words(w, o);
+        CHECK(l.lift.ok() && located_inputs(l.lift.spirv) == 1 && located_inputs(l.ref.spirv) == 1);
+        if (chan == 0 && l.lift.ok()) {
+            const QuadRun r = run_quad(l.lift.spirv, 0.0f, 0.0f, attr);
+            CHECK(r.ok && r.out[0] == attr[0] && r.out[3] == attr[3]);
+        }
+    }
+}
+
 void packed_exports() {
     for (const bool varying : {false, true}) {
         std::vector<std::uint32_t> w = {vintrp(0, 2, 0, 0, 0), vintrp(1, 2, 0, 0, 1), vop1(kVMov, 3, kZero)};
@@ -4379,6 +4452,7 @@ int main(int argc, char** argv) {
     control_flow::run();
     cndmask_modifiers();
     packed_exports();
+    default_inputs();
     synthetic_swizzles();
     swizzles_in_blocks();
     swizzles_and_loops();

@@ -1275,6 +1275,19 @@ struct Translator {
         in_location_vars[location] = var;
         return var;
     }
+    // A pixel shader input's value: its Input variable, loaded, or GCN's
+    // default constant where the input map gives the default
+    // (TranslateOptions::kPsInputDefault), which has no variable.
+    Id in_value(int attr) {
+        const std::uint8_t entry = static_cast<std::size_t>(attr) < opt.ps_input_map.size() ? opt.ps_input_map[attr] : static_cast<std::uint8_t>(attr);
+        if (TranslateOptions::ps_input_is_default(entry)) return ps_input_default(entry & 3);
+        return m.load(t_v4f, in_param(attr));
+    }
+    // SPI_PS_INPUT_CNTL.DEFAULT_VAL v: (0,0,0,0), (0,0,0,1), (1,1,1,0), (1,1,1,1).
+    Id ps_input_default(std::uint32_t v) {
+        const Id rgb = cf(v >= 2 ? 1.0f : 0.0f), a = cf((v & 1) ? 1.0f : 0.0f);
+        return m.const_composite(t_v4f, {rgb, rgb, rgb, a});
+    }
     Id out_param(int n) {
         auto it = out_params.find(n);
         if (it != out_params.end()) return it->second;
@@ -3558,8 +3571,7 @@ struct Translator {
 
     // ---- interpolation and export
     void vintrp(const Inst& in) {
-        const Id var = in_param(in.attr);
-        const Id v = m.load(t_v4f, var);
+        const Id v = in_value(in.attr);
         write_v(in.dst, u(extract(t_f32, v, in.attr_chan)));
     }
     void exp(const Inst& in) {
@@ -3627,7 +3639,7 @@ struct Translator {
                 return;
             }
             if (opt.debug_ps == 3) {
-                const Id uv = m.load(t_v4f, in_param(1));
+                const Id uv = in_value(1);
                 m.store(var, vec4f(extract(t_f32, uv, 0), extract(t_f32, uv, 1), cf(0.0f), cf(1.0f)));
                 return;
             }
