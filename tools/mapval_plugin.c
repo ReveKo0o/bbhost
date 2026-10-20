@@ -28,7 +28,10 @@
  *                                             with the loading screen gone. Up
  *                                             to four event flags are turned on
  *                                             first, as the load reads them: a
- *                                             door's "opened", say
+ *                                             door's "opened", say. Failed
+ *                                             after BBHOST_MAPVAL_TRAVEL_S
+ *                                             seconds (150; a slow renderer
+ *                                             such as lavapipe needs more)
  *     walk <name> <s>                         log walk-ready and give the
  *                                             driver <s> seconds to walk
  *     wait <s>
@@ -173,6 +176,7 @@ static double travel_still_t;  /* when the player came to rest for the travel's 
 static double travel_loading;  /* loading-screen seconds within the current travel step */
 static int dump_chrs = 0, want_team = -1;
 static int warp_tries = 10; /* BBHOST_MAPVAL_WARP_TRIES */
+static double travel_limit = 150; /* BBHOST_MAPVAL_TRAVEL_S: the seconds a travel may take */
 /* BBHOST_MAPVAL_DEADLINE=<s>: that long after the probe loads, a tour still
  * running skips to its exit step (a harness's lock hold has a limit; the run
  * still ends with its reports and cache saves). */
@@ -778,7 +782,7 @@ static void tick(double t) {
             ++retravel;
             api->lamp_warp(tour_rp);
         }
-        if (travel_still > 90 || el > 150) {
+        if (travel_still > 90 || el > travel_limit) {
             retravel = 0;
             api->log("mapval retravel-%s %.3f %08x", travel_still > 90 ? "done" : "failed", t, b);
             begin(cur, t);
@@ -920,7 +924,7 @@ static void tick(double t) {
             good_pos[1] += 0.3f;
             have_good = 1;
             next = 1;
-        } else if (travel_failed || el > 150) {
+        } else if (travel_failed || el > travel_limit) {
             api->log("mapval travel-failed %s %.3f in %08x after %.1f s", s->name, t, b, el);
             /* The rest of this block's steps would run in the wrong place:
              * skip to the next travel. */
@@ -1100,6 +1104,8 @@ BB_PLUGIN_EXPORT int bb_plugin_image(const BbHostApi* a) {
     float_mode = fm && fm[0] == '1';
     const char* dl = getenv("BBHOST_MAPVAL_DEADLINE");
     if (dl && *dl) deadline_s = atof(dl);
+    const char* tl = getenv("BBHOST_MAPVAL_TRAVEL_S");
+    if (tl && *tl && atof(tl) > 0) travel_limit = atof(tl);
     loaded_t = now_s();
     if (tour && *tour) load_tour(tour);
     a->on_frame(on_frame, 0);

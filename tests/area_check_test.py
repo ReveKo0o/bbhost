@@ -260,6 +260,22 @@ class TourTest(unittest.TestCase):
         # No presses at fixed times: the title is passed with menutap requests (launch).
         self.assertNotIn("BBHOST_AUTOPRESS", perf)
 
+    def test_travel_limit(self):
+        """AREA_TRAVEL_S reaches the probe (BBHOST_MAPVAL_TRAVEL_S) and the pass budget; --env's value wins."""
+        areas = ac.pick_areas("central-yharnam")
+        opts = dict(ac.DEFAULTS, pipeline_cache=True, env=[])
+        with mock.patch.dict(ac.os.environ, {}, clear=False):
+            ac.os.environ.pop("AREA_TRAVEL_S", None)
+            self.assertNotIn("BBHOST_MAPVAL_TRAVEL_S", ac.pass_settings(Path("/r"), areas, opts, "perf"))
+            self.assertEqual(ac.travel_seconds(opts), 150)
+            base = ac.pass_budget(areas, opts, "perf")
+            ac.os.environ["AREA_TRAVEL_S"] = "600"
+            self.assertEqual(ac.pass_settings(Path("/r"), areas, opts, "perf")["BBHOST_MAPVAL_TRAVEL_S"], "600")
+            self.assertEqual(ac.pass_budget(areas, opts, "perf"), base + 450)
+            given = dict(opts, env=["BBHOST_MAPVAL_TRAVEL_S=1500"])
+            self.assertEqual(ac.pass_settings(Path("/r"), areas, given, "perf")["BBHOST_MAPVAL_TRAVEL_S"], "1500")
+            self.assertEqual(ac.travel_seconds(given), 1500)
+
     def test_title_taps_until_the_world(self):
         """launch() asks for the menus' confirm button until the world's first
         frame, and no more after it, each press held long until the game has

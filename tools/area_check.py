@@ -433,7 +433,21 @@ def pass_settings(pass_dir, areas, opts, kind):
         if not sep or not name.startswith("BBHOST_") or name in s:
             raise ValueError("--env takes BBHOST_NAME=VALUE and must not override the run's own settings: %s" % item)
         s[name] = value
+    if "BBHOST_MAPVAL_TRAVEL_S" not in s and os.environ.get("AREA_TRAVEL_S"):
+        s["BBHOST_MAPVAL_TRAVEL_S"] = os.environ["AREA_TRAVEL_S"]
     return s
+
+
+def travel_seconds(opts):
+    """How long the probe lets a travel take: BBHOST_MAPVAL_TRAVEL_S given with
+    --env, else AREA_TRAVEL_S from the environment (passed on to the probe),
+    else the probe's own 150. A slow renderer (lavapipe, two games on the box)
+    needs more."""
+    for item in opts.get("env", []):
+        name, _, value = item.partition("=")
+        if name == "BBHOST_MAPVAL_TRAVEL_S" and value:
+            return float(value)
+    return float(os.environ.get("AREA_TRAVEL_S") or 150)
 
 
 def look_seconds(look, opts):
@@ -446,9 +460,9 @@ def look_seconds(look, opts):
 
 def pass_budget(areas, opts, kind):
     """Seconds the pass may take: the start, then per place the probe's own
-    limits (a travel gives up after 150 s, a warp after ten 3 s tries) and the
-    holds."""
-    per = 150 + 35 + 10
+    limits (a travel gives up after travel_seconds, a warp after ten 3 s tries)
+    and the holds."""
+    per = travel_seconds(opts) + 35 + 10
     per += (opts["settle"] + opts["measure"] + opts["dumps"] * (opts["dump_gap"] + 2) + 3 if kind == "perf"
             else opts["capture_settle"] + opts["capture_window"] + 60)
     looks = sum(look_seconds(l, opts) + 30 for a in areas for l in a.looks) if kind == "perf" else 0
