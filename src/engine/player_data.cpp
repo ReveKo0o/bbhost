@@ -4,11 +4,14 @@
 #include "core/portable.h"
 #include "engine/addr.h"
 #include "engine/menu_pointer.h"
+#include "engine/world_chr.h"
 #include "bbhost/engine/sprj/game_data_man.hpp"
 #include "net/discord_presence.h"
 #include "log.h"
 
 #include <array>
+#include <chrono>
+#include <cstdio>
 #include <cstring>
 #include <string>
 #include <utility>
@@ -39,6 +42,10 @@ constexpr Stat kStats[] = {
 std::uint64_t g_slide = 0;
 bool g_ok = false;
 std::string g_last_logged_identity;
+std::uint32_t g_pending_map = 0;
+std::uint32_t g_active_map = 0;
+std::chrono::steady_clock::time_point g_pending_map_since{};
+std::string g_active_location;
 
 std::uint64_t manager() {
     std::uint64_t man = 0;
@@ -132,6 +139,56 @@ std::string utf16_to_utf8(const std::uint16_t* text, std::size_t count) {
     return out;
 }
 
+std::string location_name(std::uint32_t block) {
+    // These names are grounded in the repository's map-validation area list.
+    struct KnownMap {
+        std::uint32_t prefix;
+        const char* name;
+    };
+    static constexpr KnownMap kKnownMaps[] = {
+        {0x15000000, "Hunter's Dream"},
+        {0x18000000, "Cathedral Ward"},
+        {0x18010000, "Central Yharnam"},
+        {0x17000000, "Old Yharnam"},
+        {0x1b000000, "Forbidden Woods"},
+        {0x20000000, "Moonside Lake"},
+        {0x1a000000, "Nightmare of Mensis"},
+        {0x24000000, "Fishing Hamlet"},
+        {0x22000000, "Hunter's Nightmare"},
+    };
+    const std::uint32_t prefix = block & 0xffff0000u;
+    for (const KnownMap& map : kKnownMaps) {
+        if (map.prefix == prefix) return map.name;
+    }
+    char label[40] = {};
+    std::snprintf(label, sizeof(label), "Area %02X · Block %02X", block >> 24, (block >> 16) & 0xff);
+    return label;
+}
+
+bool stable_player_location(std::string* location, std::uint32_t* map_id) {
+    std::uint32_t block = 0;
+    if (!world_player_block(&block) || block == 0) {
+        g_pending_map = 0;
+        return false;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (block != g_pending_map) {
+        g_pending_map = block;
+        g_pending_map_since = now;
+        return false;
+    }
+    // Ignore brief invalid/transition readings and wait for a stable player block.
+    if (now - g_pending_map_since < std::chrono::milliseconds(1200)) return false;
+    if (g_active_map != block) {
+        g_active_map = block;
+        g_active_location = location_name(block);
+        host_log("discord presence: stable player map 0x%08x -> %s", block, g_active_location.c_str());
+    }
+    if (location) *location = g_active_location;
+    if (map_id) *map_id = block;
+    return true;
+}
+
 }  // namespace
 
 bool player_character_identity(std::string* name, int* level) {
@@ -198,12 +255,17 @@ void player_data_tick() {
     if (menu_pointer_front_end()) {
         net::UpdateDiscordMainMenuPresence();
         g_last_logged_identity.clear();
+        g_pending_map = 0;
+        g_active_map = 0;
+        g_active_location.clear();
         return;
     }
+    std::string location;
+    if (!stable_player_location(&location, nullptr)) return;
     std::string character_name;
     int level = 0;
     if (player_character_identity(&character_name, &level)) {
-        net::UpdateDiscordGamePresence(character_name.c_str(), level);
+        net::UpdateDiscordGamePresence(location.c_str(), character_name.c_str(), level);
         const std::string identity = character_name + "#" + std::to_string(level);
         if (identity == g_last_logged_identity) return;
         g_last_logged_identity = identity;

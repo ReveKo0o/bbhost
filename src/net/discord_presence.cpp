@@ -12,13 +12,15 @@ constexpr char kApplicationId[] = "1562063078466650206";
 bool g_initialized = false;
 std::string g_last_activity;
 
-void publish(const char* state) {
-    if (!state || g_last_activity == state) return;
+void publish(const char* details, const char* state) {
+    if (!details || !state) return;
+    const std::string activity_key = std::string(details) + "\n" + state;
+    if (g_last_activity == activity_key) return;
     DiscordRichPresence presence{};
-    presence.details = "Bloodborne";
+    presence.details = details;
     presence.state = state;
     Discord_UpdatePresence(&presence);
-    g_last_activity = state;
+    g_last_activity = activity_key;
 }
 
 }  // namespace
@@ -33,21 +35,23 @@ void InitDiscordRPC() {
 
 void UpdateDiscordLauncherPresence() {
     if (!g_initialized) return;
-    publish("In BBHost Launcher");
+    publish("Bloodborne", "In BBHost Launcher");
 }
 
 void UpdateDiscordMainMenuPresence() {
     if (!g_initialized) return;
-    publish("Main Menu");
+    publish("Bloodborne", "Main Menu");
 }
 
-void UpdateDiscordGamePresence(const char* characterName, int playerLevel) {
+void UpdateDiscordGamePresence(const char* locationName, const char* characterName, int playerLevel) {
     if (!g_initialized) return;
 
-    // Do not report a character as loaded until the guest exposes a valid level.
+    // Keep the active map and character identity in separate Discord fields.
+    std::string details = "Bloodborne";
+    if (locationName && locationName[0]) details += " · " + std::string(locationName);
     std::string state = characterName && characterName[0] ? characterName : playerLevel > 0 ? "Character loaded" : "Loading character...";
     if (playerLevel > 0) state += " · Level " + std::to_string(playerLevel);
-    publish(state.c_str());
+    publish(details.c_str(), state.c_str());
 }
 
 void ShutdownDiscordRPC() {

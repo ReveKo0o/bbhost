@@ -971,7 +971,7 @@ int main(int argc, char** argv) {
     host_options_load();
     if (host_opt_get("discord_rpc")) {
         net::InitDiscordRPC();
-        net::UpdateDiscordGamePresence(nullptr, 0);
+        net::UpdateDiscordGamePresence(nullptr, nullptr, 0);
     } else {
         net::ShutdownDiscordRPC();
     }

@@ -12,7 +12,7 @@ void UpdateDiscordLauncherPresence();
 void UpdateDiscordMainMenuPresence();
 
 // Publishes the game's location and loaded character level when available.
-void UpdateDiscordGamePresence(const char* characterName, int playerLevel);
+void UpdateDiscordGamePresence(const char* locationName, const char* characterName, int playerLevel);
 
 // Clears the activity and closes the IPC client.
 void ShutdownDiscordRPC();
