@@ -1,4 +1,4 @@
-#include "net/discord_rpc.h"
+#include "discord_rpc.h"
 #include <chrono>
 #include <string>
 #include <cstring>
