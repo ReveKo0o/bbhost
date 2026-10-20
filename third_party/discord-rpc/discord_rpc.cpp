@@ -3,16 +3,39 @@
 #include <string>
 #include <cstring>
 
-// Function to Initialize Discord RPC
+// Discord RPC SDK Stub / Mock Implementation
+extern "C" {
+
+void Discord_Initialize(const char* applicationId, DiscordEventHandlers* handlers, int autoRegister, const char* optionalSteamId) {
+    //Discord client launch body
+}
+
+void Discord_Shutdown(void) {
+}
+
+void Discord_RunCallbacks(void) {
+}
+
+void Discord_UpdatePresence(const DiscordRichPresence* presence) {
+}
+
+void Discord_ClearPresence(void) {
+}
+
+void Discord_Respond(const char* userId, int reply) {
+}
+
+void Discord_UpdateHandlers(DiscordEventHandlers* handlers) {
+}
+
+} // extern "C"
+
 void InitDiscordRPC() {
     DiscordEventHandlers handlers;
     memset(&handlers, 0, sizeof(handlers));
-
-    // Application ID: 1562063078466650206
     Discord_Initialize("1562063078466650206", &handlers, 1, nullptr);
 }
 
-// Presence Update Function
 void UpdatePlayerPresence(const char* mapName, int playerLevel) {
     DiscordRichPresence discordPresence;
     memset(&discordPresence, 0, sizeof(discordPresence));
@@ -28,7 +51,7 @@ void UpdatePlayerPresence(const char* mapName, int playerLevel) {
     ).count();
 
     discordPresence.largeImageKey = "bb_logo";
-    discordPresence.largeImageText = "Bloodborne PC (bbhost)";
+    discordPresence.largeImageText = "bbhost";
 
     Discord_UpdatePresence(&discordPresence);
 }
