@@ -627,7 +627,8 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
         ImGui::Checkbox("Skip company logos", &skip_logos);
         ImGui::Checkbox("Discord Rich Presence", &discord_rpc);
         if (ImGui::IsItemHovered()) {
-        ImGui::SetTooltip("Display your current game status and location on your Discord profile.");    
+        ImGui::SetTooltip("Display your current game status and location on your Discord profile.");
+            }
         ImGui::Checkbox("Debug camera", &debug_camera);
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("Lance McDonald's free camera: hold Interact (E) and press L3 (Left Ctrl). The debug menu's LOAD TEST crashes while it is on.");
