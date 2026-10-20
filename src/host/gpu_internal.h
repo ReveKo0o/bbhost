@@ -1731,6 +1731,20 @@ struct StreamTestCounts {
 };
 StreamTestCounts stream_test_counts();
 extern std::atomic<std::uint64_t> g_validation_messages;  // gpu.cpp: what BBHOST_VK_VALIDATE=1's layer reported
+// BBHOST_VK_VALIDATE=1's census (gpu.cpp): an object named for the layer's
+// messages - a draw's pipeline by its programs - and, for the messages that
+// name none (a pipeline's creation), what the thread is building while a
+// ValidationScope lives. Both cost a branch with the layer off.
+bool validation_on();
+void vk_debug_name(VkObjectType type, std::uint64_t handle, const char* name);
+extern thread_local const char* t_validation_scope;
+struct ValidationScope {
+    const char* prev;
+    explicit ValidationScope(const char* what) : prev(t_validation_scope) { t_validation_scope = what; }
+    ~ValidationScope() { t_validation_scope = prev; }
+    ValidationScope(const ValidationScope&) = delete;
+    ValidationScope& operator=(const ValidationScope&) = delete;
+};
 
 // Flushes this core's write-combining buffers. AMD's Windows driver records
 // into write-combined memory, and a release store does not order those

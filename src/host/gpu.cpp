@@ -80,26 +80,101 @@ const bool g_render_min = [] {
 std::vector<std::string> g_instance_exts;
 bool g_want_present = false;
 
+// The validation census (BBHOST_VK_VALIDATE=1): every message id counted, with
+// its first message, when it came first and last, and what it was about - the
+// names of the objects it named (a draw's pipeline is named by its programs,
+// vk_debug_name) and what the thread was building (ValidationScope) - for the
+// exit report's lines (host_gpu_report). The layer's own limit of ten messages
+// an id hides the counts: run with VK_KHRONOS_VALIDATION_ENABLE_MESSAGE_LIMIT=0.
+struct ValidationId {
+    std::uint64_t count = 0;
+    double first_s = 0, last_s = 0;
+    std::uint32_t severities = 0, types = 0;
+    std::string first;                            // the first message
+    std::map<std::string, std::uint64_t> about;   // the first 24 subjects, each counted
+    std::uint64_t about_other = 0;                // messages about a subject past those
+    std::unordered_set<std::string> subjects;     // every subject, up to 4096, for the count of them
+};
+std::mutex g_validation_mu;
+std::map<std::string, ValidationId> g_validation_ids;  // under g_validation_mu
+const auto g_validation_t0 = std::chrono::steady_clock::now();
+PFN_vkSetDebugUtilsObjectNameEXT g_set_object_name = nullptr;  // with the layer
+
+const char* vk_object_type_name(VkObjectType t) {
+    switch (t) {
+    case VK_OBJECT_TYPE_PIPELINE: return "pipeline";
+    case VK_OBJECT_TYPE_SHADER_MODULE: return "module";
+    case VK_OBJECT_TYPE_COMMAND_BUFFER: return "cmd";
+    case VK_OBJECT_TYPE_IMAGE: return "image";
+    case VK_OBJECT_TYPE_IMAGE_VIEW: return "view";
+    case VK_OBJECT_TYPE_BUFFER: return "buffer";
+    case VK_OBJECT_TYPE_DESCRIPTOR_SET: return "set";
+    case VK_OBJECT_TYPE_PIPELINE_LAYOUT: return "layout";
+    case VK_OBJECT_TYPE_DEVICE_MEMORY: return "memory";
+    case VK_OBJECT_TYPE_SAMPLER: return "sampler";
+    case VK_OBJECT_TYPE_QUEUE: return "queue";
+    case VK_OBJECT_TYPE_DEVICE: return "device";
+    default: return "object";
+    }
+}
+
 VKAPI_ATTR VkBool32 VKAPI_CALL debug_callback(VkDebugUtilsMessageSeverityFlagBitsEXT severity,
-                                              VkDebugUtilsMessageTypeFlagsEXT, const VkDebugUtilsMessengerCallbackDataEXT* data,
+                                              VkDebugUtilsMessageTypeFlagsEXT types, const VkDebugUtilsMessengerCallbackDataEXT* data,
                                               void*) {
     if (severity < VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT) {
         return VK_FALSE;
     }
     g_validation_messages.fetch_add(1, std::memory_order_relaxed);
+    std::string id = data && data->pMessageIdName ? data->pMessageIdName : "";
+    if (id.empty()) id = "id " + std::to_string(data ? data->messageIdNumber : 0);
+    // Its subject: the named objects (pipelines, by their programs), else what
+    // the thread was building.
+    std::string subject, objects;
+    for (std::uint32_t i = 0; data && i < data->objectCount; ++i) {
+        const VkDebugUtilsObjectNameInfoEXT& o = data->pObjects[i];
+        char b[64];
+        std::snprintf(b, sizeof(b), "%s%s 0x%llx", objects.empty() ? "" : ", ", vk_object_type_name(o.objectType),
+                      static_cast<unsigned long long>(o.objectHandle));
+        objects += b;
+        if (o.pObjectName && *o.pObjectName) {
+            objects += std::string(" \"") + o.pObjectName + "\"";
+            if (o.objectType == VK_OBJECT_TYPE_PIPELINE || o.objectType == VK_OBJECT_TYPE_SHADER_MODULE || subject.empty()) {
+                subject += (subject.empty() ? "" : " ") + std::string(o.pObjectName);
+            }
+        }
+    }
+    if (subject.empty() && t_validation_scope) subject = std::string("building ") + t_validation_scope;
+    const double now = std::chrono::duration<double>(std::chrono::steady_clock::now() - g_validation_t0).count();
     // Each message id twice, up to 200 ids: a run's first 40 messages were
     // often one id's repeats, which hid every later kind.
-    static std::mutex mu;
-    static std::map<std::string, int> seen;
-    const std::string id = data && data->pMessageIdName ? data->pMessageIdName : "";
     bool log = false;
     {
-        std::lock_guard<std::mutex> lk(mu);
-        const auto it = seen.find(id);
-        if (it != seen.end()) log = it->second++ < 2;
-        else if (seen.size() < 200) log = (seen[id] = 1) != 0;
+        std::lock_guard<std::mutex> lk(g_validation_mu);
+        auto it = g_validation_ids.find(id);
+        if (it == g_validation_ids.end()) {
+            if (g_validation_ids.size() >= 2000) return VK_FALSE;  // counted in g_validation_messages alone
+            it = g_validation_ids.emplace(id, ValidationId{}).first;
+            it->second.first_s = now;
+            it->second.first = data && data->pMessage ? data->pMessage : "?";
+        }
+        ValidationId& v = it->second;
+        log = v.count < 2 && g_validation_ids.size() <= 200;
+        ++v.count;
+        v.last_s = now;
+        v.severities |= static_cast<std::uint32_t>(severity);
+        v.types |= types;
+        if (!subject.empty()) {
+            if (auto a = v.about.find(subject); a != v.about.end()) ++a->second;
+            else if (v.about.size() < 24) v.about.emplace(subject, 1);
+            else ++v.about_other;
+            if (v.subjects.size() < 4096) v.subjects.insert(subject);
+        }
     }
-    if (log) host_log("vk validation: %s", data && data->pMessage ? data->pMessage : "?");
+    if (log) {
+        // The objects and the scope first: host_log keeps 1 KiB of a line.
+        host_log("vk validation: [%s%s%s] %s", objects.c_str(), t_validation_scope ? "; building " : "", t_validation_scope ? t_validation_scope : "",
+                 data && data->pMessage ? data->pMessage : "?");
+    }
     return VK_FALSE;
 }
 
@@ -798,6 +873,61 @@ void map_import_pages_locked(std::uint32_t index, const Chunk& c, std::uint64_t 
     }
 }
 }  // namespace
+
+thread_local const char* t_validation_scope = nullptr;
+bool validation_on() { return g_validate; }
+void vk_debug_name(VkObjectType type, std::uint64_t handle, const char* name) {
+    if (!g_validate || !g_set_object_name || !handle || !name || !g.device) return;
+    VkDebugUtilsObjectNameInfoEXT ni{VK_STRUCTURE_TYPE_DEBUG_UTILS_OBJECT_NAME_INFO_EXT};
+    ni.objectType = type;
+    ni.objectHandle = handle;
+    ni.pObjectName = name;
+    g_set_object_name(g.device, &ni);
+}
+
+// The census's lines in the exit report, the most frequent id first: its
+// count, when it came, the first message without the spec's quotation, and
+// what it was about (host_log keeps a line to 1 KiB: one line each).
+void log_validation_census() {
+    if (!g_validate) return;
+    std::vector<std::pair<std::string, ValidationId>> ids;
+    {
+        std::lock_guard<std::mutex> lk(g_validation_mu);
+        ids.assign(g_validation_ids.begin(), g_validation_ids.end());
+    }
+    std::sort(ids.begin(), ids.end(), [](const auto& a, const auto& b) { return a.second.count > b.second.count; });
+    host_log("gpu: validation census: %llu messages (warnings and errors), %zu ids", static_cast<unsigned long long>(g_validation_messages.load()),
+             ids.size());
+    for (const auto& [id, v] : ids) {
+        std::string first = v.first;
+        if (const std::size_t at = first.find("The Vulkan spec states"); at != std::string::npos) first.resize(at);
+        while (!first.empty() && (first.back() == '\n' || first.back() == ' ')) first.pop_back();
+        for (char& c : first) {
+            if (c == '\n') c = ' ';
+        }
+        host_log("gpu:   %llu x %s (%s%s; %.0f-%.0f s; %zu%s subjects)", static_cast<unsigned long long>(v.count), id.c_str(),
+                 (v.severities & VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT) ? "error" : "warning",
+                 (v.types & VK_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT) ? ", performance" : "", v.first_s, v.last_s, v.subjects.size(),
+                 v.subjects.size() >= 4096 ? "+" : "");
+        for (std::size_t at = 0; at < first.size() && at < 2400; at += 900) host_log("gpu:     %s", first.substr(at, 900).c_str());
+        if (v.about.empty()) continue;
+        std::vector<std::pair<std::uint64_t, std::string>> about;
+        for (const auto& [s, n] : v.about) about.emplace_back(n, s);
+        std::sort(about.rbegin(), about.rend());
+        std::string line;
+        for (const auto& [n, s] : about) {
+            char b[64];
+            std::snprintf(b, sizeof(b), " (%llu);", static_cast<unsigned long long>(n));
+            if (line.size() + s.size() + 24 > 900) {
+                host_log("gpu:     about:%s", line.c_str());
+                line.clear();
+            }
+            line += " " + s + b;
+        }
+        if (v.about_other) line += " others " + std::to_string(v.about_other);
+        if (!line.empty()) host_log("gpu:     about:%s", line.c_str());
+    }
+}
 
 // Waits until the submission thread has submitted everything it was given -
 // and, first, until the recorder has handed over every submission in the
@@ -2453,10 +2583,14 @@ bool init_locked() {
         if (create) {
             VkDebugUtilsMessengerCreateInfoEXT mci{VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT};
             mci.messageSeverity = VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT;
-            mci.messageType = VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT;
+            // Performance too: the best-practices checks' warnings
+            // (VK_KHRONOS_VALIDATION_VALIDATE_BEST_PRACTICES=1) come as that type.
+            mci.messageType = VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT |
+                              VK_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT;
             mci.pfnUserCallback = debug_callback;
             create(g.instance, &mci, nullptr, &g.messenger);
         }
+        g_set_object_name = reinterpret_cast<PFN_vkSetDebugUtilsObjectNameEXT>(vkGetInstanceProcAddr(g.instance, "vkSetDebugUtilsObjectNameEXT"));
         host_log("gpu: validation layer enabled");
     }
     bool has_swapchain = false;
@@ -4106,6 +4240,7 @@ VkPipeline create_compute(VkShaderModule module, CsBuild how, const std::string&
                                                      : 0;
     VkPipeline p = VK_NULL_HANDLE;
     VkResult r;
+    const ValidationScope validation(watch.c_str());
     if (how == CsBuild::kOptimizedCached) {
         r = vkCreateComputePipelines(g.device, PipelineCacheUse().cache, 1, &cpci, nullptr, &p);  // VK_PIPELINE_COMPILE_REQUIRED: not there
     } else if (own_cache != VK_NULL_HANDLE) {
@@ -4115,6 +4250,7 @@ VkPipeline create_compute(VkShaderModule module, CsBuild how, const std::string&
         CompilingScope compiling(watch, spirv);
         r = vkCreateComputePipelines(g.device, PipelineCacheUse().cache, 1, &cpci, nullptr, &p);
     }
+    if (r == VK_SUCCESS) vk_debug_name(VK_OBJECT_TYPE_PIPELINE, reinterpret_cast<std::uint64_t>(p), watch.c_str());
     return r == VK_SUCCESS ? p : VK_NULL_HANDLE;
 }
 
@@ -10131,6 +10267,7 @@ void host_gpu_report() {
     if (!g.tried) {
         return;
     }
+    log_validation_census();
     {
         // Guest memory the GPU reaches as imports: how much, made by what, and
         // with window imports what replaced what and what the prefetch did.
