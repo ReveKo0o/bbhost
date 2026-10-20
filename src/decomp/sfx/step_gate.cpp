@@ -35,6 +35,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <cstring>
 
 #include "log.h"
 
@@ -58,6 +59,8 @@ constexpr u64 kNodePool = 0x5ac8290;           // the pool the nodes come from (
 constexpr u64 kContainerUpdate = 0x2c4c8c0;    // (node + 0x80, &step, definition, render context)
 constexpr u64 kControllerUpdate = 0x2c820f0;   // (controller, instance, step)
 constexpr u64 kPrerollContext = 0x56dbd80;     // sub_2c500e0's stand-in render context's vtable
+constexpr u64 kGxRecordUpdate = 0x2cbcf50;     // a GPU particle system's record taking an item: (record, item)
+constexpr u64 kGxType2713 = 0x56eb0d0;         // GPU particle type 0x2713's vtable: its parameters are curves read at the elapsed time
 constexpr u64 kWobbleA = 0x2e89d10;            // motion 0x570e6d0's update (and the end of 0x570e690's): count +0x6c, period +0x68
 constexpr u64 kWobbleABase = 0x2e866f0;        //   its base motion, which moves by the step
 constexpr u64 kWobbleB = 0x2e8e430;            // motion 0x570e8d0's update: count +0x7c, period +0x78
@@ -72,15 +75,18 @@ using NextFn = GUEST_ABI u64 (*)(u64 node);
 using ContainerFn = GUEST_ABI void (*)(u64 container, float* step, u64 definition, u64 context);
 using ControllerFn = GUEST_ABI u64 (*)(u64 controller, u64 instance, float step);
 using MotionFn = GUEST_ABI void (*)(u64 motion, u64 node, const float* step, u64 local);
+using GxRecordFn = GUEST_ABI void (*)(u64 record, u64 item);
 
 void* g_game_instance = nullptr;
 void* g_game_light = nullptr;
 void* g_game_wobble_a = nullptr;
 void* g_game_wobble_b = nullptr;
 void* g_game_wobble_follow = nullptr;
+void* g_game_gx_record = nullptr;
 
 std::atomic<u32> g_between{0};
-std::atomic<u64> g_frames_between{0}, g_instances_held{0}, g_lights_held{0}, g_motions_held{0}, g_still_frames{0};
+std::atomic<u32> g_step_between{0};  // a frame between whole effect steps, the gate on or off (decomp_sfx_step_frame)
+std::atomic<u64> g_frames_between{0}, g_instances_held{0}, g_lights_held{0}, g_motions_held{0}, g_still_frames{0}, g_records_held{0};
 
 // A frame bbhost put between whole steps that is not the game's own still frame.
 inline bool held() {
@@ -91,6 +97,14 @@ inline bool held() {
         return false;
     }
     return true;
+}
+
+// A frame between whole effect steps - the gate on or off, 30 or 60 steps a
+// second - that is not the game's own still frame.
+inline bool between_steps() {
+    if (!g_step_between.load(std::memory_order_relaxed)) return false;
+    const u64 sfx = load<u64>(game_address(kSprjSfx));
+    return !(sfx && load<u32>(sfx + 0x8c) && !MUTANT(18));
 }
 
 // A node on such a frame: what 0x2c4df80 does with its state machine, its
@@ -217,10 +231,51 @@ DECOMP_LEAF void sfx_wobble_follow(u64 motion, u64 node, const float* step, u64 
     game_function<MotionFn>(kWobbleABase)(motion, node, step, local);
 }
 
+// sub_2cbcf50(record, item): a GPU particle system's record takes an item of
+// its node's container call - its matrix rows, the previous time +0x24 = the
+// time +0x28, the time += the item's step +0x60 - and hands its type (+8) the
+// record +0x10 for the type's update (vtable +0x10), which reads the elapsed
+// time, +0x28 - +0x24. Type 0x2713 (vtable 0x56eb0d0) reads its definition's
+// five keyframe curves at that elapsed time - the last item's step, not an
+// age - into its two sizes +0x1c / +0x20 and its three colours +0x50 / +0x60 /
+// +0x70, and its draw (vtable +0x18) reads the same curves at it again. At 30
+// that is 1/30 s on every frame; on a frame between whole effect steps its
+// items have a step of 0, so the curves were read at 0 there and at the whole
+// step on the others, and wherever a curve is not flat over that range the
+// values took turns every frame - with the gate on or off, at 30 or 60 steps
+// a second. On a frame between whole steps the record of a 0x2713 whose
+// elapsed time is not 0 keeps its previous time and its type the five values:
+// the game's call runs as it is - the matrix, the bounds, every other field -
+// and both are put back, so the type's update and its draw read the last whole
+// step's elapsed time and values, as on every frame at 30.
+DECOMP_LEAF void sfx_gx_record_update(u64 record, u64 item) {
+    const auto game = reinterpret_cast<GxRecordFn>(g_game_gx_record);
+    const u64 type = load<u64>(record + 8);
+    const bool is_2713 = type && (load<u64>(type) == game_address(kGxType2713) || MUTANT(15));
+    if (!is_2713 || (load<float>(item + 0x60) != 0.0f && !MUTANT(16)) || (load<u32>(record + 0x24) == load<u32>(record + 0x28) && !MUTANT(17)) ||
+        !between_steps()) {
+        game(record, item);
+        return;
+    }
+    g_records_held.fetch_add(1, std::memory_order_relaxed);
+    const u32 previous = load<u32>(record + 0x24);
+    u64 sizes = load<u64>(type + 0x1c);
+    u8 colours[0x30];
+    std::memcpy(colours, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(type + 0x50)), sizeof colours);
+    game(record, item);
+    if (!MUTANT(13)) store<u32>(record + 0x24, previous);
+    if (!MUTANT(14)) {
+        store<u64>(type + 0x1c, sizes);
+        std::memcpy(reinterpret_cast<void*>(static_cast<std::uintptr_t>(type + 0x50)), colours, sizeof colours);
+    }
+}
+
 void decomp_sfx_gate_frame(bool between) {
     g_between.store(between ? 1u : 0u, std::memory_order_relaxed);
     if (between) g_frames_between.fetch_add(1, std::memory_order_relaxed);
 }
+
+void decomp_sfx_step_frame(bool between) { g_step_between.store(between ? 1u : 0u, std::memory_order_relaxed); }
 
 bool decomp_sfx_gate_placed() { return decomp_placed("sub_2c4ff30") == 1 && decomp_placed("sub_131e660") == 1; }
 
@@ -232,13 +287,15 @@ constexpr std::uint8_t kLightEntry[] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41
 // The three motions' (sub rsp, 0x78 for the two counting ones; 0x58 for the follow).
 constexpr std::uint8_t kWobbleEntry[] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x55, 0x41, 0x54, 0x53, 0x48, 0x83, 0xec, 0x78};
 constexpr std::uint8_t kFollowEntry[] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x55, 0x41, 0x54, 0x53, 0x48, 0x83, 0xec, 0x58};
+// The record update's (sub rsp, 0x68).
+constexpr std::uint8_t kGxRecordEntry[] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x55, 0x41, 0x54, 0x53, 0x48, 0x83, 0xec, 0x68};
 
 void report() {
     if (!decomp_sfx_gate_placed()) return;
     host_log("decomp: the effects' frames between whole steps: %llu frames; %llu instance updates, %llu light updates and %llu wobble "
-             "motion updates held; %llu calls on the game's own still frame left to it",
+             "motion updates held, %llu GPU type 0x2713 items kept at their whole step's time; %llu calls on the game's own still frame left to it",
              static_cast<ull>(g_frames_between.load()), static_cast<ull>(g_instances_held.load()), static_cast<ull>(g_lights_held.load()),
-             static_cast<ull>(g_motions_held.load()), static_cast<ull>(g_still_frames.load()));
+             static_cast<ull>(g_motions_held.load()), static_cast<ull>(g_records_held.load()), static_cast<ull>(g_still_frames.load()));
 }
 
 }  // namespace
@@ -257,4 +314,6 @@ void decomp_sfx_step_gate_add() {
                 &g_game_wobble_b});
     decomp_add({"sub_2e896f0", area, kWobbleFollow, kFollowEntry, sizeof(kFollowEntry), reinterpret_cast<void*>(&sfx_wobble_follow),
                 DecompKind::Leaf, &g_game_wobble_follow});
+    decomp_add({"sub_2cbcf50", area, kGxRecordUpdate, kGxRecordEntry, sizeof(kGxRecordEntry), reinterpret_cast<void*>(&sfx_gx_record_update),
+                DecompKind::Leaf, &g_game_gx_record});
 }

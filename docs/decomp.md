@@ -387,6 +387,7 @@ instead of ~60%.
 | effect instance update (`sub_2c4ff30`) | `0x2c4ff30` | steps an effect's controllers and its nodes; on a frame bbhost puts between whole effect steps, only the nodes' containers - the follow, the render items - with a dead node kept for the next whole step to free | 40,000 generated instances against the game's own code with its node update held, 40,000 nodes against the game's node update; 5 mutants caught |
 | FFX light module update (`sub_131e660`) | `0x131e660` | a light effect's colour, radius, place and flicker; on such a frame with its flicker phase and blend held | 40,000 generated modules against the game's own run with the two held; 3 mutants caught |
 | wobble motion updates (`sub_2e89d10`, `sub_2e8e430`, `sub_2e896f0`) | `0x2e89d10`, `0x2e8e430`, `0x2e896f0` | an effect motion that turns its direction by a random angle every few updates (motion classes `0x570e6d0`, `0x570e690`, `0x570e8d0`) and, for `0x570e690`, lags toward what it follows by a factor an update; on such a frame only its base motion runs - no count, re-roll or lerp | 40,000 generated motions against the game's own code (its base motions and the effects' random numbers the test's); 4 mutants caught |
+| GPU particle record update (`sub_2cbcf50`) | `0x2cbcf50` | a GPU particle system's record taking an item - its time chain (the previous time = the time, the time += the item's step) and its type's update; for type `0x2713`, whose sizes and colours are curves read at the elapsed time (in its update and its draw), on any frame between whole steps (the gate on or off) the record keeps its previous time and the type its five values, so both read the last whole step's elapsed time and values, as on every frame at 30 | 40,000 generated records with the game's own type `0x2713` update under test curves against the game's own code (ordinary values, then special ones); 6 mutants caught |
 
 The two ribbon writers are rewritten for Windows. The game's versions keep
 their arguments in the 128 bytes below the stack pointer - the red zone, which
@@ -417,7 +418,13 @@ updates, in the container calls such a frame still makes: every few updates
 they turn their direction by two angles from the effects' random numbers,
 and one of them lags toward what it follows by a factor an update. On such
 a frame they run only their base motion, so they turn and close in 30 times
-a second at any frame rate, as at 30, not once a frame.
+a second at any frame rate, as at 30, not once a frame. One GPU particle type,
+`0x2713`, reads its sizes and colours from curves at the elapsed time of its
+record's last item - a step's, 1/30 s at 30, and 0 on a frame between whole
+steps, with the gate on or off - in its update and again in its draw, so
+wherever a curve is not flat over that range they took turns between two
+values every frame; on every frame between whole steps its record keeps its
+last whole step's elapsed time and values instead, as at 30.
 
 ### Replaced outside the list
 

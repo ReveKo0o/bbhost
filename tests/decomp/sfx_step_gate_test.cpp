@@ -23,6 +23,15 @@
 //     same calls and every byte of the motion, its node, the parent and the
 //     FX RNG; held, one call of the base motion with the same arguments and
 //     nothing else touched - no count, no re-roll, no draw, no lerp;
+//   - a GPU particle system's record taking an item, 0x2cbcf50, with the game's
+//     own GPU particle type 0x2713 update (0x12e81b0) under test curves: not a
+//     frame between whole steps (whatever the gate), or another type, or an
+//     item with a step, or a record whose elapsed time is already 0, or the
+//     game's own still frame, ours against the game's - every byte of the
+//     record and its type; between whole steps, the gate on or off, the game's
+//     call with the record's previous time +0x24 and the type's sizes +0x1c /
+//     +0x20 and colours +0x50..+0x7f put back - every other byte the game's,
+//     and the elapsed time the type's draw then reads the last whole step's;
 // and each of the source's mutants caught. Skips without the 1.09 eboot.
 #define DECOMP_SFX_STEP_GATE_MUTANTS
 int g_sfx_gate_mutant = 0;
@@ -30,6 +39,7 @@ int g_sfx_gate_mutant = 0;
 
 #include "eboot_kit.h"
 
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -605,6 +615,114 @@ int check_wobbles(int cases, u64 sfx) {
     return bad;
 }
 
+// --- the GPU particle type 0x2713's record ---------------------------------------
+
+// Test curves for the type's definition (vtable +0x58: (curve, node, &time) -> the value at it, a vector;
+// +0x90: (curve, node) -> its largest value): a + b t in each lane, the lanes apart.
+GUEST_ABI __m128 curve_2713(u64 curve, u64, const float* t) {
+    const float a = load<float>(curve + 8), b = load<float>(curve + 12);
+    return _mm_set_ps(a + 3 * b * *t, a + 2 * b * *t, a - b * *t, a + b * *t);
+}
+GUEST_ABI float curve_2713_max(u64 curve, u64) { return std::fabs(load<float>(curve + 8)) + std::fabs(load<float>(curve + 12)); }
+alignas(64) u8 g_curve_2713_vt[0xa0];
+GUEST_ABI u64 stub_scratch_mark() { return 0; }
+GUEST_ABI void stub_scratch_release(u64) {}
+// Another GPU particle type's update (vtable +0x10: (&bounds, type, record +0x10, buffer)): its bounds, nothing else.
+GUEST_ABI void stub_other_type(u64 out, u64, u64, u64) { std::memset(reinterpret_cast<void*>(out), 0, 32); }
+alignas(64) u8 g_other_type_vt[0x40];
+
+struct Record {
+    u64 record, item, type;
+};
+Record make_record(bool type_2713) {
+    Record r;
+    r.record = block(0x80);
+    r.item = block(0x70);
+    r.type = block(0xb0);
+    const u64 def = block(0xe0), counts = block(0x20), node = block(0x100);
+    store<u64>(r.type, type_2713 ? game_address(kGxType2713) : reinterpret_cast<u64>(g_other_type_vt));
+    store<u64>(r.type + 8, def);
+    for (const u64 off : {0x48ull, 0x58ull, 0x88ull, 0x98ull, 0xa8ull}) {
+        const u64 c = block(0x20);
+        store<u64>(c, reinterpret_cast<u64>(g_curve_2713_vt));
+        store<float>(c + 8, value(0, 2));
+        store<float>(c + 12, g_rng.chance(0.3) ? 0.0f : value(-20, 20));  // flat now and then: no change to see
+        store<u64>(def + off, c);
+    }
+    for (int k = 0x1c; k < 0xa0; k += 4) store<float>(r.type + k, value(-1, 2));
+    store<u64>(r.record + 8, r.type);
+    store<u64>(r.record + 0x10, node);
+    store<u64>(r.record + 0x18, counts);  // +8 = 0: no buffers
+    const float t = value(0, 50);
+    store<float>(r.record + 0x28, t);
+    // the last item's elapsed time: a whole step's, or 0 (the record just made, or a zero step last)
+    store<float>(r.record + 0x24, g_rng.chance(0.8) ? t - 1.0f / 30.0f : t);
+    for (int k = 0; k < 0x60; k += 4) store<float>(r.item + k, value(-3, 3));
+    store<float>(r.item + 0x60, g_rng.chance(0.8) ? 0.0f : 1.0f / 30.0f);
+    return r;
+}
+std::vector<u8> record_bytes(const Record& r) {
+    std::vector<u8> v(0x80 + 0xb0);
+    std::memcpy(v.data(), reinterpret_cast<void*>(r.record), 0x80);
+    std::memcpy(v.data() + 0x80, reinterpret_cast<void*>(r.type), 0xb0);
+    return v;
+}
+void put_record(const Record& r, const std::vector<u8>& v) {
+    std::memcpy(reinterpret_cast<void*>(r.record), v.data(), 0x80);
+    std::memcpy(reinterpret_cast<void*>(r.type), v.data() + 0x80, 0xb0);
+}
+
+int check_records(int cases, u64 sfx) {
+    const auto game = eboot_kit::fn<GxRecordFn>(kGxRecordUpdate);
+    int bad = 0, held_cases = 0;
+    for (int c = 0; c < cases; ++c) {
+        g_blocks.clear();
+        const bool type_2713 = g_rng.chance(0.8), held_frame = g_rng.chance(0.7), still = g_rng.chance(0.1);
+        const Record r = make_record(type_2713);
+        store<u32>(sfx + 0x8c, still ? 1u : 0u);
+        const std::vector<u8> before = record_bytes(r);
+        // the game's
+        game(r.record, r.item);
+        const std::vector<u8> theirs = record_bytes(r);
+        put_record(r, before);
+        // ours: on any frame between whole steps, the gate on or off
+        decomp_sfx_gate_frame(held_frame && g_rng.chance(0.5));
+        decomp_sfx_step_frame(held_frame);
+        sfx_gx_record_update(r.record, r.item);
+        decomp_sfx_step_frame(false);
+        decomp_sfx_gate_frame(false);
+        const std::vector<u8> ours = record_bytes(r);
+        const bool takes = type_2713 && held_frame && !still && load<float>(r.item + 0x60) == 0.0f &&
+                           load<u32>(reinterpret_cast<u64>(before.data()) + 0x24) != load<u32>(reinterpret_cast<u64>(before.data()) + 0x28);
+        const char* why = nullptr;
+        if (!takes) {
+            if (ours != theirs) why = "not held: the game's";
+        } else {
+            ++held_cases;
+            // the record's previous time and the type's five values as before, every other byte the game's
+            std::vector<u8> want = theirs;
+            std::memcpy(want.data() + 0x24, before.data() + 0x24, 4);
+            std::memcpy(want.data() + 0x80 + 0x1c, before.data() + 0x80 + 0x1c, 8);
+            std::memcpy(want.data() + 0x80 + 0x50, before.data() + 0x80 + 0x50, 0x30);
+            if (ours != want) why = "held: the previous time and the five values kept, the rest the game's";
+            // the draw's elapsed time: the last whole step's
+            float pa, ca, pb, cb;
+            std::memcpy(&pa, ours.data() + 0x24, 4);
+            std::memcpy(&ca, ours.data() + 0x28, 4);
+            std::memcpy(&pb, before.data() + 0x24, 4);
+            std::memcpy(&cb, before.data() + 0x28, 4);
+            if (!why && bits(ca - pa) != bits(cb - pb)) why = "held: the elapsed time the draw reads";
+        }
+        put_record(r, before);
+        if (why && ++bad <= 6 && !g_quiet)
+            std::printf("record case %d (type 0x2713 %d, held %d, still %d, step %g): %s differs\n", c, type_2713, held_frame, still,
+                        load<float>(r.item + 0x60), why);
+    }
+    store<u32>(sfx + 0x8c, 0u);
+    if (!g_quiet) std::printf("decomp_sfx_step_gate: %d GPU particle record cases (%d held for type 0x2713), %d differ\n", cases, held_cases, bad);
+    return bad;
+}
+
 }  // namespace
 
 int main() {
@@ -613,8 +731,9 @@ int main() {
         std::memcmp(eboot_kit::at(0x131e660), kLightEntry, sizeof kLightEntry) != 0 ||
         std::memcmp(eboot_kit::at(kWobbleA), kWobbleEntry, sizeof kWobbleEntry) != 0 ||
         std::memcmp(eboot_kit::at(kWobbleB), kWobbleEntry, sizeof kWobbleEntry) != 0 ||
-        std::memcmp(eboot_kit::at(kWobbleFollow), kFollowEntry, sizeof kFollowEntry) != 0) {
-        std::printf("decomp_sfx_step_gate: the five entries are not where the gate expects them\n");
+        std::memcmp(eboot_kit::at(kWobbleFollow), kFollowEntry, sizeof kFollowEntry) != 0 ||
+        std::memcmp(eboot_kit::at(kGxRecordUpdate), kGxRecordEntry, sizeof kGxRecordEntry) != 0) {
+        std::printf("decomp_sfx_step_gate: the six entries are not where the gate expects them\n");
         return 1;
     }
     // The singletons: SprjSfx (its still-frame word +0x8c), the node pool, and
@@ -642,6 +761,7 @@ int main() {
     g_game_wobble_a = eboot_kit::at(kWobbleA);
     g_game_wobble_b = eboot_kit::at(kWobbleB);
     g_game_wobble_follow = eboot_kit::at(kWobbleFollow);
+    g_game_gx_record = eboot_kit::at(kGxRecordUpdate);
 
     constexpr int kCases = 20000;
     int bad = 0, total = 0;
@@ -718,6 +838,29 @@ int main() {
         }
     }
     g_sfx_gate_mutant = 0;
-    std::printf("decomp_sfx_step_gate: %d of 12 mutants caught\n", 12 - missed);
+    // The GPU particle type 0x2713's record last: the scratch allocator the record update brackets its work with
+    // stubbed, the type's curves the test's.
+    store<u64>(reinterpret_cast<u64>(g_curve_2713_vt) + 0x58, reinterpret_cast<u64>(&curve_2713));
+    store<u64>(reinterpret_cast<u64>(g_curve_2713_vt) + 0x90, reinterpret_cast<u64>(&curve_2713_max));
+    store<u64>(reinterpret_cast<u64>(g_other_type_vt) + 0x10, reinterpret_cast<u64>(&stub_other_type));
+    eboot_kit::stub(0x247d5b0, reinterpret_cast<const void*>(&stub_scratch_mark));
+    eboot_kit::stub(0x247d5f0, reinterpret_cast<const void*>(&stub_scratch_release));
+    g_quiet = false;
+    g_rng.specials = false;
+    int rbad = check_records(kCases, sfx);
+    g_rng.specials = true;
+    rbad += check_records(kCases, sfx);
+    if (rbad) return 1;
+    g_quiet = true;
+    for (const int m : {13, 14, 15, 16, 17, 18}) {
+        g_sfx_gate_mutant = m;
+        g_rng.specials = false;
+        if (!check_records(2000, sfx)) {
+            std::printf("decomp_sfx_step_gate: mutant %d not caught by the GPU particle records\n", m);
+            ++missed;
+        }
+    }
+    g_sfx_gate_mutant = 0;
+    std::printf("decomp_sfx_step_gate: %d of 18 mutants caught\n", 18 - missed);
     return missed ? 1 : 0;
 }
