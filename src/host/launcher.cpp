@@ -185,6 +185,8 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
     bool fullscreen = host_opt_index("window_mode") == 1;
     bool skip_logos = host_opt_get("skip_logos");
     bool debug_camera = host_opt_get("debug_camera");
+    // Enable or disable Discord Rich Presence status sharing
+    bool discord_rpc = host_opt_get("discord_rpc");
     int frame_cap = host_opt_frame_cap();
     int resolution = host_opt_resolution_index();
     static const char* const kResolutions[] = {"1280x720",         "1600x900",         "1920x1080",        "2560x1440",
@@ -624,6 +626,10 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
         ImGui::SameLine(260 * scale);
         ImGui::Checkbox("Skip company logos", &skip_logos);
         ImGui::Checkbox("Debug camera", &debug_camera);
+            ImGui::Checkbox("Discord Rich Presence", &discord_rpc);
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Display your current game status and location on your Discord profile.");
+    }
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("Lance McDonald's free camera: hold Interact (E) and press L3 (Left Ctrl). The debug menu's LOAD TEST crashes while it is on.");
         ImGui::SetNextItemWidth(200 * scale);
