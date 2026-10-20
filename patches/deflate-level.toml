@@ -1,0 +1,17 @@
+# The game compresses data it makes at run time with the Dantelion deflate
+# codec, which it picks by a settings string - "algorithm=deflate;level=9" -
+# that five producers share (and four readers, for whom the level means
+# nothing). One of them packs the player's recording, ~300 KB, into an ENFL
+# container on the main thread every ~50 s of play (Binary Ninja 0x1dc97a0):
+# at level 9 that is ~23 ms of zlib's longest_match inside one frame
+# (sampled). Level 1 does the same job in a fraction of the time;
+# inflate reads either, so the data only grows a little.
+[patch]
+name = "deflate-level"
+eboot = "941f887a562aae054fac35af8cc8f27cf075f3d4cc2e029fb5ae2a663aaa5ae7"
+description = "the game's run-time deflate compresses at level 1, not 9 (a main-thread hitch every ~50 s)"
+
+[site.level]
+address = "0x4d3a79a"
+expect = "3d 39 00"
+bytes = "3d 31 00"

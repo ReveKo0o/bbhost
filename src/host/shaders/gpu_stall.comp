@@ -1,0 +1,41 @@
+#version 460
+// BBHOST_TEST_GPU_STALL (host/gpu.cpp): one piece of a GPU job that holds a
+// submission until the host lets it go, so a wait for its fence meets a GPU
+// that is still busy. The job is many pieces in a row, a barrier between
+// each; a piece is one invocation that turns a bounded number of times
+// unless the host has let the job go - a word in host-visible memory it reads
+// every turn - so the GPU can switch to other work between pieces (one long
+// dispatch it cannot preempt is reset by the driver: NVIDIA's context switch
+// timeout, Windows' TDR), and the pieces left end at once when it lets go.
+//
+// Compiled offline (tools/build_shaders.sh) into gpu_stall.spv.h.
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 4) coherent volatile buffer Flag {
+    uint go;      // set by the host: the job may end
+    uint turns;   // the turns taken so far
+    uint pieces;  // the pieces that turned so far
+    uint mix;     // the arithmetic's result, so the turns are not taken out
+};
+
+layout(push_constant) uniform Push {
+    Flag flag;
+    uint max_turns;  // a piece's bound
+    uint pad;
+} pc;
+
+void main() {
+    if (pc.flag.go != 0u) return;
+    uint x = pc.flag.mix;
+    uint n = 0u;
+    while (n < pc.max_turns && pc.flag.go == 0u) {
+        for (uint i = 0u; i < 1024u; ++i) x = x * 1664525u + 1013904223u;
+        ++n;
+    }
+    pc.flag.turns += n;
+    pc.flag.pieces += 1u;
+    pc.flag.mix = x;
+}

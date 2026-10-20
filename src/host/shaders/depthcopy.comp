@@ -1,0 +1,25 @@
+#version 460
+// A depth target's Z plane copied into an R32_SFLOAT colour image: the
+// snapshot the lighting passes sample when the game copies its depth buffer
+// (render.cpp, render_copy_target_locked). Depth and colour images cannot be
+// copied image to image; through a buffer that was two copies and a barrier,
+// ~0.45 ms a frame on an RTX 4070. One invocation per texel, the float as it
+// is: bit for bit the copy it replaces.
+//
+// Compiled offline (tools/build_shaders.sh) into depthcopy.spv.h.
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform texture2D depth_plane;
+layout(set = 0, binding = 1) uniform sampler any_sampler;
+layout(set = 0, binding = 2, r32f) uniform writeonly image2D snapshot;
+
+layout(push_constant) uniform Params {
+    uint width;
+    uint height;
+};
+
+void main() {
+    const ivec2 xy = ivec2(gl_GlobalInvocationID.xy);
+    if (xy.x >= int(width) || xy.y >= int(height)) return;
+    imageStore(snapshot, xy, vec4(texelFetch(sampler2D(depth_plane, any_sampler), xy, 0).r, 0.0, 0.0, 0.0));
+}

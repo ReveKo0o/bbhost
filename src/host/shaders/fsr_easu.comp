@@ -1,0 +1,45 @@
+#version 450
+// FSR 1 EASU (edge-adaptive spatial upsampling) of the display buffer's
+// rendered area into the presenter's output size (host/fsr.cpp). The FSR
+// headers are AMD's (fsr1/, MIT).
+#extension GL_GOOGLE_include_directive : enable
+
+layout(push_constant) uniform Constants {
+    uvec4 con0;
+    uvec4 con1;
+    uvec4 con2;
+    uvec4 con3;
+};
+
+#define A_GPU 1
+#define A_GLSL 1
+#include "fsr1/ffx_a.h"
+
+layout(set = 0, binding = 0) uniform texture2D src_image;
+layout(set = 0, binding = 1) uniform sampler src_sampler;
+layout(set = 0, binding = 2, rgba8) uniform writeonly image2D dst_image;
+
+#define FSR_EASU_F 1
+AF4 FsrEasuRF(AF2 p) { return textureGather(sampler2D(src_image, src_sampler), p, 0); }
+AF4 FsrEasuGF(AF2 p) { return textureGather(sampler2D(src_image, src_sampler), p, 1); }
+AF4 FsrEasuBF(AF2 p) { return textureGather(sampler2D(src_image, src_sampler), p, 2); }
+#include "fsr1/ffx_fsr1.h"
+
+void upscale_pixel(AU2 pos) {
+    AF3 c;
+    FsrEasuF(c, pos, con0, con1, con2, con3);
+    imageStore(dst_image, ASU2(pos), AF4(c, 1.0));
+}
+
+layout(local_size_x = 64) in;
+void main() {
+    // Each group fills a 16x16 tile, 8x8 at a time, in AMD's swizzle.
+    AU2 gxy = ARmp8x8(gl_LocalInvocationID.x) + AU2(gl_WorkGroupID.x << 4u, gl_WorkGroupID.y << 4u);
+    upscale_pixel(gxy);
+    gxy.x += 8u;
+    upscale_pixel(gxy);
+    gxy.y += 8u;
+    upscale_pixel(gxy);
+    gxy.x -= 8u;
+    upscale_pixel(gxy);
+}

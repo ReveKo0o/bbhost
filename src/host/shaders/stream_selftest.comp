@@ -1,0 +1,11 @@
+#version 450
+// The command stream's self-test (host/stream_selftest.cpp): dst[i] =
+// src[i] * mul + add over n words, the two buffers from one descriptor set.
+layout(local_size_x = 64) in;
+layout(set = 0, binding = 0) readonly buffer Src { uint v[]; } src;
+layout(set = 0, binding = 1) buffer Dst { uint v[]; } dst;
+layout(push_constant) uniform Push { uint src_off; uint dst_off; uint n; uint mul; uint add; } pc;
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i < pc.n) dst.v[pc.dst_off + i] = src.v[pc.src_off + i] * pc.mul + pc.add;
+}

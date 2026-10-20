@@ -1,0 +1,35 @@
+#version 460
+// An indirect dispatch's arguments, copied into a slot of the clamp ring
+// (indirect_clamp.cpp), checked on the GPU just before the dispatch reads
+// them: a group count past 65,535 in any dimension - D3D11's limit, which
+// this engine's PC renderer keeps to - makes the dispatch run nothing. The
+// slot keeps the counts as they came (words 4-6) and a flag (word 3) for the
+// host to log once the submission is done.
+//
+// Compiled offline (tools/build_shaders.sh) into indirectclamp.spv.h.
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer Slot {
+    uint v[8];
+};
+
+layout(push_constant) uniform Params {
+    Slot slot;
+};
+
+void main() {
+    const uint x = slot.v[0], y = slot.v[1], z = slot.v[2];
+    slot.v[4] = x;
+    slot.v[5] = y;
+    slot.v[6] = z;
+    if (x > 65535u || y > 65535u || z > 65535u) {
+        slot.v[0] = 0u;
+        slot.v[1] = 0u;
+        slot.v[2] = 0u;
+        slot.v[3] = 1u;
+    } else {
+        slot.v[3] = 0u;
+    }
+}

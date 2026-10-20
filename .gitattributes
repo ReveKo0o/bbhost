@@ -1,0 +1,13 @@
+# Text in the repository is LF everywhere; Windows batch files are CRLF for cmd.
+* text=auto eol=lf
+*.bat text eol=crlf
+*.cmd text eol=crlf
+# Binary.
+*.gz binary
+*.png binary
+*.ico binary
+*.ppm binary
+*.bin binary
+*.bndb binary
+*.7z binary
+*.zip binary

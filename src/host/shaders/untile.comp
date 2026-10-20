@@ -1,0 +1,101 @@
+#version 460
+// A PS4 (GCN) tiled texture level, untiled on the GPU: the same address math
+// as textures.cpp's untile_slice_reference - thin_index() for the 8x8 micro
+// tile, tiled2d_offset() for ARRAY_2D_TILED_THIN1 on the PS4's eight pipes -
+// one invocation per element, a slice per z. It reads the texture where the
+// game left it, in guest memory imported into Vulkan, and writes the linear
+// elements into the upload's staging span, from which the image is copied as
+// before (textures.cpp, upload_surface). Both by buffer device address.
+//
+// Compiled offline (tools/build_shaders.sh) into untile.spv.h, which is
+// checked in: the build needs no shader compiler.
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer Src { uint w[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) writeonly buffer Dst { uint w[]; };
+
+layout(push_constant) uniform Params {
+    uint64_t src;              // slice 0's tiled bytes
+    uint64_t dst;              // slice 0's linear bytes
+    uint64_t src_slice_bytes;  // one slice's tiled extent: also how far a slice may be read
+    uint64_t dst_slice_bytes;
+    uint width_e;
+    uint height_e;
+    uint pitch_e;
+    uint esize;        // bytes an element: 4, 8 or 16
+    uint mode;         // 0 linear, 1 1D tiled thin, 2 2D tiled thin
+    uint bank_height;  // 2D: the macro tile mode (textures.cpp, macro_mode_for)
+    uint aspect;
+    uint banks;
+} p;
+
+uint thin_index(uint x, uint y) {
+    return (x & 1u) | ((y & 1u) << 1) | ((x & 2u) << 1) | ((y & 2u) << 2) | ((x & 4u) << 2) | ((y & 4u) << 3);
+}
+
+uint64_t tiled2d_offset(uint x, uint y) {
+    const uint num_pipes = 8u;
+    const uint micro_bytes = 64u * p.esize;
+    const uint macro_pitch = 8u * num_pipes * p.aspect;
+    const uint macro_height = 8u * p.bank_height * p.banks / p.aspect;
+    const uint64_t macro_bytes = uint64_t(micro_bytes) * uint64_t(macro_pitch / 8u) * uint64_t(macro_height / 8u);
+    const uint macros_per_row = max(1u, (p.pitch_e + macro_pitch - 1u) / macro_pitch);
+    const uint64_t macro_offset = (uint64_t(y / macro_height) * uint64_t(macros_per_row) + uint64_t(x / macro_pitch)) * macro_bytes;
+    // the pipe from the micro tile's coordinates
+    const uint tx = x >> 3, ty = y >> 3;
+    const uint x3 = tx & 1u, x4 = (tx >> 1) & 1u, x5 = (tx >> 2) & 1u;
+    const uint y3 = ty & 1u, y4 = (ty >> 1) & 1u, y5 = (ty >> 2) & 1u;
+    const uint pipe = (x4 ^ y3 ^ x5) | ((x3 ^ y4) << 1) | ((x5 ^ y5) << 2);
+    // the bank from the bank tile's
+    const uint bx = x >> 6;
+    uint bh_shift = 0u;
+    while ((1u << bh_shift) < p.bank_height) ++bh_shift;
+    const uint by = y >> (3u + bh_shift);
+    const uint bx3 = bx & 1u, bx4 = (bx >> 1) & 1u, bx5 = (bx >> 2) & 1u, bx6 = (bx >> 3) & 1u;
+    const uint by3 = by & 1u, by4 = (by >> 1) & 1u, by5 = (by >> 2) & 1u, by6 = (by >> 3) & 1u;
+    uint bank, bank_bits;
+    if (p.banks == 16u) {
+        bank = (bx3 ^ by6) | ((bx4 ^ by5 ^ by6) << 1) | ((bx5 ^ by4) << 2) | ((bx6 ^ by3) << 3);
+        bank_bits = 4u;
+    } else if (p.banks == 8u) {
+        bank = (bx3 ^ by5) | ((bx4 ^ by4 ^ by5) << 1) | ((bx5 ^ by3) << 2);
+        bank_bits = 3u;
+    } else if (p.banks == 4u) {
+        bank = (bx3 ^ by4) | ((bx4 ^ by3 ^ by4) << 1);
+        bank_bits = 2u;
+    } else {
+        bank = bx3 ^ by3;
+        bank_bits = 1u;
+    }
+    // the element within the micro tile, and the micro tile within the bank tile
+    const uint64_t elem = uint64_t(thin_index(x & 7u, y & 7u)) * p.esize + uint64_t(ty & (p.bank_height - 1u)) * micro_bytes;
+    const uint64_t total = macro_offset + elem;
+    const uint64_t low = total & 255ul;
+    const uint64_t high = (total >> 8) << (8u + 3u + bank_bits);
+    return high | (uint64_t(bank) << 11) | (uint64_t(pipe) << 8) | low;
+}
+
+void main() {
+    const uint x = gl_GlobalInvocationID.x, y = gl_GlobalInvocationID.y, slice = gl_GlobalInvocationID.z;
+    if (x >= p.width_e || y >= p.height_e) return;
+    uint64_t off;
+    if (p.mode == 0u) {
+        off = (uint64_t(y) * p.pitch_e + x) * p.esize;
+    } else if (p.mode == 1u) {
+        const uint tiles_per_row = (p.pitch_e + 7u) / 8u;
+        const uint64_t tile = uint64_t(y / 8u) * tiles_per_row + uint64_t(x / 8u);
+        off = tile * uint64_t(64u * p.esize) + uint64_t(thin_index(x & 7u, y & 7u)) * p.esize;
+    } else {
+        off = tiled2d_offset(x, y);
+    }
+    // Past the slice's tiled extent: outside the padded surface, left alone
+    // (the CPU's 2D path skips these too; linear and 1D surfaces that reach
+    // this far stay on the CPU).
+    if (off + p.esize > p.src_slice_bytes) return;
+    Src s = Src(p.src + uint64_t(slice) * p.src_slice_bytes + off);
+    Dst d = Dst(p.dst + uint64_t(slice) * p.dst_slice_bytes + (uint64_t(y) * p.width_e + x) * p.esize);
+    for (uint k = 0u; k < (p.esize >> 2); ++k) d.w[k] = s.w[k];
+}

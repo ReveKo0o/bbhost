@@ -1,0 +1,38 @@
+# bbhost - playtest settings for the dev server (dev.thehuntersdream.com).
+#
+# Leave this file as it is. The game's paths are not set here: they live in
+# your per-user config (%APPDATA%\bbhost\bbhost.toml on Windows,
+# ~/.config/bbhost/bbhost.toml on Linux), which the first start writes and
+# every copy of bbhost reads - see TESTING.md. This file only adds the dev
+# server's settings on top of it.
+
+[online]
+host = "dev.thehuntersdream.com"
+# Everything to the server is encrypted, and its certificate is checked.
+scheme = "https"
+verify_tls = true
+stun_server = "dev.thehuntersdream.com:3478"
+auth_server = "https://dev.thehuntersdream.com"
+# The game stays signed out until this PC is linked to an account
+# (F10 -> Account). The account's name becomes your online name.
+require_account = true
+# online_id is set by the account; nothing to fill in here.
+# Two PCs in the same house playing together: put this PC's LAN address here
+# (for example "192.168.1.23") so the other PC can reach it directly.
+# p2p_addr = "192.168.1.23"
+# The UDP port other players reach you at. Forwarding it on your router helps
+# when summons fail.
+p2p_port = 9307
+
+[player]
+# type: when the game asks for a name, type it in the window (Enter accepts).
+ime = "type"
+
+[video]
+width = 1920
+height = 1080
+fps_cap = 30
+
+[startup]
+# Skip the company logos at start.
+skip_intro = true

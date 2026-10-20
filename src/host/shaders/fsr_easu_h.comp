@@ -1,0 +1,47 @@
+#version 450
+// FSR 1 EASU in half precision (FSR_EASU_H): AMD's RDNA does its f16
+// arithmetic two lanes to a register, about half fsr_easu.comp's ALU time.
+// host/fsr.cpp takes it where the device has shaderFloat16 and shaderInt16.
+// The FSR headers are AMD's (fsr1/, MIT).
+#extension GL_GOOGLE_include_directive : enable
+
+layout(push_constant) uniform Constants {
+    uvec4 con0;
+    uvec4 con1;
+    uvec4 con2;
+    uvec4 con3;
+};
+
+#define A_GPU 1
+#define A_GLSL 1
+#define A_HALF 1
+#include "fsr1/ffx_a.h"
+
+layout(set = 0, binding = 0) uniform texture2D src_image;
+layout(set = 0, binding = 1) uniform sampler src_sampler;
+layout(set = 0, binding = 2, rgba8) uniform writeonly image2D dst_image;
+
+#define FSR_EASU_H 1
+AH4 FsrEasuRH(AF2 p) { return AH4(textureGather(sampler2D(src_image, src_sampler), p, 0)); }
+AH4 FsrEasuGH(AF2 p) { return AH4(textureGather(sampler2D(src_image, src_sampler), p, 1)); }
+AH4 FsrEasuBH(AF2 p) { return AH4(textureGather(sampler2D(src_image, src_sampler), p, 2)); }
+#include "fsr1/ffx_fsr1.h"
+
+void upscale_pixel(AU2 pos) {
+    AH3 c;
+    FsrEasuH(c, pos, con0, con1, con2, con3);
+    imageStore(dst_image, ASU2(pos), AF4(c, 1.0));
+}
+
+layout(local_size_x = 64) in;
+void main() {
+    // Each group fills a 16x16 tile, 8x8 at a time, in AMD's swizzle.
+    AU2 gxy = ARmp8x8(gl_LocalInvocationID.x) + AU2(gl_WorkGroupID.x << 4u, gl_WorkGroupID.y << 4u);
+    upscale_pixel(gxy);
+    gxy.x += 8u;
+    upscale_pixel(gxy);
+    gxy.y += 8u;
+    upscale_pixel(gxy);
+    gxy.x -= 8u;
+    upscale_pixel(gxy);
+}

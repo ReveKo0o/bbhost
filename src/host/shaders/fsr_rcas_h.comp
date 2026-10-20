@@ -1,0 +1,46 @@
+#version 450
+// FSR 1 RCAS in packed half precision (FSR_RCAS_HX2): two 8x8 tiles at once,
+// each f16 operation on a pair (host/fsr.cpp, as fsr_easu_h.comp). The FSR
+// headers are AMD's (fsr1/, MIT).
+#extension GL_GOOGLE_include_directive : enable
+
+layout(push_constant) uniform Constants {
+    uvec4 con0;
+    uvec4 out_rect;  // where the result goes in dst_image: x, y, width, height
+};
+
+#define A_GPU 1
+#define A_GLSL 1
+#define A_HALF 1
+#include "fsr1/ffx_a.h"
+
+layout(set = 0, binding = 0) uniform texture2D src_image;
+layout(set = 0, binding = 1) uniform sampler src_sampler;
+// No format: the presenter's swapchain image (BGRA) or an RGBA8 target.
+layout(set = 0, binding = 2) uniform writeonly image2D dst_image;
+void rcas_store(AU2 pos, AF3 c) {
+    if (pos.x < out_rect.z && pos.y < out_rect.w) imageStore(dst_image, ASU2(pos + out_rect.xy), AF4(c, 1.0));
+}
+
+#define FSR_RCAS_HX2 1
+AH4 FsrRcasLoadHx2(ASW2 p) { return AH4(texelFetch(sampler2D(src_image, src_sampler), ASU2(p), 0)); }
+void FsrRcasInputHx2(inout AH2 r, inout AH2 g, inout AH2 b) {}
+#include "fsr1/ffx_fsr1.h"
+
+void sharpen_pair(AU2 pos) {
+    AH2 r, g, b;
+    FsrRcasHx2(r, g, b, pos, con0);
+    AH4 p0, p1;
+    FsrRcasDepackHx2(p0, p1, r, g, b);
+    rcas_store(pos, AF3(p0.rgb));
+    rcas_store(pos + AU2(8, 0), AF3(p1.rgb));
+}
+
+layout(local_size_x = 64) in;
+void main() {
+    // A 16x16 tile a group: each call does an 8x8 tile and the one right of it.
+    AU2 gxy = ARmp8x8(gl_LocalInvocationID.x) + AU2(gl_WorkGroupID.x << 4u, gl_WorkGroupID.y << 4u);
+    sharpen_pair(gxy);
+    gxy.y += 8u;
+    sharpen_pair(gxy);
+}

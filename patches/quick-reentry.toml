@@ -1,0 +1,28 @@
+# No 12-second minimum on a load after a death or lamp travel.
+#
+# The in-game step (vtable 0x5730480, run by sub_1d386e0) is made for every
+# load. Its first state (sub_1d38870) sets two countdowns sub_1d386e0 takes
+# down by the frame's time: +0x27c to 15 s, how long the last state waits for
+# the other players of a multiplayer session, and +0x278 to 12 s when the
+# step's +0xe4 is set - every load after a death or a lamp's travel - or to 0
+# (the first load from the title). The last state (sub_1d3a3e0) starts the
+# game (InGameStart) once +0x278 is down to 0 and the area says it is ready.
+# On a PC the loading itself is done in 1.5-2.7 s; the screen then waited
+# out the rest of the 12 s with every loader idle (respawn loads 12.1-12.5 s
+# on this project's Linux box and the Windows test laptop alike). The `je`
+# that picks the 0 becomes a `jmp`, so every load takes it; the multiplayer
+# wait and the readiness check stay the game's. Measured: respawns 2.2-2.7 s,
+# a lamp's travel 2.6 s; the first frames after arrival hitch no more than
+# after a 12 s load. On unless `quick_reentry = false` under [loading] in
+# bbhost.toml (BBHOST_QUICK_REENTRY=0 or 1 overrides).
+[patch]
+name = "quick-reentry"
+eboot = "941f887a562aae054fac35af8cc8f27cf075f3d4cc2e029fb5ae2a663aaa5ae7"
+description = "a load after a death or lamp travel ends when the area is ready, not after a 12-second minimum"
+option = "loading.quick_reentry"
+
+# sub_1d38870: cmp byte [r12+0xe4], 0 / je +10 (to the 0) / vmovss xmm0, [12.0f]
+[site.reentry-minimum]
+address = "0x01d38b59"
+expect = "41 80 bc 24 e4 00 00 00 00 74 0a c5 fa 10 05"
+bytes = "41 80 bc 24 e4 00 00 00 00 eb 0a c5 fa 10 05"

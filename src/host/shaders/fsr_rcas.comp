@@ -1,0 +1,44 @@
+#version 450
+// FSR 1 RCAS (robust contrast-adaptive sharpening) of EASU's output
+// (host/fsr.cpp). The FSR headers are AMD's (fsr1/, MIT).
+#extension GL_GOOGLE_include_directive : enable
+
+layout(push_constant) uniform Constants {
+    uvec4 con0;
+    uvec4 out_rect;  // where the result goes in dst_image: x, y, width, height
+};
+
+#define A_GPU 1
+#define A_GLSL 1
+#include "fsr1/ffx_a.h"
+
+layout(set = 0, binding = 0) uniform texture2D src_image;
+layout(set = 0, binding = 1) uniform sampler src_sampler;
+// No format: the presenter's swapchain image (BGRA) or an RGBA8 target.
+layout(set = 0, binding = 2) uniform writeonly image2D dst_image;
+void rcas_store(AU2 pos, AF3 c) {
+    if (pos.x < out_rect.z && pos.y < out_rect.w) imageStore(dst_image, ASU2(pos + out_rect.xy), AF4(c, 1.0));
+}
+
+#define FSR_RCAS_F 1
+AF4 FsrRcasLoadF(ASU2 p) { return texelFetch(sampler2D(src_image, src_sampler), p, 0); }
+void FsrRcasInputF(inout AF1 r, inout AF1 g, inout AF1 b) {}
+#include "fsr1/ffx_fsr1.h"
+
+void sharpen_pixel(AU2 pos) {
+    AF3 c;
+    FsrRcasF(c.r, c.g, c.b, pos, con0);
+    rcas_store(pos, c);
+}
+
+layout(local_size_x = 64) in;
+void main() {
+    AU2 gxy = ARmp8x8(gl_LocalInvocationID.x) + AU2(gl_WorkGroupID.x << 4u, gl_WorkGroupID.y << 4u);
+    sharpen_pixel(gxy);
+    gxy.x += 8u;
+    sharpen_pixel(gxy);
+    gxy.y += 8u;
+    sharpen_pixel(gxy);
+    gxy.x -= 8u;
+    sharpen_pixel(gxy);
+}

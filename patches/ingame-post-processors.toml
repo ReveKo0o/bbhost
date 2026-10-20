@@ -1,0 +1,24 @@
+# All three resource post-processors in play, not two.
+#
+# The resource system (sub_24c4240, Core.Resource.PostProcessorNum 3) runs
+# three post-processor threads, Core.Res.PostProcessor_0-2: they decompress
+# and build what the file loaders read. sub_1827e50 switches them between
+# the loading screen and play (File.EnableIngameMuiltithreadLoad, on): on a
+# loading screen _0 and _2 run, in play _0 and _1, and _2 is held (its state
+# word, +0xe50 of the post-processor array, set to 0). In a Central Yharnam
+# warp tour the two in play were 56-78% busy each after a warp. This keeps _2
+# running in play: the store of 0 becomes a store of 2, the state the loading
+# screen left it in (it was started and signalled then, so it needs no
+# wake-up). Off unless `all_post_processors = true` under [streaming] in
+# bbhost.toml (BBHOST_ALL_POST_PROCESSORS=0 or 1 overrides).
+[patch]
+name = "ingame-post-processors"
+eboot = "941f887a562aae054fac35af8cc8f27cf075f3d4cc2e029fb5ae2a663aaa5ae7"
+description = "all three resource post-processors run in play, not two"
+option = "streaming.all_post_processors"
+
+# sub_1827e50, play: lock _2; mov dword [rbx+0xe50], 0; unlock
+[site.post-processor-2]
+address = "0x018281a8"
+expect = "c7 83 50 0e 00 00 00 00 00 00"
+bytes = "c7 83 50 0e 00 00 02 00 00 00"

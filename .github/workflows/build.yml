@@ -1,0 +1,30 @@
+# Builds bbhost, its tools and tests on Ubuntu 24.04 and runs ctest, for every
+# push and pull request (tools/ci_build.sh; no game files - the tests that read
+# them skip). The dependency prefix (Vulkan headers, SDL3, ffmpeg) is cached.
+name: build
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  linux:
+    # The check master's ruleset requires: one name per job, across workflows.
+    name: tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # cmake/version.cmake names the revision
+      - uses: actions/cache@v4
+        with:
+          path: build-ci/prefix
+          key: deps-${{ runner.os }}-${{ hashFiles('tools/ci_build.sh') }}
+      - name: build and test
+        run: tools/ci_build.sh
+      - name: logs on failure
+        if: failure()
+        run: tail -n 80 build-ci/*.log || true

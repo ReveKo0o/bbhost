@@ -1,0 +1,28 @@
+build/
+out/
+/data/
+/tmp/
+eboot*.bin
+*.elf
+*.self
+.cache/
+CMakeUserPresets.json
+*.user
+compile_commands.json
+.vscode/
+.idea/
+# anchored: an unanchored "core" also matches the src/core/ directory, which
+# silently kept config/sha256/thunk out of the repo.
+/core
+/core.*
+*.core
+/bbhost.toml
+/build2/
+__pycache__/
+/bbhost-options.toml
+build-win/
+build-linux-portable/
+/build-ci/
+# Private working notes and the eboot's symbol files stay out of the repository.
+/notes/
+/symbols/

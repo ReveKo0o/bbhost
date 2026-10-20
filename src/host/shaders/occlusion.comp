@@ -1,0 +1,135 @@
+#version 460
+// The PS4's depth-block sample counters, kept on the GPU (host/occlusion.cpp).
+//
+// On the PS4 every depth block (DB, eight of them) counts the samples that
+// pass the depth test, and a ZPASS_DONE / PIXEL_PIPE_STAT_DUMP event makes
+// each one store its count with bit 63 (valid) set at the dump's address +
+// 16 * db. The game zeroes a query block, dumps into it before and after the
+// draws it measures (begin at +0, end at +8) and reads the difference.
+//
+// Here the draws after a dump carry Vulkan occlusion queries, whose results
+// are copied (with availability) into a buffer, and this shader walks the
+// command processor's record of the stream in order - query, unmeasured
+// draw, dump, predicate - keeping the running total T the DBs would hold:
+//   - a query adds its samples (an unprecise device's "some" counts as many);
+//   - an unmeasured draw adds a large count, so any difference spanning it
+//     reads visible, never occluded;
+//   - a dump writes T split over the eight DBs, valid bit set, into guest
+//     memory by device address - unless a query of the interval it closes
+//     never became available, in which case nothing is written and the block
+//     stays as the game left it (zeroed: not ready);
+//   - a predicate reads a block back and writes whether a predicated draw
+//     goes ahead, for VK_EXT_conditional_rendering.
+// One invocation does it all: a submission has a few hundred items, and they
+// must be taken in order. T and the open interval live in a small buffer of
+// their own, so they carry across command buffers on the one queue.
+//
+// Compiled offline (tools/build_shaders.sh) into occlusion.spv.h.
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer Items { uvec4 v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 8) readonly buffer Results { uint64_t v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 8) buffer Words { uint64_t v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 8) buffer State {
+    uint64_t total;  // T
+    uint64_t acc;    // samples since the last dump
+    uint bad;        // a query since the last dump was not available
+    uint pad;
+    uint counters[12];
+};
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer Preds { uint v[]; };
+
+layout(push_constant) uniform Params {
+    uint64_t items;    // this resolve's first item
+    uint64_t results;  // {samples, available} per query, the slot's query 0 first
+    uint64_t state;
+    uint64_t preds;    // two words a predicate: [0] draw (1) or not (0), [1] visible | unknown << 1
+    uint count;
+    uint flags;  // bit 0: the queries are not precise
+} p;
+
+// Item kinds (occlusion.cpp, OccItem).
+const uint kQuery = 0u, kPoison = 1u, kDump = 2u, kPredicate = 3u;
+// Counters (occlusion.cpp, the report).
+const uint kWritten = 0u, kNotReady = 1u, kUnavailable = 2u, kPairsVisible = 3u, kPairsOccluded = 4u;
+const uint kPredDraw = 5u, kPredSkip = 6u, kPredUnknown = 7u;
+
+const uint64_t kValid = 1ul << 63;
+const uint64_t kUnmeasured = 0x2fffffful;  // what an unmeasured draw adds: plainly visible
+
+// The sum of a block's end - begin over its DBs, or false when a word is not valid.
+bool block_samples(uint64_t block, uint pipes, out uint64_t sum) {
+    Words w = Words(block);
+    sum = 0ul;
+    for (uint k = 0u; k < pipes; ++k) {
+        const uint64_t b = w.v[2u * k], e = w.v[2u * k + 1u];
+        if ((b & kValid) == 0ul || (e & kValid) == 0ul) return false;
+        sum += (e & ~kValid) - (b & ~kValid);
+    }
+    return true;
+}
+
+void main() {
+    State s = State(p.state);
+    uint64_t total = s.total, acc = s.acc;
+    bool bad = s.bad != 0u;
+    Items items = Items(p.items);
+    Results res = Results(p.results);
+    for (uint i = 0u; i < p.count; ++i) {
+        const uvec4 it = items.v[i];
+        const uint kind = it.x & 0xffu;
+        if (kind == kQuery) {
+            const uint64_t n = res.v[2u * it.y], available = res.v[2u * it.y + 1u];
+            if (available == 0ul) {
+                bad = true;
+                s.counters[kUnavailable] += 1u;
+            } else {
+                acc += (p.flags & 1u) != 0u && n != 0ul ? kUnmeasured : n;
+            }
+        } else if (kind == kPoison) {
+            acc += kUnmeasured;
+        } else if (kind == kDump) {
+            total += acc;
+            acc = 0ul;
+            if (bad) {
+                s.counters[kNotReady] += 1u;
+            } else {
+                const uint pipes = (it.x >> 8) & 0xffu;
+                const uint64_t at = uint64_t(it.y) | (uint64_t(it.z) << 32);
+                Words w = Words(at);
+                const uint64_t share = total / uint64_t(pipes), extra = total % uint64_t(pipes);
+                for (uint k = 0u; k < pipes; ++k) w.v[2u * k] = (share + (uint64_t(k) < extra ? 1ul : 0ul)) | kValid;
+                s.counters[kWritten] += 1u;
+                // The second dump of a Gnm block (at +8): how the pair reads.
+                uint64_t sum;
+                if (((it.x >> 16) & 1u) != 0u && block_samples(at - 8ul, pipes, sum)) {
+                    s.counters[sum != 0ul ? kPairsVisible : kPairsOccluded] += 1u;
+                }
+            }
+            bad = false;
+        } else if (kind == kPredicate) {
+            // x: kind | pipes << 8 | draw-if-visible << 16 | continue << 17; y, z: the block; w: the predicate.
+            const uint pipes = (it.x >> 8) & 0xffu;
+            const bool if_visible = ((it.x >> 16) & 1u) != 0u, cont = ((it.x >> 17) & 1u) != 0u;
+            Preds pr = Preds(p.preds);
+            uint seen = cont ? pr.v[2u * it.w + 1u] : 0u;
+            uint64_t sum;
+            if (block_samples(uint64_t(it.y) | (uint64_t(it.z) << 32), pipes, sum)) {
+                if (sum != 0ul) seen |= 1u;
+            } else {
+                seen |= 2u;
+            }
+            // Unknown draws: a wrong "occluded" would make geometry vanish.
+            const bool draw = (seen & 2u) != 0u || (((seen & 1u) != 0u) == if_visible);
+            pr.v[2u * it.w + 1u] = seen;
+            pr.v[2u * it.w] = draw ? 1u : 0u;
+            s.counters[(seen & 2u) != 0u ? kPredUnknown : draw ? kPredDraw : kPredSkip] += 1u;
+        }
+    }
+    s.total = total;
+    s.acc = acc;
+    s.bad = bad ? 1u : 0u;
+}
