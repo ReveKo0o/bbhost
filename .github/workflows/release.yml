@@ -70,7 +70,9 @@ jobs:
       - name: package
         env:
           RELEASE_SIGNING_KEY: ${{ github.event_name != 'pull_request' && secrets.RELEASE_SIGNING_KEY || '' }}
-        run: tools/package_linux.sh build-ci/build/bbhost build/linux
+        run: |
+          chmod +x tools/*.sh
+          tools/package_linux.sh build-ci/build/bbhost build/linux
       - uses: actions/upload-artifact@v4
         with:
           retention-days: ${{ github.event_name == 'pull_request' && 14 || 90 }}
@@ -129,6 +131,7 @@ jobs:
           path: dist
       - name: the Steam Deck kit and the updater's executables
         run: |
+          chmod +x tools/*.sh
           tools/package_steamdeck.sh dist/linux/*.tar.gz dist/steamdeck
           mkdir -p dist/release dist/x
           cp dist/windows/* dist/linux/* dist/steamdeck/* dist/release/
