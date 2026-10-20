@@ -8289,9 +8289,13 @@ bool host_gpu_dispatch(const GpuDispatch& d_in) {
     mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
     // What follows may also take indirect arguments a shader wrote (the
     // particles' counter passes write the next dispatch's) or copy out of
-    // memory it wrote (a counter, into the arguments).
-    mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_INDEX_READ_BIT |
-                       VK_ACCESS_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT;
+    // memory it wrote (a counter, into the arguments) - and fetch vertices
+    // from a buffer it wrote, or draw into or copy over an image it stored
+    // (BBHOST_BARRIER_MASKS: every access; =0 the narrower set, which left
+    // vertex fetch, attachments and transfer writes out).
+    mb.dstAccessMask = barrier_masks_fixed() ? VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT
+                                             : VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_INDEX_READ_BIT |
+                                                   VK_ACCESS_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT;
     rec().pipeline_barrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0,
                          nullptr, 0, nullptr);
     g.dispatches.fetch_add(1);
@@ -9595,6 +9599,14 @@ void transfer_flush_locked() {
     // Into the open packet when it can take it (a draw's, before its pass).
     DrawCmds* c = DrawCmds::open();
     if (!c || !c->transfer_end()) rec().transfer_barrier(false);
+}
+
+bool barrier_masks_fixed() {
+    static const bool on = [] {
+        const char* e = std::getenv("BBHOST_BARRIER_MASKS");
+        return !(e && e[0] == '0');
+    }();
+    return on;
 }
 
 void record_transfer_barrier(VkCommandBuffer cmd, bool begin) {

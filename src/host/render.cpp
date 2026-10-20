@@ -9945,9 +9945,12 @@ void record_end_rendering(VkCommandBuffer cmd, bool barrier) {
 }
 
 void record_pass_barrier(VkCommandBuffer cmd) {
-    // Attachment writes must be visible to later shader reads / blits.
+    // Attachment writes must be visible to later shader reads / blits - and
+    // the pass's shader stores (the particles' vertex stages, pixel shaders'
+    // UAVs) to what follows, a dispatch or a copy (BBHOST_BARRIER_MASKS).
     VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
-    mb.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+    mb.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT |
+                       (barrier_masks_fixed() ? VK_ACCESS_SHADER_WRITE_BIT : 0u);
     mb.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
     vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0, nullptr, 0,
                          nullptr);
@@ -16116,7 +16119,13 @@ bool tess_ls_pass_locked(const GpuDraw& d, TessDraw& t) {
     VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
     mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
     mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-    vkCmdPipelineBarrier(g_cmd(), VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_VERTEX_SHADER_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
+    // The ring is read by the vertex stage, or with the host's tessellator by
+    // its control and evaluation stages (BBHOST_BARRIER_MASKS).
+    const VkPipelineStageFlags readers =
+        VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | (barrier_masks_fixed() && g.has_tessellation ? VK_PIPELINE_STAGE_TESSELLATION_CONTROL_SHADER_BIT |
+                                                                                                    VK_PIPELINE_STAGE_TESSELLATION_EVALUATION_SHADER_BIT
+                                                                                              : 0u);
+    vkCmdPipelineBarrier(g_cmd(), VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, readers, 0, 1, &mb, 0, nullptr, 0, nullptr);
     // BBHOST_TESS_DEBUG=4: where each patch of a draw lands on the screen,
     // to find the one that fills the frame. The domain shader builds a world
     // position out of the patch's three rows and the domain coordinate -

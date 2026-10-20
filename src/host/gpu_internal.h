@@ -1939,6 +1939,11 @@ DrawCmds* draw_packet_early_locked();
 // The barrier render_end_pass_locked records after vkCmdEndRendering.
 void record_end_rendering(VkCommandBuffer cmd, bool barrier = true);
 void record_pass_barrier(VkCommandBuffer cmd);  // what makes a pass's attachment writes visible to everything after
+// BBHOST_BARRIER_MASKS (on unless 0; gpu.cpp): the barriers after a pass, a
+// dispatch and the tessellation LS pass name every access that can follow -
+// shader stores before a pass ends, vertex fetch and attachments after a
+// dispatch, the tessellation stages after the LS pass.
+bool barrier_masks_fixed();
 // A transfer batch's barrier: into the transfer stage (`begin`), or out of it.
 void record_transfer_barrier(VkCommandBuffer cmd, bool begin);
 // Inside a batch: the transfers recorded before it finish before the ones after.
