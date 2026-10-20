@@ -480,6 +480,12 @@ struct Gpu {
     std::map<std::uint32_t, VkImage> dummy_dim_images;
     std::map<std::uint32_t, VkDeviceMemory> dummy_dim_mem;
     std::map<std::uint32_t, VkImageView> dummy_dim_views;
+    // 1x1 D32_SFLOAT images at the far plane, by (dim << 1) | arrayed (2D, 2D
+    // array, cube, cube array): what a depth-compare binding samples where its
+    // colour view cannot compare (depth_dummy_view_for).
+    std::map<std::uint32_t, VkImage> dummy_depth_images;
+    std::map<std::uint32_t, VkDeviceMemory> dummy_depth_mem;
+    std::map<std::uint32_t, VkImageView> dummy_depth_views;
     VkSampler dummy_sampler = VK_NULL_HANDLE;
     // Constant buffers as storage buffers (TranslateOptions::cb_ssbo, BBHOST_CB_SSBO=0 to turn off):
     // the buffer bound where a V# could not be, and the device limits for binding one.
@@ -990,6 +996,13 @@ void bind_dummy_images(VkDescriptorSet set, const gcn::TranslateResult& meta, st
 // A 1x1 view matching a binding's (spv::Dim, arrayed), for when the T# gives
 // nothing usable. Never null for a dimension the translator can emit.
 VkImageView dummy_view_for(std::uint32_t dim, bool arrayed, bool zero = false);
+// BBHOST_COMPARE_GUARD (on unless 0): a depth-compare binding that resolves to a
+// colour view whose format the device cannot compare in (VkFormatProperties3's
+// SAMPLED_IMAGE_DEPTH_COMPARISON, which lavapipe's R32F lacks) samples
+// a far-plane depth dummy of its shape instead; `view` where the device compares
+// in its format, has no such dummy, or the guard is off. tsharp: the binding's T#.
+VkImageView compare_guard_view(VkImageView view, const std::uint32_t* tsharp, std::uint32_t dim, bool arrayed);
+extern std::atomic<std::uint64_t> g_compare_guarded;
 
 // Guest memory as the translated shaders reach it (draw capture): the host
 // bytes and guest address behind a storage-buffer binding over imported

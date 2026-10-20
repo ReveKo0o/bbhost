@@ -10491,6 +10491,8 @@ void cross_vendor_report() {
     host_log("render: depth-compare texture binds: %llu a depth target, %llu a colour target, %llu a snapshot of a target, %llu a texture",
              static_cast<ull>(g_compare_binds[0].load()), static_cast<ull>(g_compare_binds[1].load()), static_cast<ull>(g_compare_binds[2].load()),
              static_cast<ull>(g_compare_binds[3].load()));
+    host_log("render: depth-compare texture binds given the far-plane depth dummy (BBHOST_COMPARE_GUARD): %llu",
+             static_cast<ull>(g_compare_guarded.load()));
 }
 
 void render_report() {
@@ -11468,6 +11470,12 @@ void stage_final_views(const gcn::TranslateResult& meta, const StageImages& pre,
                 host_log("render: %s binding %u compares against 0x%llx: %s", pipeline_name ? pipeline_name : "?", b.binding,
                          static_cast<unsigned long long>(base), kinds[kind]);
             }
+            // A texture the device cannot compare in - an R32F shadow map's T#
+            // over memory no depth target has drawn yet, at the first world
+            // load - samples the far plane instead, which Vulkan defines
+            // (compare_guard_view). Targets and snapshots hold drawn depth and
+            // keep their views (none met yet: the counts above).
+            if (kind == 3) view = compare_guard_view(view, w, b.dim, b.arrayed);
         }
         if (!view) {
             // A binding the shader reads that resolves to nothing is a black

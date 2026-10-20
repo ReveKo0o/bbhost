@@ -1340,9 +1340,25 @@ const Chunk* import_anon(std::uint64_t va, std::uint64_t len) {
     return &(g.anon_imports[va] = c);
 }
 
+// BBHOST_DUMMY_CLEAR (on unless 0): the shaped dummies below hold opaque black,
+// as the 2D one does, and a zero variant each for an invalid T#, instead of
+// whatever their memory held: a missing cube, array or 3D texture sampled
+// whatever a driver's allocation had (zeros on NVIDIA, garbage elsewhere).
+const bool g_dummy_clear = [] {
+    const char* e = std::getenv("BBHOST_DUMMY_CLEAR");
+    return !(e && e[0] == '0');
+}();
+// BBHOST_TEST_DUMMIES=1 (tests): every dummy image is read back once made and
+// its texels checked against what it should hold (check_dummies; the line
+// "gpu: dummy images checked: ..."). They are made copyable for it.
+const bool g_test_dummies = [] {
+    const char* e = std::getenv("BBHOST_TEST_DUMMIES");
+    return e && e[0] == '1';
+}();
 // The 2D dummy above covers most bindings; shaders also declare 1D, 3D, cube
 // and arrayed images, and Vulkan requires the view type to match exactly. Make
-// a 1x1 image for each so no declared binding is ever left unwritten.
+// a 1x1 image for each so no declared binding is ever left unwritten, cleared
+// to opaque black (key (dim << 1) | arrayed) and to zero (the same | 0x100).
 void create_dim_dummies() {
     struct Kind {
         std::uint32_t dim;
@@ -1361,16 +1377,116 @@ void create_dim_dummies() {
         {3, true, VK_IMAGE_TYPE_2D, VK_IMAGE_VIEW_TYPE_CUBE_ARRAY, 6, VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT},
     };
     for (const Kind& k : kinds) {
+        for (int variant = 0; variant < (g_dummy_clear ? 2 : 1); ++variant) {
+            VkImageCreateInfo ici{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+            ici.flags = k.flags;
+            ici.imageType = k.type;
+            ici.format = VK_FORMAT_R8G8B8A8_UNORM;
+            ici.extent = {1, 1, 1};
+            ici.mipLevels = 1;
+            ici.arrayLayers = k.layers;
+            ici.samples = VK_SAMPLE_COUNT_1_BIT;
+            ici.tiling = VK_IMAGE_TILING_OPTIMAL;
+            ici.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT | (g_dummy_clear ? VK_IMAGE_USAGE_TRANSFER_DST_BIT : 0u) |
+                        (g_test_dummies ? VK_IMAGE_USAGE_TRANSFER_SRC_BIT : 0u);
+            ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+            VkImage image = VK_NULL_HANDLE;
+            if (vkCreateImage(g.device, &ici, nullptr, &image) != VK_SUCCESS) continue;
+            VkMemoryRequirements req{};
+            vkGetImageMemoryRequirements(g.device, image, &req);
+            VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+            mai.allocationSize = req.size;
+            mai.memoryTypeIndex = find_memory_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+            if (mai.memoryTypeIndex == UINT32_MAX) mai.memoryTypeIndex = find_memory_type(req.memoryTypeBits, 0);
+            VkDeviceMemory mem = VK_NULL_HANDLE;
+            if (mai.memoryTypeIndex == UINT32_MAX || vkAllocateMemory(g.device, &mai, nullptr, &mem) != VK_SUCCESS) {
+                vkDestroyImage(g.device, image, nullptr);
+                continue;
+            }
+            vkBindImageMemory(g.device, image, mem, 0);
+            VkImageViewCreateInfo vci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+            vci.image = image;
+            vci.viewType = k.view;
+            vci.format = ici.format;
+            vci.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, k.layers};
+            VkImageView view = VK_NULL_HANDLE;
+            if (vkCreateImageView(g.device, &vci, nullptr, &view) != VK_SUCCESS) {
+                vkDestroyImage(g.device, image, nullptr);
+                vkFreeMemory(g.device, mem, nullptr);
+                continue;
+            }
+            // GENERAL, the layout the descriptors claim, with the texel the
+            // 2D dummies hold: opaque black, or zero for an invalid T#.
+            VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+            bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+            vkBeginCommandBuffer(g_cmd(), &bi);
+            ++g.record_serial;  // dynamic state recorded so far is gone
+            VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+            b.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+            b.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+            b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            b.image = image;
+            b.subresourceRange = vci.subresourceRange;
+            b.dstAccessMask = g_dummy_clear ? VK_ACCESS_TRANSFER_WRITE_BIT : VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+            vkCmdPipelineBarrier(g_cmd(), VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, g_dummy_clear ? VK_PIPELINE_STAGE_TRANSFER_BIT : VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0,
+                                 nullptr, 0, nullptr, 1, &b);
+            if (g_dummy_clear) {
+                const VkClearColorValue texel{{0.0f, 0.0f, 0.0f, variant ? 0.0f : 1.0f}};
+                vkCmdClearColorImage(g_cmd(), image, VK_IMAGE_LAYOUT_GENERAL, &texel, 1, &vci.subresourceRange);
+                b.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+                b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+                b.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+                vkCmdPipelineBarrier(g_cmd(), VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
+            }
+            vkEndCommandBuffer(g_cmd());
+            VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+            si.commandBufferCount = 1;
+            si.pCommandBuffers = &g.cmd_;
+            vkResetFences(g.device, 1, &g.fence);
+            {
+                QueueGuard queue;
+                vkQueueSubmit(g.queue, 1, &si, g.fence);
+            }
+            vkWaitForFences(g.device, 1, &g.fence, VK_TRUE, UINT64_MAX);
+            vkResetFences(g.device, 1, &g.fence);  // the slot's own: its first real submission wants it unsignaled
+            const std::uint32_t key = (k.dim << 1) | (k.arrayed ? 1u : 0u) | (variant ? 0x100u : 0u);
+            g.dummy_dim_images[key] = image;
+            g.dummy_dim_mem[key] = mem;
+            g.dummy_dim_views[key] = view;
+        }
+    }
+}
+
+// The far-plane depth dummies (Gpu::dummy_depth_views): D32_SFLOAT where the
+// device samples it with a comparison, cleared to 1.0, GENERAL.
+void create_depth_dummies() {
+    VkFormatProperties fp{};
+    vkGetPhysicalDeviceFormatProperties(g.phys, VK_FORMAT_D32_SFLOAT, &fp);
+    if (!(fp.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT)) return;
+    struct Kind {
+        std::uint32_t dim;
+        bool arrayed;
+        VkImageViewType view;
+        std::uint32_t layers;
+        VkImageCreateFlags flags;
+    };
+    static const Kind kinds[] = {
+        {1, false, VK_IMAGE_VIEW_TYPE_2D, 1, 0},
+        {1, true, VK_IMAGE_VIEW_TYPE_2D_ARRAY, 1, 0},
+        {3, false, VK_IMAGE_VIEW_TYPE_CUBE, 6, VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT},
+        {3, true, VK_IMAGE_VIEW_TYPE_CUBE_ARRAY, 6, VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT},
+    };
+    for (const Kind& k : kinds) {
         VkImageCreateInfo ici{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
         ici.flags = k.flags;
-        ici.imageType = k.type;
-        ici.format = VK_FORMAT_R8G8B8A8_UNORM;
+        ici.imageType = VK_IMAGE_TYPE_2D;
+        ici.format = VK_FORMAT_D32_SFLOAT;
         ici.extent = {1, 1, 1};
         ici.mipLevels = 1;
         ici.arrayLayers = k.layers;
         ici.samples = VK_SAMPLE_COUNT_1_BIT;
         ici.tiling = VK_IMAGE_TILING_OPTIMAL;
-        ici.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT;
+        ici.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | (g_test_dummies ? VK_IMAGE_USAGE_TRANSFER_SRC_BIT : 0u);
         ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
         VkImage image = VK_NULL_HANDLE;
         if (vkCreateImage(g.device, &ici, nullptr, &image) != VK_SUCCESS) continue;
@@ -1390,16 +1506,13 @@ void create_dim_dummies() {
         vci.image = image;
         vci.viewType = k.view;
         vci.format = ici.format;
-        vci.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, k.layers};
+        vci.subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, k.layers};
         VkImageView view = VK_NULL_HANDLE;
         if (vkCreateImageView(g.device, &vci, nullptr, &view) != VK_SUCCESS) {
             vkDestroyImage(g.device, image, nullptr);
             vkFreeMemory(g.device, mem, nullptr);
             continue;
         }
-        // Undefined contents are fine for a binding the shader should not be
-        // reading; what matters is that the descriptor is defined. Move it to
-        // GENERAL so the layout matches what the descriptor claims.
         VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
         bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
         vkBeginCommandBuffer(g_cmd(), &bi);
@@ -1410,9 +1523,14 @@ void create_dim_dummies() {
         b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         b.image = image;
         b.subresourceRange = vci.subresourceRange;
-        b.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
-        vkCmdPipelineBarrier(g_cmd(), VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr,
-                             0, nullptr, 1, &b);
+        b.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        vkCmdPipelineBarrier(g_cmd(), VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
+        const VkClearDepthStencilValue far{1.0f, 0};
+        vkCmdClearDepthStencilImage(g_cmd(), image, VK_IMAGE_LAYOUT_GENERAL, &far, 1, &vci.subresourceRange);
+        b.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+        b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        b.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        vkCmdPipelineBarrier(g_cmd(), VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
         vkEndCommandBuffer(g_cmd());
         VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
         si.commandBufferCount = 1;
@@ -1425,10 +1543,90 @@ void create_dim_dummies() {
         vkWaitForFences(g.device, 1, &g.fence, VK_TRUE, UINT64_MAX);
         vkResetFences(g.device, 1, &g.fence);  // the slot's own: its first real submission wants it unsignaled
         const std::uint32_t key = (k.dim << 1) | (k.arrayed ? 1u : 0u);
-        g.dummy_dim_images[key] = image;
-        g.dummy_dim_mem[key] = mem;
-        g.dummy_dim_views[key] = view;
+        g.dummy_depth_images[key] = image;
+        g.dummy_depth_mem[key] = mem;
+        g.dummy_depth_views[key] = view;
     }
+}
+
+// BBHOST_TEST_DUMMIES=1: each dummy image's every layer read back and checked -
+// the 2D and shaped colour ones opaque black (0, 0, 0, 255) or, the zero
+// variants, all zero; the depth ones 1.0.
+void check_dummies() {
+    struct One {
+        VkImage image;
+        std::uint32_t layers;
+        bool depth;
+        std::uint32_t want;  // the texel's bits
+        std::string what;
+    };
+    std::vector<One> all = {{g.dummy_image, 1, false, 0xff000000u, "2D"}, {g.dummy_zero_image, 1, false, 0u, "2D zero"}};
+    for (const auto& [key, image] : g.dummy_dim_images) {
+        const std::uint32_t dim = (key & 0xff) >> 1;
+        all.push_back({image, dim == 3 ? 6u : 1u, false, (key & 0x100) ? 0u : 0xff000000u,
+                       "dim " + std::to_string(dim) + ((key & 1) ? " array" : "") + ((key & 0x100) ? " zero" : "")});
+    }
+    for (const auto& [key, image] : g.dummy_depth_images) {
+        all.push_back({image, (key >> 1) == 3 ? 6u : 1u, true, 0x3f800000u, "depth dim " + std::to_string(key >> 1) + ((key & 1) ? " array" : "")});
+    }
+    std::uint32_t texels = 0;
+    for (const One& o : all) texels += o.layers;
+    DevBuffer rb;
+    if (!create_dev_buffer(rb, texels * 4, true, true)) {
+        host_log("gpu: dummy images checked: no readback buffer");
+        return;
+    }
+    VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkBeginCommandBuffer(g_cmd(), &bi);
+    ++g.record_serial;
+    VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    mb.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+    mb.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    vkCmdPipelineBarrier(g_cmd(), VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
+    std::uint32_t at = 0;
+    for (const One& o : all) {
+        for (std::uint32_t l = 0; l < o.layers; ++l, ++at) {
+            VkBufferImageCopy c{};
+            c.bufferOffset = at * 4;
+            c.imageSubresource = {static_cast<VkImageAspectFlags>(o.depth ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT), 0, l, 1};
+            c.imageExtent = {1, 1, 1};
+            vkCmdCopyImageToBuffer(g_cmd(), o.image, VK_IMAGE_LAYOUT_GENERAL, rb.buffer, 1, &c);
+        }
+    }
+    mb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    mb.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+    vkCmdPipelineBarrier(g_cmd(), VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
+    vkEndCommandBuffer(g_cmd());
+    VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    si.commandBufferCount = 1;
+    si.pCommandBuffers = &g.cmd_;
+    vkResetFences(g.device, 1, &g.fence);
+    {
+        QueueGuard queue;
+        vkQueueSubmit(g.queue, 1, &si, g.fence);
+    }
+    vkWaitForFences(g.device, 1, &g.fence, VK_TRUE, UINT64_MAX);
+    vkResetFences(g.device, 1, &g.fence);
+    std::uint32_t wrong = 0;
+    std::string first;
+    at = 0;
+    for (const One& o : all) {
+        for (std::uint32_t l = 0; l < o.layers; ++l, ++at) {
+            std::uint32_t got;
+            std::memcpy(&got, static_cast<const std::uint8_t*>(rb.map) + at * 4, 4);
+            if (got == o.want) continue;
+            ++wrong;
+            if (first.empty()) {
+                char b[160];
+                std::snprintf(b, sizeof(b), "; first: %s layer %u holds %08x, not %08x", o.what.c_str(), l, got, o.want);
+                first = b;
+            }
+        }
+    }
+    host_log("gpu: dummy images checked: %zu images, %u texels, %u wrong%s", all.size(), texels, wrong, first.c_str());
+    vkDestroyBuffer(g.device, rb.buffer, nullptr);
+    vkFreeMemory(g.device, rb.memory, nullptr);
 }
 
 bool create_dummy_resources() {
@@ -1440,7 +1638,8 @@ bool create_dummy_resources() {
     ici.arrayLayers = 1;
     ici.samples = VK_SAMPLE_COUNT_1_BIT;
     ici.tiling = VK_IMAGE_TILING_OPTIMAL;
-    ici.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    ici.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                (g_test_dummies ? VK_IMAGE_USAGE_TRANSFER_SRC_BIT : 0u);
     ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     if (vkCreateImage(g.device, &ici, nullptr, &g.dummy_image) != VK_SUCCESS) return false;
     VkMemoryRequirements req{};
@@ -1523,6 +1722,8 @@ bool create_dummy_resources() {
     vkWaitForFences(g.device, 1, &g.fence, VK_TRUE, UINT64_MAX);
     vkResetFences(g.device, 1, &g.fence);  // the slot's own: its first real submission wants it unsignaled
     create_dim_dummies();
+    create_depth_dummies();
+    if (g_test_dummies) check_dummies();
     return true;
 }
 
@@ -3648,10 +3849,38 @@ VkDescriptorSet alloc_set_locked(VkDescriptorSetLayout layout) {
     return sets[0];
 }
 
+std::atomic<std::uint64_t> g_compare_guarded{0};
+VkImageView compare_guard_view(VkImageView view, const std::uint32_t* t, std::uint32_t dim, bool arrayed) {
+    static const bool on = [] {
+        const char* e = std::getenv("BBHOST_COMPARE_GUARD");
+        return !(e && e[0] == '0');
+    }();
+    if (!on) return view;
+    // R32F (DATA_FORMAT 4, NUM_FORMAT 7: the shadow maps' T#s) where the
+    // device compares in it keeps its view; anything else is no depth format.
+    static const bool r32f_compares = [] {
+        VkFormatProperties3 f3{VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_3};
+        VkFormatProperties2 f2{VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_2};
+        f2.pNext = &f3;
+        vkGetPhysicalDeviceFormatProperties2(g.phys, VK_FORMAT_R32_SFLOAT, &f2);
+        return (f3.optimalTilingFeatures & VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_DEPTH_COMPARISON_BIT) != 0;
+    }();
+    const bool r32f = ((t[1] >> 20) & 0x3f) == 4 && ((t[1] >> 26) & 0xf) == 7;
+    if (r32f && r32f_compares) return view;
+    const auto it = g.dummy_depth_views.find((dim << 1) | (arrayed ? 1u : 0u));
+    if (it == g.dummy_depth_views.end()) return view;
+    g_compare_guarded.fetch_add(1, std::memory_order_relaxed);
+    return it->second;
+}
+
 VkImageView dummy_view_for(std::uint32_t dim, bool arrayed, bool zero) {
     if (zero && dim == 1 && !arrayed && g.dummy_zero_view) return g.dummy_zero_view;
     if (dim == 1 && !arrayed) return g.dummy_view;
-    auto it = g.dummy_dim_views.find((dim << 1) | (arrayed ? 1u : 0u));
+    const std::uint32_t key = (dim << 1) | (arrayed ? 1u : 0u);
+    if (zero) {  // an invalid T#'s zeros, where the shape has them (create_dim_dummies)
+        if (const auto z = g.dummy_dim_views.find(key | 0x100u); z != g.dummy_dim_views.end()) return z->second;
+    }
+    auto it = g.dummy_dim_views.find(key);
     return it == g.dummy_dim_views.end() ? VK_NULL_HANDLE : it->second;
 }
 
