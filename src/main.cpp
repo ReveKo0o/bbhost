@@ -7,6 +7,7 @@
 #include "core/portable.h"
 #include "core/thunk.h"
 #include "core/elf.h"
+#include "../third_party/discord-rpc/discord_rpc.h"
 #include "core/imports.h"
 #include "core/win_watch.h"
 #include "core/write_watch.h"
@@ -968,6 +969,19 @@ int main(int argc, char** argv) {
     // and they seed from bbhost.toml, so a run with no options file behaves
     // exactly as it did.
     host_options_load();
+    // Initialize Discord Rich Presence if enabled in options
+if (host_opt_get("discord_rpc")) {
+    DiscordEventHandlers handlers;
+    std::memset(&handlers, 0, sizeof(handlers));
+    Discord_Initialize("1562063078466650206", &handlers, 1, nullptr);
+
+    DiscordRichPresence presence;
+    std::memset(&presence, 0, sizeof(presence));
+    presence.state = "Exploring";
+    presence.details = "Bloodborne PC";
+    presence.largeImageKey = "logo";
+    Discord_UpdatePresence(&presence);
+}
     config_set_skip_intro(host_settings().skip_logos);
     // The PC enhancements are read the same way, once: each installs (or its
     // patch applies) while the guest is prepared, so a change waits for the
