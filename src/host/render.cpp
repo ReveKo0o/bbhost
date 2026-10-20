@@ -107,11 +107,29 @@ VkFormat cb_format(const CbInfo& i) {
     }
 }
 
+// A Z_16 target with stencil is D24_UNORM_S8_UINT where the device can make
+// that a depth attachment, and D32_SFLOAT_S8_UINT where it cannot (AMD's
+// drivers have no D24S8): a format the device lacks is no target at all.
+// BBHOST_DEPTH_FORMAT_CHECK=0: D24S8 everywhere, as before.
+VkFormat z16_stencil_format() {
+    static const VkFormat f = [] {
+        const char* e = std::getenv("BBHOST_DEPTH_FORMAT_CHECK");
+        if (e && e[0] == '0') return VK_FORMAT_D24_UNORM_S8_UINT;
+        VkFormatProperties fp{};
+        vkGetPhysicalDeviceFormatProperties(g.phys, VK_FORMAT_D24_UNORM_S8_UINT, &fp);
+        const VkFormatFeatureFlags need = VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT;
+        if ((fp.optimalTilingFeatures & need) == need) return VK_FORMAT_D24_UNORM_S8_UINT;
+        host_log("render: no D24_UNORM_S8_UINT depth attachments on this device: Z_16 targets with stencil are D32_SFLOAT_S8_UINT");
+        return VK_FORMAT_D32_SFLOAT_S8_UINT;
+    }();
+    return f;
+}
+
 VkFormat db_format(std::uint32_t z_info, std::uint32_t stencil_info) {
     const std::uint32_t zf = z_info & 3;
     const bool stencil = (stencil_info & 1) != 0;
     if (zf == 0) return stencil ? VK_FORMAT_D32_SFLOAT_S8_UINT : VK_FORMAT_UNDEFINED;
-    if (zf == 1) return stencil ? VK_FORMAT_D24_UNORM_S8_UINT : VK_FORMAT_D16_UNORM;
+    if (zf == 1) return stencil ? z16_stencil_format() : VK_FORMAT_D16_UNORM;
     return stencil ? VK_FORMAT_D32_SFLOAT_S8_UINT : VK_FORMAT_D32_SFLOAT;
 }
 
