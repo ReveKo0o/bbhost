@@ -222,7 +222,11 @@ update read and wrote its 176-byte records across the bus at about 0.2 µs a
 particle: 7.4 ms of an RTX 4070 a frame in Vicar Amelia's room (73 fps
 uncapped at 1080p), against 0.14 ms as twins (161 fps). An integrated GPU's
 device memory is the host's own, so there they stay in guest memory, as they
-do under a capture. With window imports a copy's source the CPU wrote is
+do under a capture. Every buffer binding asks the twins first; one that meets
+no twin and no armed buffer - nearly all of a frame's - is answered from a
+sorted list of their ranges' union instead of two map walks
+(`BBHOST_TWIN_FAST_MISS`: `0` walks the maps for every lookup, `check` does
+both and counts any answer that differs in the exit report). With window imports a copy's source the CPU wrote is
 copied through upload staging, as copy versions' bytes are, rather than read
 through an import. The exit report lists what still reads or writes guest
 memory in place, by the path that asked.

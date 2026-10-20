@@ -614,6 +614,11 @@ if(UNIX)
   target_link_libraries(cb_proof_test PRIVATE pthread)
   add_test(NAME cb_proof_test COMMAND cb_proof_test)
   set_tests_properties(cb_proof_test PROPERTIES ENVIRONMENT "BBHOST_CB_RECORD_PROOF=1")
+  # The twins' miss filter against the map walks it stands in for, without the GPU (tests/twin_filter_test.cpp;
+  # twin_filter_test --bench times the miss path both ways).
+  add_executable(twin_filter_test tests/twin_filter_test.cpp)
+  target_include_directories(twin_filter_test PRIVATE src)
+  add_test(NAME twin_filter_test COMMAND twin_filter_test)
   # The engine's classes by the names they register (tools/class_catalog.cpp).
   add_executable(class_catalog tools/class_catalog.cpp src/decomp/insn.cpp)
   target_link_libraries(class_catalog PRIVATE eboot_kit)

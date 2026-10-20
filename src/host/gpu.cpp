@@ -12,6 +12,7 @@
 #include "host/shaders/gpu_stall.spv.h"
 #include "host/shader_bundles.h"
 #include "host/translation_cache.h"
+#include "host/twin_filter.h"
 #include "host/options.h"
 
 #include "gcn/container.h"
@@ -8340,13 +8341,10 @@ std::atomic<std::uint64_t> g_twin_armed{0};
 // Level 3: the armed candidates' ranges (memory -> end), under g.mu - a filter
 // in front of the candidates' lock, so a binding that meets none of them (most
 // of a frame's) costs one lookup in a short map. It holds every armed
-// candidate's range, perhaps more (one let go or gone since).
-std::map<std::uint64_t, std::uint64_t> g_twin_armed_ranges;
-bool twin_armed_meets_locked(std::uint64_t va, std::uint64_t bytes) {
-    auto it = g_twin_armed_ranges.upper_bound(va);
-    if (it != g_twin_armed_ranges.begin() && va < std::prev(it)->second) return true;
-    return it != g_twin_armed_ranges.end() && it->first < va + bytes;
-}
+// candidate's range, perhaps more (one let go or gone since). Its inserts and
+// erases move its shape, as the live twins' do: the miss filter's rebuild.
+twins::ShapedMap<std::uint64_t> g_twin_armed_ranges;
+bool twin_armed_meets_locked(std::uint64_t va, std::uint64_t bytes) { return twins::ranges_meet(g_twin_armed_ranges, va, bytes); }
 // Its range out of the filter, unless an armed candidate (a newer resource's)
 // still holds that memory. Not under g_twin_cand_mu (it takes it).
 void twin_armed_forget_locked(std::uint64_t memory);
@@ -8363,7 +8361,7 @@ struct Twin {
     int block = -1;
     DevBuffer own;
 };
-std::map<std::uint64_t, Twin> g_twin_live;  // by memory, under g.mu
+twins::ShapedMap<Twin> g_twin_live;  // by memory, under g.mu (inserts and erases move its shape: twin_filter.h)
 enum { kTwinGoneWalk, kTwinGoneEdge, kTwinGoneDead, kTwinGoneFill, kTwinGoneTexture, kTwinGoneCpuMapped, kTwinGoneWhys };
 std::atomic<std::uint64_t> g_twin_cands{0}, g_twin_made{0}, g_twin_made_bytes{0}, g_twin_served{0}, g_twin_addresses{0},
     g_twin_refused{0}, g_twin_partial{0}, g_twin_edge_in_pass{0}, g_twin_edge_ended_pass{0}, g_twin_gone[kTwinGoneWhys], g_twin_copy_cands{0},
@@ -8578,6 +8576,47 @@ void twins_drop_cpu_mapped_locked() {
     }
     for (const std::uint64_t memory : gone) twin_drop_locked(memory, false, kTwinGoneCpuMapped);
 }
+// A drop the next lookup must make first: a gone resource's twin
+// (twins_drain_gone_locked) or a CPU-mapped one (twins_drop_cpu_mapped_locked)
+// - exactly when either of those does any work.
+bool twins_drop_pending_locked() {
+    return g_twin_gone_n.load(std::memory_order_acquire) != g_twin_gone_seen ||
+           (g_twin_cpu_mapped_n.load(std::memory_order_relaxed) != g_twin_cpu_mapped_seen && !g_twin_live.empty());
+}
+// The miss filter (twin_filter.h): the live twins' and armed ranges' union,
+// under g.mu. A lookup that meets none of it has the answer the maps would
+// give it - no live twin, refused by the armed filter - without walking them.
+// BBHOST_TWIN_FAST_MISS=0: every lookup walks the maps, as before; =check:
+// both, each "no" of the filter checked against the maps' (the exit report
+// counts any that differ).
+enum { kFastMissOff, kFastMissOn, kFastMissCheck };
+const int g_twin_fast_miss = [] {
+    const char* e = std::getenv("BBHOST_TWIN_FAST_MISS");
+    if (e && e[0] == '0') return int{kFastMissOff};
+    if (e && std::strcmp(e, "check") == 0) return int{kFastMissCheck};
+    return int{kFastMissOn};
+}();
+twins::MissFilter g_twin_filter;
+std::uint64_t g_twin_filter_misses = 0, g_twin_filter_checked = 0, g_twin_filter_wrong = 0;  // under g.mu
+// [va, va + bytes) meets no live twin and no armed range (bytes > 0).
+bool twin_filter_misses_locked(std::uint64_t va, std::uint64_t bytes) {
+    if (g_twin_fast_miss == kFastMissOff) return false;
+    g_twin_filter.refresh(g_twin_live, g_twin_armed_ranges);
+    if (g_twin_filter.meets(va, bytes)) return false;
+    ++g_twin_filter_misses;
+    if (g_twin_fast_miss == kFastMissCheck) {
+        ++g_twin_filter_checked;
+        if (twins::live_meets(g_twin_live, va, bytes) || twins::ranges_meet(g_twin_armed_ranges, va, bytes)) {
+            if (++g_twin_filter_wrong <= 8) {
+                host_log("gpu: twins: the miss filter said 0x%llx + 0x%llx meets nothing, and the maps disagree (%zu spans, %zu live, %zu armed)",
+                         static_cast<unsigned long long>(va), static_cast<unsigned long long>(bytes), g_twin_filter.spans(), g_twin_live.size(),
+                         g_twin_armed_ranges.size());
+            }
+            return false;  // the maps' answer, as without the filter
+        }
+    }
+    return true;
+}
 }  // namespace
 
 bool twins_on() { return g_twins.load(std::memory_order_relaxed) != 0; }
@@ -8617,7 +8656,7 @@ void twins_arm_wanted_locked() {
     for (const std::uint64_t memory : g_twin_want) {
         if (auto c = g_twin_cand.find(memory); c != g_twin_cand.end() && !c->second.armed && !c->second.let_go) {
             c->second.armed = true;
-            g_twin_armed_ranges[memory] = memory + c->second.bytes;
+            g_twin_armed_ranges.assign(memory, memory + c->second.bytes);
             g_twin_armed.fetch_add(1, std::memory_order_relaxed);
         }
     }
@@ -8626,6 +8665,10 @@ void twins_arm_wanted_locked() {
 
 bool twin_locate_locked(std::uint64_t va, std::uint64_t bytes, Located& out, VkDeviceAddress* address) {
     if (!g_twins || !bytes || !g_twin_cand_n.load(std::memory_order_relaxed)) return false;
+    // Level 3 (the particle twins), no drop pending: a range that meets no live
+    // twin and no armed range is refused below by the armed filter, after both
+    // walks - answered here from the filter instead.
+    if (g_twins.load(std::memory_order_relaxed) == 3 && !twins_drop_pending_locked() && twin_filter_misses_locked(va, bytes)) return false;
     twins_drain_gone_locked();
     twins_drop_cpu_mapped_locked();
     // Inside a live twin (the common case): served without the candidates'
@@ -8783,6 +8826,7 @@ bool twin_locate_locked(std::uint64_t va, std::uint64_t bytes, Located& out, VkD
 
 bool twin_covers_locked(std::uint64_t va, std::uint64_t bytes) {
     if (!g_twins || g_twin_live.empty() || !bytes) return false;
+    if (!twins_drop_pending_locked() && twin_filter_misses_locked(va, bytes)) return false;  // meets no live twin
     // A twin whose buffer died is dropped first (its memory may be a CPU ring
     // now, which must keep its copies): the registry tells (twins_buffer_gone).
     twins_drain_gone_locked();
@@ -8796,6 +8840,7 @@ bool twin_covers_locked(std::uint64_t va, std::uint64_t bytes) {
 
 bool twin_holds_live_locked(std::uint64_t va, std::uint64_t bytes) {
     if (!g_twins || g_twin_live.empty() || !bytes) return false;
+    if (twin_filter_misses_locked(va, bytes)) return false;  // meets no live twin
     auto it = g_twin_live.upper_bound(va);
     if (it == g_twin_live.begin()) return false;
     --it;
@@ -8804,7 +8849,8 @@ bool twin_holds_live_locked(std::uint64_t va, std::uint64_t bytes) {
 
 bool twin_candidate_straddles(std::uint64_t va, std::uint64_t bytes) {
     if (!g_twins || !bytes || !g_twin_cand_n.load(std::memory_order_relaxed)) return false;
-    if (g_twins.load(std::memory_order_relaxed) == 3 && !twin_armed_meets_locked(va, bytes)) return false;  // (callers hold g.mu)
+    if (g_twins.load(std::memory_order_relaxed) == 3 && (twin_filter_misses_locked(va, bytes) || !twin_armed_meets_locked(va, bytes)))
+        return false;  // (callers hold g.mu)
     std::lock_guard<std::mutex> lk(g_twin_cand_mu);
     auto it = g_twin_cand.upper_bound(va);
     if (it != g_twin_cand.begin()) {
@@ -8882,7 +8928,8 @@ void twin_note_import_near_locked(std::uint64_t va, std::uint64_t bytes, const c
 
 bool twin_candidate_holds(std::uint64_t va, std::uint64_t bytes) {
     if (!g_twins || !bytes || !g_twin_cand_n.load(std::memory_order_relaxed)) return false;
-    if (g_twins.load(std::memory_order_relaxed) == 3 && !twin_armed_meets_locked(va, bytes)) return false;  // (callers hold g.mu)
+    if (g_twins.load(std::memory_order_relaxed) == 3 && (twin_filter_misses_locked(va, bytes) || !twin_armed_meets_locked(va, bytes)))
+        return false;  // (callers hold g.mu)
     std::lock_guard<std::mutex> lk(g_twin_cand_mu);
     auto it = g_twin_cand.upper_bound(va);
     if (it == g_twin_cand.begin()) return false;
@@ -8919,11 +8966,15 @@ std::string twins_report() {
         cands = g_twin_cand.size();
         cpu_mapped = g_twin_cpu_mapped.size();
     }
+    std::uint64_t filter_misses = 0, filter_checked = 0, filter_wrong = 0, filter_builds = 0;
+    std::size_t filter_spans = 0;
     {
         std::lock_guard<GpuMutex> lock(g.mu);  // the command processor may still be making twins
         live = g_twin_live.size();
         live_bytes = g_twin_live_bytes;
         blocks = g_twin_blocks.size();
+        filter_misses = g_twin_filter_misses, filter_checked = g_twin_filter_checked, filter_wrong = g_twin_filter_wrong;
+        filter_builds = g_twin_filter.builds(), filter_spans = g_twin_filter.spans();
     }
     using ull = unsigned long long;
     char mode[96];
@@ -8947,7 +8998,21 @@ std::string twins_report() {
                   static_cast<ull>(g_twin_edge_ended_pass.load()), static_cast<ull>(g_twin_edge_in_pass.load()),
                   static_cast<ull>(g_twin_gone[kTwinGoneTexture].load()), static_cast<ull>(g_twin_gone[kTwinGoneDead].load()),
                   static_cast<ull>(g_twin_gone[kTwinGoneFill].load()), static_cast<ull>(cpu_mapped), static_cast<ull>(g_twin_cpu_mapped_n.load()));
-    return b;
+    std::string out = b;
+    // The miss filter (twin_filter.h): lookups it answered without walking the maps.
+    char f[300];
+    if (g_twin_fast_miss == kFastMissOff) {
+        std::snprintf(f, sizeof(f), "; miss filter off (BBHOST_TWIN_FAST_MISS=0)");
+    } else {
+        std::snprintf(f, sizeof(f), "; miss filter: %llu lookups answered from %zu spans (%llu builds)", static_cast<ull>(filter_misses), filter_spans,
+                      static_cast<ull>(filter_builds));
+        if (g_twin_fast_miss == kFastMissCheck) {
+            const std::size_t at = std::strlen(f);
+            std::snprintf(f + at, sizeof(f) - at, ", each checked against the maps: %llu checked, %llu differ", static_cast<ull>(filter_checked),
+                          static_cast<ull>(filter_wrong));
+        }
+    }
+    return out + f;
 }
 
 void twins_buffer_gone(std::uint64_t memory, std::uint64_t gen) {
