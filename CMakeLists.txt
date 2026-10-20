@@ -24,7 +24,8 @@ target_include_directories(monocypher PUBLIC third_party/monocypher)
 set_target_properties(monocypher PROPERTIES C_STANDARD 99 POSITION_INDEPENDENT_CODE ON)
 
 # Discord RPC for Rich Presence
-add_library(discord-rpc STATIC third_party/discord-rpc/discord_rpc.cpp)
+file(GLOB DISCORD_RPC_SOURCES "third_party/discord-rpc/*.cpp")
+add_library(discord-rpc STATIC ${DISCORD_RPC_SOURCES})
 target_include_directories(discord-rpc PUBLIC third_party/discord-rpc)
 set_target_properties(discord-rpc PROPERTIES CXX_STANDARD 17 POSITION_INDEPENDENT_CODE ON)
 
