@@ -57,6 +57,11 @@
  *                                             "hide" Player Hide (0x593e88e): the
  *                                             enemies do not notice the player;
  *                                             "off": both off again
+ *     pitch <radians>|off                     hold the follow camera's pitch
+ *                                             (+0x140, and the reset's +0x148 and
+ *                                             the return's +0x150 so it does not
+ *                                             ease back; positive looks down)
+ *                                             every frame until "pitch off"
  *     turn <n> <s>                            the follow camera through 360
  *                                             degrees in n headings, s seconds
  *                                             each (its yaw, ChrExFollowCam
@@ -135,7 +140,7 @@ static double loading_t0;  /* when the screen came up */
 /* --- the tour ------------------------------------------------------------ */
 
 enum { S_WARP, S_KILL, S_FALL, S_WAIT, S_TRAVEL, S_WALK, S_HOLD, S_MARK, S_CAMERA, S_QUIET, S_DUMP, S_CAPTURE, S_F12,
-       S_GOD, S_TURN, S_FLAGS, S_FLAGLOG, S_REMO, S_MOVIE, S_EXIT, S_BITS };
+       S_GOD, S_TURN, S_FLAGS, S_FLAGLOG, S_REMO, S_MOVIE, S_EXIT, S_BITS, S_PITCH };
 #define MAX_STEPS 4096
 typedef struct {
     int kind;
@@ -279,6 +284,12 @@ static void load_tour(const char* path) {
         }
         else if (!strcmp(kind, "turn") && sscanf(line, "%*s %d %f", &s.team, &s.hold) == 2 && s.team > 0)
             s.kind = S_TURN, strcpy(s.name, "turn");
+        else if (!strcmp(kind, "pitch")) {
+            char opt[16] = "";
+            s.kind = S_PITCH, strcpy(s.name, "pitch");
+            if (sscanf(line, "%*s %15s", opt) != 1 || !strcmp(opt, "off")) s.team = 0;
+            else s.team = 1, s.hold = (float)atof(opt);
+        }
         else if (!strcmp(kind, "flags")) {
             s.kind = S_FLAGS, strcpy(s.name, "flags");
             const char* q = line + 5;
@@ -525,6 +536,8 @@ static uint64_t ex_follow_cam(void) {
 }
 static double turn_base;
 static int turn_k = -1;
+static int pitch_on;    /* "pitch": the camera's pitch held every frame */
+static float pitch_hold;
 
 /* A cutscene plays while bit 0 of byte +0x168 of the remo manager
  * (*(*0x5940058 + 8)) is set: what the event scripts' wait for one polls
@@ -652,6 +665,11 @@ static void begin(int i, double t) {
         int r = api->write(0x593e888, &v, 1);
         if (s->team) r |= api->write(0x593e88e, &v, 1);
         api->log("mapval god %.3f no-dead%s -> %s", t, s->team ? " hide" : "", r ? "REFUSED" : v ? "on" : "off");
+    } else if (s->kind == S_PITCH) {
+        uint64_t cam = ex_follow_cam();
+        pitch_on = s->team, pitch_hold = s->hold;
+        api->log("mapval pitch %.3f %s%s", t, s->team ? "held at" : "off", cam ? "" : " (no camera)");
+        if (s->team) api->log("mapval pitch-to %.3f (was %.3f)", pitch_hold, cam ? *(const volatile float*)(uintptr_t)(cam + 0x140) : 0.f);
     } else if (s->kind == S_TURN) {
         uint64_t cam = ex_follow_cam();
         turn_k = -1;
@@ -976,7 +994,8 @@ static void tick(double t) {
     } else if (s->kind == S_EXIT) {
         if (el > 30) next = 1; /* the host ends the run before this */
     } else if (s->kind == S_MARK || s->kind == S_CAMERA || s->kind == S_QUIET || s->kind == S_DUMP || s->kind == S_CAPTURE ||
-               s->kind == S_F12 || s->kind == S_GOD || s->kind == S_FLAGS || s->kind == S_FLAGLOG || s->kind == S_BITS) {
+               s->kind == S_F12 || s->kind == S_GOD || s->kind == S_FLAGS || s->kind == S_FLAGLOG || s->kind == S_BITS ||
+               s->kind == S_PITCH) {
         next = 1; /* done in begin() */
     } else if (el >= s->hold) {
         next = 1;
@@ -1044,6 +1063,15 @@ static void on_frame(void* u) {
             int64_t hp = player_hp();
             api->player_block(&b);
             api->log("mapval pos %.3f %08x %.3f %.3f %.3f %.3f %lld", t, b, p[0], p[1], p[2], yaw, (long long)hp);
+        }
+    }
+    if (pitch_on) {
+        uint64_t cam = ex_follow_cam();
+        if (cam) {
+            volatile float* f = (volatile float*)(uintptr_t)cam;
+            f[0x140 / 4] = pitch_hold; /* every frame: the camera's return would ease it back */
+            f[0x148 / 4] = pitch_hold;
+            f[0x150 / 4] = pitch_hold;
         }
     }
     if (cur < 0 && nsteps && have && first_seen_t && t - first_seen_t >= start_after) {
