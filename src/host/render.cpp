@@ -13,6 +13,7 @@
 #include "host/shader_patch.h"
 #include "host/tess_lds.h"
 #include "host/translation_cache.h"
+#include "host/vertex_plan.h"
 
 #include "host/cb_proof.h"
 #include "host/draw_capture.h"
@@ -2920,35 +2921,7 @@ void report_gx_state_compare() {
              static_cast<unsigned long long>(g_gs_bypass), static_cast<unsigned long long>(g_gs_biased));
 }
 
-// Vulkan vertex input: the unsigned format that holds a V# data
-// format's raw components (packed formats as one dword), so the vertex shader
-// converts them as the fetch shader did; UNDEFINED for unknown formats.
-VkFormat vertex_format(std::uint32_t dfmt) {
-    switch (dfmt) {
-        case 1: return VK_FORMAT_R8_UINT;
-        case 3: return VK_FORMAT_R8G8_UINT;
-        case 10: return VK_FORMAT_R8G8B8A8_UINT;
-        case 2: return VK_FORMAT_R16_UINT;
-        case 5: return VK_FORMAT_R16G16_UINT;
-        case 12: return VK_FORMAT_R16G16B16A16_UINT;
-        case 4: return VK_FORMAT_R32_UINT;
-        case 11: return VK_FORMAT_R32G32_UINT;
-        case 13: return VK_FORMAT_R32G32B32_UINT;
-        case 14: return VK_FORMAT_R32G32B32A32_UINT;
-        case 6: case 7: case 8: case 9: return VK_FORMAT_R32_UINT;
-        default: return VK_FORMAT_UNDEFINED;
-    }
-}
-std::uint32_t vertex_format_bytes(std::uint32_t dfmt) {
-    switch (dfmt) {
-        case 1: return 1;
-        case 2: case 3: return 2;
-        case 11: case 12: return 8;
-        case 13: return 12;
-        case 14: return 16;
-        default: return 4;
-    }
-}
+// vertex_format and vertex_format_bytes: host/vertex_plan.h.
 // The packing (gcn::VertexElement::packed) an attribute's format says its
 // element arrives in: the R16, R32 or R32G32 UINT format pack_vertex_input
 // gives an element of 8- or 16-bit components, where one component a channel
@@ -3981,6 +3954,15 @@ void note_precompile_miss(const std::string& name, const PsStageInputs& in);
 // A vertex shader's stage translation (step 6d), as PsStageInputs: a draw fills
 // it from the draw state, and per-shader compiles from the shader's binary
 // (elements from its input table, registers from its register block).
+// BBHOST_VERTEX_KEY_PACKING (on unless 0): a vertex shader stage with constant
+// formats is keyed by how its elements arrive (packed or one component a
+// channel), and a recorded vertex input is replanned as this run's draws plan
+// theirs, unpacked where they do not pack (replan_recorded_vertex_input).
+// =0: as before, a packed recipe's stage shared with unpacked draws.
+const bool g_vertex_key_packing = [] {
+    const char* e = std::getenv("BBHOST_VERTEX_KEY_PACKING");
+    return !(e && e[0] == '0');
+}();
 struct VsStageInputs {
     const std::vector<std::uint32_t>* words;
     const std::vector<std::uint32_t>* fetch_words;  // translated only without vertex input
@@ -4006,7 +3988,14 @@ std::uint64_t vs_stage_key(const VsStageInputs& in) {
     key = fnv1a(vk, sizeof(vk), key);
     if (in.elements) {
         for (const gcn::VertexElement& el : *in.elements) {
-            const std::uint32_t e[4] = {el.location, el.vdata, el.count, in.formats_from_params ? 0u : el.w3};
+            // Constant formats are the element's word 3 and how it arrives
+            // (vertex_stage_key_word): a translation that takes an element
+            // packed reads its attribute's dwords apart, and on a draw that
+            // gives it one component a channel it decodes garbage - a recipe
+            // recorded packed and replayed where draws do not pack (formats as
+            // constants: no pipeline libraries, BBHOST_VERTEX_FORMAT_PARAMS=0)
+            // put such a stage under the unpacked draws' key.
+            const std::uint32_t e[4] = {el.location, el.vdata, el.count, vertex_stage_key_word(el, in.formats_from_params, g_vertex_key_packing)};
             key = fnv1a(e, sizeof(e), key);
         }
     }
@@ -13366,12 +13355,24 @@ void pack_vertex_input(VertexInputPlan& p, bool ask_usable = true) {
 // On a precompile worker: the packed formats are not asked about
 // (vertex_format_usable's answers are kept under g.mu), since R16_UINT,
 // R32_UINT and R32G32_UINT are vertex formats every Vulkan device must have.
+// A run whose draws do not pack (formats as constants: without pipeline
+// libraries, BBHOST_VERTEX_FORMAT_PARAMS=0 or BBHOST_VERTEX_PACK=0) takes a
+// recorded plan's packed elements apart again, one component a channel, as its
+// draws plan them (unpack_vertex_attributes): built packed, the recipe made a
+// pipeline no draw takes, and - before its stage was keyed by the packing - put
+// a vertex shader that reads packed dwords under the key of draws that give it
+// one component a channel (broken geometry wherever a shipped list or an
+// earlier session's manifest replayed on such a run).
 void replan_recorded_vertex_input(VertexInputPlan& p, bool tess_native) {
-    if (vertex_plan_hash(p) == p.hash) return;
-    if (g_vertex_pack && !tess_native && g_vertex_format_params && use_pipeline_library() &&
-        gcn::vertex_formats_from_params_supported(p.elements)) {
-        pack_vertex_input(p, false);
+    const bool draws_pack = g_vertex_pack && !tess_native && g_vertex_format_params && use_pipeline_library() &&
+                            gcn::vertex_formats_from_params_supported(p.elements);
+    if (!draws_pack && g_vertex_key_packing) {
+        unpack_vertex_attributes(p.elements, p.attributes);  // host/vertex_plan.h
+        p.hash = vertex_plan_hash(p);
+        return;
     }
+    if (vertex_plan_hash(p) == p.hash) return;
+    if (draws_pack) pack_vertex_input(p, false);
     p.hash = vertex_plan_hash(p);
 }
 

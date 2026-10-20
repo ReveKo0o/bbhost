@@ -623,6 +623,14 @@ if(UNIX)
   add_executable(twin_filter_test tests/twin_filter_test.cpp)
   target_include_directories(twin_filter_test PRIVATE src)
   add_test(NAME twin_filter_test COMMAND twin_filter_test)
+  # A pipeline recipe recorded where draws pack their vertex elements, replayed where they do not
+  # (host/vertex_plan.h; tests/vertex_plan_test.cpp).
+  if(TARGET Vulkan::Headers)
+    add_executable(vertex_plan_test tests/vertex_plan_test.cpp)
+    target_include_directories(vertex_plan_test PRIVATE src)
+    target_link_libraries(vertex_plan_test PRIVATE Vulkan::Headers)
+    add_test(NAME vertex_plan_test COMMAND vertex_plan_test)
+  endif()
   # The engine's classes by the names they register (tools/class_catalog.cpp).
   add_executable(class_catalog tools/class_catalog.cpp src/decomp/insn.cpp)
   target_link_libraries(class_catalog PRIVATE eboot_kit)
