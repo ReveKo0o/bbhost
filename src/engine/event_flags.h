@@ -28,6 +28,8 @@ bool event_flag_set(std::uint32_t id, bool value);
 // handful every frame (engine/rebirth.cpp). False when any could not be read;
 // out is then partly written.
 bool event_flags_get(const std::uint32_t* ids, std::size_t n, bool* out);
+// Enables narrow, temporary logging of changed M24 runtime flags while the player is in that area.
+void event_flags_boss_capture(bool enabled);
 // From the frame-time manager's hook: the changes since the last frame, and
 // the one-time check against the game's getter once the manager exists.
 void event_flags_tick();

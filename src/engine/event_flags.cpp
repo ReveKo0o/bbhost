@@ -10,6 +10,7 @@
 #include "log.h"
 
 #include <cstdlib>
+#include <initializer_list>
 
 namespace {
 
@@ -20,7 +21,13 @@ std::uint64_t g_slide = 0;
 bool g_ok = false;
 bool g_checked = false;
 bool g_log = false;
+bool g_boss_capture = false;
 std::uint64_t g_logged = 0, g_lost_said = 0;
+
+bool is_m24_runtime_flag(std::uint32_t id) {
+    const std::uint32_t bank = id / 1000;
+    return bank >= 12404 && bank <= 12494 && (bank - 12404) % 10 == 0;
+}
 
 // The game's memory read without trusting it: the store may not exist yet
 // when a plugin asks.
@@ -80,6 +87,20 @@ bool event_flags_get(const std::uint32_t* ids, std::size_t n, bool* out) {
     return true;
 }
 
+void event_flags_boss_capture(bool enabled) {
+    if (g_boss_capture == enabled) return;
+    g_boss_capture = enabled;
+    if (!enabled) return;
+    // Event changes are queued only while watching; scope this diagnostic to M24.
+    event_flag_watch(true);
+    host_log("boss flag capture: entered M24; logging changed M24 runtime flags only");
+    for (const std::uint32_t id : {12404800u, 12404802u}) {
+        bool value = false;
+        if (event_flag_get(id, &value)) host_log("boss flag capture: initial flag %u = %u", id, value ? 1u : 0u);
+        else host_log("boss flag capture: initial flag %u is not readable yet", id);
+    }
+}
+
 bool event_flag_set(std::uint32_t id, bool value) {
     const std::uint64_t man = manager();
     std::uint64_t byte = 0;
@@ -100,6 +121,8 @@ void event_flags_tick() {
         while ((n = event_flag_take_changes(changes, 256, &lost)) != 0) {
             for (std::size_t i = 0; i < n; ++i) {
                 if (g_log) host_log("event flag %u -> %u", changes[i].id, changes[i].value);
+                if (g_boss_capture && is_m24_runtime_flag(changes[i].id))
+                    host_log("boss flag capture: event flag %u -> %u", changes[i].id, changes[i].value);
                 plugins_event_flag(changes[i].id, changes[i].value != 0);
             }
             g_logged += n;

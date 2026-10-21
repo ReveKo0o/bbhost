@@ -3,6 +3,7 @@
 #include "core/elf.h"
 #include "core/portable.h"
 #include "engine/addr.h"
+#include "engine/event_flags.h"
 #include "engine/menu_pointer.h"
 #include "engine/world_chr.h"
 #include "bbhost/engine/sprj/game_data_man.hpp"
@@ -202,6 +203,10 @@ bool player_origin(int* origin) {
 
 void player_data_tick() {
     if (!g_ok) return;
+    std::uint32_t current_map = 0;
+    const bool has_map = world_player_block(&current_map);
+    const bool in_m24 = has_map && ((current_map >> 24) & 0xffu) == 0x18u;
+    event_flags_boss_capture(in_m24);
     if (!net::discord_rpc_enabled()) {
         net::ShutdownDiscordRPC();
         return;
